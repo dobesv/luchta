@@ -1,0 +1,16 @@
+[package]
+name = "luchta-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description.workspace = true
+
+[dependencies]
+petgraph = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+luchta-types = { path = "../luchta-types" }

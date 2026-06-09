@@ -1,0 +1,8 @@
+/target
+**/target
+
+# Local agent tooling / plan storage (not part of the project)
+/.agent/
+
+# Vendored reference clone (not part of the project)
+/turborepo/
