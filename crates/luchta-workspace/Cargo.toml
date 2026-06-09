@@ -12,4 +12,11 @@ description.workspace = true
 [dependencies]
 petgraph = { workspace = true }
 thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+globset = { workspace = true }
+walkdir = { workspace = true }
 luchta-types = { path = "../luchta-types" }
+
+[dev-dependencies]
+tempfile = { workspace = true }
