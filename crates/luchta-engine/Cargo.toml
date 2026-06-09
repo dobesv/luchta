@@ -14,3 +14,7 @@ petgraph = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
 luchta-types = { path = "../luchta-types" }
+luchta-workspace = { path = "../luchta-workspace" }
+
+[dev-dependencies]
+tempfile = { workspace = true }

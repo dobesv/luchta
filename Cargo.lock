@@ -352,7 +352,9 @@ name = "luchta-engine"
 version = "0.1.0"
 dependencies = [
  "luchta-types",
+ "luchta-workspace",
  "petgraph",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
 ]
