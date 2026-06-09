@@ -304,13 +304,40 @@ fn resolve_command(
     // Priority 2: look up in package.json scripts
     if let Some(pkg) = package {
         let pkg_json_path = pkg.path.join("package.json");
-        if let Ok(contents) = fs::read_to_string(&pkg_json_path) {
-            if let Ok(pkg_json) = serde_json::from_str::<PackageJson>(&contents) {
-                if let Some(ref scripts) = pkg_json.scripts {
-                    if let Some(cmd) = scripts.get(task_name.as_str()) {
-                        return Ok(Some(cmd.clone()));
+
+        match fs::read_to_string(&pkg_json_path) {
+            Ok(contents) => {
+                // File read successfully - parse JSON
+                match serde_json::from_str::<PackageJson>(&contents) {
+                    Ok(pkg_json) => {
+                        // Parsed successfully - look for script
+                        if let Some(ref scripts) = pkg_json.scripts {
+                            if let Some(cmd) = scripts.get(task_name.as_str()) {
+                                return Ok(Some(cmd.clone()));
+                            }
+                        }
+                        // No matching script - fall through to Ok(None)
+                    }
+                    Err(e) => {
+                        // Malformed JSON - this is an error, not a no-op
+                        bail!(
+                            "Failed to parse package.json at {}: {}",
+                            pkg_json_path.display(),
+                            e
+                        );
                     }
                 }
+            }
+            Err(e) => {
+                // File read failed - distinguish NotFound from other errors
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    // Permission error, I/O error, etc. - this is an error
+                    return Err(e).into_diagnostic().wrap_err_with(|| {
+                        format!("Failed to read package.json at {}", pkg_json_path.display())
+                    });
+                }
+                // NotFound is fine - package legitimately may have no package.json
+                // Fall through to Ok(None)
             }
         }
     }

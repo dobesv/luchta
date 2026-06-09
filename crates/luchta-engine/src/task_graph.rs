@@ -54,15 +54,23 @@ impl TaskGraph {
             for (task_name, definition) in pipeline {
                 let source_id = TaskId::new(package.name.clone(), task_name.clone());
                 for dependency in &definition.depends_on {
-                    for target_id in
-                        task_graph.expand_dependency(package_graph, &package.name, dependency)?
-                    {
-                        if let (Some(source_index), Some(target_index)) = (
-                            task_graph.node_index(&source_id),
-                            task_graph.node_index(&target_id),
-                        ) {
-                            edges.insert((source_index, target_index));
-                        }
+                    for target_id in task_graph.expand_dependency(
+                        package_graph,
+                        pipeline,
+                        &package.name,
+                        &source_id,
+                        dependency,
+                    )? {
+                        let source_index = task_graph
+                            .node_index(&source_id)
+                            .expect("source task node should exist");
+                        let target_index = task_graph.node_index(&target_id).ok_or_else(|| {
+                            EngineError::UnknownDependencyTarget {
+                                from: source_id.clone(),
+                                target: target_id.clone(),
+                            }
+                        })?;
+                        edges.insert((source_index, target_index));
                     }
                 }
             }
@@ -104,24 +112,49 @@ impl TaskGraph {
     fn expand_dependency(
         &self,
         package_graph: &PackageGraph,
+        pipeline: &HashMap<TaskName, TaskDefinition>,
         package_name: &PackageName,
+        source_id: &TaskId,
         dependency: &DependsOn,
     ) -> Result<Vec<TaskId>, EngineError> {
         match dependency {
             DependsOn::SamePackage(task_name) => {
+                self.ensure_pipeline_task_exists(pipeline, source_id, task_name)?;
                 Ok(vec![TaskId::new(package_name.clone(), task_name.clone())])
             }
-            DependsOn::DirectUpstream(task_name) => Ok(package_graph
-                .dependencies_of(package_name)?
-                .into_iter()
-                .map(|package| TaskId::new(package.name.clone(), task_name.clone()))
-                .collect()),
-            DependsOn::TransitiveUpstream(task_name) => Ok(self
-                .transitive_upstream_packages(package_graph, package_name)?
-                .into_iter()
-                .map(|package| TaskId::new(package, task_name.clone()))
-                .collect()),
+            DependsOn::DirectUpstream(task_name) => {
+                self.ensure_pipeline_task_exists(pipeline, source_id, task_name)?;
+                Ok(package_graph
+                    .dependencies_of(package_name)?
+                    .into_iter()
+                    .map(|package| TaskId::new(package.name.clone(), task_name.clone()))
+                    .collect())
+            }
+            DependsOn::TransitiveUpstream(task_name) => {
+                self.ensure_pipeline_task_exists(pipeline, source_id, task_name)?;
+                Ok(self
+                    .transitive_upstream_packages(package_graph, package_name)?
+                    .into_iter()
+                    .map(|package| TaskId::new(package, task_name.clone()))
+                    .collect())
+            }
             DependsOn::Specific(task_id) => Ok(vec![task_id.clone()]),
+        }
+    }
+
+    fn ensure_pipeline_task_exists(
+        &self,
+        pipeline: &HashMap<TaskName, TaskDefinition>,
+        source_id: &TaskId,
+        task_name: &TaskName,
+    ) -> Result<(), EngineError> {
+        if pipeline.contains_key(task_name) {
+            Ok(())
+        } else {
+            Err(EngineError::UnknownDependencyTask {
+                from: source_id.clone(),
+                task: task_name.clone(),
+            })
         }
     }
 
@@ -261,6 +294,48 @@ mod tests {
             "build",
             "@repo/c",
             "build"
+        ));
+    }
+
+    #[test]
+    fn errors_on_unknown_pipeline_task_dependency() {
+        let package_graph = package_graph_single("@repo/app");
+        let pipeline = HashMap::from([(
+            TaskName::from("build"),
+            TaskDefinition {
+                depends_on: vec![DependsOn::DirectUpstream(TaskName::from("nonexistent"))],
+                ..TaskDefinition::default()
+            },
+        )]);
+
+        let error = TaskGraph::build(&package_graph, &pipeline)
+            .expect_err("unknown pipeline task dependency expected");
+        assert!(matches!(
+            error,
+            EngineError::UnknownDependencyTask { from, task }
+                if from == TaskId::new("@repo/app", "build")
+                    && task == TaskName::from("nonexistent")
+        ));
+    }
+
+    #[test]
+    fn errors_on_unknown_specific_dependency_target() {
+        let package_graph = package_graph_single("@repo/app");
+        let pipeline = HashMap::from([(
+            TaskName::from("build"),
+            TaskDefinition {
+                depends_on: vec![DependsOn::Specific(TaskId::new("ghost", "build"))],
+                ..TaskDefinition::default()
+            },
+        )]);
+
+        let error = TaskGraph::build(&package_graph, &pipeline)
+            .expect_err("unknown specific dependency target expected");
+        assert!(matches!(
+            error,
+            EngineError::UnknownDependencyTarget { from, target }
+                if from == TaskId::new("@repo/app", "build")
+                    && target == TaskId::new("ghost", "build")
         ));
     }
 
