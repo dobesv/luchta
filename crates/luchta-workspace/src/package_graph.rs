@@ -40,6 +40,9 @@ impl PackageNode {
     }
 }
 
+/// A package graph under construction: the node graph plus a name→index lookup.
+type GraphNodes = (DiGraph<PackageNode, ()>, HashMap<PackageName, NodeIndex>);
+
 /// Directed graph of workspace packages and their dependency edges.
 #[derive(Debug, Default)]
 pub struct PackageGraph {
@@ -57,6 +60,21 @@ impl PackageGraph {
     /// package's `package.json` and extracting dependency names from both
     /// `dependencies` and `devDependencies`.
     pub fn build(packages: Vec<PackageNode>) -> Result<Self, WorkspaceError> {
+        let (mut graph, indices_by_name) = Self::insert_nodes(packages)?;
+        let edges = Self::collect_dependency_edges(&graph, &indices_by_name)?;
+
+        for (source_index, dependency_index) in edges {
+            graph.add_edge(source_index, dependency_index, ());
+        }
+
+        Ok(Self {
+            graph,
+            indices_by_name,
+        })
+    }
+
+    /// Adds every package as a node, erroring on duplicate names.
+    fn insert_nodes(packages: Vec<PackageNode>) -> Result<GraphNodes, WorkspaceError> {
         let mut graph = DiGraph::new();
         let mut indices_by_name = HashMap::with_capacity(packages.len());
 
@@ -70,6 +88,14 @@ impl PackageGraph {
             }
         }
 
+        Ok((graph, indices_by_name))
+    }
+
+    /// Resolves intra-workspace dependency edges from each package's manifest.
+    fn collect_dependency_edges(
+        graph: &DiGraph<PackageNode, ()>,
+        indices_by_name: &HashMap<PackageName, NodeIndex>,
+    ) -> Result<HashSet<(NodeIndex, NodeIndex)>, WorkspaceError> {
         let workspace_names: HashSet<_> = indices_by_name.keys().cloned().collect();
         let mut edges = HashSet::new();
 
@@ -87,14 +113,7 @@ impl PackageGraph {
             }
         }
 
-        for (source_index, dependency_index) in edges {
-            graph.add_edge(source_index, dependency_index, ());
-        }
-
-        Ok(Self {
-            graph,
-            indices_by_name,
-        })
+        Ok(edges)
     }
 
     /// Returns number of package nodes currently stored.

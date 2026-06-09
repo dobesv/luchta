@@ -224,9 +224,7 @@ impl WalkerState {
         let mut visited = HashSet::new();
         let mut skipped = 0;
 
-        if let Some(dependents) = self.dependents.get(&node_index) {
-            queue.extend(dependents.iter().copied());
-        }
+        self.enqueue_dependents(node_index, &mut queue);
 
         let mut states = self.states.lock().expect("walker states poisoned");
         while let Some(dependent) = queue.pop_front() {
@@ -237,15 +235,20 @@ impl WalkerState {
             if states.get(&dependent).copied() == Some(NodeState::Pending) {
                 states.insert(dependent, NodeState::Skipped);
                 skipped += 1;
-                if let Some(next) = self.dependents.get(&dependent) {
-                    queue.extend(next.iter().copied());
-                }
+                self.enqueue_dependents(dependent, &mut queue);
             }
         }
         drop(states);
 
         if skipped > 0 {
             self.bump_terminal_count(skipped);
+        }
+    }
+
+    /// Pushes the direct dependents of `node_index` onto `queue`.
+    fn enqueue_dependents(&self, node_index: NodeIndex, queue: &mut VecDeque<NodeIndex>) {
+        if let Some(dependents) = self.dependents.get(&node_index) {
+            queue.extend(dependents.iter().copied());
         }
     }
 

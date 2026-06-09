@@ -8,7 +8,9 @@ use std::{
     sync::Arc,
 };
 
-use luchta_engine::{ExecutionRequest, TaskGraph, Walker, WeightedExecutor};
+use luchta_engine::{
+    CompletionSignal, ExecutionRequest, TaskGraph, TaskNode, Walker, WeightedExecutor,
+};
 use luchta_types::{TaskDefinition, TaskId, TaskName};
 use luchta_workspace::{PackageNode, WorkspaceDiscovery, YarnWorkspace};
 use miette::{bail, Context, IntoDiagnostic, Result};
@@ -51,18 +53,24 @@ pub fn resolve_workspace_root(explicit: Option<PathBuf>) -> Result<PathBuf> {
 fn find_workspace_root(start: &Path) -> Option<PathBuf> {
     let mut current = start.to_path_buf();
     loop {
-        let pkg_json_path = current.join("package.json");
-        if let Ok(contents) = fs::read_to_string(&pkg_json_path) {
-            if let Ok(pkg) = serde_json::from_str::<serde_json::Value>(&contents) {
-                if pkg.get("workspaces").is_some() {
-                    return Some(current);
-                }
-            }
+        if has_workspaces_field(&current) {
+            return Some(current);
         }
         if !current.pop() {
             return None;
         }
     }
+}
+
+/// Returns true when `dir`'s `package.json` declares a `workspaces` field.
+fn has_workspaces_field(dir: &Path) -> bool {
+    let Ok(contents) = fs::read_to_string(dir.join("package.json")) else {
+        return false;
+    };
+    let Ok(pkg) = serde_json::from_str::<serde_json::Value>(&contents) else {
+        return false;
+    };
+    pkg.get("workspaces").is_some()
 }
 
 /// Run the requested tasks.
@@ -125,69 +133,14 @@ pub async fn run_tasks(workspace_root: &PathBuf, requested_tasks: &[String]) -> 
 
     // Process ready tasks
     while let Some((task_node, done_tx)) = receiver.recv().await {
-        let task_id = task_node.id.clone();
-
-        // Skip if not in our target set
-        if !tasks_to_run.contains(&task_id) {
-            // Send success to unblock dependents
-            let _ = done_tx.send(true);
-            continue;
-        }
-
-        // Check if we have a command
-        let Some(request) = commands.get(&task_id) else {
-            // No command - this is a no-op, mark as success
-            println!(
-                "{} {} (no command, skipping)",
-                "○".dimmed(),
-                task_id.to_string().dimmed()
-            );
-            let _ = done_tx.send(true);
-            continue;
-        };
-
-        // Check if any prior task failed - if so, skip
-        if any_failed.load(Ordering::SeqCst) {
-            println!(
-                "{} {} (skipped due to prior failure)",
-                "⊘".yellow(),
-                task_id.to_string().yellow()
-            );
-            let _ = done_tx.send(false);
-            continue;
-        }
-
-        println!("{} {}", "●".green(), task_id.to_string().green());
-
-        // Execute
-        let executor_clone = Arc::clone(&executor);
-        let any_failed_clone = Arc::clone(&any_failed);
-        let request_clone = request.clone();
-
-        tokio::spawn(async move {
-            let result = executor_clone.run(&request_clone).await;
-            match result {
-                Ok(status) if status.success() => {
-                    println!("{} {}", "✓".green(), task_id.to_string().green());
-                    let _ = done_tx.send(true);
-                }
-                Ok(status) => {
-                    eprintln!(
-                        "{} {} (exit code: {:?})",
-                        "✗".red(),
-                        task_id.to_string().red(),
-                        status.code()
-                    );
-                    any_failed_clone.store(true, Ordering::SeqCst);
-                    let _ = done_tx.send(false);
-                }
-                Err(e) => {
-                    eprintln!("{} {} error: {}", "✗".red(), task_id.to_string().red(), e);
-                    any_failed_clone.store(true, Ordering::SeqCst);
-                    let _ = done_tx.send(false);
-                }
-            }
-        });
+        dispatch_ready_task(
+            task_node,
+            done_tx,
+            &tasks_to_run,
+            &commands,
+            &executor,
+            &any_failed,
+        );
     }
 
     // Wait for walker to complete
@@ -205,54 +158,149 @@ pub async fn run_tasks(workspace_root: &PathBuf, requested_tasks: &[String]) -> 
     Ok(())
 }
 
+/// Handles a single ready task: skip non-targets/no-ops, short-circuit after a
+/// prior failure, or spawn the command for execution.
+fn dispatch_ready_task(
+    task_node: TaskNode,
+    done_tx: CompletionSignal,
+    tasks_to_run: &HashSet<TaskId>,
+    commands: &HashMap<TaskId, ExecutionRequest>,
+    executor: &Arc<WeightedExecutor>,
+    any_failed: &Arc<AtomicBool>,
+) {
+    let task_id = task_node.id.clone();
+
+    // Skip if not in our target set (send success to unblock dependents).
+    if !tasks_to_run.contains(&task_id) {
+        let _ = done_tx.send(true);
+        return;
+    }
+
+    // No command - this is a no-op, mark as success.
+    let Some(request) = commands.get(&task_id) else {
+        println!(
+            "{} {} (no command, skipping)",
+            "○".dimmed(),
+            task_id.to_string().dimmed()
+        );
+        let _ = done_tx.send(true);
+        return;
+    };
+
+    // Short-circuit once any prior task has failed.
+    if any_failed.load(Ordering::SeqCst) {
+        println!(
+            "{} {} (skipped due to prior failure)",
+            "⊘".yellow(),
+            task_id.to_string().yellow()
+        );
+        let _ = done_tx.send(false);
+        return;
+    }
+
+    println!("{} {}", "●".green(), task_id.to_string().green());
+    let job = TaskJob {
+        task_id,
+        request: request.clone(),
+        executor: Arc::clone(executor),
+        any_failed: Arc::clone(any_failed),
+    };
+    spawn_task_execution(job, done_tx);
+}
+
+/// Everything needed to execute one task on the executor.
+struct TaskJob {
+    task_id: TaskId,
+    request: ExecutionRequest,
+    executor: Arc<WeightedExecutor>,
+    any_failed: Arc<AtomicBool>,
+}
+
+/// Spawns a task on the executor, reporting status and recording any failure.
+fn spawn_task_execution(job: TaskJob, done_tx: CompletionSignal) {
+    let TaskJob {
+        task_id,
+        request,
+        executor,
+        any_failed,
+    } = job;
+
+    tokio::spawn(async move {
+        match executor.run(&request).await {
+            Ok(status) if status.success() => {
+                println!("{} {}", "✓".green(), task_id.to_string().green());
+                let _ = done_tx.send(true);
+            }
+            Ok(status) => {
+                eprintln!(
+                    "{} {} (exit code: {:?})",
+                    "✗".red(),
+                    task_id.to_string().red(),
+                    status.code()
+                );
+                any_failed.store(true, Ordering::SeqCst);
+                let _ = done_tx.send(false);
+            }
+            Err(e) => {
+                eprintln!("{} {} error: {}", "✗".red(), task_id.to_string().red(), e);
+                any_failed.store(true, Ordering::SeqCst);
+                let _ = done_tx.send(false);
+            }
+        }
+    });
+}
+
 /// Resolve which tasks to run: requested tasks + all their dependencies.
 fn resolve_tasks_to_run(
     task_graph: &TaskGraph,
     requested_tasks: &[String],
 ) -> Result<HashSet<TaskId>> {
     let mut tasks_to_run = HashSet::new();
-    let mut to_process: Vec<TaskId> = Vec::new();
-
-    // Find initial task IDs matching requested names
-    for task_name in requested_tasks {
-        let found_any = task_graph
-            .as_graph()
-            .node_weights()
-            .any(|node| node.id.task.as_str() == task_name);
-
-        if !found_any {
-            bail!("task '{}' not found in pipeline", task_name);
-        }
-
-        // Add all task IDs matching this name
-        for node in task_graph.as_graph().node_weights() {
-            if node.id.task.as_str() == task_name {
-                to_process.push(node.id.clone());
-            }
-        }
-    }
+    let mut to_process = seed_requested_tasks(task_graph, requested_tasks)?;
 
     // Walk dependencies
     while let Some(task_id) = to_process.pop() {
-        if tasks_to_run.contains(&task_id) {
+        if !tasks_to_run.insert(task_id.clone()) {
             continue;
         }
-        tasks_to_run.insert(task_id.clone());
-
-        // Add dependencies
-        if let Some(node_idx) = task_graph.indices_by_id.get(&task_id) {
-            let node_idx = *node_idx;
-            for neighbor in task_graph
-                .graph
-                .neighbors_directed(node_idx, Direction::Outgoing)
-            {
-                let dep_node = &task_graph.graph[neighbor];
-                to_process.push(dep_node.id.clone());
-            }
-        }
+        push_dependencies(task_graph, &task_id, &mut to_process);
     }
 
     Ok(tasks_to_run)
+}
+
+/// Collects the task IDs of every node whose task name was requested.
+///
+/// Errors if a requested name matches no node in the pipeline.
+fn seed_requested_tasks(task_graph: &TaskGraph, requested_tasks: &[String]) -> Result<Vec<TaskId>> {
+    let mut seed = Vec::new();
+    for task_name in requested_tasks {
+        let matching: Vec<TaskId> = task_graph
+            .as_graph()
+            .node_weights()
+            .filter(|node| node.id.task.as_str() == task_name)
+            .map(|node| node.id.clone())
+            .collect();
+
+        if matching.is_empty() {
+            bail!("task '{}' not found in pipeline", task_name);
+        }
+        seed.extend(matching);
+    }
+    Ok(seed)
+}
+
+/// Pushes the direct dependency task IDs of `task_id` onto `to_process`.
+fn push_dependencies(task_graph: &TaskGraph, task_id: &TaskId, to_process: &mut Vec<TaskId>) {
+    let Some(&node_idx) = task_graph.indices_by_id.get(task_id) else {
+        return;
+    };
+    for neighbor in task_graph
+        .graph
+        .neighbors_directed(node_idx, Direction::Outgoing)
+    {
+        to_process.push(task_graph.graph[neighbor].id.clone());
+    }
 }
 
 /// Build command map for each task in the graph.
@@ -299,54 +347,47 @@ fn resolve_command(
     task_name: &TaskName,
     package: Option<&PackageNode>,
 ) -> Result<Option<String>> {
-    // Priority 1: explicit command in TaskDefinition
-    if let Some(def) = task_def {
-        if let Some(ref cmd) = def.command {
-            return Ok(Some(cmd.clone()));
-        }
+    // Priority 1: explicit command in TaskDefinition.
+    if let Some(cmd) = task_def.and_then(|def| def.command.clone()) {
+        return Ok(Some(cmd));
     }
 
-    // Priority 2: look up in package.json scripts
-    if let Some(pkg) = package {
-        let pkg_json_path = pkg.path.join("package.json");
+    // Priority 2: look up in package.json scripts.
+    let Some(pkg) = package else {
+        return Ok(None);
+    };
+    script_from_package_json(&pkg.path, task_name)
+}
 
-        match fs::read_to_string(&pkg_json_path) {
-            Ok(contents) => {
-                // File read successfully - parse JSON
-                match serde_json::from_str::<PackageJson>(&contents) {
-                    Ok(pkg_json) => {
-                        // Parsed successfully - look for script
-                        if let Some(ref scripts) = pkg_json.scripts {
-                            if let Some(cmd) = scripts.get(task_name.as_str()) {
-                                return Ok(Some(cmd.clone()));
-                            }
-                        }
-                        // No matching script - fall through to Ok(None)
-                    }
-                    Err(e) => {
-                        // Malformed JSON - this is an error, not a no-op
-                        bail!(
-                            "Failed to parse package.json at {}: {}",
-                            pkg_json_path.display(),
-                            e
-                        );
-                    }
-                }
-            }
-            Err(e) => {
-                // File read failed - distinguish NotFound from other errors
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    // Permission error, I/O error, etc. - this is an error
-                    return Err(e).into_diagnostic().wrap_err_with(|| {
-                        format!("Failed to read package.json at {}", pkg_json_path.display())
-                    });
-                }
-                // NotFound is fine - package legitimately may have no package.json
-                // Fall through to Ok(None)
-            }
+/// Looks up `task_name` in the `scripts` map of `<package_dir>/package.json`.
+///
+/// A missing `package.json` is a legitimate no-op (`Ok(None)`); an unreadable or
+/// malformed manifest is an error.
+fn script_from_package_json(package_dir: &Path, task_name: &TaskName) -> Result<Option<String>> {
+    let pkg_json_path = package_dir.join("package.json");
+
+    let contents = match fs::read_to_string(&pkg_json_path) {
+        Ok(contents) => contents,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(e).into_diagnostic().wrap_err_with(|| {
+                format!("Failed to read package.json at {}", pkg_json_path.display())
+            });
         }
-    }
+    };
 
-    // No command found - this is a no-op task
-    Ok(None)
+    let pkg_json: PackageJson = serde_json::from_str(&contents).map_err(|e| {
+        miette::miette!(
+            "Failed to parse package.json at {}: {}",
+            pkg_json_path.display(),
+            e
+        )
+    })?;
+
+    let command = pkg_json
+        .scripts
+        .as_ref()
+        .and_then(|scripts| scripts.get(task_name.as_str()))
+        .cloned();
+    Ok(command)
 }
