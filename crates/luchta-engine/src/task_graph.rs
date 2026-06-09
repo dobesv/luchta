@@ -17,8 +17,8 @@ pub struct TaskNode {
 
 #[derive(Debug, Default)]
 pub struct TaskGraph {
-    graph: DiGraph<TaskNode, ()>,
-    indices_by_id: HashMap<TaskId, NodeIndex>,
+    pub graph: DiGraph<TaskNode, ()>,
+    pub indices_by_id: HashMap<TaskId, NodeIndex>,
 }
 
 impl TaskGraph {

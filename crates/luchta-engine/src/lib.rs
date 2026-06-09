@@ -6,7 +6,7 @@ use luchta_types::TaskId;
 use luchta_workspace::WorkspaceError;
 use thiserror::Error;
 
-pub use executor::{ExecutorError, TaskExecutor, WeightedExecutor};
+pub use executor::{ExecutionRequest, ExecutorError, TaskExecutor, WeightedExecutor};
 pub use task_graph::{TaskGraph, TaskNode};
 pub use walker::{CompletionSignal, ReadyTaskMessage, Walker};
 
