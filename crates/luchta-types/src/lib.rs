@@ -1,7 +1,7 @@
 //! Shared core domain types for Luchta.
 //!
 //! These types model package names, task names, task identifiers, task
-//! dependency declarations, and `luchta.toml` configuration shared across crates.
+//! dependency declarations, and the `luchta-config.*` configuration shared across crates.
 
 mod config;
 
@@ -117,14 +117,14 @@ impl fmt::Display for TaskId {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TaskDefinition {
     /// Dependencies that must complete before task may run.
-    #[serde(default)]
+    #[serde(default, rename = "dependsOn", alias = "depends_on")]
     pub depends_on: Vec<DependsOn>,
     /// Relative weight used by weighted scheduler.
     #[serde(default = "default_task_weight")]
     pub weight: u32,
     /// Explicit command line for task.
     ///
-    /// Command resolution priority: explicit `command` in `luchta.toml` first,
+    /// Command resolution priority: explicit `command` in the config first,
     /// otherwise matching `scripts` entry from `package.json` for task name.
     #[serde(default)]
     pub command: Option<String>,
@@ -179,7 +179,7 @@ impl std::error::Error for ParseDependsOnError {}
 
 /// Dependency reference used in task pipeline definitions.
 ///
-/// Serde representation is string-based for `luchta.toml` UX:
+/// Serde representation is string-based for config UX:
 /// `^task`, `^^task`, `task`, or `pkg#task`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum DependsOn {

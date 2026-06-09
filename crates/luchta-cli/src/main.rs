@@ -31,8 +31,7 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Commands::Check => {
             // Stub: validate config + graph construction
-            let config_path = workspace_root.join("luchta.toml");
-            let _config = config::load_config(&config_path)?;
+            let _config = config::load_config(&workspace_root).await?;
             println!("Configuration valid");
             Ok(())
         }

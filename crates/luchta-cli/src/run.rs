@@ -68,9 +68,14 @@ fn find_workspace_root(start: &Path) -> Option<PathBuf> {
 /// Run the requested tasks.
 pub async fn run_tasks(workspace_root: &PathBuf, requested_tasks: &[String]) -> Result<()> {
     // Load config
-    let config_path = workspace_root.join("luchta.toml");
-    let config = crate::config::load_config(&config_path)
-        .wrap_err_with(|| format!("failed to load config from {}", config_path.display()))?;
+    let config = crate::config::load_config(workspace_root)
+        .await
+        .wrap_err_with(|| {
+            format!(
+                "failed to load config from workspace root {}",
+                workspace_root.display()
+            )
+        })?;
 
     // Discover packages
     let workspace = YarnWorkspace::new(workspace_root);

@@ -52,18 +52,13 @@ fn setup_workspace(temp: &assert_fs::TempDir) {
         )
         .expect("write packages/b/package.json");
 
-    // luchta.toml config
-    let config = temp.child("luchta.toml");
+    // luchta executable config
+    let config = temp.child("luchta-config.sh");
     config
         .write_str(
-            r#"[concurrency]
-max_weight = 4
-
-[pipeline.build]
-depends_on = ["^build"]
-"#,
+            "#!/bin/sh\necho '{\"concurrency\":{\"maxWeight\":4},\"pipeline\":{\"build\":{\"dependsOn\":[\"^build\"]}}}'\n",
         )
-        .expect("write luchta.toml");
+        .expect("write luchta-config.sh");
 }
 
 #[test]
@@ -118,17 +113,15 @@ fn run_fails_on_script_failure() {
         )
         .expect("write packages/a/package.json");
 
-    // luchta.toml config
-    let config = temp.child("luchta.toml");
+    // luchta executable config
+    let config = temp.child("luchta-config.sh");
     config
         .write_str(
-            r#"[concurrency]
-max_weight = 4
-
-[pipeline.build]
+            r#"#!/bin/sh
+echo '{"concurrency":{"maxWeight":4},"pipeline":{"build":{}}}'
 "#,
         )
-        .expect("write luchta.toml");
+        .expect("write luchta-config.sh");
 
     let mut cmd = Command::cargo_bin("luchta").expect("find binary");
     cmd.arg("run")
@@ -191,18 +184,13 @@ fn run_fails_on_malformed_package_json() {
         )
         .expect("write packages/b/package.json (malformed)");
 
-    // luchta.toml config
-    let config = temp.child("luchta.toml");
+    // luchta executable config
+    let config = temp.child("luchta-config.sh");
     config
         .write_str(
-            r#"[concurrency]
-max_weight = 4
-
-[pipeline.build]
-depends_on = ["^build"]
-"#,
+            "#!/bin/sh\necho '{\"concurrency\":{\"maxWeight\":4},\"pipeline\":{\"build\":{\"dependsOn\":[\"^build\"]}}}'\n",
         )
-        .expect("write luchta.toml");
+        .expect("write luchta-config.sh");
 
     let mut cmd = Command::cargo_bin("luchta").expect("find binary");
     cmd.arg("run")

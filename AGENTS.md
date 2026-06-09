@@ -23,7 +23,7 @@ Agents must respect these fundamental design choices:
 - **Error Handling:**
     - Use `thiserror` for library crates (`luchta-types`, `luchta-lockfiles`, `luchta-workspace`, `luchta-engine`).
     - Use `miette` only in the `luchta-cli` for user-facing diagnostics.
-- **Configuration:** Primary configuration is `luchta.toml` (TOML).
+- **Configuration:** Primary configuration is an executable `luchta-config.*` script at the workspace root that prints a JSON configuration object to `stdout`.
 
 ## Validation Commands
 Before submitting changes, ensure the following commands pass:

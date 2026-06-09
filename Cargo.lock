@@ -446,6 +446,7 @@ dependencies = [
  "assert_cmd",
  "assert_fs",
  "clap",
+ "libc",
  "luchta-engine",
  "luchta-types",
  "luchta-workspace",
@@ -457,7 +458,6 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
- "toml",
 ]
 
 [[package]]

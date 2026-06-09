@@ -20,7 +20,7 @@ The project is organized into a multi-crate Cargo workspace under `crates/`:
 - `luchta-lockfiles`: `Lockfile` trait abstraction and Yarn v1 implementation.
 - `luchta-workspace`: Workspace discovery and Package Graph construction.
 - `luchta-engine`: Task Graph construction and the weighted task executor.
-- `luchta-cli`: Entry point, `clap` CLI, and `luchta.toml` configuration loading.
+- `luchta-cli`: Entry point, `clap` CLI, and executable config script loading.
 
 ## Development
 
@@ -44,7 +44,25 @@ cargo build -p luchta-cli
 
 ## Usage Sketch
 
-Luchta uses a `luchta.toml` file at the workspace root to define the task pipeline.
+Luchta is configured via an executable script at the workspace root matching `luchta-config.*` (e.g., `.ts`, `.js`, `.sh`, `.py`). 
+
+The script **must** have a shebang line and print its configuration to `stdout` as a JSON object with `camelCase` fields. Luchta executes the script directly and parses this JSON to load the pipeline definition.
+
+Example `luchta-config.ts`:
+```typescript
+#!/usr/bin/env node
+console.log(JSON.stringify({ 
+  pipeline: { 
+    build: { 
+      dependsOn: ["^build"], 
+      weight: 2 
+    } 
+  }, 
+  concurrency: { 
+    maxWeight: 10 
+  } 
+}));
+```
 
 ```bash
 # Run the build task for all relevant packages
