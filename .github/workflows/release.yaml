@@ -1,0 +1,185 @@
+name: Release
+
+on:
+  push:
+    tags:
+    # knope tags releases as `luchta/v<version>` (the package-prefixed form
+    # from the [packages.luchta] config). The bare `v<version>` pattern is also
+    # matched for any manual tags that don't go through knope.
+    - 'luchta/v[0-9]+.[0-9]+.[0-9]+*'
+    - 'v[0-9]+.[0-9]+.[0-9]+*'
+  # Allow building a release on demand against an arbitrary ref without a tag.
+  workflow_dispatch:
+
+jobs:
+  release:
+    name: Build & publish binaries
+    permissions:
+      contents: write
+    outputs:
+      rc: ${{ steps.check-tag.outputs.rc }}
+
+    strategy:
+      # Surface every target's failure in one run instead of cancelling on the
+      # first error. Each platform builds independently and partial success is
+      # still useful to ship.
+      fail-fast: false
+      # Same three-platform coverage as harnx: Linux (x86_64 + aarch64, musl
+      # static via cross), macOS (x86_64 + aarch64), and Windows (x86_64 +
+      # aarch64 + i686). `use-cross: true` jobs build inside a cross container;
+      # the rest build natively on the matching runner.
+      matrix:
+        include:
+        - target: aarch64-unknown-linux-musl
+          os: ubuntu-latest
+          use-cross: true
+        - target: aarch64-apple-darwin
+          os: macos-latest
+          # macos-latest runners are ARM64, so this builds natively.
+          use-cross: false
+        - target: aarch64-pc-windows-msvc
+          os: windows-latest
+          use-cross: true
+        - target: x86_64-apple-darwin
+          os: macos-latest
+          use-cross: false
+        - target: x86_64-pc-windows-msvc
+          os: windows-latest
+          use-cross: false
+        - target: x86_64-unknown-linux-musl
+          os: ubuntu-latest
+          use-cross: true
+        - target: i686-pc-windows-msvc
+          os: windows-latest
+          use-cross: true
+
+    runs-on: ${{ matrix.os }}
+    env:
+      BUILD_CMD: cargo
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Check tag
+      id: check-tag
+      shell: bash
+      run: |
+        # For tag pushes the version is the ref tail; for workflow_dispatch
+        # there is no tag, so fall back to the short SHA.
+        if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+          ver=${GITHUB_REF##*/}
+        else
+          ver=$(git rev-parse --short HEAD)
+        fi
+        echo "version=$ver" >> "$GITHUB_OUTPUT"
+        # A plain X.Y.Z tail is a final release; anything else (rc, beta, a
+        # bare SHA) is treated as a prerelease.
+        if [[ "$ver" =~ [0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          echo "rc=false" >> "$GITHUB_OUTPUT"
+        else
+          echo "rc=true" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: ${{ matrix.target }}
+
+    # rust-toolchain.toml pins the active toolchain, so `cargo build` uses it
+    # rather than the `stable` toolchain dtolnay set up — the target stdlib
+    # must be added to the active toolchain too. cross also silently falls back
+    # to plain cargo when no Docker image exists for a target (e.g. the Windows
+    # MSVC targets), so the rustup target must be present even on
+    # `use-cross: true` jobs. When cross does run a real container build,
+    # `rustup target add` is a harmless no-op against the host toolchain.
+    - name: Install Rust target for active toolchain
+      shell: bash
+      run: rustup target add ${{ matrix.target }}
+
+    - uses: Swatinem/rust-cache@v2
+
+    - name: Install cross
+      if: matrix.use-cross
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cross
+
+    - name: Use cross as the build command
+      if: matrix.use-cross
+      shell: bash
+      run: echo "BUILD_CMD=cross" >> "$GITHUB_ENV"
+
+    - name: Show version information
+      shell: bash
+      run: |
+        rustup -V || true
+        cargo -V
+        rustc -V
+
+    - name: Build
+      shell: bash
+      run: |
+        $BUILD_CMD build --locked --release --target=${{ matrix.target }} -p luchta-cli
+
+    # Smoke test: run the freshly built binary so a broken artifact (bad
+    # dynamic linking, missing symbols) fails the job before it is published.
+    # Only run on native (`use-cross: false`) targets — the host can execute
+    # those: windows-latest is x86_64, and macos-latest (ARM) runs the
+    # x86_64-apple-darwin binary via Rosetta 2. cross targets can't run here.
+    # `luchta` has no `--version` flag, so `--help` (exit 0) is the probe.
+    - name: Smoke test binary
+      if: ${{ !matrix.use-cross }}
+      shell: bash
+      run: |
+        bin="target/${{ matrix.target }}/release/luchta"
+        if [[ "$RUNNER_OS" == "Windows" ]]; then
+          bin="$bin.exe"
+        fi
+        "$bin" --help
+
+    - name: Build archive
+      id: package
+      shell: bash
+      env:
+        target: ${{ matrix.target }}
+        version: ${{ steps.check-tag.outputs.version }}
+      run: |
+        set -euxo pipefail
+
+        dist_dir="$(pwd)/dist"
+        staging="$dist_dir/stage"
+        mkdir -p "$staging"
+
+        # luchta-cli produces a single binary named `luchta`.
+        bin=luchta
+        executable="target/$target/release/$bin"
+        if [[ "$RUNNER_OS" == "Windows" ]]; then
+          executable="$executable.exe"
+        fi
+        cp "$executable" "$staging/"
+
+        name="luchta-$version-$target"
+        if [[ "$RUNNER_OS" == "Windows" ]]; then
+          archive="$dist_dir/$name.zip"
+          (cd "$staging" && 7z a "$archive" *)
+          echo "archive=dist/$name.zip" >> "$GITHUB_OUTPUT"
+        else
+          archive="$dist_dir/$name.tar.gz"
+          (cd "$staging" && tar -czf "$archive" *)
+          echo "archive=dist/$name.tar.gz" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Publish archive
+      uses: softprops/action-gh-release@v2
+      if: ${{ startsWith(github.ref, 'refs/tags/') }}
+      with:
+        draft: false
+        files: ${{ steps.package.outputs.archive }}
+        prerelease: ${{ steps.check-tag.outputs.rc == 'true' }}
+
+    - name: Upload archive as workflow artifact
+      if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: luchta-${{ matrix.target }}
+        path: ${{ steps.package.outputs.archive }}

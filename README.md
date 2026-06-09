@@ -28,12 +28,19 @@ The project is organized into a multi-crate Cargo workspace under `crates/`:
 
 To build the entire workspace:
 ```bash
-cargo build
+cargo build --workspace
 ```
 
-To run all tests:
+Tests run via [cargo-nextest](https://nexte.st/). Install it once with
+`cargo install cargo-nextest --locked`, then:
 ```bash
-cargo test
+cargo nextest run --workspace
+```
+
+It is recommended to run the suite **5 times** to catch flaky tests before
+opening a PR:
+```bash
+cargo nextest run --workspace --stress-count=5
 ```
 
 To build and run the CLI:
@@ -41,6 +48,42 @@ To build and run the CLI:
 cargo build -p luchta-cli
 ./target/debug/luchta --help
 ```
+
+### Verification
+
+Before committing, run the full pipeline (see `AGENTS.md` for details):
+
+```bash
+cargo build --workspace
+cargo fmt --all
+cargo clippy --workspace --all-targets -- -D warnings
+cargo nextest run --workspace --stress-count=5
+cs delta $(git merge-base HEAD origin/main)   # CodeScene — must be all green
+```
+
+The CodeScene `cs delta` check **must be all green** (no new code-health
+problems) for a change to be considered done.
+
+### Releasing
+
+Releases are managed by [knope](https://knope.tech/) and driven by changeset
+files in `.changeset/`. Add a changeset for every user-visible change:
+
+```markdown
+---
+luchta: minor
+---
+Brief description of the change.
+```
+
+The front-matter key is always `luchta`, and the bump level is one of `patch`,
+`minor`, or `major`. To cut a release, run the **Prepare Release** GitHub
+Action (or `knope release` locally); knope bumps the version, updates
+`CHANGELOG.md`, and pushes a `luchta/v<version>` tag. The tag push triggers the
+**Release** workflow, which cross-builds the `luchta` binary for Linux, macOS,
+and Windows and attaches the archives to the GitHub Release. The Release
+workflow can also be run on demand (`workflow_dispatch`) to build binaries
+without cutting a version.
 
 ## Usage Sketch
 
@@ -78,6 +121,6 @@ Luchta supports flexible dependency definitions between tasks:
 
 ## Roadmap
 
-- **Phase 1 (Current):** Multi-crate workspace skeleton and CI setup.
+- **Phase 1 (Current):** Multi-crate workspace skeleton, CI, and release tooling (nextest, knope changesets, GitHub release workflows).
 - **Phase 2:** Foundation libraries (workspace discovery, lockfile parsing, graph construction, weighted parallel execution).
 - **Future:** Caching (blake3 hashing) and advanced features.
