@@ -166,18 +166,10 @@ impl TaskGraph {
         let mut visited = HashSet::new();
         let mut queue = VecDeque::new();
 
-        for dependency in package_graph.dependencies_of(package_name)? {
-            if visited.insert(dependency.name.clone()) {
-                queue.push_back(dependency.name.clone());
-            }
-        }
+        enqueue_unvisited_dependencies(package_graph, package_name, &mut visited, &mut queue)?;
 
         while let Some(current) = queue.pop_front() {
-            for dependency in package_graph.dependencies_of(&current)? {
-                if visited.insert(dependency.name.clone()) {
-                    queue.push_back(dependency.name.clone());
-                }
-            }
+            enqueue_unvisited_dependencies(package_graph, &current, &mut visited, &mut queue)?;
         }
 
         Ok(visited.into_iter().collect())
@@ -194,6 +186,21 @@ impl TaskGraph {
     fn node_index(&self, task_id: &TaskId) -> Option<NodeIndex> {
         self.indices_by_id.get(task_id).copied()
     }
+}
+
+/// Pushes the not-yet-visited direct dependencies of `package_name` onto `queue`.
+fn enqueue_unvisited_dependencies(
+    package_graph: &PackageGraph,
+    package_name: &PackageName,
+    visited: &mut HashSet<PackageName>,
+    queue: &mut VecDeque<PackageName>,
+) -> Result<(), EngineError> {
+    for dependency in package_graph.dependencies_of(package_name)? {
+        if visited.insert(dependency.name.clone()) {
+            queue.push_back(dependency.name.clone());
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -224,24 +231,18 @@ mod tests {
         assert_eq!(task_graph.node_count(), 3);
         assert!(has_edge(
             &task_graph,
-            "@repo/a",
-            "build",
-            "@repo/b",
-            "build"
+            TaskId::new("@repo/a", "build"),
+            TaskId::new("@repo/b", "build")
         ));
         assert!(has_edge(
             &task_graph,
-            "@repo/b",
-            "build",
-            "@repo/c",
-            "build"
+            TaskId::new("@repo/b", "build"),
+            TaskId::new("@repo/c", "build")
         ));
         assert!(!has_edge(
             &task_graph,
-            "@repo/a",
-            "build",
-            "@repo/c",
-            "build"
+            TaskId::new("@repo/a", "build"),
+            TaskId::new("@repo/c", "build")
         ));
 
         let order = task_graph
@@ -276,66 +277,40 @@ mod tests {
         assert_eq!(task_graph.node_count(), 3);
         assert!(has_edge(
             &task_graph,
-            "@repo/a",
-            "build",
-            "@repo/b",
-            "build"
+            TaskId::new("@repo/a", "build"),
+            TaskId::new("@repo/b", "build")
         ));
         assert!(has_edge(
             &task_graph,
-            "@repo/a",
-            "build",
-            "@repo/c",
-            "build"
+            TaskId::new("@repo/a", "build"),
+            TaskId::new("@repo/c", "build")
         ));
         assert!(has_edge(
             &task_graph,
-            "@repo/b",
-            "build",
-            "@repo/c",
-            "build"
+            TaskId::new("@repo/b", "build"),
+            TaskId::new("@repo/c", "build")
         ));
     }
 
     #[test]
-    fn errors_on_unknown_pipeline_task_dependency() {
-        let package_graph = package_graph_single("@repo/app");
-        let pipeline = HashMap::from([(
-            TaskName::from("build"),
-            TaskDefinition {
-                depends_on: vec![DependsOn::DirectUpstream(TaskName::from("nonexistent"))],
-                ..TaskDefinition::default()
-            },
-        )]);
+    fn errors_on_unknown_dependency_targets() {
+        let app_build = TaskId::new("@repo/app", "build");
 
-        let error = TaskGraph::build(&package_graph, &pipeline)
-            .expect_err("unknown pipeline task dependency expected");
+        // An unknown pipeline task name is reported as UnknownDependencyTask.
+        let error =
+            build_single_dep_error(DependsOn::DirectUpstream(TaskName::from("nonexistent")));
         assert!(matches!(
             error,
             EngineError::UnknownDependencyTask { from, task }
-                if from == TaskId::new("@repo/app", "build")
-                    && task == TaskName::from("nonexistent")
+                if from == app_build && task == TaskName::from("nonexistent")
         ));
-    }
 
-    #[test]
-    fn errors_on_unknown_specific_dependency_target() {
-        let package_graph = package_graph_single("@repo/app");
-        let pipeline = HashMap::from([(
-            TaskName::from("build"),
-            TaskDefinition {
-                depends_on: vec![DependsOn::Specific(TaskId::new("ghost", "build"))],
-                ..TaskDefinition::default()
-            },
-        )]);
-
-        let error = TaskGraph::build(&package_graph, &pipeline)
-            .expect_err("unknown specific dependency target expected");
+        // An unknown specific `package#task` target is reported as UnknownDependencyTarget.
+        let error = build_single_dep_error(DependsOn::Specific(TaskId::new("ghost", "build")));
         assert!(matches!(
             error,
             EngineError::UnknownDependencyTarget { from, target }
-                if from == TaskId::new("@repo/app", "build")
-                    && target == TaskId::new("ghost", "build")
+                if from == app_build && target == TaskId::new("ghost", "build")
         ));
     }
 
@@ -363,38 +338,50 @@ mod tests {
         assert!(matches!(error, EngineError::TaskGraphCycle { .. }));
     }
 
-    fn has_edge(
-        task_graph: &TaskGraph,
-        source_package: &str,
-        source_task: &str,
-        target_package: &str,
-        target_task: &str,
-    ) -> bool {
-        let source_id = TaskId::new(source_package, source_task);
-        let target_id = TaskId::new(target_package, target_task);
-
+    fn has_edge(task_graph: &TaskGraph, source_id: TaskId, target_id: TaskId) -> bool {
         task_graph.as_graph().edge_references().any(|edge| {
             task_graph.as_graph()[edge.source()].id == source_id
                 && task_graph.as_graph()[edge.target()].id == target_id
         })
     }
 
+    /// Builds a single-package graph whose `build` task carries `depends_on` and
+    /// returns the resulting build error for the caller to match against.
+    fn build_single_dep_error(depends_on: DependsOn) -> EngineError {
+        let package_graph = package_graph_single("@repo/app");
+        let pipeline = HashMap::from([(
+            TaskName::from("build"),
+            TaskDefinition {
+                depends_on: vec![depends_on],
+                ..TaskDefinition::default()
+            },
+        )]);
+
+        TaskGraph::build(&package_graph, &pipeline).expect_err("build error expected")
+    }
+
     fn package_graph_chain() -> PackageGraph {
         let temp_dir = tempdir().expect("create temp dir");
         write_package(
             temp_dir.path().join("packages/a/package.json"),
-            "@repo/a",
-            &["@repo/b"],
+            PackageManifest {
+                name: "@repo/a",
+                dependencies: &["@repo/b"],
+            },
         );
         write_package(
             temp_dir.path().join("packages/b/package.json"),
-            "@repo/b",
-            &["@repo/c"],
+            PackageManifest {
+                name: "@repo/b",
+                dependencies: &["@repo/c"],
+            },
         );
         write_package(
             temp_dir.path().join("packages/c/package.json"),
-            "@repo/c",
-            &[],
+            PackageManifest {
+                name: "@repo/c",
+                dependencies: &[],
+            },
         );
 
         PackageGraph::build(vec![
@@ -407,7 +394,13 @@ mod tests {
 
     fn package_graph_single(name: &str) -> PackageGraph {
         let temp_dir = tempdir().expect("create temp dir");
-        write_package(temp_dir.path().join("packages/app/package.json"), name, &[]);
+        write_package(
+            temp_dir.path().join("packages/app/package.json"),
+            PackageManifest {
+                name,
+                dependencies: &[],
+            },
+        );
 
         PackageGraph::build(vec![package_node(
             temp_dir.path().join("packages/app"),
@@ -420,8 +413,15 @@ mod tests {
         PackageNode::new(PackageName::from(name), path.as_ref())
     }
 
-    fn write_package(path: impl AsRef<Path>, name: &str, dependencies: &[&str]) {
-        let dependencies_json = dependency_entries_json(dependencies);
+    /// A package.json fixture: the package name plus its workspace dependencies.
+    struct PackageManifest<'a> {
+        name: &'a str,
+        dependencies: &'a [&'a str],
+    }
+
+    fn write_package(path: impl AsRef<Path>, manifest: PackageManifest<'_>) {
+        let dependencies_json = manifest.dependency_entries_json();
+        let name = manifest.name;
         write_json(
             path,
             &format!(
@@ -435,17 +435,20 @@ mod tests {
         );
     }
 
-    fn dependency_entries_json(entries: &[&str]) -> String {
-        if entries.is_empty() {
-            return "{}".to_string();
-        }
+    impl PackageManifest<'_> {
+        fn dependency_entries_json(&self) -> String {
+            if self.dependencies.is_empty() {
+                return "{}".to_string();
+            }
 
-        let joined = entries
-            .iter()
-            .map(|name| format!(r#""{name}": "workspace:*""#))
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!("{{ {joined} }}")
+            let joined = self
+                .dependencies
+                .iter()
+                .map(|name| format!(r#""{name}": "workspace:*""#))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{{ {joined} }}")
+        }
     }
 
     fn write_json(path: impl AsRef<Path>, contents: &str) {

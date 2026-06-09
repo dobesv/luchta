@@ -179,23 +179,44 @@ async fn spawn_config_script_with_retry(
     workspace_root: &Path,
     config_path: &Path,
 ) -> Result<Child> {
+    let error_message = || format!("failed to execute config script {}", config_path.display());
     spawn_with_retry(
         || spawn_config_script(workspace_root, config_path),
-        EXECUTE_CONFIG_ETXTBSY_RETRIES,
-        EXECUTE_CONFIG_ETXTBSY_BACKOFF,
-        || format!("failed to execute config script {}", config_path.display()),
-        || format!("failed to execute config script {}", config_path.display()),
+        RetryConfig {
+            retries: EXECUTE_CONFIG_ETXTBSY_RETRIES,
+            backoff: EXECUTE_CONFIG_ETXTBSY_BACKOFF,
+            execute_error: error_message,
+            exhausted_error: error_message,
+        },
     )
     .await
 }
 
-async fn spawn_with_retry<T, F, E, X>(
-    mut spawn: F,
+/// Retry policy and error-message providers for [`spawn_with_retry`].
+struct RetryConfig<E, X>
+where
+    E: Fn() -> String,
+    X: Fn() -> String,
+{
     retries: usize,
     backoff: Duration,
+    /// Context for a non-ETXTBSY spawn failure.
     execute_error: E,
+    /// Context for exhausting all ETXTBSY retries.
     exhausted_error: X,
-) -> Result<T>
+}
+
+/// Outcome of a single spawn attempt within the retry loop.
+enum SpawnAttempt<T> {
+    /// Spawn succeeded.
+    Done(T),
+    /// Spawn hit ETXTBSY; retry after backoff (carrying the last error).
+    Retry(io::Error),
+    /// Spawn failed for a non-retryable reason.
+    Fatal(io::Error),
+}
+
+async fn spawn_with_retry<T, F, E, X>(mut spawn: F, config: RetryConfig<E, X>) -> Result<T>
 where
     F: FnMut() -> io::Result<T>,
     E: Fn() -> String,
@@ -203,29 +224,41 @@ where
 {
     let mut last_etxtbsy_error = None;
 
-    for attempt in 0..=retries {
-        match spawn() {
-            Ok(value) => return Ok(value),
-            Err(error) if is_etxtbsy(&error) => {
+    for attempt in 0..=config.retries {
+        match classify_spawn(spawn()) {
+            SpawnAttempt::Done(value) => return Ok(value),
+            SpawnAttempt::Fatal(error) => {
+                return Err(error)
+                    .into_diagnostic()
+                    .wrap_err_with(&config.execute_error)
+            }
+            SpawnAttempt::Retry(error) => {
                 last_etxtbsy_error = Some(error);
-                if attempt < retries {
+                if attempt < config.retries {
                     // Linux can return ETXTBSY if exec races with a just-written/chmodded file.
                     // Retry briefly so config loading stays reliable under parallel test load.
-                    sleep(backoff).await;
-                    continue;
+                    sleep(config.backoff).await;
                 }
             }
-            Err(error) => return Err(error).into_diagnostic().wrap_err_with(execute_error),
         }
     }
 
     let error = last_etxtbsy_error.expect("ETXTBSY retry loop should capture last error");
     Err(miette!(
         "{} after {} retries because file was still busy: {}",
-        exhausted_error(),
-        retries,
+        (config.exhausted_error)(),
+        config.retries,
         error
     ))
+}
+
+/// Classifies a spawn result into a retry-loop control outcome.
+fn classify_spawn<T>(result: io::Result<T>) -> SpawnAttempt<T> {
+    match result {
+        Ok(value) => SpawnAttempt::Done(value),
+        Err(error) if is_etxtbsy(&error) => SpawnAttempt::Retry(error),
+        Err(error) => SpawnAttempt::Fatal(error),
+    }
 }
 
 fn spawn_config_script(workspace_root: &Path, config_path: &Path) -> io::Result<Child> {
@@ -253,21 +286,34 @@ fn config_timeout() -> Duration {
 /// unparseable values fall back to [`DEFAULT_CONFIG_TIMEOUT`]; a non-empty but
 /// invalid value also emits a warning so the silent fallback is visible.
 fn resolve_timeout(raw: Option<String>) -> Duration {
-    match raw {
-        None => DEFAULT_CONFIG_TIMEOUT,
-        Some(value) => match value.trim().parse::<u64>() {
-            Ok(seconds) if seconds > 0 => Duration::from_secs(seconds),
-            _ => {
-                if !value.trim().is_empty() {
-                    eprintln!(
-                        "warning: ignoring invalid {CONFIG_TIMEOUT_ENV_VAR}=\"{value}\"; \
-                         using default of {}s",
-                        DEFAULT_CONFIG_TIMEOUT.as_secs()
-                    );
-                }
-                DEFAULT_CONFIG_TIMEOUT
-            }
-        },
+    let Some(value) = raw else {
+        return DEFAULT_CONFIG_TIMEOUT;
+    };
+
+    if let Some(duration) = parse_positive_secs(&value) {
+        return duration;
+    }
+
+    warn_invalid_timeout(&value);
+    DEFAULT_CONFIG_TIMEOUT
+}
+
+/// Parses a trimmed positive integer number of seconds into a [`Duration`].
+fn parse_positive_secs(value: &str) -> Option<Duration> {
+    match value.trim().parse::<u64>() {
+        Ok(seconds) if seconds > 0 => Some(Duration::from_secs(seconds)),
+        _ => None,
+    }
+}
+
+/// Warns about a non-empty but invalid timeout value being ignored.
+fn warn_invalid_timeout(value: &str) {
+    if !value.trim().is_empty() {
+        eprintln!(
+            "warning: ignoring invalid {CONFIG_TIMEOUT_ENV_VAR}=\"{value}\"; \
+             using default of {}s",
+            DEFAULT_CONFIG_TIMEOUT.as_secs()
+        );
     }
 }
 
@@ -424,9 +470,38 @@ mod tests {
     use tokio::process::Command;
 
     use super::{
-        load_config, load_config_with_timeout, resolve_timeout, spawn_with_retry,
+        load_config, load_config_with_timeout, resolve_timeout, spawn_with_retry, RetryConfig,
         DEFAULT_CONFIG_TIMEOUT, EXECUTE_CONFIG_ETXTBSY_RETRIES,
     };
+
+    const TEST_CONFIG_ERROR: &str = "failed to execute config script /tmp/luchta-config.sh";
+
+    /// Builds a [`RetryConfig`] whose error messages match [`TEST_CONFIG_ERROR`].
+    fn test_retry_config(retries: usize) -> RetryConfig<impl Fn() -> String, impl Fn() -> String> {
+        RetryConfig {
+            retries,
+            backoff: Duration::ZERO,
+            execute_error: || TEST_CONFIG_ERROR.to_owned(),
+            exhausted_error: || TEST_CONFIG_ERROR.to_owned(),
+        }
+    }
+
+    /// Runs `spawn_with_retry` against a closure that always fails with `errno`,
+    /// returning the attempt count and the resulting error.
+    async fn spawn_failing_with_errno(errno: i32, retries: usize) -> (usize, miette::Report) {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_for_spawn = Arc::clone(&attempts);
+        let error = spawn_with_retry::<(), _, _, _>(
+            move || {
+                attempts_for_spawn.fetch_add(1, Ordering::SeqCst);
+                Err(io::Error::from_raw_os_error(errno))
+            },
+            test_retry_config(retries),
+        )
+        .await
+        .expect_err("spawn should fail");
+        (attempts.load(Ordering::SeqCst), error)
+    }
 
     #[test]
     fn resolve_timeout_uses_positive_override() {
@@ -624,10 +699,7 @@ echo '{"pipeline":{"build":{"dependsOn":["^build"],"weight":2}},"concurrency":{"
                         .spawn()
                 }
             },
-            EXECUTE_CONFIG_ETXTBSY_RETRIES,
-            Duration::ZERO,
-            || "failed to execute config script /tmp/luchta-config.sh".to_owned(),
-            || "failed to execute config script /tmp/luchta-config.sh".to_owned(),
+            test_retry_config(EXECUTE_CONFIG_ETXTBSY_RETRIES),
         )
         .await
         .expect("spawn should eventually succeed");
@@ -639,47 +711,21 @@ echo '{"pipeline":{"build":{"dependsOn":["^build"],"weight":2}},"concurrency":{"
     #[cfg(unix)]
     #[tokio::test]
     async fn errors_after_etxtbsy_retry_exhaustion() {
-        let attempts = Arc::new(AtomicUsize::new(0));
-        let attempts_for_spawn = Arc::clone(&attempts);
-        let error = spawn_with_retry::<(), _, _, _>(
-            move || {
-                attempts_for_spawn.fetch_add(1, Ordering::SeqCst);
-                Err(io::Error::from_raw_os_error(26))
-            },
-            3,
-            Duration::ZERO,
-            || "failed to execute config script /tmp/luchta-config.sh".to_owned(),
-            || "failed to execute config script /tmp/luchta-config.sh".to_owned(),
-        )
-        .await
-        .expect_err("spawn should fail after retries");
+        // 26 == ETXTBSY: every attempt retries until the budget is exhausted.
+        let (attempts, error) = spawn_failing_with_errno(26, 3).await;
 
-        assert_eq!(attempts.load(Ordering::SeqCst), 4);
-        assert!(error
-            .to_string()
-            .contains("failed to execute config script /tmp/luchta-config.sh after 3 retries because file was still busy"));
+        assert_eq!(attempts, 4);
+        assert!(error.to_string().contains(&format!(
+            "{TEST_CONFIG_ERROR} after 3 retries because file was still busy"
+        )));
     }
 
     #[tokio::test]
     async fn propagates_non_etxtbsy_spawn_error_without_retry() {
-        let attempts = Arc::new(AtomicUsize::new(0));
-        let attempts_for_spawn = Arc::clone(&attempts);
-        let error = spawn_with_retry::<(), _, _, _>(
-            move || {
-                attempts_for_spawn.fetch_add(1, Ordering::SeqCst);
-                Err(io::Error::from_raw_os_error(13))
-            },
-            EXECUTE_CONFIG_ETXTBSY_RETRIES,
-            Duration::ZERO,
-            || "failed to execute config script /tmp/luchta-config.sh".to_owned(),
-            || "failed to execute config script /tmp/luchta-config.sh".to_owned(),
-        )
-        .await
-        .expect_err("non-ETXTBSY should fail immediately");
+        // 13 == EACCES: a non-retryable error must fail on the first attempt.
+        let (attempts, error) = spawn_failing_with_errno(13, EXECUTE_CONFIG_ETXTBSY_RETRIES).await;
 
-        assert_eq!(attempts.load(Ordering::SeqCst), 1);
-        assert!(error
-            .to_string()
-            .contains("failed to execute config script /tmp/luchta-config.sh"));
+        assert_eq!(attempts, 1);
+        assert!(error.to_string().contains(TEST_CONFIG_ERROR));
     }
 }

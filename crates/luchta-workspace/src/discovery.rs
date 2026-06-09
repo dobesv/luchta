@@ -70,6 +70,61 @@ impl WorkspacesField {
     }
 }
 
+impl YarnWorkspace {
+    /// Walks the workspace tree collecting directories that match a workspace
+    /// glob and contain a `package.json`.
+    fn collect_package_paths(
+        &self,
+        matcher: &GlobSet,
+    ) -> Result<BTreeSet<PathBuf>, WorkspaceError> {
+        let mut package_paths = BTreeSet::new();
+
+        for entry in WalkDir::new(&self.root)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(|entry| !is_node_modules(entry.path()))
+        {
+            let entry = entry.map_err(|error| WorkspaceError::Discovery(error.to_string()))?;
+            if let Some(path) = self.matched_package_dir(&entry, matcher)? {
+                package_paths.insert(path);
+            }
+        }
+
+        Ok(package_paths)
+    }
+
+    /// Returns the package directory for `entry` when it is a workspace-matched
+    /// directory containing a `package.json`, otherwise `None`.
+    fn matched_package_dir(
+        &self,
+        entry: &walkdir::DirEntry,
+        matcher: &GlobSet,
+    ) -> Result<Option<PathBuf>, WorkspaceError> {
+        if !entry.file_type().is_dir() {
+            return Ok(None);
+        }
+
+        let path = entry.path();
+        if path == self.root {
+            return Ok(None);
+        }
+
+        let relative_path = path
+            .strip_prefix(&self.root)
+            .map_err(|error| WorkspaceError::Discovery(error.to_string()))?;
+
+        if !matcher.is_match(relative_path) {
+            return Ok(None);
+        }
+
+        if path.join("package.json").is_file() {
+            Ok(Some(path.to_path_buf()))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
 impl WorkspaceDiscovery for YarnWorkspace {
     fn discover(&self) -> Result<Vec<PackageNode>, WorkspaceError> {
         let root_package_path = self.root.join("package.json");
@@ -84,36 +139,7 @@ impl WorkspaceDiscovery for YarnWorkspace {
             .packages();
 
         let matcher = build_globset(&workspace_globs)?;
-        let mut package_paths = BTreeSet::new();
-
-        for entry in WalkDir::new(&self.root)
-            .follow_links(false)
-            .into_iter()
-            .filter_entry(|entry| !is_node_modules(entry.path()))
-        {
-            let entry = entry.map_err(|error| WorkspaceError::Discovery(error.to_string()))?;
-            if !entry.file_type().is_dir() {
-                continue;
-            }
-
-            let path = entry.path();
-            if path == self.root {
-                continue;
-            }
-
-            let relative_path = path
-                .strip_prefix(&self.root)
-                .map_err(|error| WorkspaceError::Discovery(error.to_string()))?;
-
-            if !matcher.is_match(relative_path) {
-                continue;
-            }
-
-            let package_json_path = path.join("package.json");
-            if package_json_path.is_file() {
-                package_paths.insert(path.to_path_buf());
-            }
-        }
+        let package_paths = self.collect_package_paths(&matcher)?;
 
         let mut packages = Vec::new();
         if root_package.has_scripts() {

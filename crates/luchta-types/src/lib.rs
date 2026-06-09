@@ -208,24 +208,23 @@ impl FromStr for DependsOn {
     type Err = ParseDependsOnError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        if let Some(task) = value.strip_prefix("^^") {
-            if task.is_empty() {
-                return Err(ParseDependsOnError::new(
-                    "transitive upstream dependency must include task name",
-                ));
-            }
-
-            return Ok(Self::TransitiveUpstream(TaskName::from(task)));
+        // `^^` must be tried before `^` since the latter is a prefix of the former.
+        if let Some(parsed) = parse_upstream(
+            value,
+            "^^",
+            Self::TransitiveUpstream,
+            "transitive upstream dependency must include task name",
+        ) {
+            return parsed;
         }
 
-        if let Some(task) = value.strip_prefix('^') {
-            if task.is_empty() {
-                return Err(ParseDependsOnError::new(
-                    "direct upstream dependency must include task name",
-                ));
-            }
-
-            return Ok(Self::DirectUpstream(TaskName::from(task)));
+        if let Some(parsed) = parse_upstream(
+            value,
+            "^",
+            Self::DirectUpstream,
+            "direct upstream dependency must include task name",
+        ) {
+            return parsed;
         }
 
         if let Some((package, task)) = value.split_once('#') {
@@ -246,6 +245,24 @@ impl FromStr for DependsOn {
 
         Ok(Self::SamePackage(TaskName::from(value)))
     }
+}
+
+/// Parses an upstream dependency (`^`/`^^` prefixed) from `value`.
+///
+/// Returns `None` when `value` lacks `prefix` so the caller can try the next
+/// form. When the prefix matches, yields the constructed variant, or an error
+/// using `empty_message` if the task name is empty.
+fn parse_upstream(
+    value: &str,
+    prefix: &str,
+    construct: fn(TaskName) -> DependsOn,
+    empty_message: &str,
+) -> Option<Result<DependsOn, ParseDependsOnError>> {
+    let task = value.strip_prefix(prefix)?;
+    if task.is_empty() {
+        return Some(Err(ParseDependsOnError::new(empty_message)));
+    }
+    Some(Ok(construct(TaskName::from(task))))
 }
 
 impl Serialize for DependsOn {
