@@ -11,3 +11,4 @@ description.workspace = true
 
 [dependencies]
 thiserror = { workspace = true }
+yarn-lock-parser = { workspace = true }
