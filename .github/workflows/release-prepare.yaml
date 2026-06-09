@@ -1,0 +1,97 @@
+# Cuts a release on request: bumps the workspace version, aggregates pending
+# changesets into CHANGELOG.md, refreshes Cargo.lock, commits, tags
+# `luchta/v<version>`, and pushes both the commit and the tag. The tag push
+# then triggers `release.yaml`, which builds and uploads the platform binaries.
+#
+# One-time setup required:
+#   1. Create a GitHub App with `contents: write` permission and install it on
+#      this repo.
+#   2. If `main` is protected, add the App as a Bypass actor on the branch
+#      ruleset so the release commit pushes directly to `main`.
+#   3. Set repo variable `RELEASE_BOT_APP_ID`      (the App's numeric ID) and
+#      repo secret   `RELEASE_BOT_PRIVATE_KEY` (the App's private key, including
+#      the BEGIN/END PRIVATE KEY lines).
+#
+# If you prefer the default `GITHUB_TOKEN` instead of a GitHub App, delete the
+# "Mint release-bot token" step and the `token:` line in checkout — but note
+# the default token cannot push to a protected `main` and its pushes do not
+# re-trigger `release.yaml`.
+#
+# Manual trigger: Actions -> Prepare Release -> Run workflow.
+
+name: Prepare Release
+
+on:
+  workflow_dispatch:
+  # schedule:
+  #   - cron: '0 18 * * 1'  # every Monday 18:00 UTC
+
+jobs:
+  prepare:
+    name: Run knope release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mint release-bot token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+          # Persist the bot token for the subsequent `git push` from knope.
+          persist-credentials: true
+
+      - name: Bail if no changesets
+        id: check
+        shell: bash
+        run: |
+          # knope's PrepareRelease errors out when there are no consumable
+          # changesets. Detect that ahead of time so the workflow exits 0 with
+          # a friendly status instead of a confusing failure.
+          shopt -s nullglob
+          actual=()
+          for c in .changeset/*.md; do
+            [[ "$(basename "$c")" == ".gitkeep" ]] && continue
+            actual+=("$c")
+          done
+          if (( ${#actual[@]} == 0 )); then
+            echo "No changesets pending — nothing to release."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Found ${#actual[@]} pending changesets."
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install Rust toolchain
+        if: steps.check.outputs.skip != 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and target
+        if: steps.check.outputs.skip != 'true'
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install knope
+        if: steps.check.outputs.skip != 'true'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: knope
+
+      - name: Configure git as the release bot
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          slug='${{ steps.app-token.outputs.app-slug }}'
+          git config user.name  "${slug}[bot]"
+          git config user.email "${{ steps.app-token.outputs.installation-id }}+${slug}[bot]@users.noreply.github.com"
+
+      - name: knope release --dry-run (sanity check)
+        if: steps.check.outputs.skip != 'true'
+        run: knope release --dry-run
+
+      - name: knope release
+        if: steps.check.outputs.skip != 'true'
+        run: knope release

@@ -1,0 +1,7 @@
+# CI installs the toolchain via `dtolnay/rust-toolchain@stable`. Pin to the
+# same `stable` channel here so local builds (rustup reads this file
+# automatically) match CI. The project's MSRV is declared separately as
+# `rust-version = "1.78"` in Cargo.toml.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]

@@ -1,0 +1,31 @@
+queue_rules:
+  - name: main
+    batch_size: 5
+    merge_method: squash
+    checks_timeout: 15 m 30 s
+    max_checks_retries: 5
+    update_method: rebase
+    batch_max_wait_time: 15 m 34 s
+    batch_max_failure_resolution_attempts: 10
+    # The batch is only merged once every required CI check is green.
+    # These names match the `name:` of each job in .github/workflows/ci.yml.
+    merge_conditions:
+      - check-success=Check
+      - check-success=Test
+      - check-success=Clippy
+      - check-success=Format
+
+pull_request_rules:
+  - name: Automerge passing Renovate PRs
+    conditions:
+      - author=renovate[bot]
+    actions:
+      queue:
+        name: main
+
+  - name: Automerge PRs labeled automerge
+    conditions:
+      - label=automerge
+    actions:
+      queue:
+        name: main

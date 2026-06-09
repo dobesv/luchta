@@ -37,8 +37,13 @@ jobs:
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
 
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
       - name: Test workspace
-        run: cargo test --workspace
+        run: cargo nextest run --workspace
 
   clippy:
     name: Clippy

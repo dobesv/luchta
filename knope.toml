@@ -1,0 +1,57 @@
+# Single logical package: the entire Luchta Cargo workspace.
+#
+# Every workspace crate inherits `version` from `[workspace.package]` in the
+# root Cargo.toml (`version.workspace = true`), so the whole workspace shares
+# one version. knope updates that single field; running `cargo build
+# --workspace` afterwards refreshes Cargo.lock to match.
+#
+# Multi-package syntax (`[packages.luchta]`) is used instead of the bare
+# `[package]` form so changeset files carry a `luchta: <level>` front-matter
+# key. The key on the left of a changeset must always be `luchta` — individual
+# crate names are not valid keys.
+[packages.luchta]
+versioned_files = ["Cargo.toml"]
+changelog = "CHANGELOG.md"
+
+# With multi-package syntax knope prepends the package name to tags, so release
+# tags look like `luchta/v0.1.0` (NOT `v0.1.0`). The release workflow trigger
+# pattern in `.github/workflows/release.yaml` matches accordingly.
+tag_prefix = "v"
+
+[[workflows]]
+name = "release"
+
+# Consume pending changesets: bump the workspace version, aggregate changeset
+# entries into CHANGELOG.md, and delete the consumed changeset files.
+[[workflows.steps]]
+type = "PrepareRelease"
+
+# Refresh Cargo.lock so the lockfile records the new workspace version.
+[[workflows.steps]]
+type = "Command"
+command = "cargo build --workspace"
+
+# Stage exactly the files a release touches: the version bump (Cargo.toml),
+# the lockfile refresh (Cargo.lock), the changelog, and the consumed changeset
+# files under .changeset/ (PrepareRelease deletes them; `git add` stages the
+# deletions). Scoping the add — rather than `git add -A` — keeps a manual local
+# `knope release` from sweeping unrelated working-tree changes into the commit.
+[[workflows.steps]]
+type = "Command"
+command = "git add Cargo.toml Cargo.lock CHANGELOG.md .changeset"
+
+[[workflows.steps]]
+type = "Command"
+command = "git commit -m \"chore: prepare release\""
+
+# Create the git tag (`luchta/v<version>`). The actual GitHub Release (with
+# attached binaries) is created by `.github/workflows/release.yaml` once the
+# tag push below triggers it — not by this step.
+[[workflows.steps]]
+type = "Release"
+
+# Push the release commit and the new tag. The tag push triggers
+# `.github/workflows/release.yaml`, which builds and uploads platform binaries.
+[[workflows.steps]]
+type = "Command"
+command = "git push --follow-tags"
