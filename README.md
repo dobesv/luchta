@@ -22,6 +22,9 @@ The project is organized into a multi-crate Cargo workspace under `crates/`:
 - `luchta-engine`: Task Graph construction and the weighted task executor.
 - `luchta-cli`: Entry point, `clap` CLI, and executable config script loading.
 
+Project automation lives in the `xtask/` crate (the standard Rust `xtask`
+pattern), invoked via the `cargo xtask` alias.
+
 ## Development
 
 ### Building and Testing
@@ -48,6 +51,17 @@ To build and run the CLI:
 cargo build -p luchta-cli
 ./target/debug/luchta --help
 ```
+
+### Project Automation (`xtask`)
+
+Repetitive project tasks live in the `xtask` crate, run through the
+`cargo xtask` alias. To install all workspace binary crates in one step:
+```bash
+cargo xtask install
+```
+This discovers every workspace member with a binary target via `cargo
+metadata` and runs `cargo install --path` for each, so it stays correct as
+crates are added.
 
 ### Verification
 

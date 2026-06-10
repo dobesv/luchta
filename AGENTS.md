@@ -12,6 +12,7 @@ Luchta is a Cargo workspace with the following crate layout:
 - `crates/luchta-workspace`: Workspace and package discovery.
 - `crates/luchta-engine`: Graph logic and execution engine.
 - `crates/luchta-cli`: CLI interface and configuration.
+- `xtask`: Project automation crate (standard Rust `xtask` pattern), run via the `cargo xtask` alias.
 
 ## Key Architectural Decisions
 Agents must respect these fundamental design choices:
@@ -36,6 +37,7 @@ cargo clippy --workspace --all-targets -- -D warnings    # Lint — treat warnin
 cargo nextest run --workspace                            # Run all tests via nextest
 cargo nextest run --workspace --stress-count=5           # Repeat 5x to catch flaky tests
 cs delta $(git merge-base HEAD origin/main)              # CodeScene quality analysis of branch changes
+cargo xtask install                                      # Install all workspace binary crates locally
 ```
 
 **CodeScene must be all green.** `cs delta` must report no new code-health
