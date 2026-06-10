@@ -25,6 +25,7 @@ pub struct ExecutionRequest {
     pub cwd: Option<PathBuf>,
     pub env: HashMap<String, String>,
     pub worker: Option<String>,
+    pub workspace: Option<String>,
 }
 
 impl ExecutionRequest {
@@ -35,6 +36,7 @@ impl ExecutionRequest {
             cwd: None,
             env: HashMap::new(),
             worker: None,
+            workspace: None,
         }
     }
 
@@ -184,6 +186,7 @@ impl WeightedExecutor {
                                 .cwd
                                 .as_ref()
                                 .map(|path| path.to_string_lossy().into_owned()),
+                            workspace: request.workspace.clone(),
                             env: request.env.clone(),
                         },
                     )

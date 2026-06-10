@@ -108,6 +108,36 @@ fn init_marker(temp: &assert_fs::TempDir, name: &str) -> std::path::PathBuf {
     marker.path().to_path_buf()
 }
 
+fn write_fake_yarn(temp: &assert_fs::TempDir) -> std::path::PathBuf {
+    let bin_dir = temp.child("bin");
+    fs::create_dir_all(bin_dir.path()).expect("create fake yarn bin dir");
+    write_executable(
+        temp,
+        "bin/yarn",
+        r#"#!/bin/sh
+if [ "$1" = "workspace" ]; then
+  ws="$2"
+  script="$3"
+  shift 3
+  echo "yarn-ran workspace=$ws script=$script args=$*"
+else
+  script="$1"
+  shift
+  echo "yarn-ran root script=$script args=$*"
+fi
+"#,
+    );
+    bin_dir.path().to_path_buf()
+}
+
+fn path_with_prepend(bin_dir: &Path) -> String {
+    format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    )
+}
+
 /// A resident worker that records its PID/PGID, serves jobs, signals `ready`,
 /// then `exec sleep 60` so it must be SIGKILLed at shutdown.
 fn write_sleeping_worker(
@@ -155,6 +185,7 @@ fn resident_worker_reuse_and_output_streaming() {
     setup_two_packages(&temp, false);
 
     let pid_marker = init_marker(&temp, "worker.pid");
+    let fake_yarn_bin = write_fake_yarn(&temp);
     let wrapper = write_executable(
         &temp,
         "yarn-wrapper.sh",
@@ -174,6 +205,7 @@ fn resident_worker_reuse_and_output_streaming() {
 
     let output = assert_cmd::Command::cargo_bin("luchta")
         .expect("find binary")
+        .env("PATH", path_with_prepend(&fake_yarn_bin))
         .arg("run")
         .arg("build")
         .arg("--workspace-root")
@@ -195,12 +227,12 @@ fn resident_worker_reuse_and_output_streaming() {
         "expected single worker PID (resident reuse)"
     );
     assert!(
-        stdout.contains("a#build") && stdout.contains("built-a"),
-        "expected a#build output, got: {stdout}"
+        stdout.contains("a#build") && stdout.contains("yarn-ran workspace=a script=build"),
+        "expected a#build yarn output, got: {stdout}"
     );
     assert!(
-        stdout.contains("b#build") && stdout.contains("built-b"),
-        "expected b#build output, got: {stdout}"
+        stdout.contains("b#build") && stdout.contains("yarn-ran workspace=b script=build"),
+        "expected b#build yarn output, got: {stdout}"
     );
 
     temp.close().expect("cleanup temp dir");
@@ -306,21 +338,48 @@ fn worker_is_reaped_after_run() {
 }
 
 #[test]
-fn real_yarn_worker_e2e() {
+fn explicit_worker_command_sends_workspace_in_request_json() {
     let temp = assert_fs::TempDir::new().expect("create temp dir");
     write_workspace(
         &temp,
-        &[Pkg {
-            name: "myapp",
-            script: "echo built-via-yarn-worker",
-            depends_on_a: false,
-        }],
+        &[
+            Pkg {
+                name: "a",
+                script: "echo built-a",
+                depends_on_a: false,
+            },
+            Pkg {
+                name: "b",
+                script: "echo built-b",
+                depends_on_a: false,
+            },
+        ],
+    );
+
+    let capture = temp.child("worker-requests.log");
+    capture.write_str("").expect("init capture file");
+    let worker = write_executable(
+        &temp,
+        "capture-worker.sh",
+        &format!(
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  printf '%s
+' "$line" >> "{capture}"
+  id=$(printf '%s
+' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  printf '{{"type":"done","id":"%s","exitCode":0}}
+' "$id"
+done
+"#,
+            capture = capture.path().display()
+        ),
     );
     write_config(
         &temp,
         &format!(
-            r#"{{"concurrency":{{"maxWeight":4}},"tasks":{{"build":{{"worker":"yarn"}}}},"workers":{{"yarn":{{"command":"{}"}}}}}}"#,
-            yarn_worker_bin().display()
+            r#"{{"concurrency":{{"maxWeight":1}},"tasks":{{"build":{{"worker":"capture","command":"build --flag"}}}},"workers":{{"capture":{{"command":"{}"}}}}}}"#,
+            worker.display()
         ),
     );
 
@@ -331,9 +390,294 @@ fn real_yarn_worker_e2e() {
         .arg("--workspace-root")
         .arg(temp.path())
         .assert()
+        .success();
+
+    let requests = fs::read_to_string(capture.path()).expect("read captured requests");
+    assert!(
+        requests.contains(r#""workspace":"a""#),
+        "expected package workspace in worker request: {requests}"
+    );
+    assert!(
+        requests.contains(r#""command":"build --flag""#),
+        "expected explicit command in worker request: {requests}"
+    );
+
+    temp.close().expect("cleanup temp dir");
+}
+
+#[test]
+fn explicit_root_worker_command_sends_empty_workspace_in_request_json() {
+    let temp = assert_fs::TempDir::new().expect("create temp dir");
+    temp.child("package.json")
+        .write_str(
+            r#"{ "name": "root", "private": true, "workspaces": ["packages/*"], "scripts": { "build": "echo root-build" } }"#,
+        )
+        .expect("write root package.json");
+
+    let capture = temp.child("worker-requests.log");
+    capture.write_str("").expect("init capture file");
+    let worker = write_executable(
+        &temp,
+        "capture-root-worker.sh",
+        &format!(
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  printf '%s
+' "$line" >> "{capture}"
+  id=$(printf '%s
+' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  printf '{{"type":"done","id":"%s","exitCode":0}}
+' "$id"
+done
+"#,
+            capture = capture.path().display()
+        ),
+    );
+    write_config(
+        &temp,
+        &format!(
+            r#"{{"concurrency":{{"maxWeight":1}},"tasks":{{"build":{{"worker":"capture","command":"install"}}}},"workers":{{"capture":{{"command":"{}"}}}}}}"#,
+            worker.display()
+        ),
+    );
+
+    assert_cmd::Command::cargo_bin("luchta")
+        .expect("find binary")
+        .arg("run")
+        .arg("build")
+        .arg("--workspace-root")
+        .arg(temp.path())
+        .assert()
+        .success();
+
+    let requests = fs::read_to_string(capture.path()).expect("read captured requests");
+    assert!(
+        requests.contains(r#""workspace":"""#),
+        "expected root worker request to use empty workspace hint: {requests}"
+    );
+    assert!(
+        requests.contains(r#""command":"install""#),
+        "expected explicit root command in worker request: {requests}"
+    );
+
+    temp.close().expect("cleanup temp dir");
+}
+
+#[test]
+fn root_worker_task_without_command_defaults_to_task_name() {
+    let temp = assert_fs::TempDir::new().expect("create temp dir");
+    temp.child("package.json")
+        .write_str(
+            r#"{ "name": "root", "private": true, "workspaces": ["packages/*"], "scripts": { "build": "echo root-build" } }"#,
+        )
+        .expect("write root package.json");
+
+    let capture = temp.child("worker-requests.log");
+    capture.write_str("").expect("init capture file");
+    let worker = write_executable(
+        &temp,
+        "capture-root-default-worker.sh",
+        &format!(
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  printf '%s
+' "$line" >> "{capture}"
+  id=$(printf '%s
+' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  printf '{{"type":"done","id":"%s","exitCode":0}}
+' "$id"
+done
+"#,
+            capture = capture.path().display()
+        ),
+    );
+    // Root/top-level worker task with NO command: defaults to the task name and
+    // an empty workspace hint, so the worker runs `yarn build`.
+    write_config(
+        &temp,
+        &format!(
+            r#"{{"concurrency":{{"maxWeight":1}},"tasks":{{"build":{{"worker":"capture"}}}},"workers":{{"capture":{{"command":"{}"}}}}}}"#,
+            worker.display()
+        ),
+    );
+
+    assert_cmd::Command::cargo_bin("luchta")
+        .expect("find binary")
+        .arg("run")
+        .arg("build")
+        .arg("--workspace-root")
+        .arg(temp.path())
+        .assert()
+        .success();
+
+    let requests = fs::read_to_string(capture.path()).expect("read captured requests");
+    assert!(
+        requests.contains(r#""workspace":"""#),
+        "expected root worker request to use empty workspace hint: {requests}"
+    );
+    assert!(
+        requests.contains(r#""command":"build""#),
+        "expected missing root worker command to default to task name: {requests}"
+    );
+
+    temp.close().expect("cleanup temp dir");
+}
+
+#[test]
+fn blank_explicit_worker_command_defaults_to_task_name() {
+    let temp = assert_fs::TempDir::new().expect("create temp dir");
+    write_workspace(
+        &temp,
+        &[Pkg {
+            name: "a",
+            script: "echo built-a",
+            depends_on_a: false,
+        }],
+    );
+
+    let capture = temp.child("worker-requests.log");
+    capture.write_str("").expect("init capture file");
+    let worker = write_executable(
+        &temp,
+        "capture-blank-worker.sh",
+        &format!(
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  printf '%s
+' "$line" >> "{capture}"
+  id=$(printf '%s
+' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  printf '{{"type":"done","id":"%s","exitCode":0}}
+' "$id"
+done
+"#,
+            capture = capture.path().display()
+        ),
+    );
+    write_config(
+        &temp,
+        &format!(
+            r#"{{"concurrency":{{"maxWeight":1}},"tasks":{{"build":{{"worker":"capture","command":"   "}}}},"workers":{{"capture":{{"command":"{}"}}}}}}"#,
+            worker.display()
+        ),
+    );
+
+    assert_cmd::Command::cargo_bin("luchta")
+        .expect("find binary")
+        .arg("run")
+        .arg("build")
+        .arg("--workspace-root")
+        .arg(temp.path())
+        .assert()
+        .success();
+
+    let requests = fs::read_to_string(capture.path()).expect("read captured requests");
+    assert!(
+        requests.contains(r#""workspace":"a""#),
+        "expected package workspace in worker request: {requests}"
+    );
+    assert!(
+        requests.contains(r#""command":"build""#),
+        "expected blank explicit command to default to task name in worker request: {requests}"
+    );
+
+    temp.close().expect("cleanup temp dir");
+}
+
+#[test]
+fn worker_task_without_command_defaults_to_task_name() {
+    let temp = assert_fs::TempDir::new().expect("create temp dir");
+    write_workspace(
+        &temp,
+        &[Pkg {
+            name: "a",
+            script: "echo built-a",
+            depends_on_a: false,
+        }],
+    );
+
+    let capture = temp.child("worker-requests.log");
+    capture.write_str("").expect("init capture file");
+    let worker = write_executable(
+        &temp,
+        "capture-default-worker.sh",
+        &format!(
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  printf '%s
+' "$line" >> "{capture}"
+  id=$(printf '%s
+' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  printf '{{"type":"done","id":"%s","exitCode":0}}
+' "$id"
+done
+"#,
+            capture = capture.path().display()
+        ),
+    );
+    write_config(
+        &temp,
+        &format!(
+            r#"{{"concurrency":{{"maxWeight":1}},"tasks":{{"build":{{"worker":"capture"}}}},"workers":{{"capture":{{"command":"{}"}}}}}}"#,
+            worker.display()
+        ),
+    );
+
+    assert_cmd::Command::cargo_bin("luchta")
+        .expect("find binary")
+        .arg("run")
+        .arg("build")
+        .arg("--workspace-root")
+        .arg(temp.path())
+        .assert()
+        .success();
+
+    let requests = fs::read_to_string(capture.path()).expect("read captured requests");
+    assert!(
+        requests.contains(r#""workspace":"a""#),
+        "expected package workspace in worker request: {requests}"
+    );
+    assert!(
+        requests.contains(r#""command":"build""#),
+        "expected missing worker command to default to task name in worker request: {requests}"
+    );
+
+    temp.close().expect("cleanup temp dir");
+}
+
+#[test]
+fn real_yarn_worker_e2e() {
+    let temp = assert_fs::TempDir::new().expect("create temp dir");
+    write_workspace(
+        &temp,
+        &[Pkg {
+            name: "myapp",
+            script: "echo built-via-yarn-worker",
+            depends_on_a: false,
+        }],
+    );
+    let fake_yarn_bin = write_fake_yarn(&temp);
+    write_config(
+        &temp,
+        &format!(
+            r#"{{"concurrency":{{"maxWeight":4}},"tasks":{{"build":{{"worker":"yarn"}}}},"workers":{{"yarn":{{"command":"{}"}}}}}}"#,
+            yarn_worker_bin().display()
+        ),
+    );
+
+    assert_cmd::Command::cargo_bin("luchta")
+        .expect("find binary")
+        .env("PATH", path_with_prepend(&fake_yarn_bin))
+        .arg("run")
+        .arg("build")
+        .arg("--workspace-root")
+        .arg(temp.path())
+        .assert()
         .success()
         .stdout(predicate::str::contains("myapp#build"))
-        .stdout(predicate::str::contains("built-via-yarn-worker"));
+        .stdout(predicate::str::contains(
+            "yarn-ran workspace=myapp script=build",
+        ));
 
     temp.close().expect("cleanup temp dir");
 }
