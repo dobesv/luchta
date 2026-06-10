@@ -31,5 +31,6 @@ libc = { workspace = true }
 [dev-dependencies]
 assert_cmd = { workspace = true }
 assert_fs = { workspace = true }
+escargot = "0.5"
 predicates = { workspace = true }
 tempfile = { workspace = true }

@@ -74,8 +74,8 @@ fn run_build_succeeds_and_runs_in_order() {
         .assert()
         .success()
         .stdout(
-            predicate::str::contains("[a#build] built-a")
-                .and(predicate::str::contains("[b#build] built-b")),
+            predicate::str::contains("a#build | built-a")
+                .and(predicate::str::contains("b#build | built-b")),
         );
 
     // Verify order: a comes before b
