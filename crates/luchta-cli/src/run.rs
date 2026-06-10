@@ -351,30 +351,45 @@ fn build_command_map(
         // Find the package node for this task's package
         let package = packages.iter().find(|p| p.name == task_id.package);
 
-        // Resolve command
-        let command = resolve_command(task_def, &task_id.task, package)?;
-
-        if let Some(cmd) = command {
-            let cwd = package
-                .map(|p| p.path.clone())
-                .unwrap_or_else(|| workspace_root.to_path_buf());
-
-            let worker = task_def.and_then(|def| def.worker.clone());
-            if let Some(ref name) = worker {
-                if !workers.contains_key(name) {
-                    bail!("task {} references undefined worker '{}'", task_id, name);
-                }
+        let worker = task_def.and_then(|def| def.worker.clone());
+        if let Some(ref name) = worker {
+            if !workers.contains_key(name) {
+                bail!("task {} references undefined worker '{}'", task_id, name);
             }
-
-            let request = ExecutionRequest {
-                task: node.clone(),
-                command: cmd,
-                cwd: Some(cwd),
-                env: HashMap::new(),
-                worker,
-            };
-            commands.insert(task_id.clone(), request);
         }
+
+        let cwd = package
+            .map(|p| p.path.clone())
+            .unwrap_or_else(|| workspace_root.to_path_buf());
+
+        let (command, workspace) = if worker.is_some() {
+            let explicit = task_def
+                .and_then(|def| def.command.as_deref())
+                .map(str::trim)
+                .filter(|command| !command.is_empty())
+                .map(str::to_owned);
+            let command = explicit.unwrap_or_else(|| task_id.task.to_string());
+            let workspace = package
+                .filter(|pkg| pkg.path != workspace_root)
+                .map(|pkg| pkg.name.to_string())
+                .unwrap_or_default();
+            (command, Some(workspace))
+        } else {
+            match resolve_command(task_def, &task_id.task, package)? {
+                Some(command) => (command, None),
+                None => continue,
+            }
+        };
+
+        let request = ExecutionRequest {
+            task: node.clone(),
+            command,
+            cwd: Some(cwd),
+            env: HashMap::new(),
+            worker,
+            workspace,
+        };
+        commands.insert(task_id.clone(), request);
     }
 
     Ok(commands)

@@ -96,7 +96,10 @@ async fn run_one_job(
 
 fn spawn_child(request: &WorkerRequest) -> Result<tokio::process::Child, WorkerError> {
     let mut command = Command::new("sh");
-    command.arg("-c").arg(&request.command);
+    command.arg("-c").arg(build_shell_command(
+        request.workspace.as_deref(),
+        &request.command,
+    ));
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
     command.envs(&request.env);
@@ -106,6 +109,18 @@ fn spawn_child(request: &WorkerRequest) -> Result<tokio::process::Child, WorkerE
     }
 
     command.spawn().map_err(WorkerError::from)
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn build_shell_command(workspace: Option<&str>, command: &str) -> String {
+    match workspace {
+        None => command.to_owned(),
+        Some("") => format!("yarn {command}"),
+        Some(workspace) => format!("yarn workspace {} {command}", shell_single_quote(workspace)),
+    }
 }
 
 async fn stream_child_output<R>(
@@ -148,4 +163,51 @@ enum WorkerError {
     Join(#[from] tokio::task::JoinError),
     #[error("missing {0} pipe")]
     MissingPipe(&'static str),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_shell_command, shell_single_quote};
+
+    #[test]
+    fn build_shell_command_keeps_raw_command_when_workspace_missing() {
+        assert_eq!(build_shell_command(None, "echo hello"), "echo hello");
+    }
+
+    #[test]
+    fn build_shell_command_prefixes_root_workspace_with_yarn() {
+        assert_eq!(
+            build_shell_command(Some(""), "install --mode=skip-build"),
+            "yarn install --mode=skip-build"
+        );
+    }
+
+    #[test]
+    fn build_shell_command_prefixes_named_workspace_with_yarn_workspace() {
+        assert_eq!(
+            build_shell_command(Some("a"), "build --flag"),
+            "yarn workspace 'a' build --flag"
+        );
+    }
+
+    #[test]
+    fn shell_single_quote_escapes_embedded_single_quotes() {
+        assert_eq!(shell_single_quote("a'b"), r"'a'\''b'");
+    }
+
+    #[test]
+    fn build_shell_command_quotes_workspace_names_with_spaces() {
+        assert_eq!(
+            build_shell_command(Some("my pkg"), "build"),
+            "yarn workspace 'my pkg' build"
+        );
+    }
+
+    #[test]
+    fn build_shell_command_quotes_workspace_names_with_single_quotes() {
+        assert_eq!(
+            build_shell_command(Some("a'b"), "build"),
+            r"yarn workspace 'a'\''b' build"
+        );
+    }
 }

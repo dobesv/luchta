@@ -8,6 +8,12 @@ pub struct WorkerRequest {
     pub id: String,
     pub command: String,
     pub cwd: Option<String>,
+    /// Yarn workspace hint for yarn worker.
+    /// `None` => run `command` as raw shell command (generic behavior).
+    /// `Some("")` => run `yarn <command>` at workspace root.
+    /// `Some(name)` => run `yarn workspace <name> <command>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
     #[serde(default)]
     pub env: HashMap<String, String>,
 }
@@ -18,12 +24,18 @@ impl WorkerRequest {
             id: id.into(),
             command: command.into(),
             cwd: None,
+            workspace: None,
             env: HashMap::new(),
         }
     }
 
     pub fn with_cwd(mut self, cwd: impl Into<String>) -> Self {
         self.cwd = Some(cwd.into());
+        self
+    }
+
+    pub fn with_workspace(mut self, workspace: impl Into<String>) -> Self {
+        self.workspace = Some(workspace.into());
         self
     }
 
@@ -102,6 +114,53 @@ mod tests {
     }
 
     #[test]
+    fn worker_request_roundtrip_preserves_workspace_some_and_none() {
+        let with_workspace = WorkerRequest::new("pkg#task", "build --flag")
+            .with_cwd("packages/pkg")
+            .with_workspace("pkg");
+        let with_workspace_json =
+            serde_json::to_string(&with_workspace).expect("request serializes");
+        let with_workspace_decoded: WorkerRequest =
+            serde_json::from_str(&with_workspace_json).expect("request deserializes");
+        assert_eq!(with_workspace_decoded, with_workspace);
+
+        let without_workspace = WorkerRequest::new("pkg#task", "build --flag");
+        let without_workspace_json =
+            serde_json::to_string(&without_workspace).expect("request serializes");
+        let without_workspace_decoded: WorkerRequest =
+            serde_json::from_str(&without_workspace_json).expect("request deserializes");
+        assert_eq!(without_workspace_decoded, without_workspace);
+        assert_eq!(without_workspace_decoded.workspace, None);
+    }
+
+    #[test]
+    fn worker_request_workspace_serializes_empty_and_named_values() {
+        let root_value =
+            serde_json::to_value(WorkerRequest::new("root#build", "install").with_workspace(""))
+                .expect("request serializes");
+        assert_eq!(root_value["workspace"], Value::String(String::new()));
+        let root_decoded: WorkerRequest = serde_json::from_value(root_value).expect("deserialize");
+        assert_eq!(root_decoded.workspace.as_deref(), Some(""));
+
+        let package_value = serde_json::to_value(
+            WorkerRequest::new("pkg#build", "build --flag").with_workspace("pkg"),
+        )
+        .expect("request serializes");
+        assert_eq!(package_value["workspace"], Value::String("pkg".to_owned()));
+        let package_decoded: WorkerRequest =
+            serde_json::from_value(package_value).expect("deserialize");
+        assert_eq!(package_decoded.workspace.as_deref(), Some("pkg"));
+    }
+
+    #[test]
+    fn worker_request_none_workspace_omits_key() {
+        let value = serde_json::to_value(WorkerRequest::new("pkg#task", "yarn test"))
+            .expect("request serializes");
+        let object = value.as_object().expect("request is object");
+        assert!(!object.contains_key("workspace"));
+    }
+
+    #[test]
     fn worker_request_json_uses_camel_case_fields() {
         let request = WorkerRequest::new("pkg#task", "yarn test").with_cwd("packages/pkg");
 
@@ -160,7 +219,7 @@ mod tests {
     }
 
     #[test]
-    fn worker_request_deserialization_defaults_env() {
+    fn worker_request_deserialization_defaults_env_and_workspace() {
         let decoded: WorkerRequest = serde_json::from_value(json!({
             "id": "pkg#task",
             "command": "yarn test",
@@ -169,6 +228,7 @@ mod tests {
         .expect("request deserializes");
 
         assert_eq!(decoded.env, HashMap::new());
+        assert_eq!(decoded.workspace, None);
     }
 
     #[test]
