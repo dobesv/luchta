@@ -5,12 +5,14 @@
 //! for different lockfile formats.
 
 mod yarn1;
+mod yarn_berry;
 
 use std::collections::BTreeMap;
 
 use thiserror::Error;
 
 pub use yarn1::Yarn1Lockfile;
+pub use yarn_berry::YarnBerryLockfile;
 
 /// Resolved package entry in a lockfile.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -43,6 +45,17 @@ pub trait Lockfile: Send + Sync + std::fmt::Debug {
 
     /// Returns all direct dependencies for package identified by lockfile key.
     fn all_dependencies(&self, key: &str) -> Result<BTreeMap<String, String>, LockfileError>;
+}
+
+/// Parses supported Yarn lockfile content and returns matching backend.
+///
+/// Detects Yarn Berry via mandatory `__metadata` block. Falls back to Yarn v1.
+pub fn parse_lockfile(content: &str) -> Result<Box<dyn Lockfile>, LockfileError> {
+    if content.contains("__metadata:") {
+        YarnBerryLockfile::parse(content).map(|lockfile| Box::new(lockfile) as Box<dyn Lockfile>)
+    } else {
+        Yarn1Lockfile::parse(content).map(|lockfile| Box::new(lockfile) as Box<dyn Lockfile>)
+    }
 }
 
 /// Errors produced by lockfile loading or lookup.
