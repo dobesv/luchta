@@ -10,8 +10,9 @@ use std::{
 
 use luchta_engine::{
     CompletionSignal, ExecutionRequest, TaskGraph, TaskNode, Walker, WeightedExecutor,
+    WorkerManager,
 };
-use luchta_types::{TaskDefinition, TaskId, TaskName};
+use luchta_types::{TaskDefinition, TaskId, TaskName, WorkerDefinition};
 use luchta_workspace::{PackageNode, WorkspaceDiscovery, YarnWorkspace};
 use miette::{bail, Context, IntoDiagnostic, Result};
 use owo_colors::OwoColorize;
@@ -100,9 +101,12 @@ pub async fn run_tasks(workspace_root: &PathBuf, requested_tasks: &[String]) -> 
     let package_graph = luchta_workspace::PackageGraph::build(packages.clone())
         .map_err(|e| miette::miette!("failed to build package graph: {}", e))?;
 
+    // Clone workers before config.tasks is moved.
+    let workers: HashMap<String, WorkerDefinition> = config.workers.clone();
+
     // Build task graph - convert HashMap<String, TaskDefinition> to HashMap<TaskName, TaskDefinition>
     let pipeline: HashMap<TaskName, _> = config
-        .pipeline
+        .tasks
         .into_iter()
         .map(|(name, def)| (TaskName::from(name), def))
         .collect();
@@ -113,12 +117,21 @@ pub async fn run_tasks(workspace_root: &PathBuf, requested_tasks: &[String]) -> 
     // Determine which tasks to run (requested + their dependency closure)
     let tasks_to_run = resolve_tasks_to_run(&task_graph, requested_tasks)?;
 
-    // Create executor
+    // Compute prefix width from tasks to run
+    let prefix_width = compute_prefix_width(&task_graph, &tasks_to_run);
+
+    // Build command map, create worker manager and executor
+    let worker_manager =
+        Arc::new(WorkerManager::new(workers.clone()).with_prefix_width(prefix_width));
     let max_weight = config.concurrency.max_weight;
-    let executor = Arc::new(WeightedExecutor::new(max_weight));
+    let executor = Arc::new(
+        WeightedExecutor::new(max_weight)
+            .with_worker_manager(Arc::clone(&worker_manager))
+            .with_prefix_width(prefix_width),
+    );
 
     // Build command map for each task node
-    let commands = build_command_map(&task_graph, &packages, &pipeline, workspace_root)?;
+    let commands = build_command_map(&task_graph, &packages, &pipeline, workspace_root, &workers)?;
 
     // Register execution requests
     for request in commands.values() {
@@ -151,11 +164,16 @@ pub async fn run_tasks(workspace_root: &PathBuf, requested_tasks: &[String]) -> 
         .wrap_err("walker task panicked")?;
 
     // Check final status
-    if any_failed.load(Ordering::SeqCst) {
-        bail!("one or more tasks failed")
-    }
+    let result = if any_failed.load(Ordering::SeqCst) {
+        Err(miette::miette!("one or more tasks failed"))
+    } else {
+        Ok(())
+    };
 
-    Ok(())
+    // Gracefully shut down workers
+    worker_manager.shutdown().await;
+
+    result
 }
 
 /// Handles a single ready task: skip non-targets/no-ops, short-circuit after a
@@ -303,12 +321,24 @@ fn push_dependencies(task_graph: &TaskGraph, task_id: &TaskId, to_process: &mut 
     }
 }
 
+/// Compute aligned prefix width from the tasks being run.
+fn compute_prefix_width(task_graph: &TaskGraph, tasks_to_run: &HashSet<TaskId>) -> usize {
+    task_graph
+        .as_graph()
+        .node_weights()
+        .filter(|node| tasks_to_run.contains(&node.id))
+        .map(|node| node.id.to_string().len())
+        .max()
+        .unwrap_or(0)
+}
+
 /// Build command map for each task in the graph.
 fn build_command_map(
     task_graph: &TaskGraph,
     packages: &[PackageNode],
     pipeline: &HashMap<TaskName, TaskDefinition>,
     workspace_root: &Path,
+    workers: &HashMap<String, WorkerDefinition>,
 ) -> Result<HashMap<TaskId, ExecutionRequest>> {
     let mut commands = HashMap::new();
 
@@ -328,11 +358,20 @@ fn build_command_map(
             let cwd = package
                 .map(|p| p.path.clone())
                 .unwrap_or_else(|| workspace_root.to_path_buf());
+
+            let worker = task_def.and_then(|def| def.worker.clone());
+            if let Some(ref name) = worker {
+                if !workers.contains_key(name) {
+                    bail!("task {} references undefined worker '{}'", task_id, name);
+                }
+            }
+
             let request = ExecutionRequest {
                 task: node.clone(),
                 command: cmd,
                 cwd: Some(cwd),
                 env: HashMap::new(),
+                worker,
             };
             commands.insert(task_id.clone(), request);
         }

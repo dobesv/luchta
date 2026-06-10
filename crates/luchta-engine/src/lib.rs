@@ -1,6 +1,7 @@
 pub mod executor;
 pub mod task_graph;
 pub mod walker;
+pub mod worker;
 
 use luchta_types::{TaskId, TaskName};
 use luchta_workspace::WorkspaceError;
@@ -9,6 +10,8 @@ use thiserror::Error;
 pub use executor::{ExecutionRequest, ExecutorError, TaskExecutor, WeightedExecutor};
 pub use task_graph::{TaskGraph, TaskNode};
 pub use walker::{CompletionSignal, ReadyTaskMessage, Walker};
+pub use worker::manager::{WorkerError, WorkerManager};
+pub use worker::protocol::{LogStream, WorkerRequest, WorkerResponse};
 
 #[derive(Debug, Error)]
 pub enum EngineError {

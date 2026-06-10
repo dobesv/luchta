@@ -128,6 +128,9 @@ pub struct TaskDefinition {
     /// otherwise matching `scripts` entry from `package.json` for task name.
     #[serde(default)]
     pub command: Option<String>,
+    /// Optional named worker used to execute this task.
+    #[serde(default)]
+    pub worker: Option<String>,
 }
 
 impl TaskDefinition {
@@ -137,6 +140,7 @@ impl TaskDefinition {
             depends_on,
             weight,
             command: None,
+            worker: None,
         }
     }
 }
@@ -147,6 +151,7 @@ impl Default for TaskDefinition {
             depends_on: Vec::new(),
             weight: default_task_weight(),
             command: None,
+            worker: None,
         }
     }
 }

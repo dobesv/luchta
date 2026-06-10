@@ -547,8 +547,8 @@ echo '{"pipeline":{"build":{"dependsOn":["^build"],"weight":2}},"concurrency":{"
         let config = load_config(temp.path()).await.expect("config should load");
 
         assert_eq!(config.concurrency.max_weight, 10);
-        assert_eq!(config.pipeline["build"].weight, 2);
-        assert_eq!(config.pipeline["build"].depends_on.len(), 1);
+        assert_eq!(config.tasks["build"].weight, 2);
+        assert_eq!(config.tasks["build"].depends_on.len(), 1);
     }
 
     #[tokio::test]
