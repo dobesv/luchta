@@ -48,6 +48,7 @@ type GraphNodes = (DiGraph<PackageNode, ()>, HashMap<PackageName, NodeIndex>);
 pub struct PackageGraph {
     graph: DiGraph<PackageNode, ()>,
     indices_by_name: HashMap<PackageName, NodeIndex>,
+    root_package: Option<PackageName>,
 }
 
 impl PackageGraph {
@@ -70,7 +71,19 @@ impl PackageGraph {
         Ok(Self {
             graph,
             indices_by_name,
+            root_package: None,
         })
+    }
+
+    /// Tags graph with workspace root package name.
+    pub fn with_root_package(mut self, name: PackageName) -> Self {
+        self.root_package = Some(name);
+        self
+    }
+
+    /// Returns workspace root package when known.
+    pub fn root_package(&self) -> Option<&PackageName> {
+        self.root_package.as_ref()
     }
 
     /// Adds every package as a node, erroring on duplicate names.
@@ -269,6 +282,18 @@ mod tests {
 
         let order = package_names(graph.topological_order().expect("topological order"));
         assert_eq!(order, vec!["@repo/c", "@repo/b", "@repo/a"]);
+    }
+
+    #[test]
+    fn stores_root_package_name() {
+        let temp_dir = tempdir().expect("create temp dir");
+        write_package(temp_dir.path().join("package.json"), "root", &[], &[]);
+
+        let graph = PackageGraph::build(vec![package_node(temp_dir.path(), "root")])
+            .expect("build graph")
+            .with_root_package(PackageName::from("root"));
+
+        assert_eq!(graph.root_package(), Some(&PackageName::from("root")));
     }
 
     #[test]

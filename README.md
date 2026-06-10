@@ -194,6 +194,7 @@ Luchta supports flexible dependency definitions between tasks:
 - `^^task`: Transitive upstream packages' task.
 - `task`: Same-package task.
 - `pkg#task`: Specific package and task.
+- `#task`: Root workspace (monorepo top-level) task.
 
 ### Workers
 For tools with heavy startup costs (Yarn PnP, Babel, ESLint, Jest), Luchta can
