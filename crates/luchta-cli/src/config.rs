@@ -539,7 +539,7 @@ mod tests {
         fs::write(
             temp.path().join("luchta-config.sh"),
             r#"#!/bin/sh
-echo '{"pipeline":{"build":{"dependsOn":["^build"],"weight":2}},"concurrency":{"maxWeight":10}}'
+echo '{"tasks":{"build":{"dependsOn":["^build"],"weight":2}},"concurrency":{"maxWeight":10}}'
 "#,
         )
         .expect("write script");

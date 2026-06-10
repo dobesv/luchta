@@ -108,18 +108,80 @@ The script **must** have a shebang line and print its configuration to `stdout` 
 Example `luchta-config.ts`:
 ```typescript
 #!/usr/bin/env node
-console.log(JSON.stringify({ 
-  pipeline: { 
-    build: { 
-      dependsOn: ["^build"], 
-      weight: 2 
-    } 
-  }, 
-  concurrency: { 
-    maxWeight: 10 
-  } 
-}));
+
+/**
+ * A dependency reference for a task. One of:
+ * - `"^task"`   direct upstream packages' task
+ * - `"^^task"`  transitive upstream packages' task
+ * - `"task"`    same-package task
+ * - `"pkg#task"` a specific package's task
+ */
+type DependsOn = string;
+
+interface TaskDefinition {
+  /** Tasks that must finish before this one runs. */
+  dependsOn?: DependsOn[];
+  /** Relative cost for the weighted scheduler. Defaults to 1. */
+  weight?: number;
+  /**
+   * Explicit command line. When omitted, the matching `scripts` entry from
+   * the package's `package.json` is used. For tasks routed to a `worker`,
+   * this is passed to the worker (e.g. the Yarn subcommand) and defaults to
+   * the task name.
+   */
+  command?: string;
+  /** Name of a worker (from `workers`) that should execute this task. */
+  worker?: string;
+}
+
+interface WorkerDefinition {
+  /** Command that launches the long-lived worker process. */
+  command: string;
+}
+
+interface LuchtaConfig {
+  /** Pipeline task definitions, keyed by task name. */
+  tasks?: Record<string, TaskDefinition>;
+  /** Stay-resident worker definitions, keyed by worker name (Unix only). */
+  workers?: Record<string, WorkerDefinition>;
+  /** Scheduler limits. */
+  concurrency?: {
+    /** Maximum cumulative task weight allowed to run at once. */
+    maxWeight: number;
+  };
+}
+
+const config = {
+  tasks: {
+    build: {
+      dependsOn: ["^build"],
+      weight: 2
+    },
+    test: {
+      dependsOn: ["build"],
+      worker: "yarn"
+    }
+  },
+  workers: {
+    yarn: {
+      command: "luchta-yarn-worker"
+    }
+  },
+  concurrency: {
+    maxWeight: 10
+  }
+} satisfies LuchtaConfig;
+
+console.log(JSON.stringify(config));
 ```
+
+The top-level `tasks` map defines the pipeline. Each task may set:
+- `dependsOn`: dependency list (see syntax below).
+- `weight`: relative cost for the weighted scheduler (defaults to `1`).
+- `command`: explicit command line. When omitted, the matching `scripts` entry
+  from the package's `package.json` is used.
+- `worker`: name of a long-lived worker (from the `workers` map) that should
+  execute this task. The named worker **must** be defined or the run fails.
 
 ```bash
 # Run the build task for all relevant packages
@@ -132,6 +194,28 @@ Luchta supports flexible dependency definitions between tasks:
 - `^^task`: Transitive upstream packages' task.
 - `task`: Same-package task.
 - `pkg#task`: Specific package and task.
+
+### Workers
+For tools with heavy startup costs (Yarn PnP, Babel, ESLint, Jest), Luchta can
+route tasks to **stay-resident worker processes** instead of spawning a fresh
+process per task. Workers are lazily spawned on first use and reused across
+jobs, then shut down cleanly when the run completes.
+
+Define workers in the top-level `workers` map, keyed by name, each with a
+`command` that launches the long-lived worker process:
+```typescript
+workers: {
+  yarn: { command: "luchta-yarn-worker" }
+}
+```
+Then point a task at a worker with its `worker` field. Luchta ships the
+`luchta-yarn-worker` binary, which runs each task through Yarn so that
+Yarn-injected environment variables (`PATH`, `NODE_OPTIONS`, …) are available.
+For yarn-worker tasks, the task's `command` becomes the Yarn subcommand
+(defaulting to the task name) and is invoked as `yarn workspace <pkg> <command>`
+for package tasks, or `yarn <command>` at the workspace root.
+
+> **Note:** Stay-resident workers are supported on Unix only.
 
 ## Roadmap
 

@@ -56,7 +56,7 @@ fn setup_workspace(temp: &assert_fs::TempDir) {
     let config = temp.child("luchta-config.sh");
     config
         .write_str(
-            "#!/bin/sh\necho '{\"concurrency\":{\"maxWeight\":4},\"pipeline\":{\"build\":{\"dependsOn\":[\"^build\"]}}}'\n",
+            "#!/bin/sh\necho '{\"concurrency\":{\"maxWeight\":4},\"tasks\":{\"build\":{\"dependsOn\":[\"^build\"]}}}'\n",
         )
         .expect("write luchta-config.sh");
 }
@@ -118,7 +118,7 @@ fn run_fails_on_script_failure() {
     config
         .write_str(
             r#"#!/bin/sh
-echo '{"concurrency":{"maxWeight":4},"pipeline":{"build":{}}}'
+echo '{"concurrency":{"maxWeight":4},"tasks":{"build":{}}}'
 "#,
         )
         .expect("write luchta-config.sh");
@@ -188,7 +188,7 @@ fn run_fails_on_malformed_package_json() {
     let config = temp.child("luchta-config.sh");
     config
         .write_str(
-            "#!/bin/sh\necho '{\"concurrency\":{\"maxWeight\":4},\"pipeline\":{\"build\":{\"dependsOn\":[\"^build\"]}}}'\n",
+            "#!/bin/sh\necho '{\"concurrency\":{\"maxWeight\":4},\"tasks\":{\"build\":{\"dependsOn\":[\"^build\"]}}}'\n",
         )
         .expect("write luchta-config.sh");
 
