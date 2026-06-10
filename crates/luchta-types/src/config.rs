@@ -20,7 +20,7 @@ pub struct LuchtaConfig {
     #[serde(default)]
     pub concurrency: ConcurrencyConfig,
     /// Task definitions keyed by task name.
-    #[serde(default, alias = "pipeline")]
+    #[serde(default)]
     pub tasks: HashMap<String, TaskDefinition>,
     /// Worker definitions keyed by worker name.
     #[serde(default)]
@@ -47,22 +47,22 @@ mod tests {
     use crate::{DependsOn, PackageName, TaskDefinition, TaskId, TaskName, WorkerDefinition};
 
     #[test]
-    fn deserializes_luchta_toml_pipeline_with_defaults_and_commands() {
+    fn deserializes_luchta_toml_tasks_with_defaults_and_commands() {
         let sample = r#"
             [concurrency]
             max_weight = 8
 
-            [pipeline.build]
+            [tasks.build]
             depends_on = ["^build"]
             weight = 3
 
-            [pipeline.test]
+            [tasks.test]
             depends_on = ["build", "ui#build"]
             command = "vitest run"
 
-            [pipeline.lint]
+            [tasks.lint]
 
-            [pipeline.bundle]
+            [tasks.bundle]
             depends_on = ["^^build"]
         "#;
 
@@ -121,18 +121,6 @@ mod tests {
     fn deserializes_config_with_tasks_key() {
         let sample = r#"
             [tasks.build]
-            weight = 2
-        "#;
-
-        let config: LuchtaConfig = toml::from_str(sample).expect("config should deserialize");
-
-        assert_eq!(config.tasks["build"].weight, 2);
-    }
-
-    #[test]
-    fn deserializes_config_with_pipeline_alias() {
-        let sample = r#"
-            [pipeline.build]
             weight = 2
         "#;
 

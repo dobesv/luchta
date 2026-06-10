@@ -683,12 +683,12 @@ fn real_yarn_worker_e2e() {
 }
 
 #[test]
-fn pipeline_alias_still_works_without_workers() {
+fn tasks_config_works_without_workers() {
     let temp = assert_fs::TempDir::new().expect("create temp dir");
     setup_two_packages(&temp, true);
     write_config(
         &temp,
-        r#"{"concurrency":{"maxWeight":4},"pipeline":{"build":{"dependsOn":["^build"]}}}"#,
+        r#"{"concurrency":{"maxWeight":4},"tasks":{"build":{"dependsOn":["^build"]}}}"#,
     );
 
     assert_cmd::Command::cargo_bin("luchta")
