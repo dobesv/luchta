@@ -10,6 +10,12 @@ use std::{fmt, str::FromStr};
 pub use config::*;
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 
+/// Synthetic package id used for workspace-root (`#task`) tasks.
+///
+/// This sentinel is an internal identifier — it must never be shown to users.
+/// Root tasks render as `#task` (see [`TaskId`]'s `Display`).
+pub const ROOT_PACKAGE_NAME: &str = "//root";
+
 /// Name of package within workspace.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PackageName(pub String);
@@ -23,6 +29,11 @@ impl PackageName {
     /// Returns inner string slice.
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// True when this is the synthetic workspace-root package.
+    pub fn is_root(&self) -> bool {
+        self.0 == ROOT_PACKAGE_NAME
     }
 }
 
@@ -105,11 +116,22 @@ impl TaskId {
             task: task.into(),
         }
     }
+
+    /// True when this identifies a workspace-root (`#task`) task.
+    pub fn is_root(&self) -> bool {
+        self.package.is_root()
+    }
 }
 
 impl fmt::Display for TaskId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}#{}", self.package, self.task)
+        // Root tasks render with the `#task` config syntax; the synthetic
+        // `//root` package id is an internal detail and never shown.
+        if self.is_root() {
+            write!(f, "#{}", self.task)
+        } else {
+            write!(f, "{}#{}", self.package, self.task)
+        }
     }
 }
 
@@ -145,6 +167,20 @@ impl TaskDefinition {
             command: None,
             worker: None,
         }
+    }
+}
+
+/// Resolves the script/command name a worker task runs: the explicit
+/// non-blank, trimmed `command` if present, otherwise the task name.
+///
+/// This is the single source of truth for the "command overrides task name"
+/// rule shared by the engine, CLI, and worker protocol. Both inputs are
+/// treated leniently — a blank/whitespace-only command is equivalent to no
+/// command.
+pub fn resolve_script_name<'a>(command: Option<&'a str>, task_name: &'a str) -> &'a str {
+    match command.map(str::trim) {
+        Some(command) if !command.is_empty() => command,
+        _ => task_name,
     }
 }
 
@@ -313,7 +349,33 @@ impl<'de> Deserialize<'de> for DependsOn {
 
 #[cfg(test)]
 mod tests {
-    use super::{DependsOn, TaskName};
+    use super::{resolve_script_name, DependsOn, PackageName, TaskId, TaskName, ROOT_PACKAGE_NAME};
+
+    #[test]
+    fn root_task_id_displays_with_hash_syntax_not_synthetic_package() {
+        let id = TaskId::new(
+            PackageName::from(ROOT_PACKAGE_NAME),
+            TaskName::from("release"),
+        );
+        assert!(id.is_root());
+        // The synthetic `//root` package id must never leak into output.
+        assert_eq!(id.to_string(), "#release");
+        assert!(!id.to_string().contains("//root"));
+    }
+
+    #[test]
+    fn package_scoped_task_id_displays_with_package_prefix() {
+        let id = TaskId::new(PackageName::from("@repo/app"), TaskName::from("build"));
+        assert!(!id.is_root());
+        assert_eq!(id.to_string(), "@repo/app#build");
+    }
+
+    #[test]
+    fn resolve_script_name_prefers_non_blank_command_else_task_name() {
+        assert_eq!(resolve_script_name(Some("  serve "), "start"), "serve");
+        assert_eq!(resolve_script_name(Some("   "), "start"), "start");
+        assert_eq!(resolve_script_name(None, "start"), "start");
+    }
 
     #[test]
     fn parses_root_task_dependency() {

@@ -140,6 +140,36 @@ fn path_with_prepend(bin_dir: &Path) -> String {
 
 /// A resident worker that records its PID/PGID, serves jobs, signals `ready`,
 /// then `exec sleep 60` so it must be SIGKILLed at shutdown.
+/// Writes a fake worker that records each *run* request line to `capture_path`
+/// and replies `done`. During the resolution phase it accepts every task (so it
+/// enters the graph) without recording the resolve request.
+fn write_capture_worker(
+    temp: &assert_fs::TempDir,
+    file_name: &str,
+    capture_path: &Path,
+) -> std::path::PathBuf {
+    write_executable(
+        temp,
+        file_name,
+        &format!(
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  case "$line" in
+    *'"type":"resolveTask"'*)
+      printf '{{"type":"resolved","id":"%s","result":{{"decision":"accept"}}}}\n' "$id"
+      continue
+      ;;
+  esac
+  printf '%s\n' "$line" >> "{capture}"
+  printf '{{"type":"done","id":"%s","exitCode":0}}\n' "$id"
+done
+"#,
+            capture = capture_path.display()
+        ),
+    )
+}
+
 /// Markers a recording worker writes so the test can locate its process group.
 struct RecordingMarkers<'a> {
     pid: &'a Path,
@@ -171,6 +201,14 @@ echo $$ >> {pid}
 ps -o pgid= -p $$ | tr -d ' ' >> {pgid}
 while IFS= read -r line; do
   id=$(printf '%s\n' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  case "$line" in
+    *'"type":"resolveTask"'*)
+      # Resolution phase: accept every task so it enters the graph, then wait
+      # for the actual run request.
+      printf '{{"type":"resolved","id":"%s","result":{{"decision":"accept"}}}}\n' "$id"
+      continue
+      ;;
+  esac
 {body}done
 {trailer}"#,
             pid = markers.pid.display(),
@@ -505,23 +543,7 @@ fn explicit_worker_command_sends_workspace_in_request_json() {
 
     let capture = temp.child("worker-requests.log");
     capture.write_str("").expect("init capture file");
-    let worker = write_executable(
-        &temp,
-        "capture-worker.sh",
-        &format!(
-            r#"#!/bin/sh
-while IFS= read -r line; do
-  printf '%s
-' "$line" >> "{capture}"
-  id=$(printf '%s
-' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
-  printf '{{"type":"done","id":"%s","exitCode":0}}
-' "$id"
-done
-"#,
-            capture = capture.path().display()
-        ),
-    );
+    let worker = write_capture_worker(&temp, "capture-worker.sh", capture.path());
     write_config(
         &temp,
         &format!(
@@ -563,23 +585,7 @@ fn explicit_root_worker_command_sends_empty_workspace_in_request_json() {
 
     let capture = temp.child("worker-requests.log");
     capture.write_str("").expect("init capture file");
-    let worker = write_executable(
-        &temp,
-        "capture-root-worker.sh",
-        &format!(
-            r#"#!/bin/sh
-while IFS= read -r line; do
-  printf '%s
-' "$line" >> "{capture}"
-  id=$(printf '%s
-' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
-  printf '{{"type":"done","id":"%s","exitCode":0}}
-' "$id"
-done
-"#,
-            capture = capture.path().display()
-        ),
-    );
+    let worker = write_capture_worker(&temp, "capture-root-worker.sh", capture.path());
     write_config(
         &temp,
         &format!(
@@ -621,23 +627,7 @@ fn root_worker_task_without_command_defaults_to_task_name() {
 
     let capture = temp.child("worker-requests.log");
     capture.write_str("").expect("init capture file");
-    let worker = write_executable(
-        &temp,
-        "capture-root-default-worker.sh",
-        &format!(
-            r#"#!/bin/sh
-while IFS= read -r line; do
-  printf '%s
-' "$line" >> "{capture}"
-  id=$(printf '%s
-' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
-  printf '{{"type":"done","id":"%s","exitCode":0}}
-' "$id"
-done
-"#,
-            capture = capture.path().display()
-        ),
-    );
+    let worker = write_capture_worker(&temp, "capture-root-default-worker.sh", capture.path());
     // Root/top-level worker task with NO command: defaults to the task name and
     // an empty workspace hint, so the worker runs `yarn build`.
     write_config(
@@ -684,23 +674,7 @@ fn blank_explicit_worker_command_defaults_to_task_name() {
 
     let capture = temp.child("worker-requests.log");
     capture.write_str("").expect("init capture file");
-    let worker = write_executable(
-        &temp,
-        "capture-blank-worker.sh",
-        &format!(
-            r#"#!/bin/sh
-while IFS= read -r line; do
-  printf '%s
-' "$line" >> "{capture}"
-  id=$(printf '%s
-' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
-  printf '{{"type":"done","id":"%s","exitCode":0}}
-' "$id"
-done
-"#,
-            capture = capture.path().display()
-        ),
-    );
+    let worker = write_capture_worker(&temp, "capture-blank-worker.sh", capture.path());
     write_config(
         &temp,
         &format!(
@@ -745,23 +719,7 @@ fn worker_task_without_command_defaults_to_task_name() {
 
     let capture = temp.child("worker-requests.log");
     capture.write_str("").expect("init capture file");
-    let worker = write_executable(
-        &temp,
-        "capture-default-worker.sh",
-        &format!(
-            r#"#!/bin/sh
-while IFS= read -r line; do
-  printf '%s
-' "$line" >> "{capture}"
-  id=$(printf '%s
-' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
-  printf '{{"type":"done","id":"%s","exitCode":0}}
-' "$id"
-done
-"#,
-            capture = capture.path().display()
-        ),
-    );
+    let worker = write_capture_worker(&temp, "capture-default-worker.sh", capture.path());
     write_config(
         &temp,
         &format!(
@@ -849,6 +807,176 @@ fn tasks_config_without_workers_skips_noop_tasks() {
         .stdout(predicate::str::contains("(no command, skipping)"))
         .stdout(predicate::str::contains("built-a").not())
         .stdout(predicate::str::contains("built-b").not());
+
+    temp.close().expect("cleanup temp dir");
+}
+
+/// Writes a workspace where `has-build` declares a `build` script and
+/// `no-build` declares only a `lint` script (no `build`). Returns nothing; the
+/// caller drives `luchta run build` against it.
+fn write_mixed_scripts_workspace(temp: &assert_fs::TempDir) {
+    temp.child("package.json")
+        .write_str(r#"{ "name": "root", "private": true, "workspaces": ["packages/*"] }"#)
+        .expect("write root package.json");
+
+    fs::create_dir_all(temp.child("packages/has-build").path()).expect("mkdir has-build");
+    temp.child("packages/has-build/package.json")
+        .write_str(r#"{ "name": "has-build", "scripts": { "build": "echo built-has" } }"#)
+        .expect("write has-build package.json");
+
+    fs::create_dir_all(temp.child("packages/no-build").path()).expect("mkdir no-build");
+    temp.child("packages/no-build/package.json")
+        .write_str(r#"{ "name": "no-build", "scripts": { "lint": "echo linted" } }"#)
+        .expect("write no-build package.json");
+}
+
+#[test]
+fn global_task_prunes_packages_missing_the_script() {
+    let temp = assert_fs::TempDir::new().expect("create temp dir");
+    write_mixed_scripts_workspace(&temp);
+    let fake_yarn_bin = write_fake_yarn(&temp);
+    write_config(
+        &temp,
+        &format!(
+            r#"{{"concurrency":{{"maxWeight":4}},"tasks":{{"build":{{"worker":"yarn"}}}},"workers":{{"yarn":{{"command":"{}"}}}}}}"#,
+            yarn_worker_bin().display()
+        ),
+    );
+
+    assert_cmd::Command::cargo_bin("luchta")
+        .expect("find binary")
+        .env("PATH", path_with_prepend(&fake_yarn_bin))
+        .env("NO_COLOR", "1")
+        .arg("run")
+        .arg("build")
+        .arg("--workspace-root")
+        .arg(temp.path())
+        .assert()
+        .success()
+        // has-build#build runs through the (fake) yarn worker.
+        .stdout(predicate::str::contains(
+            "yarn-ran workspace=has-build script=build",
+        ))
+        // no-build#build is pruned: it is listed as pruned and never executed.
+        .stdout(
+            predicate::str::contains("pruned during resolution")
+                .and(predicate::str::contains("no-build#build")),
+        )
+        .stdout(predicate::str::contains("yarn-ran workspace=no-build").not());
+
+    temp.close().expect("cleanup temp dir");
+}
+
+#[test]
+fn explicit_command_resolves_against_scripts_for_pruning() {
+    // Task name is `start` (absent everywhere) but an explicit `command:"build"`
+    // points at the `build` script. has-build keeps it; no-build is pruned
+    // because it has no `build` script.
+    let temp = assert_fs::TempDir::new().expect("create temp dir");
+    write_mixed_scripts_workspace(&temp);
+    let fake_yarn_bin = write_fake_yarn(&temp);
+    write_config(
+        &temp,
+        &format!(
+            r#"{{"concurrency":{{"maxWeight":4}},"tasks":{{"start":{{"worker":"yarn","command":"build"}}}},"workers":{{"yarn":{{"command":"{}"}}}}}}"#,
+            yarn_worker_bin().display()
+        ),
+    );
+
+    assert_cmd::Command::cargo_bin("luchta")
+        .expect("find binary")
+        .env("PATH", path_with_prepend(&fake_yarn_bin))
+        .env("NO_COLOR", "1")
+        .arg("run")
+        .arg("start")
+        .arg("--workspace-root")
+        .arg(temp.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "yarn-ran workspace=has-build script=build",
+        ))
+        .stdout(predicate::str::contains("yarn-ran workspace=no-build").not())
+        .stdout(predicate::str::contains("pruned during resolution"));
+
+    temp.close().expect("cleanup temp dir");
+}
+
+#[test]
+fn check_reports_prunes_without_failing() {
+    // `luchta check` must succeed (Prune is informational) while still listing
+    // the pruned task.
+    let temp = assert_fs::TempDir::new().expect("create temp dir");
+    write_mixed_scripts_workspace(&temp);
+    let fake_yarn_bin = write_fake_yarn(&temp);
+    write_config(
+        &temp,
+        &format!(
+            r#"{{"concurrency":{{"maxWeight":4}},"tasks":{{"build":{{"worker":"yarn"}}}},"workers":{{"yarn":{{"command":"{}"}}}}}}"#,
+            yarn_worker_bin().display()
+        ),
+    );
+
+    assert_cmd::Command::cargo_bin("luchta")
+        .expect("find binary")
+        .env("PATH", path_with_prepend(&fake_yarn_bin))
+        .env("NO_COLOR", "1")
+        .arg("check")
+        .arg("--workspace-root")
+        .arg(temp.path())
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("pruned during resolution")
+                .and(predicate::str::contains("no-build#build")),
+        )
+        .stdout(predicate::str::contains("Configuration valid"))
+        // `check` resolves only — it must never reach the run phase, so the
+        // surviving task is never executed through the (fake) yarn worker.
+        .stdout(predicate::str::contains("yarn-ran").not());
+
+    temp.close().expect("cleanup temp dir");
+}
+
+#[test]
+fn root_worker_task_resolves_against_root_package_scripts() {
+    // A `#task` root worker task must resolve against the workspace-root
+    // package's scripts (not against an empty set), so a root `build` script
+    // keeps the task instead of pruning it.
+    let temp = assert_fs::TempDir::new().expect("create temp dir");
+    temp.child("package.json")
+        .write_str(
+            r#"{ "name": "root", "private": true, "workspaces": ["packages/*"], "scripts": { "release": "echo released" } }"#,
+        )
+        .expect("write root package.json");
+    fs::create_dir_all(temp.child("packages/app").path()).expect("mkdir app");
+    temp.child("packages/app/package.json")
+        .write_str(r#"{ "name": "app", "scripts": { "build": "echo built" } }"#)
+        .expect("write app package.json");
+
+    let fake_yarn_bin = write_fake_yarn(&temp);
+    write_config(
+        &temp,
+        &format!(
+            r##"{{"concurrency":{{"maxWeight":4}},"tasks":{{"#release":{{"worker":"yarn"}}}},"workers":{{"yarn":{{"command":"{}"}}}}}}"##,
+            yarn_worker_bin().display()
+        ),
+    );
+
+    assert_cmd::Command::cargo_bin("luchta")
+        .expect("find binary")
+        .env("PATH", path_with_prepend(&fake_yarn_bin))
+        .env("NO_COLOR", "1")
+        .arg("run")
+        .arg("release")
+        .arg("--workspace-root")
+        .arg(temp.path())
+        .assert()
+        .success()
+        // The root task ran (root workspace => empty workspace hint => `yarn release`),
+        // and was NOT pruned.
+        .stdout(predicate::str::contains("yarn-ran root script=release"))
+        .stdout(predicate::str::contains("pruned during resolution").not());
 
     temp.close().expect("cleanup temp dir");
 }

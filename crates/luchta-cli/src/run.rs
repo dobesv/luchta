@@ -10,8 +10,9 @@ use std::{
 };
 
 use luchta_engine::{
-    is_root_task, CompletionSignal, ExecutionRequest, ReadyTaskMessage, TaskExecutor, TaskGraph,
-    TaskNode, Walker, WeightedExecutor, WorkerManager,
+    is_root_task, CompletionSignal, ExecutionRequest, PackageResolveInfo, PrunedTask,
+    ReadyTaskMessage, ResolveMode, TaskExecutor, TaskGraph, TaskNode, Walker, WeightedExecutor,
+    WorkerManager,
 };
 use luchta_types::{TaskDefinition, TaskId, TaskName, WorkerDefinition};
 use luchta_workspace::{PackageGraph, PackageNode, WorkspaceDiscovery, YarnWorkspace};
@@ -26,6 +27,14 @@ pub struct PreparedWorkspace {
     pub task_graph: TaskGraph,
     pub workers: HashMap<String, WorkerDefinition>,
     pub max_weight: u32,
+    /// Tasks excluded from the graph during the worker-mediated resolution
+    /// phase (with their reasons), for CLI reporting.
+    pub pruned: Vec<PrunedTask>,
+    /// The set of pruned task ids, for validation tolerance in `check`.
+    pub pruned_ids: HashSet<TaskId>,
+    /// The resident worker manager used for resolution; reused for execution so
+    /// resolve and run share the same worker processes.
+    pub worker_manager: Arc<WorkerManager>,
 }
 
 pub fn resolve_workspace_root(workspace_root: Option<PathBuf>) -> Result<PathBuf> {
@@ -33,7 +42,15 @@ pub fn resolve_workspace_root(workspace_root: Option<PathBuf>) -> Result<PathBuf
     Ok(workspace_root.unwrap_or(cwd))
 }
 
-pub async fn prepare_workspace(workspace_root: &Path) -> Result<PreparedWorkspace> {
+/// Discovers the workspace, loads config, and builds the task graph after
+/// running the worker-mediated resolution phase. `mode` controls how a worker
+/// `Reject` is treated (run: warn+prune; check: error). The worker manager
+/// created here is returned so callers reuse the same resident worker processes
+/// for execution.
+pub async fn prepare_workspace(
+    workspace_root: &Path,
+    mode: ResolveMode,
+) -> Result<PreparedWorkspace> {
     let workspace = YarnWorkspace::new(workspace_root);
     let packages = workspace
         .discover()
@@ -50,8 +67,18 @@ pub async fn prepare_workspace(workspace_root: &Path) -> Result<PreparedWorkspac
         .map(|(name, definition)| (TaskName::from(name), definition))
         .collect::<HashMap<_, _>>();
 
-    let task_graph = TaskGraph::build(&package_graph, &pipeline)
-        .map_err(|error| miette::miette!("failed to build task graph: {}", error))?;
+    let worker_manager = Arc::new(WorkerManager::new(config.workers.clone()));
+    let resolve_info = PackageResolveInfo::map_from_packages_with_root(&packages, workspace_root);
+    let (task_graph, pruned) = TaskGraph::build_resolved(
+        &package_graph,
+        &pipeline,
+        &resolve_info,
+        worker_manager.as_ref(),
+        mode,
+    )
+    .await
+    .map_err(|error| miette::miette!("failed to build task graph: {}", error))?;
+    let pruned_ids = pruned.iter().map(|entry| entry.task_id.clone()).collect();
 
     Ok(PreparedWorkspace {
         packages,
@@ -60,6 +87,9 @@ pub async fn prepare_workspace(workspace_root: &Path) -> Result<PreparedWorkspac
         task_graph,
         workers: config.workers,
         max_weight: config.concurrency.max_weight,
+        pruned,
+        pruned_ids,
+        worker_manager,
     })
 }
 
@@ -71,17 +101,21 @@ pub async fn run_tasks(workspace_root: &Path, requested_tasks: &[String]) -> Res
         task_graph,
         workers,
         max_weight,
-    } = prepare_workspace(workspace_root).await?;
+        pruned,
+        pruned_ids: _,
+        worker_manager,
+    } = prepare_workspace(workspace_root, ResolveMode::Run).await?;
 
     if packages.is_empty() {
         println!("{}", "No packages found in workspace".yellow());
         return Ok(());
     }
 
-    let tasks_to_run = collect_requested_subgraph(&task_graph, requested_tasks)?;
+    report_pruned_tasks(&pruned);
+
+    let tasks_to_run = collect_requested_subgraph(&task_graph, requested_tasks, &pruned)?;
     let prefix_width = compute_prefix_width(&task_graph, &tasks_to_run);
 
-    let worker_manager = Arc::new(WorkerManager::new(workers.clone()));
     let executor = Arc::new(
         WeightedExecutor::new(max_weight)
             .with_worker_manager(Arc::clone(&worker_manager))
@@ -199,6 +233,31 @@ async fn finalize_run(
     walker_result
 }
 
+/// Emit an informational line for each task the resolution phase pruned, with
+/// the worker-supplied reason (e.g. "script `build` not found in package …").
+/// Pruning is normal, expected behavior — not an error — so this is a notice.
+pub fn report_pruned_tasks(pruned: &[PrunedTask]) {
+    if pruned.is_empty() {
+        return;
+    }
+
+    let mut entries: Vec<&PrunedTask> = pruned.iter().collect();
+    entries.sort_by_key(|entry| entry.task_id.to_string());
+
+    println!(
+        "{} {} task(s) pruned during resolution:",
+        "note:".bold().yellow(),
+        entries.len()
+    );
+    for entry in entries {
+        println!(
+            "  {} {}",
+            entry.task_id.to_string().bold(),
+            format!("({})", entry.outcome.describe()).dimmed()
+        );
+    }
+}
+
 /// Print the tasks in the order they would run, grouped into parallel "waves",
 /// without executing anything. This is a diagnostic view into the task
 /// dependency graph: every task in a wave only depends on tasks in earlier
@@ -211,14 +270,23 @@ pub async fn dry_run_tasks(workspace_root: &Path, requested_tasks: &[String]) ->
         task_graph,
         workers,
         max_weight: _,
-    } = prepare_workspace(workspace_root).await?;
+        pruned,
+        pruned_ids: _,
+        worker_manager,
+    } = prepare_workspace(workspace_root, ResolveMode::Run).await?;
+
+    // Resolution may have spawned resident workers; shut them down once the
+    // graph is built since dry-run executes nothing.
+    worker_manager.shutdown().await;
 
     if packages.is_empty() {
         println!("{}", "No packages found in workspace".yellow());
         return Ok(());
     }
 
-    let tasks_to_run = collect_requested_subgraph(&task_graph, requested_tasks)?;
+    report_pruned_tasks(&pruned);
+
+    let tasks_to_run = collect_requested_subgraph(&task_graph, requested_tasks, &pruned)?;
     let CommandMap { commands, invalid } =
         build_command_map(&task_graph, &packages, workspace_root, &workers);
 
@@ -356,26 +424,61 @@ fn shutdown_signal() -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
 fn collect_requested_subgraph(
     task_graph: &TaskGraph,
     requested_tasks: &[String],
+    pruned: &[PrunedTask],
 ) -> Result<HashSet<TaskId>> {
     let mut requested_ids = HashSet::new();
     let available_nodes: Vec<&TaskNode> = task_graph.nodes().collect();
 
     for requested in requested_tasks {
-        let mut matched = false;
-        for node in &available_nodes {
-            if node.id.task.as_str() == requested {
-                requested_ids.insert(node.id.clone());
-                matched = true;
-            }
-        }
-
+        let matched = collect_matching_task_ids(&available_nodes, requested, &mut requested_ids);
         if !matched {
-            bail!("task '{}' not found in task graph", requested);
+            report_unmatched_request(requested, pruned)?;
         }
     }
 
-    let mut to_visit: Vec<TaskId> = requested_ids.iter().cloned().collect();
-    let mut included = requested_ids;
+    Ok(expand_with_dependencies(task_graph, requested_ids))
+}
+
+/// Adds every node whose task name equals `requested` to `requested_ids`,
+/// returning whether at least one matched.
+fn collect_matching_task_ids(
+    available_nodes: &[&TaskNode],
+    requested: &str,
+    requested_ids: &mut HashSet<TaskId>,
+) -> bool {
+    let mut matched = false;
+    for node in available_nodes {
+        if node.id.task.as_str() == requested {
+            requested_ids.insert(node.id.clone());
+            matched = true;
+        }
+    }
+    matched
+}
+
+/// Handles a requested task that matched no graph node. A task that survives
+/// nowhere may have been pruned away during resolution (a normal, expected
+/// outcome) — reported informationally — rather than never existing, which is
+/// an error.
+fn report_unmatched_request(requested: &str, pruned: &[PrunedTask]) -> Result<()> {
+    let pruned_away = pruned
+        .iter()
+        .any(|entry| entry.task_id.task.as_str() == requested);
+    if pruned_away {
+        println!(
+            "{} task '{}' was pruned from every package during resolution; nothing to run",
+            "note:".bold().yellow(),
+            requested
+        );
+        return Ok(());
+    }
+    bail!("task '{}' not found in task graph", requested);
+}
+
+/// Expands the seed task ids to include all of their transitive dependencies.
+fn expand_with_dependencies(task_graph: &TaskGraph, seed: HashSet<TaskId>) -> HashSet<TaskId> {
+    let mut to_visit: Vec<TaskId> = seed.iter().cloned().collect();
+    let mut included = seed;
 
     while let Some(task_id) = to_visit.pop() {
         for dependency in task_graph.dependencies_of(&task_id) {
@@ -385,7 +488,7 @@ fn collect_requested_subgraph(
         }
     }
 
-    Ok(included)
+    included
 }
 
 fn dispatch_ready_task(task_node: TaskNode, done_tx: CompletionSignal, ctx: &DispatchContext<'_>) {
@@ -533,11 +636,11 @@ fn build_command_map(
                 );
                 continue;
             }
-            let command = task_def
-                .and_then(|def| def.command.clone())
-                .map(|command| command.trim().to_owned())
-                .filter(|command| !command.is_empty())
-                .unwrap_or_else(|| task_id.task.as_str().to_string());
+            let command = luchta_types::resolve_script_name(
+                task_def.and_then(|def| def.command.as_deref()),
+                task_id.task.as_str(),
+            )
+            .to_owned();
             let workspace = package
                 .filter(|pkg| pkg.path != workspace_root)
                 .map(|pkg| pkg.name.to_string())
@@ -583,8 +686,16 @@ enum NonWorkerCommand {
 }
 
 fn resolve_non_worker_command(task_def: Option<&TaskDefinition>) -> NonWorkerCommand {
-    match task_def {
-        Some(def) if def.command.is_some() => NonWorkerCommand::CommandWithoutWorker,
-        _ => NonWorkerCommand::NoOp,
+    // A blank/whitespace-only command is treated as absent — matching the
+    // worker path's `resolve_script_name` normalization and `check`'s
+    // `has_non_blank_command` — so it is a no-op node, not a config error.
+    let has_command = task_def
+        .and_then(|def| def.command.as_deref())
+        .map(str::trim)
+        .is_some_and(|command| !command.is_empty());
+    if has_command {
+        NonWorkerCommand::CommandWithoutWorker
+    } else {
+        NonWorkerCommand::NoOp
     }
 }

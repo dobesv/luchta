@@ -8,11 +8,15 @@ use std::sync::{
 
 use luchta_types::WorkerDefinition;
 #[cfg(unix)]
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 
-use crate::worker::protocol::WorkerRequest;
+use crate::worker::protocol::{ResolveResult, ResolveTask, WorkerRequest};
 #[cfg(unix)]
-use crate::worker::{io_tasks::ReaperContext, protocol::WorkerResponse};
+use crate::worker::{
+    io_tasks::ReaperContext,
+    protocol::{WorkerMessage, WorkerResponse},
+};
+use crate::TaskResolver;
 
 #[derive(Debug, thiserror::Error)]
 pub enum WorkerError {
@@ -78,26 +82,32 @@ impl WorkerManager {
         self
     }
 
-    pub async fn run_job(
+    /// Spawns (or reuses) the worker, registers a job channel keyed by the
+    /// message's id, and sends the message. Returns the worker handle, the job
+    /// id, and the receiver for that job's responses. On any failure the job is
+    /// removed and a `Crashed` error returned. Shared by `run_job` /
+    /// `resolve_task`, which differ only in how they consume the responses.
+    async fn dispatch_message(
         &self,
         worker_name: &str,
-        request: WorkerRequest,
-    ) -> Result<i32, WorkerError> {
-        // Once a shutdown is underway, refuse to start new jobs. Without this a
+        message: WorkerMessage,
+    ) -> Result<(Arc<WorkerHandle>, String, mpsc::Receiver<WorkerResponse>), WorkerError> {
+        let job_id = message.id().to_owned();
+
+        // Once a shutdown is underway, refuse to start new work. Without this a
         // run interrupted mid-flight could spawn a fresh worker for a queued
         // task (e.g. under a concurrency limit), leaving an orphaned worker
         // that shutdown never sees.
         if self.is_shutdown.load(Ordering::SeqCst) {
             return Err(WorkerError::Crashed {
                 worker: worker_name.to_owned(),
-                id: request.id,
+                id: job_id,
             });
         }
 
         let handle = self.get_or_spawn(worker_name).await?;
         let worker = worker_name.to_owned();
-        let job_id = request.id.clone();
-        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let (tx, rx) = mpsc::channel(64);
 
         {
             let mut jobs = handle.jobs.lock().await;
@@ -114,22 +124,52 @@ impl WorkerManager {
                 }
             }
         };
-        let send_result = writer_tx.send(request).await;
 
-        if send_result.is_err() {
+        if writer_tx.send(message).await.is_err() {
             self.remove_job(&handle, &job_id).await;
             return Err(WorkerError::Crashed { worker, id: job_id });
         }
 
-        let result = loop {
+        Ok((handle, job_id, rx))
+    }
+
+    /// Sends `message` to the worker and drains the job's response channel —
+    /// printing `Log` lines — until `select` extracts a terminal value from the
+    /// next non-log response. A non-log response that `select` does not accept
+    /// (e.g. a `Done` for a resolve job, or a `Resolved` for a run job, from a
+    /// buggy or version-skewed worker) is a protocol error and fails fast rather
+    /// than looping forever. Returns `Crashed` if the channel closes before a
+    /// terminal arrives. This is the single round-trip primitive shared by
+    /// `run_job` and `resolve_task`; they differ only in the message sent and
+    /// the response they select.
+    async fn round_trip<T>(
+        &self,
+        worker_name: &str,
+        message: WorkerMessage,
+        mut select: impl FnMut(WorkerResponse) -> Option<T>,
+    ) -> Result<T, WorkerError> {
+        let (handle, job_id, mut rx) = self.dispatch_message(worker_name, message).await?;
+
+        let outcome = loop {
             match rx.recv().await {
                 Some(WorkerResponse::Log { stream, line, .. }) => {
                     print_log_line(&job_id, stream, &line, self.prefix_width)
                 }
-                Some(WorkerResponse::Done { exit_code, .. }) => break Ok(exit_code),
+                Some(response) => {
+                    let kind = response.kind();
+                    match select(response) {
+                        Some(value) => break Ok(value),
+                        None => {
+                            break Err(WorkerError::Protocol {
+                                id: job_id.clone(),
+                                detail: format!("unexpected '{kind}' response"),
+                            })
+                        }
+                    }
+                }
                 None => {
                     break Err(WorkerError::Crashed {
-                        worker: worker.clone(),
+                        worker: worker_name.to_owned(),
                         id: job_id.clone(),
                     })
                 }
@@ -137,7 +177,21 @@ impl WorkerManager {
         };
 
         self.remove_job(&handle, &job_id).await;
-        result
+        outcome
+    }
+
+    pub async fn run_job(
+        &self,
+        worker_name: &str,
+        request: WorkerRequest,
+    ) -> Result<i32, WorkerError> {
+        // Terminal response is `Done`; logs are streamed, other responses ignored.
+        self.round_trip(
+            worker_name,
+            WorkerMessage::Run(request),
+            WorkerResponse::into_exit_code,
+        )
+        .await
     }
 
     pub async fn shutdown(&self) {
@@ -305,19 +359,46 @@ impl WorkerManager {
         self
     }
 
+    fn unsupported<T>(&self, worker_name: &str, id: String) -> Result<T, WorkerError> {
+        let _ = (&self.definitions, self.shutdown_timeout, self.prefix_width);
+        Err(WorkerError::Unsupported {
+            worker: worker_name.to_owned(),
+            id,
+        })
+    }
+
     pub async fn run_job(
         &self,
         worker_name: &str,
         request: WorkerRequest,
     ) -> Result<i32, WorkerError> {
-        let _ = (&self.definitions, self.shutdown_timeout, self.prefix_width);
-        Err(WorkerError::Unsupported {
-            worker: worker_name.to_owned(),
-            id: request.id,
-        })
+        self.unsupported(worker_name, request.id)
     }
 
     pub async fn shutdown(&self) {}
 
     pub async fn shutdown_immediate(&self) {}
+}
+
+#[cfg(unix)]
+impl TaskResolver for WorkerManager {
+    /// Resolves a task by sending a `ResolveTask` to its worker and awaiting the
+    /// single `Resolved` decision (logs are streamed; other responses ignored).
+    async fn resolve(&self, worker: &str, request: ResolveTask) -> Result<ResolveResult, String> {
+        self.round_trip(
+            worker,
+            WorkerMessage::ResolveTask(request),
+            WorkerResponse::into_resolve_result,
+        )
+        .await
+        .map_err(|error| error.to_string())
+    }
+}
+
+#[cfg(not(unix))]
+impl TaskResolver for WorkerManager {
+    async fn resolve(&self, worker: &str, request: ResolveTask) -> Result<ResolveResult, String> {
+        self.unsupported::<ResolveResult>(worker, request.id)
+            .map_err(|error| error.to_string())
+    }
 }

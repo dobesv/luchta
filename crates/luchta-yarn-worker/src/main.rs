@@ -4,7 +4,9 @@ use std::sync::{
     Arc,
 };
 
-use luchta_engine::{LogStream, WorkerRequest, WorkerResponse};
+use luchta_engine::{
+    LogStream, ResolveResult, ResolveTask, WorkerMessage, WorkerRequest, WorkerResponse,
+};
 use thiserror::Error;
 use tokio::io::{stdin, stdout, AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 use tokio::process::Command;
@@ -30,8 +32,8 @@ async fn run() -> Result<(), WorkerError> {
     loop {
         match requests.next_line().await {
             Ok(Some(line)) => {
-                let request = serde_json::from_str(&line)?;
-                spawn_request(request, &writer, &shutdown, &mut jobs);
+                let message = serde_json::from_str(&line)?;
+                spawn_request(message, &writer, &shutdown, &mut jobs);
             }
             Ok(None) => break,
             Err(error) if is_pipe_shutdown_error(&error) => {
@@ -47,6 +49,18 @@ async fn run() -> Result<(), WorkerError> {
 }
 
 fn spawn_request(
+    message: WorkerMessage,
+    writer: &SharedWriter,
+    shutdown: &Arc<AtomicBool>,
+    jobs: &mut JoinSet<()>,
+) {
+    match message {
+        WorkerMessage::Run(request) => spawn_run(request, writer, shutdown, jobs),
+        WorkerMessage::ResolveTask(resolve) => spawn_resolve(resolve, writer, jobs),
+    }
+}
+
+fn spawn_run(
     request: WorkerRequest,
     writer: &SharedWriter,
     shutdown: &Arc<AtomicBool>,
@@ -61,6 +75,38 @@ fn spawn_request(
             }
         }
     });
+}
+
+fn spawn_resolve(resolve: ResolveTask, writer: &SharedWriter, jobs: &mut JoinSet<()>) {
+    let writer = Arc::clone(writer);
+    jobs.spawn(async move {
+        let id = resolve.id.clone();
+        let result = resolve_task(&resolve);
+        if let Err(error) = write_response(&writer, &WorkerResponse::resolved(id, result)).await {
+            if !error.is_pipe_shutdown() {
+                eprintln!("resolve failed: {error}");
+            }
+        }
+    });
+}
+
+/// Decide a task's fate from its declared script name. The yarn worker runs
+/// ONLY scripts that exist in the target package's `package.json` `scripts`
+/// (supplied by the engine in the request — no filesystem read here):
+///
+/// - resolved script name = non-blank `command`, else the task `name`.
+/// - present in `scripts` → `Accept`.
+/// - absent (or no scripts) → `Prune` with a descriptive reason.
+fn resolve_task(resolve: &ResolveTask) -> ResolveResult {
+    let script = resolve.resolved_script_name();
+    if resolve.scripts.iter().any(|name| name == script) {
+        ResolveResult::accept()
+    } else {
+        ResolveResult::prune(Some(format!(
+            "script `{script}` not found in package `{}`",
+            resolve.package
+        )))
+    }
 }
 
 async fn drain_jobs(jobs: &mut JoinSet<()>) {
@@ -220,13 +266,61 @@ mod tests {
         Arc,
     };
 
-    use luchta_engine::WorkerRequest;
+    use luchta_engine::{ResolveDecision, ResolveMode, ResolveTask, WorkerRequest};
     use tokio::sync::Mutex;
 
     use super::{
-        build_shell_command, handle_request, is_pipe_shutdown_error, shell_single_quote,
-        WorkerError,
+        build_shell_command, handle_request, is_pipe_shutdown_error, resolve_task,
+        shell_single_quote, WorkerError,
     };
+
+    fn resolve_request(name: &str, command: &str, scripts: &[&str]) -> ResolveTask {
+        ResolveTask {
+            id: format!("@repo/app#{name}"),
+            name: name.to_owned(),
+            command: command.to_owned(),
+            package: "@repo/app".to_owned(),
+            cwd: Some("packages/app".to_owned()),
+            scripts: scripts.iter().map(|script| script.to_string()).collect(),
+            mode: ResolveMode::Run,
+        }
+    }
+
+    #[test]
+    fn resolve_accepts_task_whose_name_is_a_declared_script() {
+        let result = resolve_task(&resolve_request("build", "", &["build", "test"]));
+        assert_eq!(result.decision, ResolveDecision::Accept);
+    }
+
+    #[test]
+    fn resolve_prunes_task_whose_name_is_absent_from_scripts() {
+        let result = resolve_task(&resolve_request("build", "", &["test"]));
+        match result.decision {
+            ResolveDecision::Prune { reason } => {
+                let reason = reason.expect("prune carries a reason");
+                assert!(reason.contains("build"), "reason: {reason}");
+                assert!(reason.contains("@repo/app"), "reason: {reason}");
+            }
+            other => panic!("expected Prune, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_uses_explicit_command_as_script_name() {
+        // Task name `start` is absent, but the explicit command `serve` exists.
+        let accepted = resolve_task(&resolve_request("start", "serve", &["serve"]));
+        assert_eq!(accepted.decision, ResolveDecision::Accept);
+
+        // Explicit command `serve` absent → pruned even though task name exists.
+        let pruned = resolve_task(&resolve_request("serve", "missing", &["serve"]));
+        assert!(matches!(pruned.decision, ResolveDecision::Prune { .. }));
+    }
+
+    #[test]
+    fn resolve_prunes_when_package_declares_no_scripts() {
+        let result = resolve_task(&resolve_request("build", "", &[]));
+        assert!(matches!(result.decision, ResolveDecision::Prune { .. }));
+    }
 
     #[test]
     fn build_shell_command_keeps_raw_command_when_workspace_missing() {

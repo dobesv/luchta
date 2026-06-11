@@ -10,11 +10,15 @@ use thiserror::Error;
 pub use executor::{ExecutionRequest, ExecutorError, TaskExecutor, WeightedExecutor};
 pub use task_graph::{
     is_root_task, root_package_name, root_task_id, DeadDependencyReason, DependencyValidationError,
-    TaskGraph, TaskNode, TaskValidationDiagnostic, TaskValidationReason, ROOT_PACKAGE_NAME,
+    PackageResolveInfo, PruneOutcome, PrunedTask, ResolveError, TaskGraph, TaskNode, TaskResolver,
+    TaskValidationDiagnostic, TaskValidationReason, ROOT_PACKAGE_NAME,
 };
 pub use walker::{CompletionSignal, ReadyTaskMessage, Walker};
 pub use worker::manager::{WorkerError, WorkerManager};
-pub use worker::protocol::{LogStream, WorkerRequest, WorkerResponse};
+pub use worker::protocol::{
+    LogStream, ResolveDecision, ResolveMode, ResolveResult, ResolveTask, TaskModification,
+    WorkerMessage, WorkerRequest, WorkerResponse,
+};
 
 #[derive(Debug, Error)]
 pub enum EngineError {
@@ -24,4 +28,6 @@ pub enum EngineError {
     Workspace(#[from] WorkspaceError),
     #[error("task graph cycle detected at {task}")]
     TaskGraphCycle { task: TaskId },
+    #[error("task resolution error: {0}")]
+    Resolve(#[from] task_graph::ResolveError),
 }

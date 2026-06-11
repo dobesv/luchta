@@ -24,7 +24,7 @@ fn make_worker_script(
 
 fn shell_worker_body(done_json: &str, extra_json: &str) -> String {
     format!(
-        "#!/bin/sh\nwhile IFS= read -r line; do\n  case \"$line\" in\n    *'\"type\":\"run\"'*)\n      id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\"\\([^\"]*\\)\".*/\\1/p')\n      {extra_json}      printf '{done_json}\\n' \"$id\"\n      ;;\n  esac\ndone\n"
+        "#!/bin/sh\nwhile IFS= read -r line; do\n  case \"$line\" in\n    *'\"type\":\"resolveTask\"'*)\n      id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\"\\([^\"]*\\)\".*/\\1/p')\n      printf '{{\"type\":\"resolved\",\"id\":\"%s\",\"result\":{{\"decision\":\"accept\"}}}}\\n' \"$id\"\n      ;;\n    *'\"type\":\"run\"'*)\n      id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\"\\([^\"]*\\)\".*/\\1/p')\n      {extra_json}      printf '{done_json}\\n' \"$id\"\n      ;;\n  esac\ndone\n"
     )
 }
 
@@ -384,18 +384,58 @@ fn dry_run_assert(
 #[test]
 fn dry_run_prints_waves_without_executing() {
     let temp = assert_fs::TempDir::new().expect("create temp dir");
+    setup_workspace(&temp);
+
     // `build` depends on the upstream package's `build` (^build). Package `b`
     // depends on `a`, so a#build must run in an earlier wave than b#build.
-    // A `yarn` worker is declared but must NEVER be invoked in --dry-run.
-    let config = r#"{"concurrency":{"maxWeight":4},"workers":{"yarn":{"command":"/bin/false"}},"tasks":{"build":{"dependsOn":["^build"],"worker":"yarn"}}}"#;
+    //
+    // The worker participates in the resolution phase (it accepts every task so
+    // the graph builds), but a task being *run* would append to the `executed`
+    // marker. Dry-run must build the graph WITHOUT executing, so the marker
+    // stays empty.
+    let executed = temp.child("executed.log");
+    executed.write_str("").expect("init executed marker");
+    let worker_script = make_worker_script(
+        &temp,
+        "dry-run-worker.sh",
+        &shell_worker_body(
+            r#"{"type":"done","id":"%s","exitCode":0}"#,
+            &format!("      printf ran >> '{}'\n", executed.path().display()),
+        ),
+    );
+    let config = format!(
+        r#"{{"concurrency":{{"maxWeight":4}},"workers":{{"yarn":{{"command":"{}"}}}},"tasks":{{"build":{{"dependsOn":["^build"],"worker":"yarn"}}}}}}"#,
+        worker_script.path().display()
+    );
 
-    dry_run_assert(&temp, config, "build").success().stdout(
-        predicate::str::contains("dry-run:")
-            .and(predicate::str::contains("Wave 1:"))
-            .and(predicate::str::contains("Wave 2:"))
-            .and(predicate::str::contains("a#build"))
-            .and(predicate::str::contains("b#build"))
-            .and(predicate::str::contains("worker 'yarn'")),
+    temp.child("luchta-config.sh")
+        .write_str(&format!("#!/bin/sh\necho '{config}'\n"))
+        .expect("write luchta-config.sh");
+
+    Command::cargo_bin("luchta")
+        .expect("find binary")
+        .arg("run")
+        .arg("build")
+        .arg("--dry-run")
+        .arg("--workspace-root")
+        .arg(temp.path())
+        .env("NO_COLOR", "1")
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("dry-run:")
+                .and(predicate::str::contains("Wave 1:"))
+                .and(predicate::str::contains("Wave 2:"))
+                .and(predicate::str::contains("a#build"))
+                .and(predicate::str::contains("b#build"))
+                .and(predicate::str::contains("worker 'yarn'")),
+        );
+
+    // No task was executed: the run marker is still empty.
+    let ran = fs::read_to_string(executed.path()).expect("read executed marker");
+    assert!(
+        ran.is_empty(),
+        "dry-run must not execute tasks, got: {ran:?}"
     );
 
     temp.close().expect("cleanup temp dir");
