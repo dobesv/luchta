@@ -10,14 +10,14 @@ use tokio::{
     task::JoinHandle,
 };
 
-use super::protocol::{WorkerRequest, WorkerResponse};
+use super::protocol::{WorkerMessage, WorkerResponse};
 
 pub(crate) type JobSender = mpsc::Sender<WorkerResponse>;
 pub(crate) type JobMap = Arc<Mutex<HashMap<String, JobSender>>>;
 
 #[derive(Debug)]
 pub(crate) struct WorkerHandle {
-    pub(crate) writer_tx: Mutex<Option<mpsc::Sender<WorkerRequest>>>,
+    pub(crate) writer_tx: Mutex<Option<mpsc::Sender<WorkerMessage>>>,
     pub(crate) jobs: JobMap,
     pub(crate) child: Arc<Mutex<Option<Child>>>,
     pub(crate) exit_notify: Arc<Notify>,
@@ -31,7 +31,7 @@ pub(crate) struct WorkerHandle {
 pub(crate) struct WriterContext {
     pub(crate) worker: String,
     pub(crate) stdin: ChildStdin,
-    pub(crate) writer_rx: mpsc::Receiver<WorkerRequest>,
+    pub(crate) writer_rx: mpsc::Receiver<WorkerMessage>,
     pub(crate) jobs: JobMap,
     pub(crate) is_shutdown: Arc<std::sync::atomic::AtomicBool>,
 }

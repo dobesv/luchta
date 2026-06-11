@@ -5,7 +5,8 @@ mod run;
 use clap::Parser;
 use cli::{Cli, Commands};
 use luchta_engine::{
-    DependencyValidationError, TaskGraph, TaskValidationDiagnostic, TaskValidationReason,
+    DependencyValidationError, ResolveMode, TaskGraph, TaskValidationDiagnostic,
+    TaskValidationReason,
 };
 use miette::Result;
 
@@ -58,13 +59,18 @@ async fn run(cli: Cli) -> Result<()> {
             }
         }
         Commands::Check => {
-            let prepared = run::prepare_workspace(&workspace_root).await?;
+            // Check mode: a worker `Reject` during resolution is a hard error
+            // (surfaced from prepare_workspace); a `Prune` is informational.
+            let prepared = run::prepare_workspace(&workspace_root, ResolveMode::Check).await?;
+            prepared.worker_manager.shutdown().await;
+            run::report_pruned_tasks(&prepared.pruned);
             let worker_names = prepared.workers.keys().cloned().collect();
 
-            match TaskGraph::validate_tasks(
+            match TaskGraph::validate_tasks_with_pruned(
                 &prepared.package_graph,
                 &prepared.pipeline,
                 &worker_names,
+                &prepared.pruned_ids,
             ) {
                 Ok(()) => {
                     println!("Configuration valid");

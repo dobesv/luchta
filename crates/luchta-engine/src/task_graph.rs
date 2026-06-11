@@ -1,16 +1,66 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use luchta_types::{DependsOn, PackageName, TaskDefinition, TaskId, TaskName};
-use luchta_workspace::PackageGraph;
+use luchta_workspace::{PackageGraph, PackageNode};
 use petgraph::{
     algo::toposort,
     graph::{DiGraph, NodeIndex},
 };
 use thiserror::Error;
 
+use crate::worker::protocol::{ResolveDecision, ResolveMode, ResolveTask};
 use crate::EngineError;
 
-pub const ROOT_PACKAGE_NAME: &str = "//root";
+/// Per-package context the resolution phase passes to a worker so it can decide
+/// a task's fate without reading the filesystem.
+#[derive(Debug, Clone, Default)]
+pub struct PackageResolveInfo {
+    /// Package root directory (string form), for diagnostics / worker cwd.
+    pub cwd: Option<String>,
+    /// Script names declared by the package.
+    pub scripts: Vec<String>,
+}
+
+impl PackageResolveInfo {
+    fn from_node(package: &PackageNode) -> Self {
+        let mut scripts: Vec<String> = package.scripts.iter().cloned().collect();
+        scripts.sort();
+        Self {
+            cwd: Some(package.path.to_string_lossy().into_owned()),
+            scripts,
+        }
+    }
+
+    /// Builds the per-package resolution lookup from discovered package nodes.
+    pub fn map_from_packages(packages: &[PackageNode]) -> HashMap<PackageName, PackageResolveInfo> {
+        packages
+            .iter()
+            .map(|package| (package.name.clone(), Self::from_node(package)))
+            .collect()
+    }
+
+    /// Like [`map_from_packages`], but also registers the workspace-root
+    /// package under the synthetic [`ROOT_PACKAGE_NAME`] so worker resolution of
+    /// root (`#task`) tasks sees the root package's scripts and cwd. The root
+    /// package is the discovered node whose path is `workspace_root`.
+    pub fn map_from_packages_with_root(
+        packages: &[PackageNode],
+        workspace_root: &std::path::Path,
+    ) -> HashMap<PackageName, PackageResolveInfo> {
+        let mut map = Self::map_from_packages(packages);
+        if let Some(root) = packages
+            .iter()
+            .find(|package| package.path == workspace_root)
+        {
+            map.insert(PackageName::from(ROOT_PACKAGE_NAME), Self::from_node(root));
+        }
+        map
+    }
+}
+
+/// Re-exported from `luchta-types`, the single source of truth for the
+/// synthetic workspace-root package id.
+pub use luchta_types::ROOT_PACKAGE_NAME;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskNode {
@@ -132,12 +182,99 @@ impl std::fmt::Display for DeadDependencyReason {
     }
 }
 
+/// Outcome of resolving a single task that did not result in `Accept`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrunedTask {
+    /// The scoped id of the task that was removed from the graph.
+    pub task_id: TaskId,
+    /// Why it was removed.
+    pub outcome: PruneOutcome,
+}
+
+/// The reason a task was excluded from the graph during resolution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PruneOutcome {
+    /// Worker returned `Prune` (a clean, expected exclusion).
+    Pruned { reason: Option<String> },
+    /// Worker returned `Reject`. In run mode this is downgraded to a prune
+    /// (with a warning); in check mode it is an error.
+    Rejected { message: String },
+}
+
+impl PruneOutcome {
+    /// Human-readable explanation for diagnostics / CLI output.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Pruned { reason } => reason
+                .clone()
+                .unwrap_or_else(|| "pruned by worker".to_owned()),
+            Self::Rejected { message } => message.clone(),
+        }
+    }
+
+    /// True when this outcome originated from a worker `Reject`.
+    pub fn is_rejected(&self) -> bool {
+        matches!(self, Self::Rejected { .. })
+    }
+}
+
+/// Error raised when the resolution phase cannot complete (e.g. a worker
+/// round-trip failed), or when check mode encounters a `Reject`.
+#[derive(Debug, Error)]
+pub enum ResolveError {
+    #[error("worker resolution failed for task '{task}': {message}")]
+    Worker { task: TaskId, message: String },
+    #[error("task '{task}' rejected by worker: {message}")]
+    Rejected { task: TaskId, message: String },
+}
+
+/// Abstraction over the worker round-trip used to resolve a task. The engine
+/// implements this with a real `WorkerManager`; tests use a stub.
+pub trait TaskResolver {
+    /// Resolve a single task by sending it to its worker and awaiting the
+    /// decision.
+    fn resolve(
+        &self,
+        worker: &str,
+        request: crate::worker::protocol::ResolveTask,
+    ) -> impl std::future::Future<Output = Result<crate::worker::protocol::ResolveResult, String>>;
+}
+
 impl TaskGraph {
     pub fn build(
         package_graph: &PackageGraph,
         pipeline: &HashMap<TaskName, TaskDefinition>,
     ) -> Result<Self, EngineError> {
         let resolved_pipeline = ResolvedPipeline::build(package_graph, pipeline)?;
+        Self::from_resolved_pipeline(package_graph, &resolved_pipeline)
+    }
+
+    /// Builds the task graph after running the worker-mediated resolution phase.
+    ///
+    /// Each expanded task with a worker is sent to that worker via `resolver`;
+    /// the returned decision is applied before nodes/edges are materialized, so
+    /// pruned tasks never become graph nodes. Returns the graph plus the list of
+    /// tasks that were pruned (for CLI/diagnostic reporting). In check mode a
+    /// worker `Reject` aborts with [`ResolveError::Rejected`]; in run mode it is
+    /// downgraded to a prune entry.
+    pub async fn build_resolved<R: TaskResolver>(
+        package_graph: &PackageGraph,
+        pipeline: &HashMap<TaskName, TaskDefinition>,
+        packages: &HashMap<PackageName, PackageResolveInfo>,
+        resolver: &R,
+        mode: ResolveMode,
+    ) -> Result<(Self, Vec<PrunedTask>), EngineError> {
+        let mut resolved_pipeline = ResolvedPipeline::build(package_graph, pipeline)?;
+        let pruned = resolved_pipeline.resolve(packages, resolver, mode).await?;
+        resolved_pipeline.apply_prunes(&pruned);
+        let graph = Self::from_resolved_pipeline(package_graph, &resolved_pipeline)?;
+        Ok((graph, pruned))
+    }
+
+    fn from_resolved_pipeline(
+        package_graph: &PackageGraph,
+        resolved_pipeline: &ResolvedPipeline,
+    ) -> Result<Self, EngineError> {
         let root_package = root_package_name();
         let mut graph = DiGraph::new();
         let mut indices_by_id = HashMap::new();
@@ -161,7 +298,7 @@ impl TaskGraph {
                 for dependency_id in with_edges.expand_dependency(
                     source_id,
                     package_graph,
-                    &resolved_pipeline,
+                    resolved_pipeline,
                     &root_package,
                     dependency,
                 )? {
@@ -182,9 +319,39 @@ impl TaskGraph {
         pipeline: &HashMap<TaskName, TaskDefinition>,
         worker_names: &HashSet<String>,
     ) -> Result<(), DependencyValidationError> {
-        let resolved_pipeline = ResolvedPipeline::build(package_graph, pipeline)
+        Self::validate_tasks_with_pruned(package_graph, pipeline, worker_names, &HashSet::new())
+    }
+
+    /// Like [`validate_tasks`], but tolerant of references to tasks that were
+    /// intentionally pruned during the resolution phase.
+    ///
+    /// The resolved pipeline is rebuilt and the given `pruned` ids removed, so a
+    /// surviving task whose `depends_on` points at a pruned task is NOT flagged
+    /// as a dead dependency (the dropped edge is informational, not an error).
+    /// A dependency on a task that never existed still errors.
+    pub fn validate_tasks_with_pruned(
+        package_graph: &PackageGraph,
+        pipeline: &HashMap<TaskName, TaskDefinition>,
+        worker_names: &HashSet<String>,
+        pruned: &HashSet<TaskId>,
+    ) -> Result<(), DependencyValidationError> {
+        let mut resolved_pipeline = ResolvedPipeline::build(package_graph, pipeline)
             .expect("resolved pipeline should match task graph construction");
+        // Apply prunes so surviving tasks are validated against the post-prune
+        // pipeline, while the pruned ids remain known for dependency tolerance.
+        if !pruned.is_empty() {
+            let pruned_tasks: Vec<PrunedTask> = pruned
+                .iter()
+                .cloned()
+                .map(|task_id| PrunedTask {
+                    task_id,
+                    outcome: PruneOutcome::Pruned { reason: None },
+                })
+                .collect();
+            resolved_pipeline.apply_prunes(&pruned_tasks);
+        }
         let mut diagnostics = Vec::new();
+        let dependency_context = DependencyContext::new(package_graph, &resolved_pipeline, pruned);
 
         for (task_id, definition) in &resolved_pipeline.tasks_by_id {
             match &definition.worker {
@@ -208,8 +375,7 @@ impl TaskGraph {
             }
 
             for dependency in &definition.depends_on {
-                if let Some(reason) =
-                    dead_dependency_reason(package_graph, &resolved_pipeline, task_id, dependency)
+                if let Some(reason) = dependency_context.dead_dependency_reason(task_id, dependency)
                 {
                     diagnostics.push(TaskValidationDiagnostic {
                         task_id: task_id.clone(),
@@ -495,6 +661,114 @@ impl ResolvedPipeline {
         })
     }
 
+    /// Runs the worker-mediated resolution phase over every expanded task that
+    /// has a worker. Tasks without a worker are left untouched (pure ordering
+    /// nodes). For each worker-task the resolver is asked for a decision:
+    ///
+    /// - `Accept`  → keep unchanged.
+    /// - `Modify`  → replace the task's command in place.
+    /// - `Prune`   → record for removal.
+    /// - `Reject`  → run mode: record for removal (caller warns); check mode:
+    ///   error out immediately.
+    ///
+    /// Returns the set of tasks to prune (applied separately via
+    /// [`apply_prunes`]) so the caller can surface them.
+    async fn resolve<R: TaskResolver>(
+        &mut self,
+        packages: &HashMap<PackageName, PackageResolveInfo>,
+        resolver: &R,
+        mode: ResolveMode,
+    ) -> Result<Vec<PrunedTask>, ResolveError> {
+        // Deterministic iteration order so prune diagnostics are stable.
+        let mut task_ids: Vec<TaskId> = self.tasks_by_id.keys().cloned().collect();
+        task_ids.sort_by_key(|task_id| task_id.to_string());
+
+        let mut pruned = Vec::new();
+
+        for task_id in task_ids {
+            let definition = &self.tasks_by_id[&task_id];
+            let Some(worker) = definition.worker.clone() else {
+                continue;
+            };
+
+            let info = packages.get(&task_id.package);
+            let request = ResolveTask {
+                id: task_id.to_string(),
+                name: task_id.task.as_str().to_owned(),
+                command: definition
+                    .command
+                    .clone()
+                    .map(|command| command.trim().to_owned())
+                    .unwrap_or_default(),
+                package: task_id.package.as_str().to_owned(),
+                cwd: info.and_then(|info| info.cwd.clone()),
+                scripts: info.map(|info| info.scripts.clone()).unwrap_or_default(),
+                mode,
+            };
+
+            let result = resolver
+                .resolve(&worker, request)
+                .await
+                .map_err(|message| ResolveError::Worker {
+                    task: task_id.clone(),
+                    message,
+                })?;
+
+            match result.decision {
+                ResolveDecision::Accept => {}
+                ResolveDecision::Modify(modification) => {
+                    if let Some(definition) = self.tasks_by_id.get_mut(&task_id) {
+                        modification.apply_to(definition);
+                    }
+                }
+                ResolveDecision::Prune { reason } => {
+                    pruned.push(PrunedTask {
+                        task_id,
+                        outcome: PruneOutcome::Pruned { reason },
+                    });
+                }
+                ResolveDecision::Reject { message } => {
+                    if mode == ResolveMode::Check {
+                        return Err(ResolveError::Rejected {
+                            task: task_id,
+                            message,
+                        });
+                    }
+                    pruned.push(PrunedTask {
+                        task_id,
+                        outcome: PruneOutcome::Rejected { message },
+                    });
+                }
+            }
+        }
+
+        Ok(pruned)
+    }
+
+    /// Removes pruned tasks from the resolved pipeline so they never become
+    /// graph nodes. Returns the set of removed ids for validation tolerance.
+    fn apply_prunes(&mut self, pruned: &[PrunedTask]) -> HashSet<TaskId> {
+        let mut removed = HashSet::new();
+        for entry in pruned {
+            let task_id = &entry.task_id;
+            self.tasks_by_id.remove(task_id);
+            if let Some(task_names) = self.task_names_by_package.get_mut(&task_id.package) {
+                // Only drop the task name for this package when no other task of
+                // the same name survives in the package (each package has at most
+                // one task per name, so this simply removes it).
+                task_names.remove(&task_id.task);
+                if task_names.is_empty() {
+                    self.task_names_by_package.remove(&task_id.package);
+                }
+            }
+            if is_root_task(task_id) {
+                self.root_task_names.remove(&task_id.task);
+            }
+            removed.insert(task_id.clone());
+        }
+        removed
+    }
+
     fn contains_package_task(&self, package_name: &PackageName, task_name: &TaskName) -> bool {
         self.task_names_by_package
             .get(package_name)
@@ -512,60 +786,131 @@ impl ResolvedPipeline {
     }
 }
 
-fn dead_dependency_reason(
-    package_graph: &PackageGraph,
-    resolved_pipeline: &ResolvedPipeline,
-    source_task_id: &TaskId,
-    dependency: &DependsOn,
-) -> Option<DeadDependencyReason> {
-    match dependency {
-        DependsOn::SamePackage(task_name) => {
-            // A bare task-name dependency resolves within the source's own scope.
-            // For a root-task source that is the set of root tasks; otherwise it
-            // is dead only when no package declares the task anywhere.
-            let exists = if is_root_task(source_task_id) {
-                resolved_pipeline.contains_root_task(task_name)
-            } else {
-                resolved_pipeline.task_exists_in_any_package(task_name)
-            };
-            (!exists).then(|| DeadDependencyReason::UnknownTaskEverywhere {
-                task: task_name.clone(),
-            })
-        }
-        DependsOn::Specific(task_id) => {
-            let package_exists = package_graph
-                .topological_order()
-                .map(|packages| {
-                    packages
-                        .into_iter()
-                        .any(|package| package.name == task_id.package)
-                })
-                .unwrap_or(false);
-            if !package_exists {
-                return Some(DeadDependencyReason::UnknownPackage {
-                    package: task_id.package.clone(),
-                });
-            }
+/// The lookups a dead-dependency check needs, bundled to keep the per-arm
+/// helpers small and the public entry point at four arguments. Package names
+/// are precomputed once so per-dependency checks avoid repeated graph walks.
+struct DependencyContext<'a> {
+    /// Names of every package in the workspace (precomputed from the graph).
+    package_names: HashSet<PackageName>,
+    resolved_pipeline: &'a ResolvedPipeline,
+    /// Tasks intentionally pruned during resolution. A reference resolving to a
+    /// pruned task is tolerated (dropped edge), not a dead-dependency error.
+    pruned: &'a HashSet<TaskId>,
+}
 
-            let exists_in_package =
-                resolved_pipeline.contains_package_task(&task_id.package, &task_id.task);
-            (!exists_in_package).then(|| DeadDependencyReason::UnknownTaskInPackage {
+impl<'a> DependencyContext<'a> {
+    fn new(
+        package_graph: &PackageGraph,
+        resolved_pipeline: &'a ResolvedPipeline,
+        pruned: &'a HashSet<TaskId>,
+    ) -> Self {
+        // A failed topological order (cycle) leaves the set empty; the same
+        // missing-package handling as before then applies.
+        let package_names = package_graph
+            .topological_order()
+            .map(|packages| packages.into_iter().map(|node| node.name.clone()).collect())
+            .unwrap_or_default();
+        Self {
+            package_names,
+            resolved_pipeline,
+            pruned,
+        }
+    }
+
+    fn pruned_has_id(&self, task_id: &TaskId) -> bool {
+        self.pruned.contains(task_id)
+    }
+
+    fn pruned_has_package_task(&self, task_name: &TaskName) -> bool {
+        self.pruned
+            .iter()
+            .any(|task_id| &task_id.task == task_name && !is_root_task(task_id))
+    }
+
+    fn pruned_has_root_task(&self, task_name: &TaskName) -> bool {
+        self.pruned
+            .iter()
+            .any(|task_id| &task_id.task == task_name && is_root_task(task_id))
+    }
+
+    fn package_exists(&self, package: &PackageName) -> bool {
+        self.package_names.contains(package)
+    }
+
+    /// `name` dependency from a source task, resolved within its own scope.
+    fn same_package_reason(
+        &self,
+        source_task_id: &TaskId,
+        task_name: &TaskName,
+    ) -> Option<DeadDependencyReason> {
+        let (exists, pruned_match) = if is_root_task(source_task_id) {
+            (
+                self.resolved_pipeline.contains_root_task(task_name),
+                self.pruned_has_root_task(task_name),
+            )
+        } else {
+            let candidate = TaskId::new(source_task_id.package.clone(), task_name.clone());
+            (
+                self.resolved_pipeline.task_exists_in_any_package(task_name),
+                self.pruned_has_id(&candidate) || self.pruned_has_package_task(task_name),
+            )
+        };
+        (!exists && !pruned_match).then(|| DeadDependencyReason::UnknownTaskEverywhere {
+            task: task_name.clone(),
+        })
+    }
+
+    fn specific_reason(&self, task_id: &TaskId) -> Option<DeadDependencyReason> {
+        if !self.package_exists(&task_id.package) {
+            return Some(DeadDependencyReason::UnknownPackage {
+                package: task_id.package.clone(),
+            });
+        }
+        let exists = self
+            .resolved_pipeline
+            .contains_package_task(&task_id.package, &task_id.task);
+        (!exists && !self.pruned_has_id(task_id)).then(|| {
+            DeadDependencyReason::UnknownTaskInPackage {
                 package: task_id.package.clone(),
                 task: task_id.task.clone(),
-            })
-        }
-        DependsOn::DirectUpstream(task_name) | DependsOn::TransitiveUpstream(task_name) => {
-            let exists_anywhere = resolved_pipeline.task_exists_in_any_package(task_name);
-            (!exists_anywhere).then(|| DeadDependencyReason::UnknownTaskEverywhere {
+            }
+        })
+    }
+
+    fn upstream_reason(&self, task_name: &TaskName) -> Option<DeadDependencyReason> {
+        let exists = self.resolved_pipeline.task_exists_in_any_package(task_name);
+        (!exists && !self.pruned_has_package_task(task_name)).then(|| {
+            DeadDependencyReason::UnknownTaskEverywhere {
                 task: task_name.clone(),
-            })
-        }
-        DependsOn::Root(task_name) => {
-            (!resolved_pipeline.contains_root_task(task_name)).then(|| {
-                DeadDependencyReason::UnknownRootTask {
-                    task: task_name.clone(),
-                }
-            })
+            }
+        })
+    }
+
+    fn root_reason(&self, task_name: &TaskName) -> Option<DeadDependencyReason> {
+        let exists = self.resolved_pipeline.contains_root_task(task_name);
+        (!exists && !self.pruned_has_root_task(task_name)).then(|| {
+            DeadDependencyReason::UnknownRootTask {
+                task: task_name.clone(),
+            }
+        })
+    }
+
+    /// Returns why `source_task_id`'s `dependency` is dead, or `None` when it
+    /// resolves (or was intentionally pruned and is therefore tolerated).
+    fn dead_dependency_reason(
+        &self,
+        source_task_id: &TaskId,
+        dependency: &DependsOn,
+    ) -> Option<DeadDependencyReason> {
+        match dependency {
+            DependsOn::SamePackage(task_name) => {
+                self.same_package_reason(source_task_id, task_name)
+            }
+            DependsOn::Specific(task_id) => self.specific_reason(task_id),
+            DependsOn::DirectUpstream(task_name) | DependsOn::TransitiveUpstream(task_name) => {
+                self.upstream_reason(task_name)
+            }
+            DependsOn::Root(task_name) => self.root_reason(task_name),
         }
     }
 }
@@ -661,7 +1006,7 @@ pub fn root_task_id(task_name: TaskName) -> TaskId {
 }
 
 pub fn is_root_task(task_id: &TaskId) -> bool {
-    task_id.package == root_package_name()
+    task_id.is_root()
 }
 
 #[cfg(test)]
@@ -1687,5 +2032,302 @@ mod tests {
         let path = path.as_ref();
         fs::create_dir_all(path.parent().expect("parent dir")).expect("create parent dir");
         fs::write(path, contents).expect("write json");
+    }
+
+    // ---- Resolution-phase tests (Task 3 + Task 4) -------------------------
+
+    use super::{PackageResolveInfo, PruneOutcome, PrunedTask, ResolveError, TaskResolver};
+    use crate::worker::protocol::{ResolveMode, ResolveResult, ResolveTask, TaskModification};
+
+    /// Stub resolver driven by a closure mapping a `ResolveTask` to a result.
+    struct StubResolver<F>(F);
+
+    impl<F> TaskResolver for StubResolver<F>
+    where
+        F: Fn(&ResolveTask) -> ResolveResult + Sync,
+    {
+        async fn resolve(
+            &self,
+            _worker: &str,
+            request: ResolveTask,
+        ) -> Result<ResolveResult, String> {
+            Ok((self.0)(&request))
+        }
+    }
+
+    /// Two independent packages `@repo/a` and `@repo/b`, no deps.
+    fn package_graph_pair() -> PackageGraph {
+        let temp_dir = tempdir().expect("create temp dir");
+        write_package(
+            temp_dir.path().join("packages/a/package.json"),
+            PackageManifest {
+                name: "@repo/a",
+                dependencies: &[],
+            },
+        );
+        write_package(
+            temp_dir.path().join("packages/b/package.json"),
+            PackageManifest {
+                name: "@repo/b",
+                dependencies: &[],
+            },
+        );
+        PackageGraph::build(vec![
+            package_node(temp_dir.path().join("packages/a"), "@repo/a"),
+            package_node(temp_dir.path().join("packages/b"), "@repo/b"),
+        ])
+        .expect("build package graph")
+    }
+
+    fn worker_task(depends_on: Vec<DependsOn>) -> TaskDefinition {
+        TaskDefinition {
+            depends_on,
+            worker: Some("yarn".to_string()),
+            ..TaskDefinition::default()
+        }
+    }
+
+    fn empty_resolve_info() -> HashMap<PackageName, PackageResolveInfo> {
+        HashMap::new()
+    }
+
+    /// Asserts that the graph contains a node for the given package/task.
+    fn assert_in_graph(graph: &TaskGraph, package: &str, task: &str) {
+        assert!(
+            graph.task_node(&TaskId::new(package, task)).is_some(),
+            "expected {package}#{task} to be a graph node"
+        );
+    }
+
+    /// Asserts that the graph does NOT contain a node for the given package/task.
+    fn assert_not_in_graph(graph: &TaskGraph, package: &str, task: &str) {
+        assert!(
+            graph.task_node(&TaskId::new(package, task)).is_none(),
+            "expected {package}#{task} to be absent (pruned)"
+        );
+    }
+
+    /// Asserts that `pruned` contains exactly the given task id with a
+    /// `Pruned` outcome.
+    fn assert_single_prune(pruned: &[PrunedTask], package: &str, task: &str) {
+        assert_eq!(pruned.len(), 1, "expected exactly one pruned task");
+        assert_eq!(pruned[0].task_id, TaskId::new(package, task));
+        assert!(matches!(pruned[0].outcome, PruneOutcome::Pruned { .. }));
+    }
+
+    /// Asserts the resolved task `@repo/a#build` in `graph` has the expected
+    /// command, dependencies, and weight (mirrored on its graph node).
+    fn assert_app_build_spec(
+        graph: &TaskGraph,
+        command: &str,
+        depends_on: Vec<DependsOn>,
+        weight: u32,
+    ) {
+        let task_id = TaskId::new("@repo/a", "build");
+        let definition = graph.task_definition(&task_id).expect("task kept");
+        assert_eq!(definition.command.as_deref(), Some(command));
+        assert_eq!(definition.depends_on, depends_on);
+        assert_eq!(definition.weight, weight);
+        assert_eq!(graph.task_node(&task_id).expect("node").weight, weight);
+    }
+
+    #[tokio::test]
+    async fn resolution_prunes_tasks_the_worker_drops() {
+        let package_graph = package_graph_pair();
+        let pipeline = HashMap::from([(TaskName::from("build"), worker_task(vec![]))]);
+
+        // Worker accepts @repo/a#build, prunes @repo/b#build.
+        let resolver = StubResolver(|request: &ResolveTask| {
+            if request.package == "@repo/b" {
+                ResolveResult::prune(Some("script `build` not found in package `@repo/b`".into()))
+            } else {
+                ResolveResult::accept()
+            }
+        });
+
+        let (graph, pruned) = TaskGraph::build_resolved(
+            &package_graph,
+            &pipeline,
+            &empty_resolve_info(),
+            &resolver,
+            ResolveMode::Run,
+        )
+        .await
+        .expect("build resolved graph");
+
+        assert_in_graph(&graph, "@repo/a", "build");
+        assert_not_in_graph(&graph, "@repo/b", "build");
+        assert_single_prune(&pruned, "@repo/b", "build");
+    }
+
+    #[tokio::test]
+    async fn resolution_modify_updates_command_depends_on_and_weight() {
+        let package_graph = package_graph_single("@repo/a");
+        // Start with weight 1 and a same-package dependency.
+        let pipeline = HashMap::from([(
+            TaskName::from("build"),
+            TaskDefinition {
+                weight: 1,
+                ..worker_task(vec![DependsOn::SamePackage(TaskName::from("prepare"))])
+            },
+        )]);
+
+        // Worker replaces command, dependency list, and weight.
+        let resolver = StubResolver(|_: &ResolveTask| {
+            ResolveResult::modify(TaskModification {
+                command: Some("compile".to_owned()),
+                depends_on: Some(vec![DependsOn::DirectUpstream(TaskName::from("build"))]),
+                weight: Some(7),
+            })
+        });
+        let (graph, pruned) = TaskGraph::build_resolved(
+            &package_graph,
+            &pipeline,
+            &empty_resolve_info(),
+            &resolver,
+            ResolveMode::Run,
+        )
+        .await
+        .expect("build resolved graph");
+
+        assert!(pruned.is_empty());
+        assert_app_build_spec(
+            &graph,
+            "compile",
+            vec![DependsOn::DirectUpstream(TaskName::from("build"))],
+            7,
+        );
+    }
+
+    #[tokio::test]
+    async fn resolution_modify_command_only_leaves_other_fields_intact() {
+        let package_graph = package_graph_single("@repo/a");
+        let pipeline = HashMap::from([(
+            TaskName::from("build"),
+            TaskDefinition {
+                weight: 3,
+                ..worker_task(vec![DependsOn::SamePackage(TaskName::from("prepare"))])
+            },
+        )]);
+
+        let resolver = StubResolver(|_: &ResolveTask| ResolveResult::modify_command("compile"));
+        let (graph, _pruned) = TaskGraph::build_resolved(
+            &package_graph,
+            &pipeline,
+            &empty_resolve_info(),
+            &resolver,
+            ResolveMode::Run,
+        )
+        .await
+        .expect("build resolved graph");
+
+        // Only the command changed; depends_on and weight are untouched.
+        assert_app_build_spec(
+            &graph,
+            "compile",
+            vec![DependsOn::SamePackage(TaskName::from("prepare"))],
+            3,
+        );
+    }
+
+    #[tokio::test]
+    async fn reject_warns_and_prunes_in_run_mode_but_errors_in_check_mode() {
+        let package_graph = package_graph_single("@repo/a");
+        let pipeline = HashMap::from([(TaskName::from("build"), worker_task(vec![]))]);
+        let resolver = StubResolver(|_: &ResolveTask| ResolveResult::reject("nope"));
+
+        // Run mode: downgraded to a prune.
+        let (graph, pruned) = TaskGraph::build_resolved(
+            &package_graph,
+            &pipeline,
+            &empty_resolve_info(),
+            &resolver,
+            ResolveMode::Run,
+        )
+        .await
+        .expect("run-mode resolve succeeds");
+        assert_eq!(graph.node_count(), 0);
+        assert_eq!(pruned.len(), 1);
+        assert!(pruned[0].outcome.is_rejected());
+
+        // Check mode: a Reject is a hard error.
+        let error = TaskGraph::build_resolved(
+            &package_graph,
+            &pipeline,
+            &empty_resolve_info(),
+            &resolver,
+            ResolveMode::Check,
+        )
+        .await
+        .expect_err("check-mode reject errors");
+        assert!(matches!(
+            error,
+            EngineError::Resolve(ResolveError::Rejected { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn dependent_still_runs_when_its_dependency_is_pruned() {
+        // @repo/b#build depends on a specific @repo/a#build; @repo/a#build is pruned.
+        let package_graph = package_graph_pair();
+        let pipeline = HashMap::from([(
+            TaskName::from("build"),
+            worker_task(vec![DependsOn::Specific(TaskId::new("@repo/a", "build"))]),
+        )]);
+        let resolver = StubResolver(|request: &ResolveTask| {
+            if request.package == "@repo/a" {
+                ResolveResult::prune(None)
+            } else {
+                ResolveResult::accept()
+            }
+        });
+
+        let (graph, pruned) = TaskGraph::build_resolved(
+            &package_graph,
+            &pipeline,
+            &empty_resolve_info(),
+            &resolver,
+            ResolveMode::Run,
+        )
+        .await
+        .expect("build resolved graph");
+
+        // Dependent survives; the dropped edge does not abort the run.
+        assert_in_graph(&graph, "@repo/b", "build");
+        assert_not_in_graph(&graph, "@repo/a", "build");
+
+        // Validation tolerates the reference to the pruned dependency.
+        let pruned_ids: HashSet<TaskId> = pruned.iter().map(|e| e.task_id.clone()).collect();
+        let worker_names = HashSet::from(["yarn".to_string()]);
+        TaskGraph::validate_tasks_with_pruned(
+            &package_graph,
+            &pipeline,
+            &worker_names,
+            &pruned_ids,
+        )
+        .expect("dependency on a pruned task is tolerated");
+    }
+
+    #[test]
+    fn dependency_on_a_genuinely_unknown_task_still_errors() {
+        // No resolution / no prunes: a dependency on a never-declared specific
+        // task must still surface as a dead dependency.
+        let package_graph = package_graph_pair();
+        let pipeline = HashMap::from([(
+            TaskName::from("build"),
+            worker_task(vec![DependsOn::Specific(TaskId::new("@repo/a", "ghost"))]),
+        )]);
+        let worker_names = HashSet::from(["yarn".to_string()]);
+
+        let error =
+            TaskGraph::validate_tasks(&package_graph, &pipeline, &worker_names).expect_err("dead");
+        let DependencyValidationError::InvalidTasks { diagnostics } = error;
+        assert!(diagnostics.iter().any(|diagnostic| matches!(
+            &diagnostic.reason,
+            TaskValidationReason::DeadDependencyReference {
+                reason: DeadDependencyReason::UnknownTaskInPackage { task, .. },
+                ..
+            } if task.as_str() == "ghost"
+        )));
     }
 }

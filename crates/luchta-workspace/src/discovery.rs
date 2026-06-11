@@ -1,7 +1,7 @@
 //! Workspace discovery abstractions.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap, HashSet},
     fs,
     path::{Component, Path, PathBuf},
 };
@@ -41,6 +41,8 @@ struct PackageJson {
     name: Option<String>,
     #[serde(default)]
     workspaces: Option<WorkspacesField>,
+    #[serde(default)]
+    scripts: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -187,7 +189,9 @@ fn package_node_from_package_json(
         })?
         .into();
 
-    Ok(PackageNode::new(name, package_path))
+    let scripts: HashSet<String> = package_json.scripts.into_keys().collect();
+
+    Ok(PackageNode::new(name, package_path).with_scripts(scripts))
 }
 
 fn is_node_modules(path: &Path) -> bool {
@@ -276,6 +280,49 @@ mod tests {
         );
 
         assert_eq!(discover_sorted(&temp_dir), vec!["@repo/real", "root"]);
+    }
+
+    /// Discovers a workspace whose single `@repo/app` package has the given
+    /// `package.json`, returning that package node's declared scripts.
+    fn app_scripts(app_json: &str) -> std::collections::HashSet<String> {
+        let temp_dir = tempdir().expect("create temp dir");
+        write_json(
+            temp_dir.path().join("package.json"),
+            r#"{
+                "name": "root",
+                "private": true,
+                "workspaces": ["packages/*"]
+            }"#,
+        );
+        write_json(temp_dir.path().join("packages/app/package.json"), app_json);
+
+        YarnWorkspace::new(temp_dir.path())
+            .discover()
+            .expect("discover packages")
+            .into_iter()
+            .find(|package| package.name.as_str() == "@repo/app")
+            .expect("app package discovered")
+            .scripts
+    }
+
+    #[test]
+    fn loads_declared_scripts_into_package_node() {
+        let scripts = app_scripts(
+            r#"{
+                "name": "@repo/app",
+                "scripts": { "build": "tsc", "test": "vitest" }
+            }"#,
+        );
+
+        assert!(scripts.contains("build"));
+        assert!(scripts.contains("test"));
+        assert!(!scripts.contains("lint"));
+    }
+
+    #[test]
+    fn package_without_scripts_field_has_empty_scripts() {
+        let scripts = app_scripts(r#"{ "name": "@repo/app" }"#);
+        assert!(scripts.is_empty());
     }
 
     /// Set up a workspace with the given root `package.json` content and a

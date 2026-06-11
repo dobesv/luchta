@@ -28,15 +28,31 @@ pub struct PackageNode {
     pub name: PackageName,
     /// Filesystem path to package root.
     pub path: PathBuf,
+    /// Script names declared in the package's `package.json` `scripts` map.
+    ///
+    /// Empty when the package has no `scripts` field or no `package.json`.
+    pub scripts: HashSet<String>,
 }
 
 impl PackageNode {
-    /// Creates package node from name and path.
+    /// Creates package node from name and path with no declared scripts.
     pub fn new(name: PackageName, path: impl Into<PathBuf>) -> Self {
         Self {
             name,
             path: path.into(),
+            scripts: HashSet::new(),
         }
+    }
+
+    /// Sets the package's declared script names.
+    pub fn with_scripts(mut self, scripts: HashSet<String>) -> Self {
+        self.scripts = scripts;
+        self
+    }
+
+    /// Returns true when the package declares a script with the given name.
+    pub fn has_script(&self, name: &str) -> bool {
+        self.scripts.contains(name)
     }
 }
 

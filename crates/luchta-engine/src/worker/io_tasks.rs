@@ -20,7 +20,7 @@ use tokio_util::codec::{FramedRead, LinesCodec, LinesCodecError};
 
 use super::{
     handle::{JobMap, WriterContext, WriterRuntime},
-    protocol::{LogStream, WorkerRequest, WorkerResponse},
+    protocol::{LogStream, WorkerMessage, WorkerResponse},
 };
 
 const MAX_LINE_LENGTH: usize = 1 << 20;
@@ -159,10 +159,10 @@ async fn crash_reader_jobs(context: &ReaderContext) {
     }
 }
 
-fn prepare_writer_action(request: WorkerRequest) -> WriterAction {
-    match serde_json::to_string(&request) {
+fn prepare_writer_action(message: WorkerMessage) -> WriterAction {
+    match serde_json::to_string(&message) {
         Ok(line) => WriterAction::Write(line),
-        Err(_error) => WriterAction::DropJob(request.id),
+        Err(_error) => WriterAction::DropJob(message.id().to_owned()),
     }
 }
 
@@ -208,7 +208,7 @@ pub(crate) async fn collect_worker_handles(
     workers.drain().map(|(_, handle)| handle).collect()
 }
 
-pub(crate) fn clear_writer_sender(writer_tx: &Mutex<Option<mpsc::Sender<WorkerRequest>>>) {
+pub(crate) fn clear_writer_sender(writer_tx: &Mutex<Option<mpsc::Sender<WorkerMessage>>>) {
     if let Ok(mut writer_tx) = writer_tx.try_lock() {
         writer_tx.take();
     }

@@ -10,8 +10,13 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 use assert_cmd::cargo::CommandCargoExt;
-use luchta_engine::WorkerRequest;
+use luchta_engine::{WorkerMessage, WorkerRequest};
 use serde_json::Value;
+
+/// Serializes an execution request as a `run` worker message JSONL line.
+fn run_line(request: WorkerRequest) -> String {
+    serde_json::to_string(&WorkerMessage::Run(request)).expect("request json")
+}
 
 fn run_worker(input: &str) -> (Vec<Value>, String) {
     let mut command = Command::cargo_bin("luchta-yarn-worker").expect("binary exists");
@@ -46,10 +51,7 @@ fn run_worker(input: &str) -> (Vec<Value>, String) {
 
 #[test]
 fn echo_request_emits_log_and_done() {
-    let input = format!(
-        "{}\n",
-        serde_json::to_string(&WorkerRequest::new("job-1", "echo hi")).expect("request json")
-    );
+    let input = format!("{}\n", run_line(WorkerRequest::new("job-1", "echo hi")));
     let (output, _stderr) = run_worker(&input);
 
     assert!(output.iter().any(|value| {
@@ -68,10 +70,7 @@ fn echo_request_emits_log_and_done() {
 
 #[test]
 fn failing_request_preserves_exit_code() {
-    let input = format!(
-        "{}\n",
-        serde_json::to_string(&WorkerRequest::new("job-2", "exit 3")).expect("request json")
-    );
+    let input = format!("{}\n", run_line(WorkerRequest::new("job-2", "exit 3")));
     let (output, _stderr) = run_worker(&input);
 
     assert!(output.iter().any(|value| {
@@ -88,10 +87,7 @@ fn invalid_cwd_still_emits_done_with_non_zero_exit_code() {
             .display()
             .to_string(),
     );
-    let input = format!(
-        "{}\n",
-        serde_json::to_string(&request).expect("request json")
-    );
+    let input = format!("{}\n", run_line(request));
     let (output, _stderr) = run_worker(&input);
 
     assert!(output.iter().any(|value| {
@@ -109,12 +105,7 @@ fn concurrent_requests_emit_done_for_both_ids() {
     ];
     let mut input = Vec::new();
     for request in requests {
-        writeln!(
-            input,
-            "{}",
-            serde_json::to_string(&request).expect("request json")
-        )
-        .expect("write request");
+        writeln!(input, "{}", run_line(request)).expect("write request");
     }
 
     let (output, _stderr) = run_worker(&String::from_utf8(input).expect("stdin utf8"));
