@@ -122,13 +122,17 @@ pub struct TaskDefinition {
     /// Relative weight used by weighted scheduler.
     #[serde(default = "default_task_weight")]
     pub weight: u32,
-    /// Explicit command line for task.
+    /// Explicit command for the task.
     ///
-    /// Command resolution priority: explicit `command` in the config first,
-    /// otherwise matching `scripts` entry from `package.json` for task name.
+    /// A command is only executed when the task also names a `worker`; the
+    /// worker is responsible for running it (for a worker task without an
+    /// explicit command, the bare task name is used). A command without a
+    /// worker is a configuration error. Tasks are never resolved from
+    /// `package.json` scripts.
     #[serde(default)]
     pub command: Option<String>,
-    /// Optional named worker used to execute this task.
+    /// Named worker used to execute this task. A task without a worker (and
+    /// without a command) is a no-op ordering node.
     #[serde(default)]
     pub worker: Option<String>,
 }
@@ -185,7 +189,7 @@ impl std::error::Error for ParseDependsOnError {}
 /// Dependency reference used in task pipeline definitions.
 ///
 /// Serde representation is string-based for config UX:
-/// `^task`, `^^task`, `task`, or `pkg#task`.
+/// `^task`, `^^task`, `task`, `pkg#task`, or `#task`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum DependsOn {
     /// `^task`: task on direct upstream workspace packages.
@@ -196,16 +200,25 @@ pub enum DependsOn {
     SamePackage(TaskName),
     /// `pkg#task`: task in specific package.
     Specific(TaskId),
+    /// `#task`: singleton root task.
+    Root(TaskName),
 }
 
 impl DependsOn {
-    fn as_config_string(&self) -> String {
+    pub fn as_config_string(&self) -> String {
         match self {
-            Self::DirectUpstream(task) => format!("^{}", task),
-            Self::TransitiveUpstream(task) => format!("^^{}", task),
+            Self::DirectUpstream(task) => format!("^{task}"),
+            Self::TransitiveUpstream(task) => format!("^^{task}"),
             Self::SamePackage(task) => task.to_string(),
             Self::Specific(task_id) => task_id.to_string(),
+            Self::Root(task) => format!("#{task}"),
         }
+    }
+}
+
+impl fmt::Display for DependsOn {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.as_config_string())
     }
 }
 
@@ -230,6 +243,16 @@ impl FromStr for DependsOn {
             "direct upstream dependency must include task name",
         ) {
             return parsed;
+        }
+
+        if let Some(task) = value.strip_prefix('#') {
+            if task.is_empty() {
+                return Err(ParseDependsOnError::new(
+                    "root dependency must include task name",
+                ));
+            }
+
+            return Ok(Self::Root(TaskName::from(task)));
         }
 
         if let Some((package, task)) = value.split_once('#') {
