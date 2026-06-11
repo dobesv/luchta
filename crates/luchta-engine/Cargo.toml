@@ -19,6 +19,7 @@ tokio-util = { workspace = true }
 tokio-stream = { workspace = true }
 libc = { workspace = true }
 luchta-types = { path = "../luchta-types" }
+luchta-worker = { path = "../luchta-worker" }
 luchta-workspace = { path = "../luchta-workspace" }
 
 [dev-dependencies]

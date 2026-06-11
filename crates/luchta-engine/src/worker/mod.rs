@@ -1,5 +1,5 @@
 pub mod manager;
-pub mod protocol;
+pub use luchta_worker as protocol;
 
 #[cfg(unix)]
 mod handle;

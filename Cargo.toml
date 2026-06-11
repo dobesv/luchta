@@ -5,8 +5,10 @@ members = [
     "crates/luchta-lockfiles",
     "crates/luchta-workspace",
     "crates/luchta-engine",
+    "crates/luchta-worker",
     "crates/luchta-cli",
     "crates/luchta-yarn-worker",
+    "crates/luchta-bash-worker",
     "xtask",
 ]
 

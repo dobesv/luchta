@@ -6,3 +6,6 @@
 
 # Vendored reference clone (not part of the project)
 /turborepo/
+
+# Isolated build dir used by agents
+/.harnx-target/
