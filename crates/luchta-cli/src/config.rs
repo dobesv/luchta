@@ -117,12 +117,23 @@ async fn execute_config_script(
     {
         use std::os::unix::fs::PermissionsExt;
 
-        let permissions = fs::Permissions::from_mode(0o755);
-        fs::set_permissions(config_path, permissions)
-            .into_diagnostic()
-            .wrap_err_with(|| {
-                format!("failed to set executable bit on {}", config_path.display())
-            })?;
+        // Ensure the config script is executable. Skip the write entirely when
+        // the owner-execute bit is already set so we don't fail on a read-only
+        // filesystem (e.g. a read-only mount) where the file is already
+        // runnable. Only surface an error if the file truly is not executable
+        // and we cannot make it so.
+        let already_executable = fs::metadata(config_path)
+            .map(|metadata| metadata.permissions().mode() & 0o100 != 0)
+            .unwrap_or(false);
+
+        if !already_executable {
+            let permissions = fs::Permissions::from_mode(0o755);
+            fs::set_permissions(config_path, permissions)
+                .into_diagnostic()
+                .wrap_err_with(|| {
+                    format!("failed to set executable bit on {}", config_path.display())
+                })?;
+        }
     }
 
     let mut child = spawn_config_script_with_retry(workspace_root, config_path).await?;
@@ -549,6 +560,39 @@ echo '{"tasks":{"build":{"dependsOn":["^build"],"weight":2}},"concurrency":{"max
         assert_eq!(config.concurrency.max_weight, 10);
         assert_eq!(config.tasks["build"].weight, 2);
         assert_eq!(config.tasks["build"].depends_on.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn loads_already_executable_config_on_read_only_dir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // An already-executable config in a read-only directory must load: the
+        // loader must not try (and fail) to re-chmod it. Regression for the
+        // "failed to set executable bit ... Read-only file system" error seen
+        // on read-only mounts.
+        let temp = tempdir().expect("tempdir");
+        let script = temp.path().join("luchta-config.sh");
+        fs::write(
+            &script,
+            "#!/bin/sh\necho '{\"tasks\":{\"build\":{}},\"concurrency\":{\"maxWeight\":3}}'\n",
+        )
+        .expect("write script");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod script");
+        // Make the directory read-only so re-chmodding the file would fail.
+        let dir_perms = fs::metadata(temp.path())
+            .expect("dir metadata")
+            .permissions();
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o555))
+            .expect("make dir read-only");
+
+        let result = load_config(temp.path()).await;
+
+        // Restore writable permissions so the temp dir can be cleaned up.
+        fs::set_permissions(temp.path(), dir_perms).expect("restore dir perms");
+
+        let config = result.expect("config should load on a read-only dir");
+        assert_eq!(config.concurrency.max_weight, 3);
     }
 
     #[tokio::test]

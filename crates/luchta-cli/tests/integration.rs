@@ -357,3 +357,58 @@ fn run_fails_on_script_failure() {
 
     temp.close().expect("cleanup temp dir");
 }
+
+/// Sets up a two-package workspace with `config_json`, runs `luchta run <task>
+/// --dry-run`, and returns the assertion handle for the caller to check.
+fn dry_run_assert(
+    temp: &assert_fs::TempDir,
+    config_json: &str,
+    task: &str,
+) -> assert_cmd::assert::Assert {
+    setup_workspace(temp);
+    temp.child("luchta-config.sh")
+        .write_str(&format!("#!/bin/sh\necho '{config_json}'\n"))
+        .expect("write luchta-config.sh");
+
+    Command::cargo_bin("luchta")
+        .expect("find binary")
+        .arg("run")
+        .arg(task)
+        .arg("--dry-run")
+        .arg("--workspace-root")
+        .arg(temp.path())
+        .env("NO_COLOR", "1")
+        .assert()
+}
+
+#[test]
+fn dry_run_prints_waves_without_executing() {
+    let temp = assert_fs::TempDir::new().expect("create temp dir");
+    // `build` depends on the upstream package's `build` (^build). Package `b`
+    // depends on `a`, so a#build must run in an earlier wave than b#build.
+    // A `yarn` worker is declared but must NEVER be invoked in --dry-run.
+    let config = r#"{"concurrency":{"maxWeight":4},"workers":{"yarn":{"command":"/bin/false"}},"tasks":{"build":{"dependsOn":["^build"],"worker":"yarn"}}}"#;
+
+    dry_run_assert(&temp, config, "build").success().stdout(
+        predicate::str::contains("dry-run:")
+            .and(predicate::str::contains("Wave 1:"))
+            .and(predicate::str::contains("Wave 2:"))
+            .and(predicate::str::contains("a#build"))
+            .and(predicate::str::contains("b#build"))
+            .and(predicate::str::contains("worker 'yarn'")),
+    );
+
+    temp.close().expect("cleanup temp dir");
+}
+
+#[test]
+fn dry_run_reports_unknown_task() {
+    let temp = assert_fs::TempDir::new().expect("create temp dir");
+    let config = r#"{"concurrency":{"maxWeight":4},"tasks":{"build":{}}}"#;
+
+    dry_run_assert(&temp, config, "does-not-exist")
+        .failure()
+        .stderr(predicate::str::contains("not found in task graph"));
+
+    temp.close().expect("cleanup temp dir");
+}

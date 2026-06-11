@@ -140,32 +140,168 @@ fn path_with_prepend(bin_dir: &Path) -> String {
 
 /// A resident worker that records its PID/PGID, serves jobs, signals `ready`,
 /// then `exec sleep 60` so it must be SIGKILLed at shutdown.
-fn write_sleeping_worker(
+/// Markers a recording worker writes so the test can locate its process group.
+struct RecordingMarkers<'a> {
+    pid: &'a Path,
+    pgid: &'a Path,
+}
+
+/// Defines a recording worker script: its file name, the per-request shell body
+/// (already indented), and a trailer run once the request loop ends.
+struct RecordingWorkerSpec<'a> {
+    file_name: &'a str,
+    per_request_body: &'a str,
+    trailer: &'a str,
+}
+
+/// Writes a worker script that records its pid/pgid, then for each request runs
+/// `spec.per_request_body`, and finally `spec.trailer` once the request loop
+/// ends. Shared scaffold for the recording worker variants.
+fn write_recording_worker(
     temp: &assert_fs::TempDir,
-    pid_marker: &Path,
-    pgid_marker: &Path,
-    ready: &Path,
+    markers: RecordingMarkers<'_>,
+    spec: RecordingWorkerSpec<'_>,
 ) -> std::path::PathBuf {
     write_executable(
         temp,
-        "sleeping-worker.sh",
+        spec.file_name,
         &format!(
             r#"#!/bin/sh
 echo $$ >> {pid}
 ps -o pgid= -p $$ | tr -d ' ' >> {pgid}
 while IFS= read -r line; do
   id=$(printf '%s\n' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
-  printf '{{"type":"log","id":"%s","stream":"stdout","line":"processed"}}\n' "$id"
-  printf '{{"type":"done","id":"%s","exitCode":0}}\n' "$id"
-  printf ready > {ready}
-done
-exec sleep 60
-"#,
-            pid = pid_marker.display(),
-            pgid = pgid_marker.display(),
-            ready = ready.display()
+{body}done
+{trailer}"#,
+            pid = markers.pid.display(),
+            pgid = markers.pgid.display(),
+            body = spec.per_request_body,
+            trailer = spec.trailer,
         ),
     )
+}
+
+/// Per-request shell body for a worker that processes a job (log + done) and
+/// signals readiness.
+fn processed_request_body(ready: &Path) -> String {
+    format!(
+        r#"  printf '{{"type":"log","id":"%s","stream":"stdout","line":"processed"}}\n' "$id"
+  printf '{{"type":"done","id":"%s","exitCode":0}}\n' "$id"
+  printf ready > {ready}
+"#,
+        ready = ready.display()
+    )
+}
+
+/// Per-request shell body for a worker that signals readiness and then blocks
+/// forever WITHOUT sending a `done` response, keeping the job in flight.
+fn never_done_request_body(ready: &Path) -> String {
+    format!(
+        r#"  printf '{{"type":"log","id":"%s","stream":"stdout","line":"started"}}\n' "$id"
+  printf ready > {ready}
+  # Never emit a `done` response: the job stays in flight until killed.
+  exec sleep 60
+"#,
+        ready = ready.display()
+    )
+}
+
+#[test]
+fn interrupt_shuts_down_promptly_without_orphans() {
+    let temp = assert_fs::TempDir::new().expect("create temp dir");
+    setup_two_packages(&temp, false);
+
+    let pid_marker = init_marker(&temp, "worker.pid");
+    let pgid_marker = init_marker(&temp, "worker.pgid");
+    let worker_ready = temp.child("worker.ready");
+    let stdout_log = temp.child("luchta.stdout");
+    let stderr_log = temp.child("luchta.stderr");
+
+    let worker = write_recording_worker(
+        &temp,
+        RecordingMarkers {
+            pid: &pid_marker,
+            pgid: &pgid_marker,
+        },
+        RecordingWorkerSpec {
+            file_name: "busy-worker.sh",
+            per_request_body: &never_done_request_body(worker_ready.path()),
+            trailer: "",
+        },
+    );
+    write_config(
+        &temp,
+        &format!(
+            r#"{{"concurrency":{{"maxWeight":1}},"tasks":{{"build":{{"worker":"busy-worker"}}}},"workers":{{"busy-worker":{{"command":"{}"}}}}}}"#,
+            worker.display()
+        ),
+    );
+
+    let mut child = Command::new(cargo_bin("luchta"))
+        .arg("run")
+        .arg("build")
+        .arg("--workspace-root")
+        .arg(temp.path())
+        .stdout(Stdio::from(
+            fs::File::create(stdout_log.path()).expect("create stdout log"),
+        ))
+        .stderr(Stdio::from(
+            fs::File::create(stderr_log.path()).expect("create stderr log"),
+        ))
+        .spawn()
+        .expect("spawn luchta");
+
+    // Wait until a job is actually in flight, then interrupt luchta.
+    wait_for_file(worker_ready.path(), Duration::from_secs(5));
+
+    let luchta_pid = child.id() as i32;
+    // SAFETY: sending SIGINT to a known child pid.
+    unsafe {
+        libc::kill(luchta_pid, libc::SIGINT);
+    }
+
+    let started = Instant::now();
+    let status = child.wait().expect("wait for luchta");
+    let elapsed = started.elapsed();
+
+    let stderr = fs::read_to_string(stderr_log.path()).unwrap_or_default();
+
+    // It must exit promptly on interrupt (not wait for the worker's 60s sleep).
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "luchta should exit promptly after SIGINT; elapsed: {elapsed:?}, stderr: {stderr}"
+    );
+    // Interrupted runs are a failure (non-zero exit).
+    assert!(
+        !status.success(),
+        "interrupted run should exit non-zero; stderr: {stderr}"
+    );
+    // No post-exit noise: neither broken-pipe spam from orphaned workers nor a
+    // per-task crash/Debug "wall of text" for jobs killed by the interrupt.
+    assert!(
+        !stderr.contains("Broken pipe")
+            && !stderr.contains("job failed")
+            && !stderr.contains("Worker {")
+            && !stderr.contains("Crashed"),
+        "interrupt must not leave broken-pipe / crash noise; stderr: {stderr}"
+    );
+
+    // The worker and its process group must be gone (no orphans).
+    assert_worker_group_reaped(&pid_marker, &pgid_marker);
+
+    temp.close().expect("cleanup temp dir");
+}
+
+/// Asserts the recorded worker pids/pgids are non-empty and fully reaped.
+fn assert_worker_group_reaped(pid_marker: &Path, pgid_marker: &Path) {
+    let worker_pids = read_marker_pids(pid_marker);
+    assert!(!worker_pids.is_empty(), "worker should record its PID");
+    let worker_pgids = read_marker_pids(pgid_marker);
+    assert!(
+        !worker_pgids.is_empty(),
+        "worker should record its process group"
+    );
+    assert_processes_gone_before_timeout(&worker_pids, &worker_pgids, Duration::from_secs(5));
 }
 
 /// Non-empty trimmed lines of a marker file parsed as PIDs.
@@ -279,7 +415,18 @@ fn worker_is_reaped_after_run() {
     let stdout_log = temp.child("luchta.stdout");
     let stderr_log = temp.child("luchta.stderr");
 
-    let worker = write_sleeping_worker(&temp, &pid_marker, &pgid_marker, worker_ready.path());
+    let worker = write_recording_worker(
+        &temp,
+        RecordingMarkers {
+            pid: &pid_marker,
+            pgid: &pgid_marker,
+        },
+        RecordingWorkerSpec {
+            file_name: "sleeping-worker.sh",
+            per_request_body: &processed_request_body(worker_ready.path()),
+            trailer: "exec sleep 60\n",
+        },
+    );
     write_config(
         &temp,
         &format!(

@@ -21,23 +21,10 @@ use crate::WorkerRequest;
 #[tokio::test]
 async fn single_job_happy_path() {
     let temp = TempDir::new().expect("tempdir");
-    let worker_path = write_worker_script(
-        temp.path(),
-        "happy-worker.sh",
-        r#"#!/bin/sh
-while IFS= read -r line; do
-  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
-  printf '{"type":"log","id":"%s","stream":"stdout","line":"hello"}\n' "$id"
-  printf '{"type":"done","id":"%s","exitCode":7}\n' "$id"
-done
-"#,
-    );
+    let worker_path = echo_then_done_worker(temp.path(), "happy-worker.sh", Some("hello"), 7);
     let manager = manager_with_worker("fake", &worker_path);
 
-    let exit_code = manager
-        .run_job("fake", WorkerRequest::new("pkg#task", "echo hi"))
-        .await
-        .expect("job succeeds");
+    let exit_code = run_one_job(&manager).await.expect("job succeeds");
 
     assert_eq!(exit_code, 7);
     manager.shutdown().await;
@@ -265,6 +252,19 @@ PY
 }
 
 #[tokio::test]
+async fn shutdown_is_idempotent() {
+    let temp = TempDir::new().expect("tempdir");
+    let worker_path = echo_then_done_worker(temp.path(), "idempotent-worker.sh", None, 0);
+    let manager = manager_with_worker("fake", &worker_path);
+    run_one_job(&manager).await.expect("job succeeds");
+
+    // Calling shutdown twice must be safe and must not hang or panic.
+    for _ in 0..2 {
+        manager.shutdown().await;
+    }
+}
+
+#[tokio::test]
 async fn shutdown_kills_sleep_forever_worker_within_timeout() {
     let temp = TempDir::new().expect("tempdir");
     let pid_file = temp.path().join("pid.txt");
@@ -314,6 +314,39 @@ fn manager_with_worker_timeout(name: &str, worker_path: &Path, timeout: Duration
         },
     );
     WorkerManager::with_shutdown_timeout(definitions, timeout)
+}
+
+/// Runs a single representative job against `manager` and returns its result.
+async fn run_one_job(manager: &WorkerManager) -> Result<i32, crate::WorkerError> {
+    manager
+        .run_job("fake", WorkerRequest::new("pkg#task", "echo hi"))
+        .await
+}
+
+/// Writes a worker script that, for each request, optionally logs a line and
+/// then reports `done` with `exit_code`. Shared by the happy-path and shutdown
+/// idempotency tests to avoid duplicated script bodies.
+fn echo_then_done_worker(
+    dir: &Path,
+    name: &str,
+    log_line: Option<&str>,
+    exit_code: i32,
+) -> PathBuf {
+    let log = match log_line {
+        Some(line) => format!(
+            "  printf '{{\"type\":\"log\",\"id\":\"%s\",\"stream\":\"stdout\",\"line\":\"{line}\"}}\\n' \"$id\"\n"
+        ),
+        None => String::new(),
+    };
+    let body = format!(
+        r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+{log}  printf '{{"type":"done","id":"%s","exitCode":{exit_code}}}\n' "$id"
+done
+"#
+    );
+    write_worker_script(dir, name, &body)
 }
 
 fn write_worker_script(dir: &Path, name: &str, body: &str) -> PathBuf {

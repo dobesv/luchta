@@ -1,5 +1,8 @@
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use luchta_engine::{LogStream, WorkerRequest, WorkerResponse};
 use thiserror::Error;
@@ -20,23 +23,42 @@ async fn main() {
 
 async fn run() -> Result<(), WorkerError> {
     let writer = Arc::new(Mutex::new(stdout()));
+    let shutdown = Arc::new(AtomicBool::new(false));
     let mut requests = BufReader::new(stdin()).lines();
     let mut jobs = JoinSet::new();
 
-    while let Some(line) = requests.next_line().await? {
-        let request = serde_json::from_str(&line)?;
-        spawn_request(request, &writer, &mut jobs);
+    loop {
+        match requests.next_line().await {
+            Ok(Some(line)) => {
+                let request = serde_json::from_str(&line)?;
+                spawn_request(request, &writer, &shutdown, &mut jobs);
+            }
+            Ok(None) => break,
+            Err(error) if is_pipe_shutdown_error(&error) => {
+                shutdown.store(true, Ordering::SeqCst);
+                break;
+            }
+            Err(error) => return Err(error.into()),
+        }
     }
 
     drain_jobs(&mut jobs).await;
     Ok(())
 }
 
-fn spawn_request(request: WorkerRequest, writer: &SharedWriter, jobs: &mut JoinSet<()>) {
+fn spawn_request(
+    request: WorkerRequest,
+    writer: &SharedWriter,
+    shutdown: &Arc<AtomicBool>,
+    jobs: &mut JoinSet<()>,
+) {
     let writer = Arc::clone(writer);
+    let shutdown = Arc::clone(shutdown);
     jobs.spawn(async move {
-        if let Err(error) = handle_request(request, writer).await {
-            eprintln!("job failed: {error}");
+        if let Err(error) = handle_request(request, writer, shutdown).await {
+            if !error.is_pipe_shutdown() {
+                eprintln!("job failed: {error}");
+            }
         }
     });
 }
@@ -49,10 +71,18 @@ async fn drain_jobs(jobs: &mut JoinSet<()>) {
     }
 }
 
-async fn handle_request(request: WorkerRequest, writer: SharedWriter) -> Result<(), WorkerError> {
+async fn handle_request(
+    request: WorkerRequest,
+    writer: SharedWriter,
+    shutdown: Arc<AtomicBool>,
+) -> Result<(), WorkerError> {
     let id = request.id.clone();
     let exit_code = match run_one_job(&request, &writer).await {
         Ok(status) => status.code().unwrap_or(1),
+        Err(error) if error.is_pipe_shutdown() => {
+            shutdown.store(true, Ordering::SeqCst);
+            return Ok(());
+        }
         Err(error) => {
             eprintln!("job {id} failed: {error}");
             1
@@ -153,6 +183,24 @@ async fn write_response(
     Ok(())
 }
 
+impl WorkerError {
+    fn is_pipe_shutdown(&self) -> bool {
+        match self {
+            Self::Io(error) => is_pipe_shutdown_error(error),
+            _ => false,
+        }
+    }
+}
+
+fn is_pipe_shutdown_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::UnexpectedEof
+            | std::io::ErrorKind::ConnectionReset
+    )
+}
+
 #[derive(Debug, Error)]
 enum WorkerError {
     #[error("io error: {0}")]
@@ -167,7 +215,18 @@ enum WorkerError {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_shell_command, shell_single_quote};
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+
+    use luchta_engine::WorkerRequest;
+    use tokio::sync::Mutex;
+
+    use super::{
+        build_shell_command, handle_request, is_pipe_shutdown_error, shell_single_quote,
+        WorkerError,
+    };
 
     #[test]
     fn build_shell_command_keeps_raw_command_when_workspace_missing() {
@@ -209,5 +268,32 @@ mod tests {
             build_shell_command(Some("a'b"), "build"),
             r"yarn workspace 'a'\''b' build"
         );
+    }
+
+    #[test]
+    fn broken_pipe_errors_are_treated_as_pipe_shutdown() {
+        assert!(is_pipe_shutdown_error(&std::io::Error::from(
+            std::io::ErrorKind::BrokenPipe,
+        )));
+        assert!(
+            WorkerError::from(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+                .is_pipe_shutdown()
+        );
+        assert!(!is_pipe_shutdown_error(&std::io::Error::other("boom")));
+    }
+
+    #[tokio::test]
+    async fn handle_request_returns_ok_and_does_not_mark_shutdown_on_success() {
+        let writer = Arc::new(Mutex::new(tokio::io::stdout()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let request = WorkerRequest::new("pkg#task", "echo hello");
+
+        let result = handle_request(request, writer, Arc::clone(&shutdown)).await;
+
+        assert!(result.is_ok());
+        // Successful job execution does not set shutdown flag.
+        // Shutdown is only marked when a pipe error (BrokenPipe/UnexpectedEof/ConnectionReset)
+        // occurs during output streaming — see broken_pipe_errors_are_treated_as_pipe_shutdown.
+        assert!(!shutdown.load(Ordering::SeqCst));
     }
 }

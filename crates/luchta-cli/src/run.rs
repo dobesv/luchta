@@ -2,14 +2,16 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    future::Future,
     path::{Path, PathBuf},
+    pin::Pin,
     sync::atomic::{AtomicBool, Ordering},
     sync::Arc,
 };
 
 use luchta_engine::{
-    is_root_task, CompletionSignal, ExecutionRequest, TaskExecutor, TaskGraph, TaskNode, Walker,
-    WeightedExecutor, WorkerManager,
+    is_root_task, CompletionSignal, ExecutionRequest, ReadyTaskMessage, TaskExecutor, TaskGraph,
+    TaskNode, Walker, WeightedExecutor, WorkerManager,
 };
 use luchta_types::{TaskDefinition, TaskId, TaskName, WorkerDefinition};
 use luchta_workspace::{PackageGraph, PackageNode, WorkspaceDiscovery, YarnWorkspace};
@@ -95,32 +97,260 @@ pub async fn run_tasks(workspace_root: &Path, requested_tasks: &[String]) -> Res
 
     let (walker, mut receiver) = Walker::new(&task_graph);
     let any_failed = Arc::new(AtomicBool::new(false));
+    // Set once a shutdown signal arrives. Spawned task runners consult this so
+    // that jobs killed by the interrupt don't each print a crash/failure error
+    // (which would flood the terminal with one line per in-flight task).
+    let interrupted = Arc::new(AtomicBool::new(false));
 
-    while let Some((task_node, done_tx)) = receiver.recv().await {
-        dispatch_ready_task(
-            task_node,
-            done_tx,
-            &tasks_to_run,
-            &commands,
-            &invalid,
-            &executor,
-            &any_failed,
-        );
-    }
+    let ctx = DispatchContext {
+        tasks_to_run: &tasks_to_run,
+        commands: &commands,
+        invalid: &invalid,
+        executor: &executor,
+        any_failed: &any_failed,
+        interrupted: &interrupted,
+    };
+    let run_result = dispatch_loop(&mut receiver, &ctx).await;
 
-    walker
-        .wait()
-        .await
-        .into_diagnostic()
-        .wrap_err("walker task panicked")?;
+    finalize_run(&worker_manager, walker, receiver, run_result.is_err()).await?;
 
-    worker_manager.shutdown().await;
+    run_result?;
 
     if any_failed.load(Ordering::SeqCst) {
         bail!("one or more tasks failed");
     }
 
     Ok(())
+}
+
+/// Shared, read-only context the dispatch loop hands to each ready task.
+struct DispatchContext<'a> {
+    tasks_to_run: &'a HashSet<TaskId>,
+    commands: &'a HashMap<TaskId, ExecutionRequest>,
+    invalid: &'a HashMap<TaskId, String>,
+    executor: &'a Arc<WeightedExecutor>,
+    any_failed: &'a Arc<AtomicBool>,
+    interrupted: &'a Arc<AtomicBool>,
+}
+
+/// Drives the walker's ready-task channel until it drains (normal completion)
+/// or a shutdown signal (Ctrl-C / SIGTERM) arrives. Returns `Ok(())` on normal
+/// completion and `Err(..)` when interrupted.
+async fn dispatch_loop(
+    receiver: &mut tokio::sync::mpsc::Receiver<ReadyTaskMessage>,
+    ctx: &DispatchContext<'_>,
+) -> Result<()> {
+    let signal = shutdown_signal();
+    tokio::pin!(signal);
+
+    loop {
+        tokio::select! {
+            signal_result = &mut signal => {
+                signal_result?;
+                // Mark interrupted BEFORE returning so in-flight task runners
+                // suppress their crash output once shutdown kills the workers.
+                ctx.interrupted.store(true, Ordering::SeqCst);
+                break Err(miette::miette!("interrupted"));
+            }
+            message = receiver.recv() => {
+                let Some((task_node, done_tx)) = message else {
+                    break Ok(());
+                };
+                dispatch_ready_task(task_node, done_tx, ctx);
+            }
+        }
+    }
+}
+
+/// Tears down workers and drains the walker after the dispatch loop ends.
+///
+/// On interruption the dispatch loop stops draining the walker's ready channel
+/// while a task is still executing. The walker cannot finish until that
+/// in-flight task reports completion, and the task cannot complete until its
+/// worker subprocess is stopped. So on interrupt we shut workers down FIRST
+/// (immediately, killing their process groups), which makes the executor
+/// resolve the pending job as a failure and lets the walker drain. On the
+/// normal path the walker has already finished, so workers are shut down
+/// gracefully afterwards.
+async fn finalize_run(
+    worker_manager: &Arc<WorkerManager>,
+    walker: Walker,
+    receiver: tokio::sync::mpsc::Receiver<ReadyTaskMessage>,
+    interrupted: bool,
+) -> Result<()> {
+    if interrupted {
+        // Dropping the receiver makes the walker's channel sends fail, so it
+        // stops enqueueing new work and can wind down once the in-flight job is
+        // resolved by the worker shutdown.
+        drop(receiver);
+        worker_manager.shutdown_immediate().await;
+    }
+
+    let walker_result = walker
+        .wait()
+        .await
+        .into_diagnostic()
+        .wrap_err("walker task panicked");
+
+    if !interrupted {
+        worker_manager.shutdown().await;
+    }
+
+    walker_result
+}
+
+/// Print the tasks in the order they would run, grouped into parallel "waves",
+/// without executing anything. This is a diagnostic view into the task
+/// dependency graph: every task in a wave only depends on tasks in earlier
+/// waves, so all tasks within a wave could run concurrently.
+pub async fn dry_run_tasks(workspace_root: &Path, requested_tasks: &[String]) -> Result<()> {
+    let PreparedWorkspace {
+        packages,
+        package_graph: _,
+        pipeline: _,
+        task_graph,
+        workers,
+        max_weight: _,
+    } = prepare_workspace(workspace_root).await?;
+
+    if packages.is_empty() {
+        println!("{}", "No packages found in workspace".yellow());
+        return Ok(());
+    }
+
+    let tasks_to_run = collect_requested_subgraph(&task_graph, requested_tasks)?;
+    let CommandMap { commands, invalid } =
+        build_command_map(&task_graph, &packages, workspace_root, &workers);
+
+    let waves = compute_execution_waves(&task_graph, &tasks_to_run);
+
+    println!(
+        "{} {} task(s) across {} wave(s) (tasks within a wave can run in parallel):",
+        "dry-run:".bold(),
+        tasks_to_run.len(),
+        waves.len()
+    );
+
+    for (index, wave) in waves.iter().enumerate() {
+        println!("\n{}", format!("Wave {}:", index + 1).bold().cyan());
+        for task_id in wave {
+            let action = describe_planned_action(task_id, &commands, &invalid);
+            println!("  {} {}", task_id.to_string().bold(), action);
+        }
+    }
+
+    Ok(())
+}
+
+/// Describe what a task would do when executed, for the dry-run output.
+fn describe_planned_action(
+    task_id: &TaskId,
+    commands: &HashMap<TaskId, ExecutionRequest>,
+    invalid: &HashMap<TaskId, String>,
+) -> String {
+    if let Some(message) = invalid.get(task_id) {
+        return format!("{} ({})", "config error".red(), message);
+    }
+
+    match commands.get(task_id) {
+        Some(request) => {
+            let worker = request
+                .worker
+                .as_deref()
+                .map(|name| format!("worker '{name}'"))
+                .unwrap_or_else(|| "no worker".to_string());
+            format!("{} via {}", request.command.dimmed(), worker.dimmed())
+        }
+        None => "(no command, would be skipped)".dimmed().to_string(),
+    }
+}
+
+/// Group the selected tasks into ordered execution "waves" using longest-path
+/// layering over the subgraph induced by `tasks_to_run`.
+///
+/// A task lands in wave `N` where `N` is one greater than the deepest wave of
+/// any of its dependencies that are also in `tasks_to_run`. Tasks with no
+/// in-subgraph dependencies are in wave 0. This mirrors how the walker releases
+/// work: a task only becomes ready once all of its dependencies have completed.
+/// Within each returned wave, task ids are sorted for stable, readable output.
+fn compute_execution_waves(
+    task_graph: &TaskGraph,
+    tasks_to_run: &HashSet<TaskId>,
+) -> Vec<Vec<TaskId>> {
+    let mut depth_of: HashMap<TaskId, usize> = HashMap::new();
+
+    // Resolve each task's wave by recursing through its dependencies. Memoize so
+    // repeated dependencies are only computed once. The graph is acyclic
+    // (validated during TaskGraph::build), so recursion terminates.
+    fn resolve_depth(
+        task_id: &TaskId,
+        task_graph: &TaskGraph,
+        tasks_to_run: &HashSet<TaskId>,
+        depth_of: &mut HashMap<TaskId, usize>,
+    ) -> usize {
+        if let Some(&depth) = depth_of.get(task_id) {
+            return depth;
+        }
+
+        let mut depth = 0;
+        for dependency in task_graph.dependencies_of(task_id) {
+            if !tasks_to_run.contains(&dependency.id) {
+                continue;
+            }
+            let dependency_depth =
+                resolve_depth(&dependency.id, task_graph, tasks_to_run, depth_of) + 1;
+            depth = depth.max(dependency_depth);
+        }
+
+        depth_of.insert(task_id.clone(), depth);
+        depth
+    }
+
+    let mut max_depth = 0;
+    for task_id in tasks_to_run {
+        let depth = resolve_depth(task_id, task_graph, tasks_to_run, &mut depth_of);
+        max_depth = max_depth.max(depth);
+    }
+
+    let mut waves: Vec<Vec<TaskId>> = vec![Vec::new(); max_depth + 1];
+    for (task_id, depth) in depth_of {
+        waves[depth].push(task_id);
+    }
+
+    for wave in &mut waves {
+        wave.sort_by_key(|task_id| task_id.to_string());
+    }
+
+    waves
+}
+
+fn shutdown_signal() -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
+    Box::pin(async {
+        #[cfg(unix)]
+        {
+            let mut sigterm =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .into_diagnostic()
+                    .wrap_err("failed to install SIGTERM handler")?;
+
+            tokio::select! {
+                result = tokio::signal::ctrl_c() => {
+                    result.into_diagnostic().wrap_err("failed to install Ctrl-C handler")?;
+                }
+                _ = sigterm.recv() => {}
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            tokio::signal::ctrl_c()
+                .await
+                .into_diagnostic()
+                .wrap_err("failed to install Ctrl-C handler")?;
+        }
+
+        Ok(())
+    })
 }
 
 fn collect_requested_subgraph(
@@ -158,32 +388,24 @@ fn collect_requested_subgraph(
     Ok(included)
 }
 
-fn dispatch_ready_task(
-    task_node: TaskNode,
-    done_tx: CompletionSignal,
-    tasks_to_run: &HashSet<TaskId>,
-    commands: &HashMap<TaskId, ExecutionRequest>,
-    invalid: &HashMap<TaskId, String>,
-    executor: &Arc<WeightedExecutor>,
-    any_failed: &Arc<AtomicBool>,
-) {
+fn dispatch_ready_task(task_node: TaskNode, done_tx: CompletionSignal, ctx: &DispatchContext<'_>) {
     let task_id = task_node.id.clone();
 
-    if !tasks_to_run.contains(&task_id) {
+    if !ctx.tasks_to_run.contains(&task_id) {
         let _ = done_tx.send(true);
         return;
     }
 
     // A misconfigured task (e.g. command without worker) only fails when it is
     // actually selected to run — it must not abort unrelated tasks.
-    if let Some(message) = invalid.get(&task_id) {
-        any_failed.store(true, Ordering::SeqCst);
+    if let Some(message) = ctx.invalid.get(&task_id) {
+        ctx.any_failed.store(true, Ordering::SeqCst);
         eprintln!("{} {}", "✖".red(), message.red());
         let _ = done_tx.send(false);
         return;
     }
 
-    let Some(request) = commands.get(&task_id).cloned() else {
+    let Some(request) = ctx.commands.get(&task_id).cloned() else {
         println!(
             "{} {} (no command, skipping)",
             "○".dimmed(),
@@ -193,7 +415,7 @@ fn dispatch_ready_task(
         return;
     };
 
-    if any_failed.load(Ordering::SeqCst) {
+    if ctx.any_failed.load(Ordering::SeqCst) {
         println!(
             "{} {} (skipped due to previous failure)",
             "○".dimmed(),
@@ -203,26 +425,61 @@ fn dispatch_ready_task(
         return;
     }
 
-    let executor = Arc::clone(executor);
-    let any_failed = Arc::clone(any_failed);
+    spawn_task_runner(task_id, request, done_tx, ctx);
+}
+
+/// Spawns the async runner that executes `request` and reports completion back
+/// through `done_tx`. Records failures in `any_failed`; errors/non-zero exits
+/// are reported unless the run was interrupted (in which case killed jobs are
+/// expected and their noise is suppressed).
+fn spawn_task_runner(
+    task_id: TaskId,
+    request: ExecutionRequest,
+    done_tx: CompletionSignal,
+    ctx: &DispatchContext<'_>,
+) {
+    let executor = Arc::clone(ctx.executor);
+    let any_failed = Arc::clone(ctx.any_failed);
+    let interrupted = Arc::clone(ctx.interrupted);
 
     tokio::spawn(async move {
-        match executor.execute(&request.task).await {
-            Ok(status) if status.success() => {
-                let _ = done_tx.send(true);
-            }
+        let succeeded = match executor.execute(&request.task).await {
+            Ok(status) if status.success() => true,
             Ok(status) => {
-                any_failed.store(true, Ordering::SeqCst);
-                eprintln!("task '{}' failed with status {:?}", task_id, status.code());
-                let _ = done_tx.send(false);
+                report_task_failure(
+                    &task_id,
+                    &format!("failed with status {:?}", status.code()),
+                    &any_failed,
+                    &interrupted,
+                );
+                false
             }
             Err(error) => {
-                any_failed.store(true, Ordering::SeqCst);
-                eprintln!("{:?}", error);
-                let _ = done_tx.send(false);
+                report_task_failure(
+                    &task_id,
+                    &format!("failed: {error}"),
+                    &any_failed,
+                    &interrupted,
+                );
+                false
             }
-        }
+        };
+        let _ = done_tx.send(succeeded);
     });
+}
+
+/// Marks the run as failed and prints a concise message, unless the run is
+/// being interrupted (where killed jobs are expected and must stay quiet).
+fn report_task_failure(
+    task_id: &TaskId,
+    detail: &str,
+    any_failed: &Arc<AtomicBool>,
+    interrupted: &Arc<AtomicBool>,
+) {
+    any_failed.store(true, Ordering::SeqCst);
+    if !interrupted.load(Ordering::SeqCst) {
+        eprintln!("task '{task_id}' {detail}");
+    }
 }
 
 fn compute_prefix_width(task_graph: &TaskGraph, tasks_to_run: &HashSet<TaskId>) -> usize {
