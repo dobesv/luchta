@@ -11,6 +11,13 @@ use miette::Result;
 
 #[tokio::main]
 async fn main() {
+    // Restore the default SIGPIPE disposition. Rust ignores SIGPIPE by default,
+    // which turns writes to a closed pipe into `EPIPE` errors that make
+    // `println!`/`eprintln!` panic (e.g. `luchta run ... | head`). Resetting it
+    // to `SIG_DFL` makes the process terminate quietly on a broken pipe, which
+    // is the expected behavior for a CLI that streams task output.
+    reset_sigpipe();
+
     let result = run(Cli::parse()).await;
     let exit_code = match result {
         Ok(()) => 0,
@@ -22,15 +29,33 @@ async fn main() {
     std::process::exit(exit_code);
 }
 
+/// Reset SIGPIPE to its default disposition so broken-pipe writes terminate the
+/// process quietly instead of panicking. No-op on non-Unix platforms.
+#[cfg(unix)]
+fn reset_sigpipe() {
+    // SAFETY: installing the default handler for SIGPIPE is async-signal-safe
+    // and is called once at startup before any output is produced.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
+#[cfg(not(unix))]
+fn reset_sigpipe() {}
+
 async fn run(cli: Cli) -> Result<()> {
     let workspace_root = run::resolve_workspace_root(cli.workspace_root)?;
 
     match cli.command {
-        Commands::Run { tasks } => {
+        Commands::Run { tasks, dry_run } => {
             if tasks.is_empty() {
                 return Err(miette::miette!("no tasks specified for run command"));
             }
-            run::run_tasks(&workspace_root, &tasks).await
+            if dry_run {
+                run::dry_run_tasks(&workspace_root, &tasks).await
+            } else {
+                run::run_tasks(&workspace_root, &tasks).await
+            }
         }
         Commands::Check => {
             let prepared = run::prepare_workspace(&workspace_root).await?;

@@ -15,6 +15,13 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Commands {
-    Run { tasks: Vec<String> },
+    Run {
+        tasks: Vec<String>,
+
+        /// Print the tasks in the order they would run (grouped into parallel
+        /// waves) without executing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
     Check,
 }

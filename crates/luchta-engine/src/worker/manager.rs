@@ -83,6 +83,17 @@ impl WorkerManager {
         worker_name: &str,
         request: WorkerRequest,
     ) -> Result<i32, WorkerError> {
+        // Once a shutdown is underway, refuse to start new jobs. Without this a
+        // run interrupted mid-flight could spawn a fresh worker for a queued
+        // task (e.g. under a concurrency limit), leaving an orphaned worker
+        // that shutdown never sees.
+        if self.is_shutdown.load(Ordering::SeqCst) {
+            return Err(WorkerError::Crashed {
+                worker: worker_name.to_owned(),
+                id: request.id,
+            });
+        }
+
         let handle = self.get_or_spawn(worker_name).await?;
         let worker = worker_name.to_owned();
         let job_id = request.id.clone();
@@ -130,7 +141,15 @@ impl WorkerManager {
     }
 
     pub async fn shutdown(&self) {
-        self.shutdown_all().await;
+        self.shutdown_all(self.shutdown_timeout).await;
+    }
+
+    /// Shut down without granting the graceful exit window: worker process
+    /// groups are killed right away. Used on the interrupt (Ctrl-C / SIGTERM)
+    /// path where the run is being aborted and responsiveness matters more than
+    /// letting in-flight jobs finish.
+    pub async fn shutdown_immediate(&self) {
+        self.shutdown_all(Duration::ZERO).await;
     }
 
     async fn get_or_spawn(&self, worker_name: &str) -> Result<Arc<WorkerHandle>, WorkerError> {
@@ -213,14 +232,22 @@ impl WorkerManager {
         jobs.remove(job_id);
     }
 
-    async fn shutdown_all(&self) {
+    async fn shutdown_all(&self, timeout: Duration) {
         if self.is_shutdown.swap(true, Ordering::SeqCst) {
             return;
         }
 
-        let handles = collect_worker_handles(&self.workers).await;
-        for handle in handles {
-            handle.shutdown(self.shutdown_timeout).await;
+        // Loop until no workers remain. A job that passed the `is_shutdown`
+        // check in `run_job` just before the flag was set may spawn a worker
+        // after the first drain; collecting again catches those stragglers.
+        loop {
+            let handles = collect_worker_handles(&self.workers).await;
+            if handles.is_empty() {
+                break;
+            }
+            for handle in handles {
+                handle.shutdown(timeout).await;
+            }
         }
     }
 }
@@ -291,4 +318,6 @@ impl WorkerManager {
     }
 
     pub async fn shutdown(&self) {}
+
+    pub async fn shutdown_immediate(&self) {}
 }

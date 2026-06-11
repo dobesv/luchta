@@ -1554,6 +1554,77 @@ mod tests {
         .expect("build package graph")
     }
 
+    #[test]
+    fn repro_global_task_specific_cross_package_dep() {
+        // Mirrors the user's config: a GLOBAL `build:node` task that depends on a
+        // package-scoped `@formative/babel-cli#build`, plus an explicit
+        // package-scoped key for that babel build.
+        let temp_dir = tempdir().expect("create temp dir");
+        write_package(
+            temp_dir.path().join("packages/babel-cli/package.json"),
+            PackageManifest {
+                name: "@formative/babel-cli",
+                dependencies: &[],
+            },
+        );
+        write_package(
+            temp_dir.path().join("packages/other/package.json"),
+            PackageManifest {
+                name: "@formative/other",
+                dependencies: &[],
+            },
+        );
+        let package_graph = PackageGraph::build(vec![
+            package_node(
+                temp_dir.path().join("packages/babel-cli"),
+                "@formative/babel-cli",
+            ),
+            package_node(temp_dir.path().join("packages/other"), "@formative/other"),
+        ])
+        .expect("build package graph");
+
+        let pipeline = HashMap::from([
+            (
+                TaskName::from("build:node"),
+                TaskDefinition {
+                    depends_on: vec![DependsOn::Specific(TaskId::new(
+                        "@formative/babel-cli",
+                        "build",
+                    ))],
+                    worker: Some("yarn".to_string()),
+                    ..TaskDefinition::default()
+                },
+            ),
+            (
+                TaskName::from("@formative/babel-cli#build"),
+                TaskDefinition {
+                    worker: Some("yarn".to_string()),
+                    ..TaskDefinition::default()
+                },
+            ),
+        ]);
+
+        let task_graph = TaskGraph::build(&package_graph, &pipeline).expect("build task graph");
+
+        let other_build_node = TaskId::new("@formative/other", "build:node");
+        let babel_build = TaskId::new("@formative/babel-cli", "build");
+
+        // The babel build node must exist.
+        assert!(
+            task_graph.task_node(&babel_build).is_some(),
+            "expected @formative/babel-cli#build node to exist"
+        );
+        // @formative/other#build:node must depend on @formative/babel-cli#build.
+        let deps: Vec<_> = task_graph
+            .dependencies_of(&other_build_node)
+            .into_iter()
+            .map(|node| node.id.clone())
+            .collect();
+        assert!(
+            deps.contains(&babel_build),
+            "expected {other_build_node} to depend on {babel_build}, got {deps:?}"
+        );
+    }
     fn package_graph_single(name: &str) -> PackageGraph {
         let temp_dir = tempdir().expect("create temp dir");
         write_package(

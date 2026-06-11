@@ -227,11 +227,20 @@ pub(crate) async fn wait_for_exit_signal(
     exited: &Arc<AtomicBool>,
     shutdown_timeout: Duration,
 ) -> Result<(), tokio::time::error::Elapsed> {
-    if exited.load(Ordering::SeqCst) {
+    // Register interest in the notification BEFORE checking `exited`. The
+    // reaper sets `exited` and then calls `notify_waiters()`. `enable()`
+    // registers this waiter immediately (and reports whether a notification
+    // already arrived), so a `notify_waiters()` that fires after this point
+    // still wakes us. This closes the missed-wakeup race where the reaper
+    // notifies in the gap between the flag check and awaiting the future.
+    let notified = exit_notify.notified();
+    tokio::pin!(notified);
+
+    if notified.as_mut().enable() || exited.load(Ordering::SeqCst) {
         return Ok(());
     }
 
-    timeout(shutdown_timeout, exit_notify.notified()).await
+    timeout(shutdown_timeout, notified).await
 }
 
 pub(crate) async fn wait_for_reaper_completion(reaper_task: &Mutex<Option<JoinHandle<()>>>) {
@@ -270,7 +279,26 @@ pub(crate) fn print_log_line(id: &str, stream: LogStream, line: &str, width: usi
     }
 }
 
+/// Politely ask the worker's process group to terminate (SIGTERM), giving the
+/// worker and its children (e.g. node/babel) a chance to exit cleanly instead
+/// of being hard-killed mid-write, which avoids stack-trace spam on the
+/// terminal.
+pub(crate) fn terminate_process_group(pgid: i32) {
+    // SAFETY: `libc::kill` is async-signal-safe. `pgid` is the worker's process
+    // group id captured at spawn (the worker runs in its own group via
+    // `process_group(0)`), so signalling `-pgid` targets only that worker and
+    // its descendants. A stale pgid simply yields ESRCH, which is harmless.
+    unsafe {
+        libc::kill(-pgid, libc::SIGTERM);
+    }
+}
+
+/// Forcibly kill the worker's process group (SIGKILL). Used as the fallback
+/// after a SIGTERM grace period, or when an immediate, unconditional kill is
+/// required.
 pub(crate) fn kill_process_group(pgid: i32) {
+    // SAFETY: see `terminate_process_group` — `libc::kill` is async-signal-safe
+    // and `-pgid` targets only the worker's own process group.
     unsafe {
         libc::kill(-pgid, libc::SIGKILL);
     }
@@ -286,4 +314,57 @@ pub(crate) fn worker_command(command_line: &str) -> tokio::process::Command {
         .stderr(Stdio::inherit())
         .process_group(0);
     command
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
+        time::Duration,
+    };
+
+    use tokio::sync::Notify;
+
+    use super::wait_for_exit_signal;
+
+    #[tokio::test]
+    async fn returns_immediately_when_already_exited() {
+        let notify = Arc::new(Notify::new());
+        let exited = Arc::new(AtomicBool::new(true));
+
+        // Already exited: must return Ok without waiting for the timeout.
+        let result = wait_for_exit_signal(&notify, &exited, Duration::from_secs(30)).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn observes_notification_without_missed_wakeup() {
+        // Reproduces the missed-wakeup race: a concurrent reaper sets `exited`
+        // and calls `notify_waiters()` right around when the waiter registers.
+        // With the `enable()` fix the waiter never misses the notification, so
+        // it returns well before the long timeout.
+        for _ in 0..200 {
+            let notify = Arc::new(Notify::new());
+            let exited = Arc::new(AtomicBool::new(false));
+
+            let reaper_notify = Arc::clone(&notify);
+            let reaper_exited = Arc::clone(&exited);
+            let reaper = tokio::spawn(async move {
+                reaper_exited.store(true, Ordering::SeqCst);
+                reaper_notify.notify_waiters();
+            });
+
+            let waited = tokio::time::timeout(
+                Duration::from_secs(5),
+                wait_for_exit_signal(&notify, &exited, Duration::from_secs(30)),
+            )
+            .await
+            .expect("wait_for_exit_signal must not hang");
+            assert!(waited.is_ok());
+            reaper.await.expect("reaper task");
+        }
+    }
 }
