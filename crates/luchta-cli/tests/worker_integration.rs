@@ -683,12 +683,12 @@ fn real_yarn_worker_e2e() {
 }
 
 #[test]
-fn tasks_config_works_without_workers() {
+fn tasks_config_without_workers_skips_noop_tasks() {
     let temp = assert_fs::TempDir::new().expect("create temp dir");
     setup_two_packages(&temp, true);
     write_config(
         &temp,
-        r#"{"concurrency":{"maxWeight":4},"tasks":{"build":{"dependsOn":["^build"]}}}"#,
+        r#"{"concurrency":{"maxWeight":4},"tasks":{"build":{"dependsOn":["^build"]},"test":{}}}"#,
     );
 
     assert_cmd::Command::cargo_bin("luchta")
@@ -699,8 +699,9 @@ fn tasks_config_works_without_workers() {
         .arg(temp.path())
         .assert()
         .success()
-        .stdout(predicate::str::contains("a#build").and(predicate::str::contains("built-a")))
-        .stdout(predicate::str::contains("b#build").and(predicate::str::contains("built-b")));
+        .stdout(predicate::str::contains("(no command, skipping)"))
+        .stdout(predicate::str::contains("built-a").not())
+        .stdout(predicate::str::contains("built-b").not());
 
     temp.close().expect("cleanup temp dir");
 }

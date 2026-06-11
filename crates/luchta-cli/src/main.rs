@@ -4,6 +4,9 @@ mod run;
 
 use clap::Parser;
 use cli::{Cli, Commands};
+use luchta_engine::{
+    DependencyValidationError, TaskGraph, TaskValidationDiagnostic, TaskValidationReason,
+};
 use miette::Result;
 
 #[tokio::main]
@@ -30,10 +33,57 @@ async fn run(cli: Cli) -> Result<()> {
             run::run_tasks(&workspace_root, &tasks).await
         }
         Commands::Check => {
-            // Stub: validate config + graph construction
-            let _config = config::load_config(&workspace_root).await?;
-            println!("Configuration valid");
-            Ok(())
+            let prepared = run::prepare_workspace(&workspace_root).await?;
+            let worker_names = prepared.workers.keys().cloned().collect();
+
+            match TaskGraph::validate_tasks(
+                &prepared.package_graph,
+                &prepared.pipeline,
+                &worker_names,
+            ) {
+                Ok(()) => {
+                    println!("Configuration valid");
+                    Ok(())
+                }
+                Err(DependencyValidationError::InvalidTasks { diagnostics }) => {
+                    let diagnostics = diagnostics
+                        .into_iter()
+                        .map(task_validation_diagnostic_report)
+                        .collect::<Vec<_>>();
+                    Err(CheckValidationError { diagnostics }.into())
+                }
+            }
         }
+    }
+}
+
+fn task_validation_diagnostic_report(diagnostic: TaskValidationDiagnostic) -> miette::Report {
+    match diagnostic.reason {
+        TaskValidationReason::DeadDependencyReference { dependency, reason } => {
+            miette::miette!("{} -> {}: {}", diagnostic.task_id, dependency, reason)
+        }
+        TaskValidationReason::CommandWithoutWorker => miette::miette!(
+            "task '{}' defines a command but no worker; specify a worker to execute it",
+            diagnostic.task_id
+        ),
+        TaskValidationReason::UnknownWorker { worker } => miette::miette!(
+            "task '{}' references unknown worker '{}'",
+            diagnostic.task_id,
+            worker
+        ),
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("task validation failed")]
+struct CheckValidationError {
+    diagnostics: Vec<miette::Report>,
+}
+
+impl miette::Diagnostic for CheckValidationError {
+    fn related<'a>(&'a self) -> Option<Box<dyn Iterator<Item = &'a dyn miette::Diagnostic> + 'a>> {
+        Some(Box::new(self.diagnostics.iter().map(|diagnostic| {
+            diagnostic.as_ref() as &dyn miette::Diagnostic
+        })))
     }
 }

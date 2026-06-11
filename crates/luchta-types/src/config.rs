@@ -187,5 +187,11 @@ mod tests {
                 TaskName::from("build"),
             ))]
         );
+        assert_eq!(
+            toml::from_str::<TaskDefinition>("depends_on = [\"#audit-licenses\"]")
+                .expect("root task")
+                .depends_on,
+            vec![DependsOn::Root(TaskName::from("audit-licenses"))]
+        );
     }
 }
