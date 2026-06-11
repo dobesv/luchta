@@ -47,15 +47,52 @@ async fn load_config_with_timeout(
     let config_path = discover_config_script(workspace_root)?;
     ensure_shebang(&config_path)?;
     let stdout = execute_config_script(workspace_root, &config_path, timeout_duration).await?;
+    let jd = &mut serde_json::Deserializer::from_slice(&stdout);
+    let config: LuchtaConfig = serde_path_to_error::deserialize(jd).map_err(|error| {
+        let stdout_str = String::from_utf8_lossy(&stdout);
+        format_config_error(&stdout_str, &config_path, &error)
+    })?;
 
-    serde_json::from_slice(&stdout).map_err(|error| {
+    Ok(config)
+}
+
+fn format_config_error(
+    stdout: &str,
+    config_path: &Path,
+    error: &serde_path_to_error::Error<serde_json::Error>,
+) -> miette::Report {
+    let json_path = error.path().to_string();
+    let inner = error.inner();
+    let line = inner.line();
+    let column = inner.column();
+
+    let lines: Vec<&str> = stdout.lines().collect();
+    let error_line_idx = line.saturating_sub(1).min(lines.len().saturating_sub(1));
+    let start = error_line_idx.saturating_sub(2);
+    let end = error_line_idx.saturating_add(3).min(lines.len());
+
+    let mut excerpt = String::new();
+    if lines.is_empty() {
+        excerpt.push_str("(config output was empty)\n");
+    } else {
+        for (i, line_text) in lines[start..end].iter().enumerate() {
+            let line_num = start + i + 1;
+            let marker = if line_num == line { " --> " } else { "     " };
+            excerpt.push_str(&format!("{marker}{line_num:>4} | {line_text}\n"));
+        }
+    }
+
+    if json_path.is_empty() || json_path == "." {
         miette!(
-            "failed to parse config script output from {} as JSON\nraw stdout:\n{}\njson error: {}",
-            config_path.display(),
-            String::from_utf8_lossy(&stdout),
-            error
+            "failed to parse config from {}\n\nerror: {inner}\n  at line {line}, column {column}\n\n{excerpt}",
+            config_path.display()
         )
-    })
+    } else {
+        miette!(
+            "failed to parse config from {}\n\nerror: {inner}\n  at {json_path} (line {line}, column {column})\n\n{excerpt}",
+            config_path.display()
+        )
+    }
 }
 
 fn discover_config_script(workspace_root: &Path) -> Result<PathBuf> {
@@ -693,9 +730,46 @@ echo '{"tasks":{"build":{"dependsOn":["^build"],"weight":2}},"concurrency":{"max
             .expect_err("invalid json should fail");
         let message = error.to_string();
 
-        assert!(message.contains("failed to parse config script output"));
-        assert!(message.contains("raw stdout:"));
-        assert!(message.contains("not-json"));
+        assert!(message.contains("failed to parse config from"));
+        assert!(message.contains("error: expected ident"));
+        assert!(message.contains("at line 1, column 2"));
+        assert!(message.contains("-->    1 | not-json"));
+    }
+
+    #[tokio::test]
+    async fn error_with_json_path_shows_path_and_excerpt() {
+        let temp = tempdir().expect("tempdir");
+        // dependsOn contains an invalid entry that will fail during deserialization
+        fs::write(
+            temp.path().join("luchta-config.sh"),
+            "#!/bin/sh\necho '{\"tasks\":{\"build\":{\"dependsOn\":[\"#\"],\"weight\":2}}}'",
+        )
+        .expect("write script");
+
+        let error = load_config(temp.path())
+            .await
+            .expect_err("bad dependsOn should fail");
+        let message = error.to_string();
+
+        assert!(
+            message.contains("tasks.build.dependsOn"),
+            "should show JSON path, got: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn error_formatting_does_not_panic_with_minimal_output() {
+        let temp = tempdir().expect("tempdir");
+        // Single-line invalid JSON — serde may report line numbers beyond content length
+        fs::write(temp.path().join("luchta-config.sh"), "#!/bin/sh\necho 'x'")
+            .expect("write script");
+
+        let error = load_config(temp.path())
+            .await
+            .expect_err("invalid json should fail");
+        // Should not panic — just check it produces a message
+        let message = error.to_string();
+        assert!(message.contains("failed to parse config from"));
     }
 
     #[tokio::test]

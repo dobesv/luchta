@@ -122,13 +122,12 @@ pub struct TaskDefinition {
     /// Relative weight used by weighted scheduler.
     #[serde(default = "default_task_weight")]
     pub weight: u32,
-    /// Explicit command for the task.
+    /// Explicit command for task.
     ///
-    /// A command is only executed when the task also names a `worker`; the
-    /// worker is responsible for running it (for a worker task without an
-    /// explicit command, the bare task name is used). A command without a
-    /// worker is a configuration error. Tasks are never resolved from
-    /// `package.json` scripts.
+    /// A command is only executed when task also names a `worker`; worker is
+    /// responsible for running it (for worker task without explicit command,
+    /// bare task name is used). A command without worker is configuration error.
+    /// Tasks are never resolved from `package.json` scripts.
     #[serde(default)]
     pub command: Option<String>,
     /// Named worker used to execute this task. A task without a worker (and
@@ -189,7 +188,7 @@ impl std::error::Error for ParseDependsOnError {}
 /// Dependency reference used in task pipeline definitions.
 ///
 /// Serde representation is string-based for config UX:
-/// `^task`, `^^task`, `task`, `pkg#task`, or `#task`.
+/// `^task`, `^^task`, `task`, `#task`, or `pkg#task`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum DependsOn {
     /// `^task`: task on direct upstream workspace packages.
@@ -226,7 +225,7 @@ impl FromStr for DependsOn {
     type Err = ParseDependsOnError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        // `^^` must be tried before `^` since the latter is a prefix of the former.
+        // `^^` must be tried before `^` since latter is prefix of former.
         if let Some(parsed) = parse_upstream(
             value,
             "^^",
@@ -275,11 +274,11 @@ impl FromStr for DependsOn {
     }
 }
 
-/// Parses an upstream dependency (`^`/`^^` prefixed) from `value`.
+/// Parses upstream dependency (`^`/`^^` prefixed) from `value`.
 ///
-/// Returns `None` when `value` lacks `prefix` so the caller can try the next
-/// form. When the prefix matches, yields the constructed variant, or an error
-/// using `empty_message` if the task name is empty.
+/// Returns `None` when `value` lacks `prefix` so caller can try next form.
+/// When prefix matches, yields constructed variant, or an error using
+/// `empty_message` if task name is empty.
 fn parse_upstream(
     value: &str,
     prefix: &str,
@@ -309,5 +308,44 @@ impl<'de> Deserialize<'de> for DependsOn {
     {
         let value = String::deserialize(deserializer)?;
         value.parse().map_err(de::Error::custom)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DependsOn, TaskName};
+
+    #[test]
+    fn parses_root_task_dependency() {
+        assert_eq!(
+            "#build".parse::<DependsOn>().expect("root task"),
+            DependsOn::Root(TaskName::from("build"))
+        );
+    }
+
+    #[test]
+    fn rejects_empty_root_task_dependency() {
+        let error = "#"
+            .parse::<DependsOn>()
+            .expect_err("missing root task name");
+        assert_eq!(error.to_string(), "root dependency must include task name");
+    }
+
+    #[test]
+    fn root_task_dependency_formats_as_config_string() {
+        assert_eq!(
+            DependsOn::Root(TaskName::from("test")).as_config_string(),
+            "#test"
+        );
+    }
+
+    #[test]
+    fn serde_round_trips_root_task_dependency() {
+        let dependency = DependsOn::Root(TaskName::from("test"));
+        let json = serde_json::to_string(&dependency).expect("serialize dependency");
+        assert_eq!(json, "\"#test\"");
+
+        let parsed: DependsOn = serde_json::from_str(&json).expect("deserialize dependency");
+        assert_eq!(parsed, dependency);
     }
 }

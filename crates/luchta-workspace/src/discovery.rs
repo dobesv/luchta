@@ -8,7 +8,6 @@ use std::{
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde::Deserialize;
-use serde_json::{Map, Value};
 use walkdir::WalkDir;
 
 use crate::{PackageNode, WorkspaceError};
@@ -41,17 +40,7 @@ impl YarnWorkspace {
 struct PackageJson {
     name: Option<String>,
     #[serde(default)]
-    scripts: Option<Map<String, Value>>,
-    #[serde(default)]
     workspaces: Option<WorkspacesField>,
-}
-
-impl PackageJson {
-    fn has_scripts(&self) -> bool {
-        self.scripts
-            .as_ref()
-            .is_some_and(|scripts| !scripts.is_empty())
-    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -142,7 +131,9 @@ impl WorkspaceDiscovery for YarnWorkspace {
         let package_paths = self.collect_package_paths(&matcher)?;
 
         let mut packages = Vec::new();
-        if root_package.has_scripts() {
+        // Include root package when it has a `name` field so `#task`
+        // references resolve even when the root package.json lacks scripts.
+        if root_package.name.is_some() {
             packages.push(package_node_from_package_json(
                 root_package,
                 self.root.clone(),
@@ -247,7 +238,21 @@ mod tests {
             .map(|package| package.name.to_string())
             .collect();
 
-        assert_eq!(discovered, vec!["@repo/app", "@repo/utils", "@repo/web"]);
+        assert_eq!(
+            discovered,
+            vec!["@repo/app", "@repo/utils", "@repo/web", "root"]
+        );
+    }
+
+    /// Discover packages and return sorted names.
+    fn discover_sorted(temp_dir: &tempfile::TempDir) -> Vec<String> {
+        let workspace = YarnWorkspace::new(temp_dir.path());
+        let mut packages = workspace.discover().expect("discover packages");
+        packages.sort_by(|left, right| left.name.as_str().cmp(right.name.as_str()));
+        packages
+            .into_iter()
+            .map(|package| package.name.to_string())
+            .collect()
     }
 
     #[test]
@@ -270,71 +275,59 @@ mod tests {
             "stray",
         );
 
-        let workspace = YarnWorkspace::new(temp_dir.path());
-        let packages = workspace.discover().expect("discover packages");
+        assert_eq!(discover_sorted(&temp_dir), vec!["@repo/real", "root"]);
+    }
 
-        let discovered: Vec<_> = packages
-            .into_iter()
-            .map(|package| package.name.to_string())
-            .collect();
-
-        assert_eq!(discovered, vec!["@repo/real"]);
+    /// Set up a workspace with the given root `package.json` content and a
+    /// single child package `@repo/app`, then return sorted discovered names.
+    fn discover_with_root(root_json: &str) -> Vec<String> {
+        let temp_dir = tempdir().expect("create temp dir");
+        write_json(temp_dir.path().join("package.json"), root_json);
+        write_package(
+            temp_dir.path().join("packages/app/package.json"),
+            "@repo/app",
+        );
+        discover_sorted(&temp_dir)
     }
 
     #[test]
     fn includes_root_package_when_scripts_present() {
-        let temp_dir = tempdir().expect("create temp dir");
-        write_json(
-            temp_dir.path().join("package.json"),
-            r#"{
-                "name": "root",
-                "private": true,
-                "scripts": { "build": "echo root" },
-                "workspaces": { "packages": ["packages/*"] }
-            }"#,
+        assert_eq!(
+            discover_with_root(
+                r#"{
+                    "name": "root", "private": true,
+                    "scripts": { "build": "echo root" },
+                    "workspaces": { "packages": ["packages/*"] }
+                }"#,
+            ),
+            vec!["@repo/app", "root"]
         );
-        write_package(
-            temp_dir.path().join("packages/app/package.json"),
-            "@repo/app",
-        );
-
-        let workspace = YarnWorkspace::new(temp_dir.path());
-        let mut packages = workspace.discover().expect("discover packages");
-        packages.sort_by(|left, right| left.name.as_str().cmp(right.name.as_str()));
-
-        let discovered: Vec<_> = packages
-            .into_iter()
-            .map(|package| package.name.to_string())
-            .collect();
-
-        assert_eq!(discovered, vec!["@repo/app", "root"]);
     }
 
     #[test]
-    fn excludes_root_package_when_scripts_missing() {
-        let temp_dir = tempdir().expect("create temp dir");
-        write_json(
-            temp_dir.path().join("package.json"),
-            r#"{
-                "name": "root",
-                "private": true,
-                "workspaces": { "packages": ["packages/*"] }
-            }"#,
+    fn includes_root_package_even_when_scripts_missing() {
+        assert_eq!(
+            discover_with_root(
+                r#"{
+                    "name": "root", "private": true,
+                    "workspaces": { "packages": ["packages/*"] }
+                }"#,
+            ),
+            vec!["@repo/app", "root"]
         );
-        write_package(
-            temp_dir.path().join("packages/app/package.json"),
-            "@repo/app",
+    }
+
+    #[test]
+    fn excludes_nameless_root_package() {
+        assert_eq!(
+            discover_with_root(
+                r#"{
+                    "private": true,
+                    "workspaces": { "packages": ["packages/*"] }
+                }"#,
+            ),
+            vec!["@repo/app"]
         );
-
-        let workspace = YarnWorkspace::new(temp_dir.path());
-        let packages = workspace.discover().expect("discover packages");
-
-        let discovered: Vec<_> = packages
-            .into_iter()
-            .map(|package| package.name.to_string())
-            .collect();
-
-        assert_eq!(discovered, vec!["@repo/app"]);
     }
 
     fn write_package(path: impl AsRef<Path>, name: &str) {
