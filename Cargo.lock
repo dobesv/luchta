@@ -463,6 +463,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "953f07c43838f8e6f9758cab68bf5bed85465e7587ebe0b823f1bcd81978ad3a"
 
 [[package]]
+name = "luchta-bash-worker"
+version = "0.1.0"
+dependencies = [
+ "assert_cmd",
+ "luchta-engine",
+ "luchta-worker",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "luchta-cli"
 version = "0.1.0"
 dependencies = [
@@ -492,6 +503,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "luchta-types",
+ "luchta-worker",
  "luchta-workspace",
  "petgraph",
  "serde",
@@ -523,6 +535,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "luchta-worker"
+version = "0.1.0"
+dependencies = [
+ "luchta-types",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
 name = "luchta-workspace"
 version = "0.1.0"
 dependencies = [
@@ -542,8 +565,8 @@ version = "0.1.0"
 dependencies = [
  "assert_cmd",
  "luchta-engine",
+ "luchta-worker",
  "serde_json",
- "thiserror 1.0.69",
  "tokio",
 ]
 

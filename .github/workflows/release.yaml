@@ -119,7 +119,7 @@ jobs:
     - name: Build
       shell: bash
       run: |
-        $BUILD_CMD build --locked --release --target=${{ matrix.target }} -p luchta-cli -p luchta-yarn-worker
+        $BUILD_CMD build --locked --release --target=${{ matrix.target }} -p luchta-cli -p luchta-yarn-worker -p luchta-bash-worker
 
     # Smoke test: run the freshly built binary so a broken artifact (bad
     # dynamic linking, missing symbols) fails the job before it is published.
@@ -127,8 +127,8 @@ jobs:
     # those: windows-latest is x86_64, and macos-latest (ARM) runs the
     # x86_64-apple-darwin binary via Rosetta 2. cross targets can't run here.
     # `luchta` has no `--version` flag, so `--help` (exit 0) is the probe.
-    # `luchta-yarn-worker` is a stdin-driven JSONL worker without CLI flags;
-    # feed it empty stdin to hit EOF and exit 0 cleanly.
+    # `luchta-yarn-worker` and `luchta-bash-worker` are stdin-driven JSONL workers
+    # without CLI flags; feed them empty stdin to hit EOF and exit 0 cleanly.
     - name: Smoke test binary
       if: ${{ !matrix.use-cross }}
       shell: bash
@@ -144,6 +144,12 @@ jobs:
           worker_bin="$worker_bin.exe"
         fi
         printf '' | "$worker_bin"
+
+        bash_worker_bin="target/${{ matrix.target }}/release/luchta-bash-worker"
+        if [[ "$RUNNER_OS" == "Windows" ]]; then
+          bash_worker_bin="$bash_worker_bin.exe"
+        fi
+        printf '' | "$bash_worker_bin"
 
     - name: Build archive
       id: package
@@ -173,6 +179,14 @@ jobs:
           worker_executable="$worker_executable.exe"
         fi
         cp "$worker_executable" "$staging/"
+
+        # luchta-bash-worker produces a binary named `luchta-bash-worker`.
+        bash_worker_bin=luchta-bash-worker
+        bash_worker_executable="target/$target/release/$bash_worker_bin"
+        if [[ "$RUNNER_OS" == "Windows" ]]; then
+          bash_worker_executable="$bash_worker_executable.exe"
+        fi
+        cp "$bash_worker_executable" "$staging/"
 
         name="luchta-$version-$target"
         if [[ "$RUNNER_OS" == "Windows" ]]; then

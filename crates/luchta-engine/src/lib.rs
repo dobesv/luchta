@@ -8,6 +8,10 @@ use luchta_workspace::WorkspaceError;
 use thiserror::Error;
 
 pub use executor::{ExecutionRequest, ExecutorError, TaskExecutor, WeightedExecutor};
+pub use luchta_worker::{
+    LogStream, ResolveDecision, ResolveMode, ResolveResult, ResolveTask, TaskModification,
+    WorkerMessage, WorkerRequest, WorkerResponse,
+};
 pub use task_graph::{
     is_root_task, root_package_name, root_task_id, DeadDependencyReason, DependencyValidationError,
     PackageResolveInfo, PruneOutcome, PrunedTask, ResolveError, TaskGraph, TaskNode, TaskResolver,
@@ -15,10 +19,6 @@ pub use task_graph::{
 };
 pub use walker::{CompletionSignal, ReadyTaskMessage, Walker};
 pub use worker::manager::{WorkerError, WorkerManager};
-pub use worker::protocol::{
-    LogStream, ResolveDecision, ResolveMode, ResolveResult, ResolveTask, TaskModification,
-    WorkerMessage, WorkerRequest, WorkerResponse,
-};
 
 #[derive(Debug, Error)]
 pub enum EngineError {

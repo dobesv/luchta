@@ -206,15 +206,20 @@ Define workers in the top-level `workers` map, keyed by name, each with a
 `command` that launches the long-lived worker process:
 ```typescript
 workers: {
-  yarn: { command: "luchta-yarn-worker" }
+  yarn: { command: "luchta-yarn-worker" },
+  bash: { command: "luchta-bash-worker" }
 }
 ```
 Then point a task at a worker with its `worker` field. Luchta ships the
-`luchta-yarn-worker` binary, which runs each task through Yarn so that
-Yarn-injected environment variables (`PATH`, `NODE_OPTIONS`, …) are available.
-For yarn-worker tasks, the task's `command` becomes the Yarn subcommand
-(defaulting to the task name) and is invoked as `yarn workspace <pkg> <command>`
-for package tasks, or `yarn <command>` at the workspace root.
+`luchta-yarn-worker` and `luchta-bash-worker` binaries:
+
+- **luchta-yarn-worker** runs each task through Yarn so that Yarn-injected
+  environment variables (`PATH`, `NODE_OPTIONS`, …) are available. For
+  yarn-worker tasks, the task's `command` becomes the Yarn subcommand
+  (defaulting to the task name) and is invoked as `yarn workspace <pkg> <command>`
+  for package tasks, or `yarn <command>` at the workspace root.
+- **luchta-bash-worker** runs arbitrary commands via `sh -c`, useful for
+  tasks that don't need Yarn workspace wrapping.
 
 > **Note:** Stay-resident workers are supported on Unix only.
 

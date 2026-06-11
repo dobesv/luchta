@@ -86,19 +86,29 @@ fn write_config(temp: &assert_fs::TempDir, json: &str) {
     );
 }
 
+/// Builds a worker binary by name and returns its absolute path.
+fn build_worker_bin(name: &str) -> std::path::PathBuf {
+    escargot::CargoBuild::new()
+        .bin(name)
+        .package(name)
+        .run()
+        .unwrap_or_else(|e| panic!("build {name}: {e}"))
+        .path()
+        .to_path_buf()
+}
+
 /// Absolute path to built `luchta-yarn-worker` binary.
 fn yarn_worker_bin() -> std::path::PathBuf {
     static BIN: OnceLock<std::path::PathBuf> = OnceLock::new();
-    BIN.get_or_init(|| {
-        escargot::CargoBuild::new()
-            .bin("luchta-yarn-worker")
-            .package("luchta-yarn-worker")
-            .run()
-            .expect("build luchta-yarn-worker")
-            .path()
-            .to_path_buf()
-    })
-    .clone()
+    BIN.get_or_init(|| build_worker_bin("luchta-yarn-worker"))
+        .clone()
+}
+
+/// Absolute path to built `luchta-bash-worker` binary.
+fn bash_worker_bin() -> std::path::PathBuf {
+    static BIN: OnceLock<std::path::PathBuf> = OnceLock::new();
+    BIN.get_or_init(|| build_worker_bin("luchta-bash-worker"))
+        .clone()
 }
 
 /// Empty marker file the worker scripts append to.
@@ -976,6 +986,79 @@ fn root_worker_task_resolves_against_root_package_scripts() {
         // The root task ran (root workspace => empty workspace hint => `yarn release`),
         // and was NOT pruned.
         .stdout(predicate::str::contains("yarn-ran root script=release"))
+        .stdout(predicate::str::contains("pruned during resolution").not());
+
+    temp.close().expect("cleanup temp dir");
+}
+
+#[test]
+fn bash_worker_blank_command_check_fails_and_run_skips() {
+    let temp = assert_fs::TempDir::new().expect("create temp dir");
+    setup_two_packages(&temp, false);
+    write_config(
+        &temp,
+        &format!(
+            r#"{{"concurrency":{{"maxWeight":1}},"tasks":{{"build":{{"worker":"bash","command":"   "}}}},"workers":{{"bash":{{"command":"{}"}}}}}}"#,
+            bash_worker_bin().display()
+        ),
+    );
+
+    assert_cmd::Command::cargo_bin("luchta")
+        .expect("find binary")
+        .env("NO_COLOR", "1")
+        .arg("check")
+        .arg("--workspace-root")
+        .arg(temp.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("blank command"));
+
+    assert_cmd::Command::cargo_bin("luchta")
+        .expect("find binary")
+        .env("NO_COLOR", "1")
+        .arg("run")
+        .arg("build")
+        .arg("--workspace-root")
+        .arg(temp.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("blank command"))
+        .stdout(predicate::str::contains("pruned during resolution"))
+        .stdout(predicate::str::contains("Running 0 task(s)").not());
+
+    temp.close().expect("cleanup temp dir");
+}
+
+#[test]
+fn real_bash_worker_e2e() {
+    let temp = assert_fs::TempDir::new().expect("create temp dir");
+    write_workspace(
+        &temp,
+        &[Pkg {
+            name: "myapp",
+            script: "echo package-build-script-unused",
+            depends_on_a: false,
+        }],
+    );
+    write_config(
+        &temp,
+        &format!(
+            r#"{{"concurrency":{{"maxWeight":1}},"tasks":{{"build":{{"worker":"bash","command":"echo bash-ran"}}}},"workers":{{"bash":{{"command":"{}"}}}}}}"#,
+            bash_worker_bin().display()
+        ),
+    );
+
+    assert_cmd::Command::cargo_bin("luchta")
+        .expect("find binary")
+        .env("NO_COLOR", "1")
+        .arg("run")
+        .arg("build")
+        .arg("--workspace-root")
+        .arg(temp.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("bash-ran"))
+        .stdout(predicate::str::contains("package-build-script-unused").not())
         .stdout(predicate::str::contains("pruned during resolution").not());
 
     temp.close().expect("cleanup temp dir");

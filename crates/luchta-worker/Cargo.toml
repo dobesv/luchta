@@ -1,5 +1,5 @@
 [package]
-name = "luchta-yarn-worker"
+name = "luchta-worker"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,10 +10,8 @@ homepage.workspace = true
 description.workspace = true
 
 [dependencies]
-luchta-worker = { path = "../luchta-worker" }
-tokio = { workspace = true }
-
-[dev-dependencies]
-assert_cmd = { workspace = true }
-luchta-engine = { path = "../luchta-engine" }
+serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+luchta-types = { path = "../luchta-types" }

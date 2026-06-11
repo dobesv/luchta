@@ -1,5 +1,5 @@
 [package]
-name = "luchta-yarn-worker"
+name = "luchta-bash-worker"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

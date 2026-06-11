@@ -201,6 +201,12 @@ mod tests {
                 "targets": [{"kind": ["bin"]}]
             },
             {
+                "id": "luchta-bash-worker 0.1.0 (path+file:///repo/crates/luchta-bash-worker)",
+                "name": "luchta-bash-worker",
+                "manifest_path": "/repo/crates/luchta-bash-worker/Cargo.toml",
+                "targets": [{"kind": ["bin"]}]
+            },
+            {
                 "id": "luchta-types 0.1.0 (path+file:///repo/crates/luchta-types)",
                 "name": "luchta-types",
                 "manifest_path": "/repo/crates/luchta-types/Cargo.toml",
@@ -223,6 +229,7 @@ mod tests {
             "zebra-tool 0.1.0 (path+file:///repo/crates/zebra-tool)",
             "luchta-cli 0.1.0 (path+file:///repo/crates/luchta-cli)",
             "luchta-yarn-worker 0.1.0 (path+file:///repo/crates/luchta-yarn-worker)",
+            "luchta-bash-worker 0.1.0 (path+file:///repo/crates/luchta-bash-worker)",
             "luchta-types 0.1.0 (path+file:///repo/crates/luchta-types)",
             "xtask 0.1.0 (path+file:///repo/xtask)"
         ]
@@ -258,7 +265,12 @@ mod tests {
         // the metadata input.
         assert_eq!(
             names,
-            vec!["luchta-cli", "luchta-yarn-worker", "zebra-tool"]
+            vec![
+                "luchta-bash-worker",
+                "luchta-cli",
+                "luchta-yarn-worker",
+                "zebra-tool"
+            ]
         );
     }
 
