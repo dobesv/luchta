@@ -77,6 +77,7 @@ mod tests {
                 weight: 3,
                 command: None,
                 worker: None,
+                ..Default::default()
             })
         );
 
@@ -93,6 +94,7 @@ mod tests {
                 weight: 1,
                 command: Some("vitest run".to_owned()),
                 worker: None,
+                ..Default::default()
             })
         );
 
@@ -103,6 +105,7 @@ mod tests {
                 weight: 1,
                 command: None,
                 worker: None,
+                ..Default::default()
             })
         );
 
@@ -113,6 +116,7 @@ mod tests {
                 weight: 1,
                 command: None,
                 worker: None,
+                ..Default::default()
             })
         );
     }

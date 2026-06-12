@@ -7,16 +7,17 @@ use std::sync::{
 };
 
 use luchta_types::WorkerDefinition;
+use luchta_worker::WorkerDonePayload;
 #[cfg(unix)]
 use tokio::sync::{mpsc, Mutex};
 
-use crate::worker::protocol::{ResolveResult, ResolveTask, WorkerRequest};
+use crate::worker::protocol::{LogStream, ResolveResult, ResolveTask, WorkerRequest};
 #[cfg(unix)]
 use crate::worker::{
     io_tasks::ReaperContext,
     protocol::{WorkerMessage, WorkerResponse},
 };
-use crate::TaskResolver;
+use crate::{ExecutionLogSink, TaskResolver};
 
 #[derive(Debug, thiserror::Error)]
 pub enum WorkerError {
@@ -41,7 +42,7 @@ use super::{
     handle::{JobMap, WorkerHandle, WriterContext},
     io_tasks::{
         collect_worker_handles, print_log_line, spawn_reader_task, spawn_reaper_task,
-        spawn_writer_task, ReaderContext,
+        spawn_writer_task, LogLineContext, ReaderContext,
     },
     spawn::spawn_worker_process,
 };
@@ -146,6 +147,8 @@ impl WorkerManager {
         &self,
         worker_name: &str,
         message: WorkerMessage,
+        mut on_log: impl FnMut(&str, LogStream, &str),
+        sink: Option<&ExecutionLogSink>,
         mut select: impl FnMut(WorkerResponse) -> Option<T>,
     ) -> Result<T, WorkerError> {
         let (handle, job_id, mut rx) = self.dispatch_message(worker_name, message).await?;
@@ -153,7 +156,16 @@ impl WorkerManager {
         let outcome = loop {
             match rx.recv().await {
                 Some(WorkerResponse::Log { stream, line, .. }) => {
-                    print_log_line(&job_id, stream, &line, self.prefix_width)
+                    on_log(&job_id, stream, &line);
+                    print_log_line(
+                        LogLineContext {
+                            id: &job_id,
+                            width: self.prefix_width,
+                            sink,
+                        },
+                        stream,
+                        &line,
+                    )
                 }
                 Some(response) => {
                     let kind = response.kind();
@@ -184,12 +196,15 @@ impl WorkerManager {
         &self,
         worker_name: &str,
         request: WorkerRequest,
-    ) -> Result<i32, WorkerError> {
+        sink: Option<&ExecutionLogSink>,
+    ) -> Result<WorkerDonePayload, WorkerError> {
         // Terminal response is `Done`; logs are streamed, other responses ignored.
         self.round_trip(
             worker_name,
             WorkerMessage::Run(request),
-            WorkerResponse::into_exit_code,
+            |_, _, _| {},
+            sink,
+            WorkerResponse::into_done,
         )
         .await
     }
@@ -371,7 +386,8 @@ impl WorkerManager {
         &self,
         worker_name: &str,
         request: WorkerRequest,
-    ) -> Result<i32, WorkerError> {
+        sink: Option<&ExecutionLogSink>,
+    ) -> Result<WorkerDonePayload, WorkerError> {
         self.unsupported(worker_name, request.id)
     }
 
@@ -388,6 +404,8 @@ impl TaskResolver for WorkerManager {
         self.round_trip(
             worker,
             WorkerMessage::ResolveTask(request),
+            |_, _, _| {},
+            None,
             WorkerResponse::into_resolve_result,
         )
         .await

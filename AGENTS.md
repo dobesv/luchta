@@ -12,6 +12,7 @@ Luchta is a Cargo workspace with the following crate layout:
 - `crates/luchta-workspace`: Workspace and package discovery.
 - `crates/luchta-engine`: Graph logic and execution engine.
 - `crates/luchta-cli`: CLI interface and configuration.
+- `crates/luchta-cache`: Filesystem-backed build cache, hashing, and skip logic (`thiserror`, filesystem records, no embedded DB).
 - `xtask`: Project automation crate (standard Rust `xtask` pattern), run via the `cargo xtask` alias.
 
 ## Key Architectural Decisions

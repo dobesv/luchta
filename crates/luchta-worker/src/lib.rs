@@ -60,11 +60,25 @@ pub enum WorkerResponse {
         line: String,
     },
     #[serde(rename_all = "camelCase")]
-    Done { id: String, exit_code: i32 },
+    Done {
+        id: String,
+        exit_code: i32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        inputs: Option<Vec<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        outputs: Option<Vec<String>>,
+    },
     /// Worker's decision for a `ResolveTask` request, correlated by `id`.
     #[serde(rename_all = "camelCase")]
     Resolved { id: String, result: ResolveResult },
 }
+
+pub type WorkerDonePayload = (
+    i32,
+    Option<Vec<String>>,
+    Option<Vec<String>>,
+    Vec<CapturedLogLine>,
+);
 
 impl WorkerResponse {
     pub fn log(id: impl Into<String>, stream: LogStream, line: impl Into<String>) -> Self {
@@ -79,6 +93,22 @@ impl WorkerResponse {
         Self::Done {
             id: id.into(),
             exit_code,
+            inputs: None,
+            outputs: None,
+        }
+    }
+
+    pub fn done_with_io(
+        id: impl Into<String>,
+        exit_code: i32,
+        inputs: Option<Vec<String>>,
+        outputs: Option<Vec<String>>,
+    ) -> Self {
+        Self::Done {
+            id: id.into(),
+            exit_code,
+            inputs,
+            outputs,
         }
     }
 
@@ -113,6 +143,18 @@ impl WorkerResponse {
         }
     }
 
+    pub fn into_done(self) -> Option<WorkerDonePayload> {
+        match self {
+            Self::Done {
+                exit_code,
+                inputs,
+                outputs,
+                ..
+            } => Some((exit_code, inputs, outputs, Vec::new())),
+            _ => None,
+        }
+    }
+
     /// The resolve decision if this is a `Resolved` response, else `None`. Used
     /// to select the terminal response of a resolution round-trip.
     pub fn into_resolve_result(self) -> Option<ResolveResult> {
@@ -128,6 +170,12 @@ impl WorkerResponse {
 pub enum LogStream {
     Stdout,
     Stderr,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapturedLogLine {
+    pub stream: LogStream,
+    pub line: String,
 }
 
 /// A message sent from the engine to a resident worker on its stdin channel.
@@ -429,6 +477,21 @@ mod tests {
                     "exitCode": 0
                 }),
             ),
+            (
+                WorkerResponse::done_with_io(
+                    "pkg#task",
+                    0,
+                    Some(vec!["src/**/*.ts".to_owned()]),
+                    Some(vec!["dist/**".to_owned()]),
+                ),
+                json!({
+                    "type": "done",
+                    "id": "pkg#task",
+                    "exitCode": 0,
+                    "inputs": ["src/**/*.ts"],
+                    "outputs": ["dist/**"]
+                }),
+            ),
         ];
 
         for (response, expected) in cases {
@@ -443,6 +506,18 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn worker_response_done_deserializes_without_optional_io_fields() {
+        let decoded: WorkerResponse = serde_json::from_value(json!({
+            "type": "done",
+            "id": "pkg#task",
+            "exitCode": 9
+        }))
+        .expect("response deserializes");
+
+        assert_eq!(decoded, WorkerResponse::done("pkg#task", 9));
     }
 
     #[test]

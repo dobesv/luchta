@@ -26,6 +26,9 @@ thiserror = { workspace = true }
 luchta-types = { path = "../luchta-types" }
 luchta-workspace = { path = "../luchta-workspace" }
 luchta-engine = { path = "../luchta-engine" }
+luchta-cache = { path = "../luchta-cache" }
+luchta-lockfiles = { path = "../luchta-lockfiles" }
+blake3 = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }

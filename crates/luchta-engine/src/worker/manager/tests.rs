@@ -17,6 +17,7 @@ use tokio::{process::Command, sync::Barrier, time::Instant};
 
 use super::{WorkerError, WorkerManager};
 use crate::WorkerRequest;
+use luchta_worker::WorkerDonePayload;
 
 #[tokio::test]
 async fn single_job_happy_path() {
@@ -24,9 +25,11 @@ async fn single_job_happy_path() {
     let worker_path = echo_then_done_worker(temp.path(), "happy-worker.sh", Some("hello"), 7);
     let manager = manager_with_worker("fake", &worker_path);
 
-    let exit_code = run_one_job(&manager).await.expect("job succeeds");
+    let outcome = run_one_job(&manager).await.expect("job succeeds");
 
-    assert_eq!(exit_code, 7);
+    assert_eq!(outcome.0, 7);
+    assert_eq!(outcome.1, None);
+    assert_eq!(outcome.2, None);
     manager.shutdown().await;
 }
 
@@ -58,11 +61,11 @@ done
     let manager = manager_with_worker("fake", &worker_path);
 
     manager
-        .run_job("fake", WorkerRequest::new("pkg#one", "echo one"))
+        .run_job("fake", WorkerRequest::new("pkg#one", "echo one"), None)
         .await
         .expect("first job succeeds");
     manager
-        .run_job("fake", WorkerRequest::new("pkg#two", "echo two"))
+        .run_job("fake", WorkerRequest::new("pkg#two", "echo two"), None)
         .await
         .expect("second job succeeds");
     manager.shutdown().await;
@@ -107,12 +110,12 @@ wait
         let counter = Arc::clone(&counter);
         tokio::spawn(async move {
             barrier.wait().await;
-            let exit = manager
-                .run_job("fake", WorkerRequest::new(id, "echo hi"))
+            let outcome = manager
+                .run_job("fake", WorkerRequest::new(id, "echo hi"), None)
                 .await
                 .expect("job succeeds");
             counter.fetch_add(1, Ordering::SeqCst);
-            exit
+            outcome.0
         })
     };
 
@@ -168,9 +171,11 @@ done
                     .run_job(
                         "fake",
                         WorkerRequest::new(format!("pkg#job-{index}"), "echo hi"),
+                        None,
                     )
                     .await
                     .expect("job succeeds")
+                    .0
             })
         })
         .collect::<Vec<_>>();
@@ -210,7 +215,7 @@ exit 0
     let manager = manager_with_worker("fake", &worker_path);
 
     let error = manager
-        .run_job("fake", WorkerRequest::new("pkg#task", "echo hi"))
+        .run_job("fake", WorkerRequest::new("pkg#task", "echo hi"), None)
         .await
         .expect_err("job should fail");
 
@@ -240,7 +245,7 @@ PY
     let manager = manager_with_worker("fake", &worker_path);
 
     let error = manager
-        .run_job("fake", WorkerRequest::new("pkg#task", "echo hi"))
+        .run_job("fake", WorkerRequest::new("pkg#task", "echo hi"), None)
         .await
         .expect_err("oversized line should crash worker job");
 
@@ -317,9 +322,9 @@ fn manager_with_worker_timeout(name: &str, worker_path: &Path, timeout: Duration
 }
 
 /// Runs a single representative job against `manager` and returns its result.
-async fn run_one_job(manager: &WorkerManager) -> Result<i32, crate::WorkerError> {
+async fn run_one_job(manager: &WorkerManager) -> Result<WorkerDonePayload, crate::WorkerError> {
     manager
-        .run_job("fake", WorkerRequest::new("pkg#task", "echo hi"))
+        .run_job("fake", WorkerRequest::new("pkg#task", "echo hi"), None)
         .await
 }
 

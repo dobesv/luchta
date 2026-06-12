@@ -1,10 +1,33 @@
+use std::collections::BTreeSet;
+
 use luchta_worker::{
     run_worker_main, shell_single_quote, ResolveResult, ResolveTask, Worker, WorkerRequest,
+    WorkerResponse,
 };
 
 struct YarnWorker;
 
+fn detected_inputs_with_package_json(inputs: Option<&[String]>) -> Option<Vec<String>> {
+    let mut detected = BTreeSet::from(["package.json".to_owned()]);
+    if let Some(inputs) = inputs {
+        detected.extend(inputs.iter().cloned());
+    }
+    Some(detected.into_iter().collect())
+}
+
 impl Worker for YarnWorker {
+    fn done_response(&self, req: &WorkerRequest, exit_code: i32) -> WorkerResponse {
+        // Worker-reported inputs replace declared cache inputs for this run, so yarn
+        // worker reports full set it wants engine/CLI to persist. Always include
+        // package.json so script changes invalidate cache entries.
+        WorkerResponse::done_with_io(
+            req.id.clone(),
+            exit_code,
+            detected_inputs_with_package_json(None),
+            None,
+        )
+    }
+
     fn resolve_task(&self, req: &ResolveTask) -> ResolveResult {
         let script = req.resolved_script_name();
         if req.scripts.iter().any(|candidate| candidate == script) {
@@ -39,6 +62,7 @@ async fn main() {
 mod tests {
     use luchta_worker::{
         shell_single_quote, ResolveDecision, ResolveMode, ResolveTask, WorkerRequest,
+        WorkerResponse,
     };
 
     use super::{Worker, YarnWorker};
@@ -113,6 +137,27 @@ mod tests {
             YarnWorker
                 .build_command(&WorkerRequest::new("job", "build --flag").with_workspace("a")),
             "yarn workspace 'a' build --flag"
+        );
+    }
+
+    #[test]
+    fn done_response_includes_package_json_input() {
+        let response = YarnWorker.done_response(&WorkerRequest::new("job", "build"), 0);
+
+        assert_eq!(
+            response,
+            WorkerResponse::done_with_io("job", 0, Some(vec!["package.json".to_owned()]), None,)
+        );
+    }
+
+    #[test]
+    fn detected_inputs_dedupes_package_json() {
+        assert_eq!(
+            super::detected_inputs_with_package_json(Some(&[
+                "src/**/*.ts".to_owned(),
+                "package.json".to_owned(),
+            ])),
+            Some(vec!["package.json".to_owned(), "src/**/*.ts".to_owned()])
         );
     }
 

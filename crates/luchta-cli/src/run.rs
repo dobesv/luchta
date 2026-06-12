@@ -1,23 +1,30 @@
 //! Run command implementation.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     future::Future,
     path::{Path, PathBuf},
     pin::Pin,
     sync::atomic::{AtomicBool, Ordering},
-    sync::Arc,
+    sync::{Arc, Mutex},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
-use luchta_engine::{
-    is_root_task, CompletionSignal, ExecutionRequest, PackageResolveInfo, PrunedTask,
-    ReadyTaskMessage, ResolveMode, TaskExecutor, TaskGraph, TaskNode, Walker, WeightedExecutor,
-    WorkerManager,
+use luchta_cache::{
+    combined_outputs_hash, decide, resolve_cache_dir, resolve_inputs, resolve_outputs, Cache,
+    Decision, RunArtifacts, TaskRunRecord, SCHEMA_VERSION_V1,
 };
-use luchta_types::{TaskDefinition, TaskId, TaskName, WorkerDefinition};
+use luchta_engine::{
+    is_root_task, CompletionSignal, ExecutionLogSink, ExecutionRequest, LogStream,
+    PackageResolveInfo, PrunedTask, ReadyTaskMessage, ResolveMode, TaskGraph, TaskNode,
+    TaskRunOutcome, Walker, WeightedExecutor, WorkerManager,
+};
+use luchta_types::{PackageName, TaskDefinition, TaskId, TaskName, WorkerDefinition};
 use luchta_workspace::{PackageGraph, PackageNode, WorkspaceDiscovery, YarnWorkspace};
 use miette::{bail, Context, IntoDiagnostic, Result};
 use owo_colors::OwoColorize;
+
+use crate::cache_ctx::{build_current_state, gather_pkg_dep_pairs, PackageDirResolver};
 
 #[derive(Debug)]
 pub struct PreparedWorkspace {
@@ -96,7 +103,7 @@ pub async fn prepare_workspace(
 pub async fn run_tasks(workspace_root: &Path, requested_tasks: &[String]) -> Result<()> {
     let PreparedWorkspace {
         packages,
-        package_graph: _,
+        package_graph,
         pipeline: _,
         task_graph,
         workers,
@@ -121,6 +128,12 @@ pub async fn run_tasks(workspace_root: &Path, requested_tasks: &[String]) -> Res
             .with_worker_manager(Arc::clone(&worker_manager))
             .with_prefix_width(prefix_width),
     );
+    let cache = Arc::new(
+        Cache::open(&resolve_cache_dir(workspace_root))
+            .into_diagnostic()
+            .wrap_err("open cache")?,
+    );
+    let output_hashes: Arc<Mutex<HashMap<TaskId, [u8; 32]>>> = Arc::new(Mutex::new(HashMap::new()));
 
     let CommandMap { commands, invalid } =
         build_command_map(&task_graph, &packages, workspace_root, &workers);
@@ -143,6 +156,12 @@ pub async fn run_tasks(workspace_root: &Path, requested_tasks: &[String]) -> Res
         executor: &executor,
         any_failed: &any_failed,
         interrupted: &interrupted,
+        workspace_root,
+        package_graph: &package_graph,
+        packages: &packages,
+        task_graph: &task_graph,
+        cache: &cache,
+        output_hashes: &output_hashes,
     };
     let run_result = dispatch_loop(&mut receiver, &ctx).await;
 
@@ -165,6 +184,60 @@ struct DispatchContext<'a> {
     executor: &'a Arc<WeightedExecutor>,
     any_failed: &'a Arc<AtomicBool>,
     interrupted: &'a Arc<AtomicBool>,
+    workspace_root: &'a Path,
+    package_graph: &'a PackageGraph,
+    packages: &'a [PackageNode],
+    task_graph: &'a TaskGraph,
+    cache: &'a Arc<Cache>,
+    output_hashes: &'a Arc<Mutex<HashMap<TaskId, [u8; 32]>>>,
+}
+
+struct TaskRunContext {
+    executor: Arc<WeightedExecutor>,
+    any_failed: Arc<AtomicBool>,
+    interrupted: Arc<AtomicBool>,
+    cache: Arc<Cache>,
+    output_hashes: Arc<Mutex<HashMap<TaskId, [u8; 32]>>>,
+    cache_write: Option<CacheWriteContext>,
+    output_hash_record: Option<OutputHashRecordContext>,
+}
+
+struct CacheWriteContext {
+    task_id: TaskId,
+    task_def: TaskDefinition,
+    package_path: PathBuf,
+    dep_outputs: BTreeMap<String, [u8; 32]>,
+    task_spec_hash: [u8; 32],
+    env_hash: [u8; 32],
+    pkg_dep_hash: [u8; 32],
+    start_unix_ms: u64,
+}
+
+struct OutputHashRecordContext {
+    task_id: TaskId,
+    package_path: PathBuf,
+    /// Effective output patterns to hash. Initialized to the task's declared
+    /// outputs and overridden by worker-detected outputs (when emitted) via
+    /// [`Self::with_effective_patterns`] after the task runs.
+    output_patterns: Vec<String>,
+}
+
+impl OutputHashRecordContext {
+    /// Returns the context with its output patterns overridden by the worker's
+    /// detected outputs when present, mirroring `effective_output_patterns`
+    /// used by the cache-write path so uncached-dependency coupling hashes the
+    /// same outputs a cached task would.
+    fn with_effective_patterns(mut self, outcome: Option<&TaskRunOutcome>) -> Self {
+        if let Some(detected) = outcome.and_then(|o| o.detected_outputs.clone()) {
+            self.output_patterns = detected;
+        }
+        self
+    }
+}
+
+enum CacheInputState {
+    Ready(Box<CacheWriteContext>),
+    Disabled,
 }
 
 /// Drives the walker's ready-task channel until it drains (normal completion)
@@ -491,6 +564,119 @@ fn expand_with_dependencies(task_graph: &TaskGraph, seed: HashSet<TaskId>) -> Ha
     included
 }
 
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn package_node_for<'a>(
+    packages: &'a [PackageNode],
+    workspace_root: &Path,
+    id: &TaskId,
+) -> Option<&'a PackageNode> {
+    if is_root_task(id) {
+        packages
+            .iter()
+            .find(|package| package.path == workspace_root)
+    } else {
+        packages.iter().find(|package| package.name == id.package)
+    }
+}
+
+struct CachePackageContext<'a> {
+    package: Option<&'a PackageNode>,
+    package_path: PathBuf,
+    package_name: PackageName,
+}
+
+fn cache_package_context_for<'a>(
+    packages: &'a [PackageNode],
+    workspace_root: &Path,
+    id: &TaskId,
+) -> Option<CachePackageContext<'a>> {
+    if is_root_task(id) {
+        Some(CachePackageContext {
+            package: package_node_for(packages, workspace_root, id),
+            package_path: workspace_root.to_path_buf(),
+            package_name: id.package.clone(),
+        })
+    } else {
+        package_node_for(packages, workspace_root, id).map(|package| CachePackageContext {
+            package: Some(package),
+            package_path: package.path.clone(),
+            package_name: package.name.clone(),
+        })
+    }
+}
+
+fn dependency_output_hashes(
+    task_id: &TaskId,
+    task_graph: &TaskGraph,
+    output_hashes: &Arc<Mutex<HashMap<TaskId, [u8; 32]>>>,
+) -> BTreeMap<String, [u8; 32]> {
+    let map = output_hashes.lock().expect("output_hashes poisoned");
+    task_graph
+        .dependencies_of(task_id)
+        .into_iter()
+        .filter_map(|d| map.get(&d.id).copied().map(|h| (d.id.to_string(), h)))
+        .collect()
+}
+
+fn record_output_hash(
+    output_hashes: &Arc<Mutex<HashMap<TaskId, [u8; 32]>>>,
+    task_id: &TaskId,
+    hash: [u8; 32],
+) {
+    output_hashes
+        .lock()
+        .expect("output_hashes poisoned")
+        .insert(task_id.clone(), hash);
+}
+
+fn effective_output_patterns(
+    task_def: &TaskDefinition,
+    outcome: Option<&TaskRunOutcome>,
+) -> (Vec<String>, bool) {
+    match outcome.and_then(|o| o.detected_outputs.clone()) {
+        Some(p) => (p, true),
+        None => (task_def.outputs.clone(), false),
+    }
+}
+
+fn effective_input_patterns(
+    task_def: &TaskDefinition,
+    outcome: Option<&TaskRunOutcome>,
+) -> (Vec<String>, bool) {
+    match outcome.and_then(|o| o.detected_inputs.clone()) {
+        Some(patterns) => (patterns, true),
+        None => (task_def.inputs.clone(), false),
+    }
+}
+
+fn split_captured_logs(sink: &ExecutionLogSink) -> (Vec<u8>, Vec<u8>) {
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    for line in sink.lines() {
+        let buf = match line.stream {
+            LogStream::Stdout => &mut out,
+            LogStream::Stderr => &mut err,
+        };
+        buf.extend_from_slice(line.line.as_bytes());
+        buf.push(b'\n');
+    }
+    (out, err)
+}
+
+fn print_captured_logs(sink: &ExecutionLogSink) {
+    for line in sink.lines() {
+        match line.stream {
+            LogStream::Stdout => println!("{}", line.line),
+            LogStream::Stderr => eprintln!("{}", line.line),
+        }
+    }
+}
+
 fn dispatch_ready_task(task_node: TaskNode, done_tx: CompletionSignal, ctx: &DispatchContext<'_>) {
     let task_id = task_node.id.clone();
 
@@ -528,7 +714,284 @@ fn dispatch_ready_task(task_node: TaskNode, done_tx: CompletionSignal, ctx: &Dis
         return;
     }
 
-    spawn_task_runner(task_id, request, done_tx, ctx);
+    let cache_enabled = ctx
+        .task_graph
+        .task_definition(&task_id)
+        .is_some_and(TaskDefinition::cache_enabled);
+    if cache_enabled {
+        if let Some(decision) = try_cache_skip(&task_id, ctx) {
+            if matches!(decision, Decision::Skip) {
+                let _ = done_tx.send(true);
+                return;
+            }
+        }
+    }
+
+    spawn_task_runner(task_id, request, done_tx, cache_enabled, ctx);
+}
+
+fn build_task_run_context(
+    task_id: &TaskId,
+    cache_enabled: bool,
+    ctx: &DispatchContext<'_>,
+) -> TaskRunContext {
+    let output_hash_record =
+        build_output_hash_record_context(task_id, ctx.task_graph, ctx.packages, ctx.workspace_root);
+    let cache_write = if cache_enabled {
+        match build_cache_write_context(task_id, ctx) {
+            CacheInputState::Ready(cache_ctx) => Some(*cache_ctx),
+            CacheInputState::Disabled => None,
+        }
+    } else {
+        None
+    };
+
+    TaskRunContext {
+        executor: Arc::clone(ctx.executor),
+        any_failed: Arc::clone(ctx.any_failed),
+        interrupted: Arc::clone(ctx.interrupted),
+        cache: Arc::clone(ctx.cache),
+        output_hashes: Arc::clone(ctx.output_hashes),
+        cache_write,
+        output_hash_record,
+    }
+}
+
+fn record_resolved_output_hash(
+    output_hashes: &Arc<Mutex<HashMap<TaskId, [u8; 32]>>>,
+    output_hash_record: &OutputHashRecordContext,
+) {
+    match resolve_outputs(&output_hash_record.package_path, &output_hash_record.output_patterns) {
+        Ok(outputs) => {
+            let outputs_hash = combined_outputs_hash(&outputs);
+            record_output_hash(output_hashes, &output_hash_record.task_id, outputs_hash);
+        }
+        Err(error) => eprintln!(
+            "warning: skipping dependency output hash record for task '{}': failed to resolve cache outputs: {error}",
+            output_hash_record.task_id
+        ),
+    }
+}
+
+fn build_output_hash_record_context(
+    task_id: &TaskId,
+    task_graph: &TaskGraph,
+    packages: &[PackageNode],
+    workspace_root: &Path,
+) -> Option<OutputHashRecordContext> {
+    let task_def = task_graph.task_definition(task_id)?;
+    let cache_package = cache_package_context_for(packages, workspace_root, task_id)?;
+    Some(OutputHashRecordContext {
+        task_id: task_id.clone(),
+        package_path: cache_package.package_path,
+        output_patterns: task_def.outputs.clone(),
+    })
+}
+fn build_cache_write_context(task_id: &TaskId, ctx: &DispatchContext<'_>) -> CacheInputState {
+    let Some(task_def) = ctx.task_graph.task_definition(task_id).cloned() else {
+        return CacheInputState::Disabled;
+    };
+    let Some(cache_package) = cache_package_context_for(ctx.packages, ctx.workspace_root, task_id)
+    else {
+        return CacheInputState::Disabled;
+    };
+    let dep_outputs = dependency_output_hashes(task_id, ctx.task_graph, ctx.output_hashes);
+    let synthetic_package;
+    let package = if let Some(package) = cache_package.package {
+        package
+    } else {
+        synthetic_package = PackageNode::new(
+            cache_package.package_name.clone(),
+            cache_package.package_path.clone(),
+        );
+        &synthetic_package
+    };
+    let pkg_dep_pairs = match gather_pkg_dep_pairs(
+        ctx.workspace_root,
+        package,
+        cache_package.package.map(|_| ctx.package_graph),
+    ) {
+        Ok(pkg_dep_pairs) => pkg_dep_pairs,
+        Err(error) => {
+            eprintln!(
+                "warning: skipping cache write for task '{task_id}': failed to gather package dependencies: {error}"
+            );
+            return CacheInputState::Disabled;
+        }
+    };
+    let resolver = PackageDirResolver::new(cache_package.package_path.clone());
+
+    let current = build_current_state(&task_def, dep_outputs.clone(), &pkg_dep_pairs, &resolver);
+    let task_spec_hash = current.task_spec_hash;
+    let env_hash = current.env_hash;
+    let pkg_dep_hash = current.pkg_dep_hash;
+
+    CacheInputState::Ready(Box::new(CacheWriteContext {
+        task_id: task_id.clone(),
+        task_def,
+        package_path: cache_package.package_path,
+        dep_outputs,
+        task_spec_hash,
+        env_hash,
+        pkg_dep_hash,
+        start_unix_ms: now_unix_ms(),
+    }))
+}
+
+fn build_run_record(
+    cache_ctx: &CacheWriteContext,
+    outcome: Option<&TaskRunOutcome>,
+    succeeded: bool,
+    end_unix_ms: u64,
+) -> Option<TaskRunRecord> {
+    let (output_patterns, detected_output_patterns) =
+        effective_output_patterns(&cache_ctx.task_def, outcome);
+    let (input_patterns, detected_input_patterns) =
+        effective_input_patterns(&cache_ctx.task_def, outcome);
+    let inputs = match resolve_inputs(&cache_ctx.package_path, &input_patterns) {
+        Ok(inputs) => inputs,
+        Err(error) => {
+            eprintln!(
+                "warning: skipping cache write for task '{}': failed to resolve cache inputs: {error}",
+                cache_ctx.task_id
+            );
+            return None;
+        }
+    };
+    let outputs = match resolve_outputs(&cache_ctx.package_path, &output_patterns) {
+        Ok(outputs) => outputs,
+        Err(error) => {
+            eprintln!(
+                "warning: skipping cache write for task '{}': failed to resolve cache outputs: {error}",
+                cache_ctx.task_id
+            );
+            return None;
+        }
+    };
+    let outputs_hash = combined_outputs_hash(&outputs);
+    let exit_status = outcome
+        .map(|result| result.status.code().unwrap_or(1))
+        .unwrap_or(1);
+
+    Some(TaskRunRecord {
+        schema_version: SCHEMA_VERSION_V1,
+        task_spec_hash: cache_ctx.task_spec_hash,
+        input_patterns,
+        inputs,
+        output_patterns,
+        outputs,
+        detected_input_patterns,
+        detected_output_patterns,
+        outputs_hash,
+        env_hash: cache_ctx.env_hash,
+        pkg_dep_hash: cache_ctx.pkg_dep_hash,
+        dep_outputs: cache_ctx.dep_outputs.clone(),
+        exit_status,
+        succeeded,
+        start_unix_ms: cache_ctx.start_unix_ms,
+        end_unix_ms,
+    })
+}
+
+async fn write_run_record(
+    cache: Arc<Cache>,
+    cache_ctx: CacheWriteContext,
+    output_hashes: Arc<Mutex<HashMap<TaskId, [u8; 32]>>>,
+    log_sink: Option<&ExecutionLogSink>,
+    outcome: Option<&TaskRunOutcome>,
+    succeeded: bool,
+    end_unix_ms: u64,
+) {
+    let Some(record) = build_run_record(&cache_ctx, outcome, succeeded, end_unix_ms) else {
+        return;
+    };
+    record_output_hash(&output_hashes, &cache_ctx.task_id, record.outputs_hash);
+    let (stdout, stderr) = log_sink.map(split_captured_logs).unwrap_or_default();
+    let cache_key = cache_ctx.task_id.to_string();
+    match tokio::task::spawn_blocking(move || {
+        cache.write(
+            &cache_key,
+            RunArtifacts {
+                record: &record,
+                stdout: &stdout,
+                stderr: &stderr,
+            },
+        )
+    })
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => eprintln!(
+            "warning: failed to write cache record for task '{}': {error}",
+            cache_ctx.task_id
+        ),
+        Err(error) => eprintln!(
+            "warning: cache write task panicked for task '{}': {error}",
+            cache_ctx.task_id
+        ),
+    }
+}
+
+fn report_task_outcome(
+    task_id: &TaskId,
+    outcome: &Result<TaskRunOutcome, luchta_engine::ExecutorError>,
+    any_failed: &Arc<AtomicBool>,
+    interrupted: &Arc<AtomicBool>,
+) {
+    match outcome {
+        Ok(result) if result.status.success() => {}
+        Ok(result) => report_task_failure(
+            task_id,
+            &format!("failed with status {:?}", result.status.code()),
+            any_failed,
+            interrupted,
+        ),
+        Err(error) => report_task_failure(
+            task_id,
+            &format!("failed: {error}"),
+            any_failed,
+            interrupted,
+        ),
+    }
+}
+
+fn try_cache_skip(task_id: &TaskId, ctx: &DispatchContext<'_>) -> Option<Decision> {
+    let task_def = ctx.task_graph.task_definition(task_id)?;
+    let cache_package = cache_package_context_for(ctx.packages, ctx.workspace_root, task_id)?;
+    let resolver = PackageDirResolver::new(cache_package.package_path.clone());
+    let dep_outputs = dependency_output_hashes(task_id, ctx.task_graph, ctx.output_hashes);
+    let synthetic_package;
+    let package = if let Some(package) = cache_package.package {
+        package
+    } else {
+        synthetic_package = PackageNode::new(
+            cache_package.package_name.clone(),
+            cache_package.package_path.clone(),
+        );
+        &synthetic_package
+    };
+    let pkg_dep_pairs = match gather_pkg_dep_pairs(
+        ctx.workspace_root,
+        package,
+        cache_package.package.map(|_| ctx.package_graph),
+    ) {
+        Ok(pkg_dep_pairs) => pkg_dep_pairs,
+        Err(error) => {
+            eprintln!(
+                "warning: skipping cache read for task '{task_id}': failed to gather package dependencies: {error}; task will run"
+            );
+            return Some(Decision::Run);
+        }
+    };
+    let current = build_current_state(task_def, dep_outputs, &pkg_dep_pairs, &resolver);
+    let prior = ctx.cache.read(&task_id.to_string());
+    let decision = decide(prior.as_ref(), &current);
+    if matches!(decision, Decision::Skip) {
+        if let Some(p) = prior {
+            record_output_hash(ctx.output_hashes, task_id, p.outputs_hash);
+        }
+    }
+    Some(decision)
 }
 
 /// Spawns the async runner that executes `request` and reports completion back
@@ -537,38 +1000,106 @@ fn dispatch_ready_task(task_node: TaskNode, done_tx: CompletionSignal, ctx: &Dis
 /// expected and their noise is suppressed).
 fn spawn_task_runner(
     task_id: TaskId,
-    request: ExecutionRequest,
+    mut request: ExecutionRequest,
     done_tx: CompletionSignal,
+    cache_enabled: bool,
     ctx: &DispatchContext<'_>,
 ) {
-    let executor = Arc::clone(ctx.executor);
-    let any_failed = Arc::clone(ctx.any_failed);
-    let interrupted = Arc::clone(ctx.interrupted);
+    let TaskRunContext {
+        executor,
+        any_failed,
+        interrupted,
+        cache,
+        output_hashes,
+        cache_write,
+        output_hash_record,
+    } = build_task_run_context(&task_id, cache_enabled, ctx);
+
+    let log_sink = cache_write.as_ref().map(|_| ExecutionLogSink::new());
+    if let Some(sink) = &log_sink {
+        request.log_sink = Some(sink.clone());
+    }
 
     tokio::spawn(async move {
-        let succeeded = match executor.execute(&request.task).await {
-            Ok(status) if status.success() => true,
-            Ok(status) => {
-                report_task_failure(
-                    &task_id,
-                    &format!("failed with status {:?}", status.code()),
-                    &any_failed,
-                    &interrupted,
-                );
-                false
-            }
-            Err(error) => {
-                report_task_failure(
-                    &task_id,
-                    &format!("failed: {error}"),
-                    &any_failed,
-                    &interrupted,
-                );
-                false
-            }
-        };
+        let outcome_res = executor.run(&request).await;
+        let end_unix_ms = now_unix_ms();
+        let succeeded = matches!(&outcome_res, Ok(result) if result.status.success());
+        // Override the declared output patterns with worker-detected outputs
+        // (when emitted) so uncached-dependency coupling matches the cache-write
+        // path's `effective_output_patterns` precedence.
+        let output_hash_record = output_hash_record
+            .map(|record| record.with_effective_patterns(outcome_res.as_ref().ok()));
+
+        persist_cache_state(CachePersistInputs {
+            cache,
+            cache_write,
+            output_hashes: &output_hashes,
+            output_hash_record: output_hash_record.as_ref(),
+            log_sink: log_sink.as_ref(),
+            outcome: outcome_res.as_ref().ok(),
+            succeeded,
+            end_unix_ms,
+        })
+        .await;
+
+        // A log sink is installed only for cache-enabled tasks (engine logging
+        // is sink-only while a sink exists). Replay the captured output so a
+        // freshly-executed cached task is not silent — on success and failure
+        // alike. Cache-hit/skipped tasks never reach here (no execution).
+        if let Some(sink) = &log_sink {
+            print_captured_logs(sink);
+        }
+
+        report_task_outcome(&task_id, &outcome_res, &any_failed, &interrupted);
         let _ = done_tx.send(succeeded);
     });
+}
+
+/// Inputs for persisting a finished task's cache state.
+struct CachePersistInputs<'a> {
+    cache: Arc<Cache>,
+    cache_write: Option<CacheWriteContext>,
+    output_hashes: &'a Arc<Mutex<HashMap<TaskId, [u8; 32]>>>,
+    output_hash_record: Option<&'a OutputHashRecordContext>,
+    log_sink: Option<&'a ExecutionLogSink>,
+    outcome: Option<&'a TaskRunOutcome>,
+    succeeded: bool,
+    end_unix_ms: u64,
+}
+
+/// Records the run record (cached tasks) or just the resolved output hash
+/// (uncached tasks) so downstream dependency coupling stays correct.
+async fn persist_cache_state(inputs: CachePersistInputs<'_>) {
+    let CachePersistInputs {
+        cache,
+        cache_write,
+        output_hashes,
+        output_hash_record,
+        log_sink,
+        outcome,
+        succeeded,
+        end_unix_ms,
+    } = inputs;
+
+    if let Some(cache_ctx) = cache_write {
+        write_run_record(
+            cache,
+            cache_ctx,
+            Arc::clone(output_hashes),
+            log_sink,
+            outcome,
+            succeeded,
+            end_unix_ms,
+        )
+        .await;
+        return;
+    }
+
+    if succeeded {
+        if let Some(record) = output_hash_record {
+            record_resolved_output_hash(output_hashes, record);
+        }
+    }
 }
 
 /// Marks the run as failed and prints a concise message, unless the run is
@@ -665,7 +1196,8 @@ fn build_command_map(
             task: node.clone(),
             command,
             cwd: Some(cwd),
-            env: HashMap::new(),
+            env: resolve_task_env(task_def),
+            log_sink: None,
             worker,
             workspace,
         };
@@ -685,6 +1217,32 @@ enum NonWorkerCommand {
     CommandWithoutWorker,
 }
 
+/// Resolves environment variables from a task definition for execution.
+///
+/// For each `(name, EnvSpec)` in `task_def.env`:
+/// - If `value` is `Some`, use that value.
+/// - Otherwise, inherit from the luchta process environment via `std::env::var(name)`.
+///   If the variable is unset in the process environment, omit it (do not insert).
+/// - The `input` flag only affects cache hashing, NOT this resolution —
+///   `input: false` vars are still present in the resulting map.
+fn resolve_task_env(task_def: Option<&TaskDefinition>) -> HashMap<String, String> {
+    let Some(task_def) = task_def else {
+        return HashMap::new();
+    };
+
+    task_def
+        .env
+        .iter()
+        .filter_map(|(name, spec)| {
+            let value = match &spec.value {
+                Some(v) => Some(v.clone()),
+                None => std::env::var(name).ok(),
+            };
+            value.map(|v| (name.clone(), v))
+        })
+        .collect()
+}
+
 fn resolve_non_worker_command(task_def: Option<&TaskDefinition>) -> NonWorkerCommand {
     // A blank/whitespace-only command is treated as absent — matching the
     // worker path's `resolve_script_name` normalization and `check`'s
@@ -697,5 +1255,159 @@ fn resolve_non_worker_command(task_def: Option<&TaskDefinition>) -> NonWorkerCom
         NonWorkerCommand::CommandWithoutWorker
     } else {
         NonWorkerCommand::NoOp
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use luchta_types::EnvSpec;
+    use std::sync::Mutex;
+
+    /// Process-wide lock to serialize env-mutating tests.
+    /// Prevents races when multiple tests use set_var/remove_var concurrently.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Guard that restores an environment variable to its prior value on drop.
+    /// Captures the current value on construction (if any) and restores it
+    /// (or removes if it was absent) when dropped, even on panic.
+    struct EnvVarGuard {
+        name: &'static str,
+        prior: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        /// Set an env var and return a guard that will restore the prior value.
+        fn set(name: &'static str, value: &str) -> Self {
+            let prior = std::env::var(name).ok();
+            std::env::set_var(name, value);
+            Self { name, prior }
+        }
+
+        /// Remove an env var and return a guard that will restore the prior value.
+        fn remove(name: &'static str) -> Self {
+            let prior = std::env::var(name).ok();
+            std::env::remove_var(name);
+            Self { name, prior }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(ref value) = self.prior {
+                std::env::set_var(self.name, value);
+            } else {
+                std::env::remove_var(self.name);
+            }
+        }
+    }
+
+    fn make_task_def(env: std::collections::BTreeMap<String, EnvSpec>) -> TaskDefinition {
+        TaskDefinition {
+            env,
+            ..TaskDefinition::default()
+        }
+    }
+
+    #[test]
+    fn resolve_task_env_explicit_value_is_used() {
+        let mut env = std::collections::BTreeMap::new();
+        env.insert(
+            "FOO".to_string(),
+            EnvSpec {
+                value: Some("bar".to_string()),
+                input: true,
+            },
+        );
+        let task_def = make_task_def(env);
+
+        let resolved = resolve_task_env(Some(&task_def));
+        assert_eq!(resolved.get("FOO"), Some(&"bar".to_string()));
+    }
+
+    #[test]
+    fn resolve_task_env_inherits_from_process_env_when_value_is_none() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvVarGuard::set("LUCHTA_TEST_INHERIT_VAR", "inherited_value");
+
+        let mut env = std::collections::BTreeMap::new();
+        env.insert(
+            "LUCHTA_TEST_INHERIT_VAR".to_string(),
+            EnvSpec {
+                value: None,
+                input: true,
+            },
+        );
+        let task_def = make_task_def(env);
+
+        let resolved = resolve_task_env(Some(&task_def));
+        assert_eq!(
+            resolved.get("LUCHTA_TEST_INHERIT_VAR"),
+            Some(&"inherited_value".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_task_env_omits_missing_process_env() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvVarGuard::remove("LUCHTA_TEST_UNDEF_VAR");
+
+        let mut env = std::collections::BTreeMap::new();
+        env.insert(
+            "LUCHTA_TEST_UNDEF_VAR".to_string(),
+            EnvSpec {
+                value: None,
+                input: true,
+            },
+        );
+        let task_def = make_task_def(env);
+
+        let resolved = resolve_task_env(Some(&task_def));
+        assert!(!resolved.contains_key("LUCHTA_TEST_UNDEF_VAR"));
+    }
+
+    #[test]
+    fn resolve_task_env_input_false_vars_are_still_present() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvVarGuard::set("LUCHTA_TEST_INPUT_FALSE_VAR", "still_present");
+
+        let mut env = std::collections::BTreeMap::new();
+        // input: false should still be included in resolved env
+        env.insert(
+            "LUCHTA_TEST_INPUT_FALSE_VAR".to_string(),
+            EnvSpec {
+                value: None,
+                input: false,
+            },
+        );
+        let task_def = make_task_def(env);
+
+        let resolved = resolve_task_env(Some(&task_def));
+        assert_eq!(
+            resolved.get("LUCHTA_TEST_INPUT_FALSE_VAR"),
+            Some(&"still_present".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_task_env_explicit_value_overrides_process_env() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvVarGuard::set("LUCHTA_TEST_OVERRIDE_VAR", "process_value");
+
+        let mut env = std::collections::BTreeMap::new();
+        env.insert(
+            "LUCHTA_TEST_OVERRIDE_VAR".to_string(),
+            EnvSpec {
+                value: Some("explicit_value".to_string()),
+                input: true,
+            },
+        );
+        let task_def = make_task_def(env);
+
+        let resolved = resolve_task_env(Some(&task_def));
+        assert_eq!(
+            resolved.get("LUCHTA_TEST_OVERRIDE_VAR"),
+            Some(&"explicit_value".to_string())
+        );
     }
 }

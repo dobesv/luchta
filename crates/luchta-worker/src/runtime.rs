@@ -15,6 +15,10 @@ use crate::{LogStream, ResolveResult, ResolveTask, WorkerMessage, WorkerRequest,
 pub trait Worker: Send + Sync + 'static {
     fn resolve_task(&self, req: &ResolveTask) -> ResolveResult;
     fn build_command(&self, req: &WorkerRequest) -> String;
+
+    fn done_response(&self, req: &WorkerRequest, exit_code: i32) -> WorkerResponse {
+        WorkerResponse::done(req.id.clone(), exit_code)
+    }
 }
 
 type SharedWriter = Arc<Mutex<Box<dyn AsyncWrite + Unpin + Send>>>;
@@ -131,7 +135,7 @@ async fn handle_request<W: Worker>(
             1
         }
     };
-    write_response(&writer, &WorkerResponse::done(id, exit_code)).await
+    write_response(&writer, &worker.done_response(&request, exit_code)).await
 }
 
 async fn run_one_job<W: Worker>(
