@@ -37,7 +37,10 @@ pub struct ConcurrencyConfig {
 
 impl Default for ConcurrencyConfig {
     fn default() -> Self {
-        Self { max_weight: 1 }
+        let max_weight = std::thread::available_parallelism()
+            .map(|n| n.get() as u32)
+            .unwrap_or(1);
+        Self { max_weight }
     }
 }
 

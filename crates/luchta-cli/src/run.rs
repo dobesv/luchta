@@ -7,7 +7,7 @@ use std::{
     pin::Pin,
     sync::atomic::{AtomicBool, Ordering},
     sync::{Arc, Mutex},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use luchta_cache::{
@@ -25,6 +25,8 @@ use miette::{bail, Context, IntoDiagnostic, Result};
 use owo_colors::OwoColorize;
 
 use crate::cache_ctx::{build_current_state, gather_pkg_dep_pairs, PackageDirResolver};
+use crate::cli::OutputMode;
+use crate::progress::ProgressReporter;
 
 #[derive(Debug)]
 pub struct PreparedWorkspace {
@@ -100,7 +102,11 @@ pub async fn prepare_workspace(
     })
 }
 
-pub async fn run_tasks(workspace_root: &Path, requested_tasks: &[String]) -> Result<()> {
+pub async fn run_tasks(
+    workspace_root: &Path,
+    requested_tasks: &[String],
+    output: OutputMode,
+) -> Result<()> {
     let PreparedWorkspace {
         packages,
         package_graph,
@@ -118,10 +124,12 @@ pub async fn run_tasks(workspace_root: &Path, requested_tasks: &[String]) -> Res
         return Ok(());
     }
 
-    report_pruned_tasks(&pruned);
-
     let tasks_to_run = collect_requested_subgraph(&task_graph, requested_tasks, &pruned)?;
     let prefix_width = compute_prefix_width(&task_graph, &tasks_to_run);
+
+    // Build the progress reporter with wave indices for all tasks to run.
+    let (wave_of, total_waves) = compute_wave_indices(&task_graph, &tasks_to_run);
+    let reporter = Arc::new(ProgressReporter::new(output, wave_of, total_waves));
 
     let executor = Arc::new(
         WeightedExecutor::new(max_weight)
@@ -162,6 +170,7 @@ pub async fn run_tasks(workspace_root: &Path, requested_tasks: &[String]) -> Res
         task_graph: &task_graph,
         cache: &cache,
         output_hashes: &output_hashes,
+        reporter: &reporter,
     };
     let run_result = dispatch_loop(&mut receiver, &ctx).await;
 
@@ -172,6 +181,9 @@ pub async fn run_tasks(workspace_root: &Path, requested_tasks: &[String]) -> Res
     if any_failed.load(Ordering::SeqCst) {
         bail!("one or more tasks failed");
     }
+
+    // Print final summary on success.
+    println!("{}", reporter.render_summary());
 
     Ok(())
 }
@@ -190,6 +202,7 @@ struct DispatchContext<'a> {
     task_graph: &'a TaskGraph,
     cache: &'a Arc<Cache>,
     output_hashes: &'a Arc<Mutex<HashMap<TaskId, [u8; 32]>>>,
+    reporter: &'a Arc<ProgressReporter>,
 }
 
 struct TaskRunContext {
@@ -240,6 +253,22 @@ enum CacheInputState {
     Disabled,
 }
 
+/// Interval between periodic progress lines.
+///
+/// Defaults to 5 seconds. Overridable via the `LUCHTA_PROGRESS_INTERVAL_MS`
+/// environment variable (milliseconds), primarily so tests can exercise the
+/// periodic-progress path quickly. A missing, empty, unparseable, or zero value
+/// falls back to the 5-second default.
+fn progress_interval_duration() -> Duration {
+    const DEFAULT_MS: u64 = 5_000;
+    let ms = std::env::var("LUCHTA_PROGRESS_INTERVAL_MS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|&ms| ms > 0)
+        .unwrap_or(DEFAULT_MS);
+    Duration::from_millis(ms)
+}
+
 /// Drives the walker's ready-task channel until it drains (normal completion)
 /// or a shutdown signal (Ctrl-C / SIGTERM) arrives. Returns `Ok(())` on normal
 /// completion and `Err(..)` when interrupted.
@@ -249,14 +278,24 @@ async fn dispatch_loop(
 ) -> Result<()> {
     let signal = shutdown_signal();
     tokio::pin!(signal);
+    let mut progress_interval = tokio::time::interval(progress_interval_duration());
+    progress_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    progress_interval.tick().await;
 
     loop {
         tokio::select! {
             signal_result = &mut signal => {
-                signal_result?;
+                let shutdown = signal_result?;
                 // Mark interrupted BEFORE returning so in-flight task runners
                 // suppress their crash output once shutdown kills the workers.
                 ctx.interrupted.store(true, Ordering::SeqCst);
+                eprintln!(
+                    "Interrupted by {}: {} tasks running after {}s; RSS: {}",
+                    shutdown.name(),
+                    ctx.reporter.running_count(),
+                    ctx.reporter.start.elapsed().as_secs(),
+                    crate::rss::format_rss(crate::rss::process_tree_rss_bytes()),
+                );
                 break Err(miette::miette!("interrupted"));
             }
             message = receiver.recv() => {
@@ -264,6 +303,12 @@ async fn dispatch_loop(
                     break Ok(());
                 };
                 dispatch_ready_task(task_node, done_tx, ctx);
+            }
+            _ = progress_interval.tick() => {
+                if ctx.reporter.mode == OutputMode::Default && ctx.reporter.running_count() > 0 {
+                    let rss = crate::rss::format_rss(crate::rss::process_tree_rss_bytes());
+                    eprintln!("{}", ctx.reporter.render_progress(&rss));
+                }
             }
         }
     }
@@ -406,20 +451,16 @@ fn describe_planned_action(
     }
 }
 
-/// Group the selected tasks into ordered execution "waves" using longest-path
-/// layering over the subgraph induced by `tasks_to_run`.
+/// Compute longest-path wave indices over subgraph induced by `tasks_to_run`.
 ///
-/// A task lands in wave `N` where `N` is one greater than the deepest wave of
-/// any of its dependencies that are also in `tasks_to_run`. Tasks with no
-/// in-subgraph dependencies are in wave 0. This mirrors how the walker releases
-/// work: a task only becomes ready once all of its dependencies have completed.
-/// Within each returned wave, task ids are sorted for stable, readable output.
-fn compute_execution_waves(
+/// A task lands in wave `N` where `N` is one greater than deepest wave of any
+/// of its dependencies that are also in `tasks_to_run`. Tasks with no
+/// in-subgraph dependencies are in wave 0. Returns `(wave_of, total_waves)`,
+/// where `total_waves` is `max_wave + 1`, or `0` when `tasks_to_run` is empty.
+fn compute_wave_indices(
     task_graph: &TaskGraph,
     tasks_to_run: &HashSet<TaskId>,
-) -> Vec<Vec<TaskId>> {
-    let mut depth_of: HashMap<TaskId, usize> = HashMap::new();
-
+) -> (HashMap<TaskId, usize>, usize) {
     // Resolve each task's wave by recursing through its dependencies. Memoize so
     // repeated dependencies are only computed once. The graph is acyclic
     // (validated during TaskGraph::build), so recursion terminates.
@@ -427,9 +468,9 @@ fn compute_execution_waves(
         task_id: &TaskId,
         task_graph: &TaskGraph,
         tasks_to_run: &HashSet<TaskId>,
-        depth_of: &mut HashMap<TaskId, usize>,
+        wave_of: &mut HashMap<TaskId, usize>,
     ) -> usize {
-        if let Some(&depth) = depth_of.get(task_id) {
+        if let Some(&depth) = wave_of.get(task_id) {
             return depth;
         }
 
@@ -439,23 +480,46 @@ fn compute_execution_waves(
                 continue;
             }
             let dependency_depth =
-                resolve_depth(&dependency.id, task_graph, tasks_to_run, depth_of) + 1;
+                resolve_depth(&dependency.id, task_graph, tasks_to_run, wave_of) + 1;
             depth = depth.max(dependency_depth);
         }
 
-        depth_of.insert(task_id.clone(), depth);
+        wave_of.insert(task_id.clone(), depth);
         depth
     }
 
+    if tasks_to_run.is_empty() {
+        return (HashMap::new(), 0);
+    }
+
+    let mut wave_of: HashMap<TaskId, usize> = HashMap::with_capacity(tasks_to_run.len());
     let mut max_depth = 0;
     for task_id in tasks_to_run {
-        let depth = resolve_depth(task_id, task_graph, tasks_to_run, &mut depth_of);
+        let depth = resolve_depth(task_id, task_graph, tasks_to_run, &mut wave_of);
         max_depth = max_depth.max(depth);
     }
 
-    let mut waves: Vec<Vec<TaskId>> = vec![Vec::new(); max_depth + 1];
-    for (task_id, depth) in depth_of {
-        waves[depth].push(task_id);
+    (wave_of, max_depth + 1)
+}
+
+/// Group the selected tasks into ordered execution "waves" using longest-path
+/// layering over the subgraph induced by `tasks_to_run`.
+///
+/// This mirrors how the walker releases work: a task only becomes ready once
+/// all of its dependencies have completed. Within each returned wave, task ids
+/// are sorted for stable, readable output.
+fn compute_execution_waves(
+    task_graph: &TaskGraph,
+    tasks_to_run: &HashSet<TaskId>,
+) -> Vec<Vec<TaskId>> {
+    let (wave_of, total_waves) = compute_wave_indices(task_graph, tasks_to_run);
+    if total_waves == 0 {
+        return Vec::new();
+    }
+
+    let mut waves: Vec<Vec<TaskId>> = vec![Vec::new(); total_waves];
+    for (task_id, wave_index) in wave_of {
+        waves[wave_index].push(task_id);
     }
 
     for wave in &mut waves {
@@ -465,7 +529,22 @@ fn compute_execution_waves(
     waves
 }
 
-fn shutdown_signal() -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
+#[derive(Debug, Clone, Copy)]
+enum ShutdownSignal {
+    CtrlC,
+    SigTerm,
+}
+
+impl ShutdownSignal {
+    fn name(self) -> &'static str {
+        match self {
+            Self::CtrlC => "SIGINT (Ctrl-C)",
+            Self::SigTerm => "SIGTERM",
+        }
+    }
+}
+
+fn shutdown_signal() -> Pin<Box<dyn Future<Output = Result<ShutdownSignal>> + Send>> {
     Box::pin(async {
         #[cfg(unix)]
         {
@@ -474,12 +553,15 @@ fn shutdown_signal() -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
                     .into_diagnostic()
                     .wrap_err("failed to install SIGTERM handler")?;
 
-            tokio::select! {
+            let signal = tokio::select! {
                 result = tokio::signal::ctrl_c() => {
                     result.into_diagnostic().wrap_err("failed to install Ctrl-C handler")?;
+                    ShutdownSignal::CtrlC
                 }
-                _ = sigterm.recv() => {}
-            }
+                _ = sigterm.recv() => ShutdownSignal::SigTerm,
+            };
+
+            Ok(signal)
         }
 
         #[cfg(not(unix))]
@@ -488,9 +570,8 @@ fn shutdown_signal() -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
                 .await
                 .into_diagnostic()
                 .wrap_err("failed to install Ctrl-C handler")?;
+            Ok(ShutdownSignal::CtrlC)
         }
-
-        Ok(())
     })
 }
 
@@ -681,6 +762,8 @@ fn dispatch_ready_task(task_node: TaskNode, done_tx: CompletionSignal, ctx: &Dis
     let task_id = task_node.id.clone();
 
     if !ctx.tasks_to_run.contains(&task_id) {
+        // Task not in requested subgraph — not counted.
+        ctx.reporter.task_finished_other(&task_id);
         let _ = done_tx.send(true);
         return;
     }
@@ -690,26 +773,22 @@ fn dispatch_ready_task(task_node: TaskNode, done_tx: CompletionSignal, ctx: &Dis
     if let Some(message) = ctx.invalid.get(&task_id) {
         ctx.any_failed.store(true, Ordering::SeqCst);
         eprintln!("{} {}", "✖".red(), message.red());
+        // Invalid/config-error — NOT counted (failure path handles it).
+        ctx.reporter.task_finished_other(&task_id);
         let _ = done_tx.send(false);
         return;
     }
 
     let Some(request) = ctx.commands.get(&task_id).cloned() else {
-        println!(
-            "{} {} (no command, skipping)",
-            "○".dimmed(),
-            task_id.to_string().dimmed()
-        );
+        // No command — treat ordering-only node as completed, not skipped.
+        ctx.reporter.task_ran(&task_id);
         let _ = done_tx.send(true);
         return;
     };
 
     if ctx.any_failed.load(Ordering::SeqCst) {
-        println!(
-            "{} {} (skipped due to previous failure)",
-            "○".dimmed(),
-            task_id
-        );
+        // Skipped due to previous failure — not counted.
+        ctx.reporter.task_finished_other(&task_id);
         let _ = done_tx.send(false);
         return;
     }
@@ -721,6 +800,8 @@ fn dispatch_ready_task(task_node: TaskNode, done_tx: CompletionSignal, ctx: &Dis
     if cache_enabled {
         if let Some(decision) = try_cache_skip(&task_id, ctx) {
             if matches!(decision, Decision::Skip) {
+                // Cache hit — this IS the "skipped" count.
+                ctx.reporter.task_skipped_cache_hit(&task_id);
                 let _ = done_tx.send(true);
                 return;
             }
@@ -1015,13 +1096,21 @@ fn spawn_task_runner(
         output_hash_record,
     } = build_task_run_context(&task_id, cache_enabled, ctx);
 
-    let log_sink = cache_write.as_ref().map(|_| ExecutionLogSink::new());
-    if let Some(sink) = &log_sink {
-        request.log_sink = Some(sink.clone());
-    }
+    let log_sink = ExecutionLogSink::new();
+    request.log_sink = Some(log_sink.clone());
+
+    // Clone reporter Arc to move into the spawned future.
+    let reporter = Arc::clone(ctx.reporter);
+
+    let started_task_id = task_id.clone();
 
     tokio::spawn(async move {
-        let outcome_res = executor.run(&request).await;
+        let outcome_res = executor
+            .run_with_on_start(&request, {
+                let reporter = Arc::clone(&reporter);
+                move || reporter.task_started(&started_task_id)
+            })
+            .await;
         let end_unix_ms = now_unix_ms();
         let succeeded = matches!(&outcome_res, Ok(result) if result.status.success());
         // Override the declared output patterns with worker-detected outputs
@@ -1035,22 +1124,29 @@ fn spawn_task_runner(
             cache_write,
             output_hashes: &output_hashes,
             output_hash_record: output_hash_record.as_ref(),
-            log_sink: log_sink.as_ref(),
+            log_sink: Some(&log_sink),
             outcome: outcome_res.as_ref().ok(),
             succeeded,
             end_unix_ms,
         })
         .await;
 
-        // A log sink is installed only for cache-enabled tasks (engine logging
-        // is sink-only while a sink exists). Replay the captured output so a
-        // freshly-executed cached task is not silent — on success and failure
-        // alike. Cache-hit/skipped tasks never reach here (no execution).
-        if let Some(sink) = &log_sink {
-            print_captured_logs(sink);
+        let interrupted_run = interrupted.load(Ordering::SeqCst);
+        let failed = !succeeded;
+        if failed && !interrupted_run {
+            print_captured_logs(&log_sink);
         }
 
         report_task_outcome(&task_id, &outcome_res, &any_failed, &interrupted);
+
+        // Report task completion to the progress reporter.
+        if succeeded {
+            reporter.task_ran(&task_id);
+        } else {
+            // Failed tasks are NOT counted in done/skipped.
+            reporter.task_finished_other(&task_id);
+        }
+
         let _ = done_tx.send(succeeded);
     });
 }
@@ -1307,6 +1403,84 @@ mod tests {
             env,
             ..TaskDefinition::default()
         }
+    }
+
+    fn build_test_task_graph(
+        depends_on: impl Fn(TaskName) -> Vec<luchta_types::DependsOn>,
+    ) -> TaskGraph {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        for (package, dependencies) in [
+            ("@repo/a", vec!["@repo/b"]),
+            ("@repo/b", vec!["@repo/c"]),
+            ("@repo/c", Vec::new()),
+        ] {
+            let package_dir = temp_dir
+                .path()
+                .join("packages")
+                .join(package.trim_start_matches("@repo/"));
+            std::fs::create_dir_all(&package_dir).expect("create package dir");
+            std::fs::write(
+                package_dir.join("package.json"),
+                serde_json::json!({
+                    "name": package,
+                    "version": "1.0.0",
+                    "dependencies": dependencies
+                        .into_iter()
+                        .map(|name| (name.to_string(), serde_json::Value::String("1.0.0".to_string())))
+                        .collect::<serde_json::Map<_, _>>(),
+                })
+                .to_string(),
+            )
+            .expect("write package manifest");
+        }
+
+        let package_graph = PackageGraph::build(vec![
+            PackageNode::new(
+                PackageName::from("@repo/a"),
+                temp_dir.path().join("packages/a"),
+            ),
+            PackageNode::new(
+                PackageName::from("@repo/b"),
+                temp_dir.path().join("packages/b"),
+            ),
+            PackageNode::new(
+                PackageName::from("@repo/c"),
+                temp_dir.path().join("packages/c"),
+            ),
+        ])
+        .expect("build package graph");
+        let pipeline = HashMap::from([(
+            TaskName::from("build"),
+            TaskDefinition {
+                depends_on: depends_on(TaskName::from("build")),
+                ..TaskDefinition::default()
+            },
+        )]);
+
+        TaskGraph::build(&package_graph, &pipeline).expect("build task graph")
+    }
+
+    #[test]
+    fn compute_wave_indices_covers_every_selected_task() {
+        let task_graph = build_test_task_graph(|task_name| {
+            vec![luchta_types::DependsOn::DirectUpstream(task_name)]
+        });
+        let tasks_to_run = HashSet::from([
+            TaskId::new("@repo/a", "build"),
+            TaskId::new("@repo/b", "build"),
+            TaskId::new("@repo/c", "build"),
+        ]);
+
+        let (wave_of, total_waves) = compute_wave_indices(&task_graph, &tasks_to_run);
+
+        assert_eq!(wave_of.len(), tasks_to_run.len());
+        for task_id in &tasks_to_run {
+            assert!(wave_of.contains_key(task_id), "missing {task_id}");
+        }
+        assert_eq!(total_waves, 3);
+        assert_eq!(wave_of[&TaskId::new("@repo/c", "build")], 0);
+        assert_eq!(wave_of[&TaskId::new("@repo/b", "build")], 1);
+        assert_eq!(wave_of[&TaskId::new("@repo/a", "build")], 2);
     }
 
     #[test]
