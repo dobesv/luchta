@@ -18,6 +18,8 @@ use tokio::{
 use tokio_stream::StreamExt;
 use tokio_util::codec::{FramedRead, LinesCodec, LinesCodecError};
 
+use crate::ExecutionLogSink;
+
 use super::{
     handle::{JobMap, WriterContext, WriterRuntime},
     protocol::{LogStream, WorkerMessage, WorkerResponse},
@@ -28,6 +30,12 @@ const MAX_LINE_LENGTH: usize = 1 << 20;
 pub(crate) struct ReaderContext {
     pub(crate) jobs: JobMap,
     pub(crate) is_shutdown: Arc<std::sync::atomic::AtomicBool>,
+}
+
+pub(crate) struct LogLineContext<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) width: usize,
+    pub(crate) sink: Option<&'a ExecutionLogSink>,
 }
 
 enum ReaderStep {
@@ -270,9 +278,17 @@ async fn drop_job_sender(jobs: &JobMap, id: &str) {
     jobs.remove(id);
 }
 
-pub(crate) fn print_log_line(id: &str, stream: LogStream, line: &str, width: usize) {
-    let w = if width > 0 { width } else { id.len() };
-    let prefix = format!("{id:<w$} |");
+pub(crate) fn print_log_line(context: LogLineContext<'_>, stream: LogStream, line: &str) {
+    let w = if context.width > 0 {
+        context.width
+    } else {
+        context.id.len()
+    };
+    let prefix = format!("{:<w$} |", context.id);
+    if let Some(sink) = context.sink {
+        sink.push(stream, line.to_string());
+        return;
+    }
     match stream {
         LogStream::Stdout => println!("{} {}", prefix, line),
         LogStream::Stderr => eprintln!("{} {}", prefix, line),

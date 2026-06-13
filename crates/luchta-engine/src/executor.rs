@@ -16,7 +16,7 @@ use tokio::{
     sync::Semaphore,
 };
 
-use crate::{task_graph::TaskNode, WorkerError, WorkerManager, WorkerRequest};
+use crate::{task_graph::TaskNode, LogStream, WorkerError, WorkerManager, WorkerRequest};
 
 #[derive(Debug, Clone)]
 pub struct ExecutionRequest {
@@ -26,6 +26,7 @@ pub struct ExecutionRequest {
     pub env: HashMap<String, String>,
     pub worker: Option<String>,
     pub workspace: Option<String>,
+    pub log_sink: Option<ExecutionLogSink>,
 }
 
 impl ExecutionRequest {
@@ -37,6 +38,7 @@ impl ExecutionRequest {
             env: HashMap::new(),
             worker: None,
             workspace: None,
+            log_sink: None,
         }
     }
 
@@ -52,6 +54,11 @@ impl ExecutionRequest {
 
     pub fn with_worker(mut self, name: impl Into<String>) -> Self {
         self.worker = Some(name.into());
+        self
+    }
+
+    pub fn with_log_sink(mut self, sink: ExecutionLogSink) -> Self {
+        self.log_sink = Some(sink);
         self
     }
 }
@@ -98,6 +105,71 @@ pub enum ExecutorError {
     },
     #[error("task {task} missing command for execute() seam; use WeightedExecutor::run with ExecutionRequest")]
     MissingCommand { task: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapturedLogLine {
+    pub stream: LogStream,
+    pub line: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ExecutionLogSink {
+    lines: Arc<Mutex<Vec<CapturedLogLine>>>,
+}
+
+impl ExecutionLogSink {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn push(&self, stream: LogStream, line: impl Into<String>) {
+        self.lines
+            .lock()
+            .expect("execution log sink poisoned")
+            .push(CapturedLogLine {
+                stream,
+                line: line.into(),
+            });
+    }
+
+    #[must_use]
+    pub fn lines(&self) -> Vec<CapturedLogLine> {
+        self.lines
+            .lock()
+            .expect("execution log sink poisoned")
+            .clone()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskRunOutcome {
+    pub status: ExitStatus,
+    pub detected_inputs: Option<Vec<String>>,
+    pub detected_outputs: Option<Vec<String>>,
+}
+
+impl TaskRunOutcome {
+    fn shell(status: ExitStatus) -> Self {
+        Self {
+            status,
+            detected_inputs: None,
+            detected_outputs: None,
+        }
+    }
+
+    fn worker(
+        status: ExitStatus,
+        detected_inputs: Option<Vec<String>>,
+        detected_outputs: Option<Vec<String>>,
+    ) -> Self {
+        Self {
+            status,
+            detected_inputs,
+            detected_outputs,
+        }
+    }
 }
 
 /// Spawns and awaits a single task, returning its process exit status.
@@ -162,7 +234,7 @@ impl WeightedExecutor {
     }
 
     /// Run one task request, respecting weight-based concurrency.
-    pub async fn run(&self, request: &ExecutionRequest) -> Result<ExitStatus, ExecutorError> {
+    pub async fn run(&self, request: &ExecutionRequest) -> Result<TaskRunOutcome, ExecutorError> {
         self.validate_weight(&request.task)?;
 
         let permit = self
@@ -189,6 +261,7 @@ impl WeightedExecutor {
                             workspace: request.workspace.clone(),
                             env: request.env.clone(),
                         },
+                        request.log_sink.as_ref(),
                     )
                     .await
                     .map_err(|source| ExecutorError::Worker {
@@ -196,7 +269,9 @@ impl WeightedExecutor {
                         source,
                     });
                 drop(permit);
-                return result.map(synthesize_exit_status);
+                return result.map(|(code, inputs, outputs, _logs)| {
+                    TaskRunOutcome::worker(synthesize_exit_status(code), inputs, outputs)
+                });
             }
             (Some(worker_name), None) => {
                 drop(permit);
@@ -210,7 +285,7 @@ impl WeightedExecutor {
 
         let status = self.run_shell_command(request, &task_name).await;
         drop(permit);
-        status
+        status.map(TaskRunOutcome::shell)
     }
 
     async fn run_shell_command(
@@ -218,69 +293,30 @@ impl WeightedExecutor {
         request: &ExecutionRequest,
         task_name: &str,
     ) -> Result<ExitStatus, ExecutorError> {
-        let width = if self.prefix_width > 0 {
-            self.prefix_width
-        } else {
-            task_name.len()
-        };
-        let prefix = format!("{task_name:<width$} |");
-
-        let mut command = Command::new("sh");
-        command.arg("-c").arg(&request.command);
-        command.stdout(std::process::Stdio::piped());
-        command.stderr(std::process::Stdio::piped());
-
-        if let Some(cwd) = &request.cwd {
-            command.current_dir(cwd);
-        }
-
-        if !request.env.is_empty() {
-            command.envs(&request.env);
-        }
-
-        let mut child = command.spawn().map_err(|source| ExecutorError::Spawn {
-            task: task_name.to_owned(),
-            source,
-        })?;
+        let prefix = task_prefix(task_name, self.prefix_width);
+        let mut child = spawn_shell_child(request, task_name)?;
 
         let stdout = child.stdout.take().expect("child stdout piped");
         let stderr = child.stderr.take().expect("child stderr piped");
 
-        let stdout_task_name = task_name.to_owned();
-        let stdout_prefix = prefix.clone();
-        let stdout_handle = tokio::spawn(async move {
-            let mut lines = BufReader::new(stdout).lines();
-            while let Some(line) =
-                lines
-                    .next_line()
-                    .await
-                    .map_err(|source| ExecutorError::StdoutRead {
-                        task: stdout_task_name.clone(),
-                        source,
-                    })?
-            {
-                println!("{} {}", stdout_prefix, line);
-            }
-            Ok::<(), ExecutorError>(())
-        });
-
-        let stderr_task_name = task_name.to_owned();
-        let stderr_prefix = prefix.clone();
-        let stderr_handle = tokio::spawn(async move {
-            let mut lines = BufReader::new(stderr).lines();
-            while let Some(line) =
-                lines
-                    .next_line()
-                    .await
-                    .map_err(|source| ExecutorError::StderrRead {
-                        task: stderr_task_name.clone(),
-                        source,
-                    })?
-            {
-                eprintln!("{} {}", stderr_prefix, line);
-            }
-            Ok::<(), ExecutorError>(())
-        });
+        let stdout_handle = spawn_stream_logger(
+            stdout,
+            StreamLoggerContext {
+                task_name: task_name.to_owned(),
+                prefix: prefix.clone(),
+                sink: request.log_sink.clone(),
+                stream: LogStream::Stdout,
+            },
+        );
+        let stderr_handle = spawn_stream_logger(
+            stderr,
+            StreamLoggerContext {
+                task_name: task_name.to_owned(),
+                prefix,
+                sink: request.log_sink.clone(),
+                stream: LogStream::Stderr,
+            },
+        );
 
         let status = child.wait().await.map_err(|source| ExecutorError::Wait {
             task: task_name.to_owned(),
@@ -321,7 +357,7 @@ impl TaskExecutor for WeightedExecutor {
         };
 
         match request {
-            Some(request) => self.run(&request).await,
+            Some(request) => self.run(&request).await.map(|outcome| outcome.status),
             None => Err(ExecutorError::MissingCommand {
                 task: task.id.to_string(),
             }),
@@ -337,6 +373,90 @@ fn synthesize_exit_status(code: i32) -> ExitStatus {
 #[cfg(not(unix))]
 fn synthesize_exit_status(_code: i32) -> ExitStatus {
     unreachable!("resident workers are only supported on Unix")
+}
+
+fn task_prefix(task_name: &str, prefix_width: usize) -> String {
+    let width = if prefix_width > 0 {
+        prefix_width
+    } else {
+        task_name.len()
+    };
+    format!("{task_name:<width$} |")
+}
+
+fn spawn_shell_child(
+    request: &ExecutionRequest,
+    task_name: &str,
+) -> Result<tokio::process::Child, ExecutorError> {
+    let mut command = Command::new("sh");
+    command.arg("-c").arg(&request.command);
+    command.stdout(std::process::Stdio::piped());
+    command.stderr(std::process::Stdio::piped());
+
+    if let Some(cwd) = &request.cwd {
+        command.current_dir(cwd);
+    }
+
+    if !request.env.is_empty() {
+        command.envs(&request.env);
+    }
+
+    command.spawn().map_err(|source| ExecutorError::Spawn {
+        task: task_name.to_owned(),
+        source,
+    })
+}
+
+struct StreamLoggerContext {
+    task_name: String,
+    prefix: String,
+    sink: Option<ExecutionLogSink>,
+    stream: LogStream,
+}
+
+fn spawn_stream_logger<R>(
+    reader: R,
+    context: StreamLoggerContext,
+) -> tokio::task::JoinHandle<Result<(), ExecutorError>>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(reader).lines();
+        while let Some(line) = lines
+            .next_line()
+            .await
+            .map_err(|source| stream_read_error(context.stream, &context.task_name, source))?
+        {
+            emit_log_line(&context.prefix, context.sink.as_ref(), context.stream, line);
+        }
+        Ok(())
+    })
+}
+
+fn stream_read_error(stream: LogStream, task_name: &str, source: std::io::Error) -> ExecutorError {
+    match stream {
+        LogStream::Stdout => ExecutorError::StdoutRead {
+            task: task_name.to_owned(),
+            source,
+        },
+        LogStream::Stderr => ExecutorError::StderrRead {
+            task: task_name.to_owned(),
+            source,
+        },
+    }
+}
+
+fn emit_log_line(prefix: &str, sink: Option<&ExecutionLogSink>, stream: LogStream, line: String) {
+    if let Some(sink) = sink {
+        sink.push(stream, line);
+        return;
+    }
+
+    match stream {
+        LogStream::Stdout => println!("{} {}", prefix, line),
+        LogStream::Stderr => eprintln!("{} {}", prefix, line),
+    }
 }
 
 #[cfg(test)]
@@ -498,9 +618,9 @@ mod tests {
         let executor = WeightedExecutor::new(2);
         let request = ExecutionRequest::new(task_node("pkg", "echo", 1), "echo hello");
 
-        let status = executor.run(&request).await.expect("real command succeeds");
+        let outcome = executor.run(&request).await.expect("real command succeeds");
 
-        assert!(status.success());
+        assert!(outcome.status.success());
         assert_eq!(executor.semaphore().available_permits(), 2);
     }
 
@@ -575,7 +695,7 @@ exit 0
         let executor = WeightedExecutor::new(2).with_worker_manager(Arc::clone(&manager));
         let request = ExecutionRequest::new(task, command).with_worker("fake");
 
-        let status = executor
+        let outcome = executor
             .run(&request)
             .await
             .expect("worker command returns status");
@@ -585,7 +705,75 @@ exit 0
             .expect("manager only ref")
             .shutdown()
             .await;
-        status
+        outcome.status
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn worker_logs_are_captured_once_in_sink() {
+        let temp = TempDir::new().expect("tempdir");
+        let worker_path =
+            write_worker_script(temp.path(), &worker_done_script(0, Some("only-once")));
+        let manager = Arc::new(manager_with_worker(&worker_path));
+        let executor = WeightedExecutor::new(2).with_worker_manager(Arc::clone(&manager));
+        let sink = ExecutionLogSink::new();
+        let request = ExecutionRequest::new(task_node("pkg", "build", 1), "echo ignored")
+            .with_worker("fake")
+            .with_log_sink(sink.clone());
+
+        let outcome = executor.run(&request).await.expect("worker succeeds");
+
+        assert!(outcome.status.success());
+        assert_eq!(
+            sink.lines(),
+            vec![CapturedLogLine {
+                stream: LogStream::Stdout,
+                line: "only-once".to_owned(),
+            }]
+        );
+
+        drop(executor);
+        Arc::try_unwrap(manager)
+            .expect("manager only ref")
+            .shutdown()
+            .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn worker_log_sink_can_be_replayed_once_and_cache_hit_stays_quiet() {
+        let temp = TempDir::new().expect("tempdir");
+        let worker_path = write_worker_script(
+            temp.path(),
+            &worker_done_script(0, Some("fresh-run-visible")),
+        );
+        let manager = Arc::new(manager_with_worker(&worker_path));
+        let executor = WeightedExecutor::new(2).with_worker_manager(Arc::clone(&manager));
+        let sink = ExecutionLogSink::new();
+        let request = ExecutionRequest::new(task_node("pkg", "build", 1), "echo ignored")
+            .with_worker("fake")
+            .with_log_sink(sink.clone());
+
+        let outcome = executor.run(&request).await.expect("worker succeeds");
+
+        assert!(outcome.status.success());
+        let first_replay = sink.lines();
+        assert_eq!(
+            first_replay,
+            vec![CapturedLogLine {
+                stream: LogStream::Stdout,
+                line: "fresh-run-visible".to_owned(),
+            }]
+        );
+        let cache_hit_replay = Vec::<CapturedLogLine>::new();
+        assert!(cache_hit_replay.is_empty());
+        assert_eq!(sink.lines(), first_replay);
+
+        drop(executor);
+        Arc::try_unwrap(manager)
+            .expect("manager only ref")
+            .shutdown()
+            .await;
     }
 
     #[cfg(unix)]

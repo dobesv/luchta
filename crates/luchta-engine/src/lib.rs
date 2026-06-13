@@ -7,10 +7,13 @@ use luchta_types::TaskId;
 use luchta_workspace::WorkspaceError;
 use thiserror::Error;
 
-pub use executor::{ExecutionRequest, ExecutorError, TaskExecutor, WeightedExecutor};
+pub use executor::{
+    ExecutionLogSink, ExecutionRequest, ExecutorError, TaskExecutor, TaskRunOutcome,
+    WeightedExecutor,
+};
 pub use luchta_worker::{
-    LogStream, ResolveDecision, ResolveMode, ResolveResult, ResolveTask, TaskModification,
-    WorkerMessage, WorkerRequest, WorkerResponse,
+    CapturedLogLine, LogStream, ResolveDecision, ResolveMode, ResolveResult, ResolveTask,
+    TaskModification, WorkerMessage, WorkerRequest, WorkerResponse,
 };
 pub use task_graph::{
     is_root_task, root_package_name, root_task_id, DeadDependencyReason, DependencyValidationError,

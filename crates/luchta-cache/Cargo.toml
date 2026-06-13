@@ -1,0 +1,23 @@
+[package]
+name = "luchta-cache"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description.workspace = true
+
+[dependencies]
+luchta-types = { path = "../luchta-types" }
+serde = { workspace = true, features = ["derive"] }
+bincode = { workspace = true }
+blake3 = { workspace = true }
+gix = { workspace = true }
+globset = { workspace = true }
+thiserror = { workspace = true }
+walkdir = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

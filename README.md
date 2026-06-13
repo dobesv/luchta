@@ -182,6 +182,10 @@ The top-level `tasks` map defines the pipeline. Each task may set:
   from the package's `package.json` is used.
 - `worker`: name of a long-lived worker (from the `workers` map) that should
   execute this task. The named worker **must** be defined or the run fails.
+- `cache`: opt-in build cache. Provide an object (`cache: {}`) to enable change-detection skips for successful prior runs; omit the field to disable. (Reserved for future per-task cache options.)
+- `inputs`: relative input paths/globs. Literal paths and glob matches are hashed from git-tracked files, so `.gitignore` is respected.
+- `outputs`: relative output paths/globs. These are checked on disk, so missing/deleted outputs invalidate cache entries even if ignored by git.
+- `env`: environment variables passed to task. `value` pins explicit value, omitted `value` inherits from current `luchta` process environment, and `input: false` keeps variable available to task while excluding it from cache hash.
 
 ```bash
 # Run the build task for all relevant packages
@@ -218,13 +222,40 @@ Then point a task at a worker with its `worker` field. Luchta ships the
   yarn-worker tasks, the task's `command` becomes the Yarn subcommand
   (defaulting to the task name) and is invoked as `yarn workspace <pkg> <command>`
   for package tasks, or `yarn <command>` at the workspace root.
+  Worker-reported detected inputs/outputs replace declared cache patterns for next run decisions; yarn worker always adds `package.json` to detected inputs so script changes invalidate cache entries.
 - **luchta-bash-worker** runs arbitrary commands via `sh -c`, useful for
   tasks that don't need Yarn workspace wrapping.
 
 > **Note:** Stay-resident workers are supported on Unix only.
 
+### Build Cache
+Luchta build cache is **opt-in** per task via `cache: {}`. Cached task skips only when prior run succeeded and all cache inputs still match: task spec, significant env, package dependency versions from `yarn.lock`, dependency-task output hashes, declared or worker-detected inputs, and outputs.
+
+- Default cache dir: `<workspace>/.luchta/cache`
+- Override: `LUCHTA_CACHE_DIR=/abs/path`
+- Inputs use git-tracked listing, so `.gitignore` is honored for globs and literals.
+- Outputs are checked directly on disk, so missing output reruns task.
+- Worker-detected inputs/outputs replace declared patterns for later cache checks.
+- Logs are stored in cache records; only FAILED-task logs are printed by default.
+
+Example:
+```typescript
+build: {
+  worker: "yarn",
+  cache: {},
+  inputs: ["src/**/*.ts", "package.json"],
+  outputs: ["dist/**"],
+  env: {
+    NODE_ENV: { value: "production" },
+    CI_JOB_ID: { input: false }
+  }
+}
+```
+
+
 ## Roadmap
 
 - **Phase 1 (Current):** Multi-crate workspace skeleton, CI, and release tooling (nextest, knope changesets, GitHub release workflows).
 - **Phase 2:** Foundation libraries (workspace discovery, lockfile parsing, graph construction, weighted parallel execution).
-- **Future:** Caching (blake3 hashing) and advanced features.
+- **Phase 3 (Current):** Opt-in build change-detection cache (blake3 hashing, filesystem-backed) — see "Build cache" above.
+- **Future:** Cross-process build locking and remote cache.

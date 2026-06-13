@@ -5,7 +5,7 @@
 
 mod config;
 
-use std::{fmt, str::FromStr};
+use std::{collections::BTreeMap, fmt, str::FromStr};
 
 pub use config::*;
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
@@ -135,7 +135,24 @@ impl fmt::Display for TaskId {
     }
 }
 
+/// Build-cache environment variable specification.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnvSpec {
+    /// Explicit value to provide to task. When absent, value is inherited from
+    /// luchta process environment at run time.
+    #[serde(default)]
+    pub value: Option<String>,
+    /// When false, variable is still provided to task but excluded from
+    /// significant-environment hash used for cache keys.
+    #[serde(default = "default_env_input")]
+    pub input: bool,
+}
+
 /// Task configuration shared across package graph and execution layers.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub struct CacheConfig {}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TaskDefinition {
     /// Dependencies that must complete before task may run.
@@ -156,6 +173,18 @@ pub struct TaskDefinition {
     /// without a command) is a no-op ordering node.
     #[serde(default)]
     pub worker: Option<String>,
+    /// Enables build-cache for this task when config object is present.
+    #[serde(default)]
+    pub cache: Option<CacheConfig>,
+    /// Significant input paths or globs relative to workspace/package context.
+    #[serde(default)]
+    pub inputs: Vec<String>,
+    /// Output paths or globs produced by task for cache restore.
+    #[serde(default)]
+    pub outputs: Vec<String>,
+    /// Environment variables provided to task, keyed by variable name.
+    #[serde(default)]
+    pub env: BTreeMap<String, EnvSpec>,
 }
 
 impl TaskDefinition {
@@ -166,6 +195,10 @@ impl TaskDefinition {
             weight,
             command: None,
             worker: None,
+            cache: None,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            env: BTreeMap::new(),
         }
     }
 }
@@ -184,6 +217,13 @@ pub fn resolve_script_name<'a>(command: Option<&'a str>, task_name: &'a str) -> 
     }
 }
 
+impl TaskDefinition {
+    #[must_use]
+    pub fn cache_enabled(&self) -> bool {
+        self.cache.is_some()
+    }
+}
+
 impl Default for TaskDefinition {
     fn default() -> Self {
         Self {
@@ -191,12 +231,20 @@ impl Default for TaskDefinition {
             weight: default_task_weight(),
             command: None,
             worker: None,
+            cache: None,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            env: BTreeMap::new(),
         }
     }
 }
 
 fn default_task_weight() -> u32 {
     1
+}
+
+fn default_env_input() -> bool {
+    true
 }
 
 /// Dependency parse error for `DependsOn` string syntax.
@@ -349,7 +397,12 @@ impl<'de> Deserialize<'de> for DependsOn {
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_script_name, DependsOn, PackageName, TaskId, TaskName, ROOT_PACKAGE_NAME};
+    use std::collections::BTreeMap;
+
+    use super::{
+        resolve_script_name, CacheConfig, DependsOn, EnvSpec, PackageName, TaskDefinition, TaskId,
+        TaskName, ROOT_PACKAGE_NAME,
+    };
 
     #[test]
     fn root_task_id_displays_with_hash_syntax_not_synthetic_package() {
@@ -409,5 +462,83 @@ mod tests {
 
         let parsed: DependsOn = serde_json::from_str(&json).expect("deserialize dependency");
         assert_eq!(parsed, dependency);
+    }
+
+    #[test]
+    fn serde_round_trips_env_spec_variants() {
+        let with_value: EnvSpec =
+            serde_json::from_str(r#"{"value":"x"}"#).expect("deserialize value variant");
+        assert_eq!(
+            with_value,
+            EnvSpec {
+                value: Some("x".to_owned()),
+                input: true,
+            }
+        );
+        assert_eq!(
+            serde_json::to_string(&with_value).expect("serialize value variant"),
+            r#"{"value":"x","input":true}"#
+        );
+
+        let excluded_input: EnvSpec =
+            serde_json::from_str(r#"{"input":false}"#).expect("deserialize input variant");
+        assert_eq!(
+            excluded_input,
+            EnvSpec {
+                value: None,
+                input: false,
+            }
+        );
+        assert_eq!(
+            serde_json::to_string(&excluded_input).expect("serialize input variant"),
+            r#"{"value":null,"input":false}"#
+        );
+
+        let inherited: EnvSpec = serde_json::from_str(r#"{}"#).expect("deserialize empty env spec");
+        assert_eq!(
+            inherited,
+            EnvSpec {
+                value: None,
+                input: true,
+            }
+        );
+        assert_eq!(
+            serde_json::to_string(&inherited).expect("serialize empty env spec"),
+            r#"{"value":null,"input":true}"#
+        );
+    }
+
+    #[test]
+    fn task_definition_defaults_new_cache_fields_when_omitted() {
+        let task: TaskDefinition = serde_json::from_str(r#"{"dependsOn":["^build"],"weight":2}"#)
+            .expect("deserialize task without cache fields");
+
+        assert_eq!(
+            task.depends_on,
+            vec![DependsOn::DirectUpstream(TaskName::from("build"))]
+        );
+        assert_eq!(task.weight, 2);
+        assert_eq!(task.cache, None);
+        assert!(!task.cache_enabled());
+        assert!(task.inputs.is_empty());
+        assert!(task.outputs.is_empty());
+        assert_eq!(task.env, BTreeMap::new());
+    }
+
+    #[test]
+    fn task_definition_enables_cache_when_object_present() {
+        let task: TaskDefinition =
+            serde_json::from_str(r#"{"cache":{}}"#).expect("deserialize task with cache object");
+
+        assert_eq!(task.cache, Some(CacheConfig::default()));
+        assert!(task.cache_enabled());
+    }
+
+    #[test]
+    fn task_definition_rejects_boolean_cache_field() {
+        let error = serde_json::from_str::<TaskDefinition>(r#"{"cache":true}"#)
+            .expect_err("boolean cache field must fail");
+
+        assert!(error.to_string().contains("invalid type: boolean `true`"));
     }
 }
