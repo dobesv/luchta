@@ -757,7 +757,7 @@ exit 0
             err,
             ExecutorError::Worker {
                 task,
-                source: WorkerError::Crashed { worker, id }
+                source: WorkerError::Crashed { worker, id, .. }
             } if task == "pkg#worker-crash" && worker == "fake" && id == "pkg#worker-crash"
         ));
         drop(executor);

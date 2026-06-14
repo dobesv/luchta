@@ -1027,13 +1027,14 @@ fn report_task_outcome(
             any_failed,
             interrupted,
         ),
-        Err(error) => report_task_failure(
-            task_id,
-            &format!("failed: {error}"),
-            any_failed,
-            interrupted,
-        ),
+        Err(error) => {
+            report_task_failure(task_id, &format_task_error(error), any_failed, interrupted)
+        }
     }
+}
+
+fn format_task_error(error: &luchta_engine::ExecutorError) -> String {
+    format!("failed: {error}")
 }
 
 fn try_cache_skip(task_id: &TaskId, ctx: &DispatchContext<'_>) -> Option<Decision> {

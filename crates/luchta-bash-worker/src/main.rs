@@ -66,7 +66,15 @@ impl Worker for BashWorker {
     }
 }
 
-#[tokio::main]
+// A single-threaded runtime is sufficient: the worker only orchestrates async
+// I/O (reads JSONL requests, spawns child processes, streams their output) and
+// does no CPU-bound work. The default multi-threaded runtime would spawn one
+// worker thread per CPU, and each thread reserves an 8 MB stack. With several
+// resident workers running at once that committed memory adds up and, on a
+// machine already near its memory commit limit, can push process/thread
+// creation into transient `EAGAIN` ("Resource temporarily unavailable")
+// failures. current_thread keeps the worker's footprint minimal.
+#[tokio::main(flavor = "current_thread")]
 async fn main() {
     run_worker_main(BashWorker).await;
 }
