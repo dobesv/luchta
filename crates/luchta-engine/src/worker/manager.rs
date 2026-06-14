@@ -1,5 +1,7 @@
 use std::{collections::HashMap, io, time::Duration};
 
+const CRASH_DETAIL_WAIT_TIMEOUT: Duration = Duration::from_millis(250);
+
 #[cfg(unix)]
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -29,8 +31,13 @@ pub enum WorkerError {
         #[source]
         source: io::Error,
     },
-    #[error("worker '{worker}' crashed during job '{id}'")]
-    Crashed { worker: String, id: String },
+    #[error("worker '{worker}' crashed during job '{id}'{detail_suffix}")]
+    Crashed {
+        worker: String,
+        id: String,
+        detail: Option<String>,
+        detail_suffix: String,
+    },
     #[error("worker protocol error for job '{id}': {detail}")]
     Protocol { id: String, detail: String },
     #[error("resident workers are only supported on Unix (worker '{worker}', job '{id}')")]
@@ -39,10 +46,10 @@ pub enum WorkerError {
 
 #[cfg(unix)]
 use super::{
-    handle::{JobMap, WorkerHandle, WriterContext},
+    handle::{JobMap, WorkerCrashState, WorkerHandle, WorkerRegistry, WriterContext},
     io_tasks::{
         collect_worker_handles, print_log_line, spawn_reader_task, spawn_reaper_task,
-        spawn_writer_task, LogLineContext, ReaderContext,
+        spawn_stderr_task, spawn_writer_task, LogLineContext, ReaderContext,
     },
     spawn::spawn_worker_process,
 };
@@ -51,7 +58,7 @@ use super::{
 #[derive(Debug)]
 pub struct WorkerManager {
     definitions: HashMap<String, WorkerDefinition>,
-    workers: Arc<Mutex<HashMap<String, Arc<WorkerHandle>>>>,
+    workers: WorkerRegistry,
     spawn_lock: Arc<Mutex<()>>,
     shutdown_timeout: Duration,
     is_shutdown: Arc<AtomicBool>,
@@ -100,14 +107,10 @@ impl WorkerManager {
         // task (e.g. under a concurrency limit), leaving an orphaned worker
         // that shutdown never sees.
         if self.is_shutdown.load(Ordering::SeqCst) {
-            return Err(WorkerError::Crashed {
-                worker: worker_name.to_owned(),
-                id: job_id,
-            });
+            return Err(self.crashed_error(worker_name, &job_id, None));
         }
 
         let handle = self.get_or_spawn(worker_name).await?;
-        let worker = worker_name.to_owned();
         let (tx, rx) = mpsc::channel(64);
 
         {
@@ -121,14 +124,14 @@ impl WorkerManager {
                 Some(writer_tx) => writer_tx.clone(),
                 None => {
                     self.remove_job(&handle, &job_id).await;
-                    return Err(WorkerError::Crashed { worker, id: job_id });
+                    return Err(self.crashed_error_for(worker_name, &handle, &job_id).await);
                 }
             }
         };
 
         if writer_tx.send(message).await.is_err() {
             self.remove_job(&handle, &job_id).await;
-            return Err(WorkerError::Crashed { worker, id: job_id });
+            return Err(self.crashed_error_for(worker_name, &handle, &job_id).await);
         }
 
         Ok((handle, job_id, rx))
@@ -179,12 +182,7 @@ impl WorkerManager {
                         }
                     }
                 }
-                None => {
-                    break Err(WorkerError::Crashed {
-                        worker: worker_name.to_owned(),
-                        id: job_id.clone(),
-                    })
-                }
+                None => break Err(self.crashed_error_for(worker_name, &handle, &job_id).await),
             }
         };
 
@@ -222,7 +220,7 @@ impl WorkerManager {
     }
 
     async fn get_or_spawn(&self, worker_name: &str) -> Result<Arc<WorkerHandle>, WorkerError> {
-        if let Some(existing) = self.workers.lock().await.get(worker_name).cloned() {
+        if let Some(existing) = self.try_reuse_worker(worker_name).await {
             return Ok(existing);
         }
 
@@ -235,31 +233,84 @@ impl WorkerManager {
                 })?;
 
         let _spawn_guard = self.spawn_lock.lock().await;
-        if let Some(existing) = self.workers.lock().await.get(worker_name).cloned() {
+        if let Some(existing) = self.try_reuse_worker(worker_name).await {
             return Ok(existing);
         }
 
-        let handle = Arc::new(self.spawn_worker(worker_name, &definition).await?);
+        let handle = self.spawn_worker(worker_name, &definition).await?;
         let mut workers = self.workers.lock().await;
         workers.insert(worker_name.to_owned(), Arc::clone(&handle));
         Ok(handle)
+    }
+
+    async fn try_reuse_worker(&self, worker_name: &str) -> Option<Arc<WorkerHandle>> {
+        let existing = {
+            let workers = self.workers.lock().await;
+            workers.get(worker_name).cloned()
+        }?;
+
+        if existing.is_alive().await {
+            return Some(existing);
+        }
+
+        self.evict_if_current(worker_name, &existing).await;
+        None
+    }
+
+    async fn evict_if_current(&self, worker_name: &str, dead: &Arc<WorkerHandle>) {
+        let mut workers = self.workers.lock().await;
+        if workers
+            .get(worker_name)
+            .is_some_and(|current| Arc::ptr_eq(current, dead))
+        {
+            workers.remove(worker_name);
+        }
+    }
+
+    /// Build a `Crashed` error for a job whose worker died: evict the dead handle
+    /// (instance-guarded) so the next dispatch respawns rather than reusing it,
+    /// wait briefly for the reaper to record exit status, then attach whatever
+    /// crash detail (exit status + stderr tail) is available. Shared by the
+    /// dispatch and round-trip crash paths.
+    async fn crashed_error_for(
+        &self,
+        worker_name: &str,
+        handle: &Arc<WorkerHandle>,
+        job_id: &str,
+    ) -> WorkerError {
+        self.evict_if_current(worker_name, handle).await;
+        self.wait_for_crash_detail(handle).await;
+        let detail = handle.crash_info().await;
+        self.crashed_error(worker_name, job_id, detail)
+    }
+
+    async fn wait_for_crash_detail(&self, handle: &WorkerHandle) {
+        let _ = super::io_tasks::wait_for_exit_signal(
+            &handle.exit_notify,
+            &handle.exited,
+            CRASH_DETAIL_WAIT_TIMEOUT,
+        )
+        .await;
     }
 
     async fn spawn_worker(
         &self,
         worker_name: &str,
         definition: &WorkerDefinition,
-    ) -> Result<WorkerHandle, WorkerError> {
+    ) -> Result<Arc<WorkerHandle>, WorkerError> {
         let mut child = spawn_worker_process(worker_name, &definition.command).await?;
         let pgid = child.id().expect("worker pid available") as i32;
         let stdin = child.stdin.take().expect("worker stdin piped");
         let stdout = child.stdout.take().expect("worker stdout piped");
+        let stderr = child.stderr.take().expect("worker stderr piped");
         let jobs: JobMap = Arc::new(Mutex::new(HashMap::new()));
         let child = Arc::new(Mutex::new(Some(child)));
         let exit_notify = Arc::new(tokio::sync::Notify::new());
         let exited = Arc::new(AtomicBool::new(false));
-        let (writer_tx, writer_rx) = tokio::sync::mpsc::channel(64);
+        let (writer_sender, writer_rx) = tokio::sync::mpsc::channel(64);
+        let writer_tx = Arc::new(Mutex::new(Some(writer_sender)));
         let is_shutdown = Arc::new(AtomicBool::new(false));
+        let crash_state = Arc::new(Mutex::new(WorkerCrashState::default()));
 
         let reader_task = spawn_reader_task(
             ReaderContext {
@@ -268,6 +319,11 @@ impl WorkerManager {
             },
             stdout,
         );
+        let stderr_task = spawn_stderr_task(super::handle::StderrContext {
+            worker: worker_name.to_owned(),
+            stderr,
+            crash_state: Arc::clone(&crash_state),
+        });
         let writer_task = spawn_writer_task(WriterContext {
             worker: worker_name.to_owned(),
             stdin,
@@ -275,25 +331,55 @@ impl WorkerManager {
             jobs: Arc::clone(&jobs),
             is_shutdown: Arc::clone(&is_shutdown),
         });
-        let reaper_task = spawn_reaper_task(ReaperContext {
-            child: Arc::clone(&child),
-            exit_notify: Arc::clone(&exit_notify),
-            exited: Arc::clone(&exited),
-            jobs: Arc::clone(&jobs),
-            is_shutdown: Arc::clone(&is_shutdown),
-        });
-
-        Ok(WorkerHandle {
-            writer_tx: Mutex::new(Some(writer_tx)),
+        let handle = Arc::new(WorkerHandle {
+            writer_tx: Arc::clone(&writer_tx),
             jobs,
             child,
             exit_notify,
             exited,
             pgid,
-            tasks: Mutex::new(vec![reader_task, writer_task]),
-            reaper_task: Mutex::new(Some(reaper_task)),
+            tasks: Mutex::new(vec![reader_task, stderr_task, writer_task]),
+            reaper_task: Mutex::new(None),
             is_shutdown,
-        })
+            crash_state,
+        });
+        let reaper_task = spawn_reaper_task(ReaperContext {
+            worker: worker_name.to_owned(),
+            workers: Arc::clone(&self.workers),
+            handle: Arc::downgrade(&handle),
+            child: Arc::clone(&handle.child),
+            exit_notify: Arc::clone(&handle.exit_notify),
+            exited: Arc::clone(&handle.exited),
+            writer_tx: Arc::clone(&handle.writer_tx),
+            jobs: Arc::clone(&handle.jobs),
+            is_shutdown: Arc::clone(&handle.is_shutdown),
+            crash_state: Arc::clone(&handle.crash_state),
+        });
+        *handle.reaper_task.lock().await = Some(reaper_task);
+
+        // Return the same `Arc` the reaper holds a `Weak` to, so the registry
+        // stores that identical allocation. Re-wrapping a moved-out value in a
+        // fresh `Arc` here would orphan the reaper's `Weak` (it could never
+        // upgrade), silently disabling reaper-side eviction.
+        Ok(handle)
+    }
+
+    fn crashed_error(
+        &self,
+        worker_name: &str,
+        job_id: &str,
+        detail: Option<super::handle::WorkerCrashInfo>,
+    ) -> WorkerError {
+        let detail = detail.map(|info| info.detail);
+        let detail_suffix = detail
+            .as_ref()
+            .map_or_else(String::new, |detail| format!(": {detail}"));
+        WorkerError::Crashed {
+            worker: worker_name.to_owned(),
+            id: job_id.to_owned(),
+            detail,
+            detail_suffix,
+        }
     }
 
     async fn remove_job(&self, handle: &Arc<WorkerHandle>, job_id: &str) {
@@ -324,15 +410,13 @@ impl WorkerManager {
 #[cfg(unix)]
 impl Drop for WorkerManager {
     fn drop(&mut self) {
-        if self.is_shutdown.swap(true, Ordering::SeqCst) {
+        if self.is_shutdown.load(Ordering::SeqCst) {
             return;
         }
 
+        self.is_shutdown.store(true, Ordering::SeqCst);
         if let Ok(mut workers) = self.workers.try_lock() {
-            let handles = workers
-                .drain()
-                .map(|(_, handle)| handle)
-                .collect::<Vec<_>>();
+            let handles: Vec<_> = workers.drain().map(|(_, handle)| handle).collect();
             drop(workers);
             for handle in handles {
                 handle.kill_now();

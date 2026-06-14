@@ -178,6 +178,15 @@ fn spawn_child<W: Worker>(
 ) -> Result<tokio::process::Child, WorkerError> {
     let mut command = Command::new("sh");
     command.arg("-c").arg(worker.build_command(request));
+    // Detach the job from the worker's own stdin. The worker reads its JSONL
+    // request protocol from fd 0; if a job child inherited that fd, a process in
+    // its tree (notably Node/libuv, which flips inherited stdin to O_NONBLOCK on
+    // the shared open file description when it activates `process.stdin`) could
+    // mark the worker's control pipe non-blocking. The worker's next protocol
+    // read would then fail with EAGAIN ("Resource temporarily unavailable",
+    // os error 11) on an otherwise-fine pipe, killing the resident worker. Jobs
+    // never need the protocol stdin, so give them `/dev/null` instead.
+    command.stdin(Stdio::null());
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
     command.envs(&request.env);
@@ -366,6 +375,43 @@ mod tests {
 
         assert_eq!(responses, vec![WorkerResponse::done("pkg#task", 1)]);
         assert!(!shutdown.load(Ordering::SeqCst));
+    }
+
+    /// Regression: a job child must NOT inherit the worker's protocol stdin
+    /// (fd 0). If it did, a process in the job tree could flip the worker's
+    /// control pipe to O_NONBLOCK (Node/libuv does this on the shared open file
+    /// description), making the worker's next protocol read fail with EAGAIN
+    /// ("Resource temporarily unavailable", os error 11) and killing the worker.
+    /// `spawn_child` gives jobs `/dev/null` on stdin, so reading the child's
+    /// stdin yields immediate EOF (empty) rather than blocking on or mutating an
+    /// inherited pipe.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn job_child_stdin_is_detached_from_worker_protocol_stdin() {
+        // The child reads its own stdin to completion and echoes how many bytes
+        // it saw. With `/dev/null` as stdin this is always 0 and returns at once.
+        // If stdin were an inherited pipe with no data, `cat` would block forever
+        // and this test would hang — so a prompt, "count: 0" result proves the
+        // detach.
+        let worker = TestWorker::new("printf 'count: %s\\n' \"$(cat | wc -c)\"");
+        let request = WorkerRequest::new("job-1", "ignored");
+        let (writer, reader) = writer_pair();
+
+        let status = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_one_job(&request, &worker, &writer),
+        )
+        .await
+        .expect("job must not hang on inherited stdin")
+        .expect("job runs");
+        drop(writer);
+        let responses = read_responses(reader).await;
+
+        assert!(status.success());
+        assert_eq!(
+            responses,
+            vec![WorkerResponse::log("job-1", LogStream::Stdout, "count: 0")]
+        );
     }
 
     #[test]
