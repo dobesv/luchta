@@ -1,11 +1,12 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
+    process::ExitStatus,
     sync::{atomic::AtomicBool, Arc},
     time::Duration,
 };
 
 use tokio::{
-    process::{Child, ChildStdin},
+    process::{Child, ChildStderr, ChildStdin},
     sync::{mpsc, Mutex, Notify},
     task::JoinHandle,
 };
@@ -14,6 +15,69 @@ use super::protocol::{WorkerMessage, WorkerResponse};
 
 pub(crate) type JobSender = mpsc::Sender<WorkerResponse>;
 pub(crate) type JobMap = Arc<Mutex<HashMap<String, JobSender>>>;
+pub(crate) type WorkerRegistry = Arc<Mutex<HashMap<String, Arc<WorkerHandle>>>>;
+
+pub(crate) const STDERR_TAIL_LIMIT: usize = 32;
+
+#[derive(Debug, Clone)]
+pub(crate) struct WorkerCrashInfo {
+    pub(crate) detail: String,
+}
+
+#[derive(Debug)]
+pub(crate) struct WorkerCrashState {
+    pub(crate) status: Option<ExitStatus>,
+    pub(crate) stderr_tail: VecDeque<String>,
+}
+
+impl Default for WorkerCrashState {
+    fn default() -> Self {
+        Self {
+            status: None,
+            stderr_tail: VecDeque::with_capacity(STDERR_TAIL_LIMIT),
+        }
+    }
+}
+
+impl WorkerCrashState {
+    pub(crate) fn record_stderr_line(&mut self, line: String) {
+        if self.stderr_tail.len() == STDERR_TAIL_LIMIT {
+            self.stderr_tail.pop_front();
+        }
+        self.stderr_tail.push_back(line);
+    }
+
+    pub(crate) fn set_status(&mut self, status: ExitStatus) {
+        self.status = Some(status);
+    }
+
+    pub(crate) fn crash_info(&self) -> Option<WorkerCrashInfo> {
+        let mut parts = Vec::new();
+
+        if let Some(status) = self.status {
+            parts.push(format!("exit status {}", format_exit_status(status)));
+        }
+
+        if !self.stderr_tail.is_empty() {
+            parts.push(format!(
+                "stderr: {}",
+                self.stderr_tail
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            ));
+        }
+
+        if parts.is_empty() {
+            None
+        } else {
+            Some(WorkerCrashInfo {
+                detail: parts.join("; "),
+            })
+        }
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct WorkerHandle {
@@ -26,6 +90,7 @@ pub(crate) struct WorkerHandle {
     pub(crate) tasks: Mutex<Vec<JoinHandle<()>>>,
     pub(crate) reaper_task: Mutex<Option<JoinHandle<()>>>,
     pub(crate) is_shutdown: Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) crash_state: Arc<Mutex<WorkerCrashState>>,
 }
 
 pub(crate) struct WriterContext {
@@ -34,6 +99,12 @@ pub(crate) struct WriterContext {
     pub(crate) writer_rx: mpsc::Receiver<WorkerMessage>,
     pub(crate) jobs: JobMap,
     pub(crate) is_shutdown: Arc<std::sync::atomic::AtomicBool>,
+}
+
+pub(crate) struct StderrContext {
+    pub(crate) worker: String,
+    pub(crate) stderr: ChildStderr,
+    pub(crate) crash_state: Arc<Mutex<WorkerCrashState>>,
 }
 
 pub(crate) struct WriterRuntime<'a> {
@@ -105,10 +176,41 @@ impl WorkerHandle {
         super::io_tasks::abort_task_handles(&self.tasks);
     }
 
+    pub(crate) async fn is_alive(&self) -> bool {
+        if self.exited.load(std::sync::atomic::Ordering::SeqCst) {
+            return false;
+        }
+
+        self.writer_tx.lock().await.is_some()
+    }
+
+    pub(crate) async fn crash_info(&self) -> Option<WorkerCrashInfo> {
+        self.crash_state.lock().await.crash_info()
+    }
+
     async fn abort_tasks(&self) {
         let mut tasks = self.tasks.lock().await;
         for task in tasks.drain(..) {
             task.abort();
         }
+    }
+}
+
+fn format_exit_status(status: ExitStatus) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+
+        if let Some(code) = status.code() {
+            return format!("code {code}");
+        }
+        if let Some(signal) = status.signal() {
+            return format!("signal {signal}");
+        }
+    }
+
+    match status.code() {
+        Some(code) => format!("code {code}"),
+        None => "unknown".to_owned(),
     }
 }

@@ -1,6 +1,6 @@
 use std::{
     io,
-    process::Stdio,
+    process::{ExitStatus, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -21,7 +21,9 @@ use tokio_util::codec::{FramedRead, LinesCodec, LinesCodecError};
 use crate::ExecutionLogSink;
 
 use super::{
-    handle::{JobMap, WriterContext, WriterRuntime},
+    handle::{
+        JobMap, StderrContext, WorkerCrashState, WorkerRegistry, WriterContext, WriterRuntime,
+    },
     protocol::{LogStream, WorkerMessage, WorkerResponse},
 };
 
@@ -68,6 +70,30 @@ pub(crate) fn spawn_reader_task(context: ReaderContext, stdout: ChildStdout) -> 
     })
 }
 
+pub(crate) fn spawn_stderr_task(context: StderrContext) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let StderrContext {
+            worker: _worker,
+            stderr,
+            crash_state,
+        } = context;
+        let mut reader = FramedRead::new(stderr, LinesCodec::new_with_max_length(MAX_LINE_LENGTH));
+
+        while let Some(result) = reader.next().await {
+            match result {
+                Ok(line) => crash_state.lock().await.record_stderr_line(line),
+                Err(error) => {
+                    crash_state
+                        .lock()
+                        .await
+                        .record_stderr_line(format!("failed to read worker stderr: {error}"));
+                    return;
+                }
+            }
+        }
+    })
+}
+
 pub(crate) fn spawn_writer_task(context: WriterContext) -> JoinHandle<()> {
     tokio::spawn(async move {
         let WriterContext {
@@ -95,20 +121,31 @@ pub(crate) fn spawn_writer_task(context: WriterContext) -> JoinHandle<()> {
 }
 
 pub(crate) struct ReaperContext {
+    pub(crate) worker: String,
+    pub(crate) workers: WorkerRegistry,
     pub(crate) child: Arc<Mutex<Option<Child>>>,
     pub(crate) exit_notify: Arc<Notify>,
     pub(crate) exited: Arc<AtomicBool>,
+    pub(crate) writer_tx: Arc<Mutex<Option<mpsc::Sender<WorkerMessage>>>>,
     pub(crate) jobs: JobMap,
     pub(crate) is_shutdown: Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) crash_state: Arc<Mutex<WorkerCrashState>>,
 }
 
 pub(crate) fn spawn_reaper_task(context: ReaperContext) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let did_exit = reap_child(Arc::clone(&context.child)).await;
-        if did_exit {
+        let exit_status = reap_child(Arc::clone(&context.child)).await;
+        let did_exit = exit_status.is_some();
+        if let Some(status) = exit_status {
+            context.crash_state.lock().await.set_status(status);
             context.exited.store(true, Ordering::SeqCst);
         }
         context.exit_notify.notify_waiters();
+
+        if did_exit {
+            clear_writer_sender(context.writer_tx.as_ref());
+            evict_worker_handle(&context.workers, &context.worker).await;
+        }
 
         if did_exit
             && !context
@@ -118,6 +155,11 @@ pub(crate) fn spawn_reaper_task(context: ReaperContext) -> JoinHandle<()> {
             crash_all_jobs(&context.jobs).await;
         }
     })
+}
+
+async fn evict_worker_handle(workers: &WorkerRegistry, worker_name: &str) {
+    let mut workers = workers.lock().await;
+    workers.remove(worker_name);
 }
 
 async fn handle_reader_frame(
@@ -210,7 +252,7 @@ async fn write_request_line(stdin: &mut ChildStdin, line: &str) -> io::Result<()
 }
 
 pub(crate) async fn collect_worker_handles(
-    workers: &Arc<Mutex<std::collections::HashMap<String, Arc<super::handle::WorkerHandle>>>>,
+    workers: &WorkerRegistry,
 ) -> Vec<Arc<super::handle::WorkerHandle>> {
     let mut workers = workers.lock().await;
     workers.drain().map(|(_, handle)| handle).collect()
@@ -258,14 +300,13 @@ pub(crate) async fn wait_for_reaper_completion(reaper_task: &Mutex<Option<JoinHa
     }
 }
 
-async fn reap_child(child: Arc<Mutex<Option<Child>>>) -> bool {
+async fn reap_child(child: Arc<Mutex<Option<Child>>>) -> Option<ExitStatus> {
     let mut child_guard = child.lock().await;
-    let Some(process) = child_guard.as_mut() else {
-        return false;
-    };
+    let process = child_guard.as_mut()?;
 
-    let _ = process.wait().await;
-    child_guard.take().is_some()
+    let status = process.wait().await.ok();
+    child_guard.take();
+    status
 }
 
 pub(crate) async fn crash_all_jobs(jobs: &JobMap) {
@@ -327,7 +368,7 @@ pub(crate) fn worker_command(command_line: &str) -> tokio::process::Command {
         .arg(command_line)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::piped())
         .process_group(0);
     command
 }
