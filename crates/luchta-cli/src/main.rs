@@ -1,6 +1,8 @@
 mod cache_ctx;
 mod cli;
 mod config;
+mod progress;
+mod rss;
 mod run;
 
 use clap::Parser;
@@ -49,14 +51,18 @@ async fn run(cli: Cli) -> Result<()> {
     let workspace_root = run::resolve_workspace_root(cli.workspace_root)?;
 
     match cli.command {
-        Commands::Run { tasks, dry_run } => {
+        Commands::Run {
+            tasks,
+            dry_run,
+            output,
+        } => {
             if tasks.is_empty() {
                 return Err(miette::miette!("no tasks specified for run command"));
             }
             if dry_run {
                 run::dry_run_tasks(&workspace_root, &tasks).await
             } else {
-                run::run_tasks(&workspace_root, &tasks).await
+                run::run_tasks(&workspace_root, &tasks, output).await
             }
         }
         Commands::Check => {

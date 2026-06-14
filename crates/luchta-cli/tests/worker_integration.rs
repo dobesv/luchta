@@ -397,10 +397,10 @@ fn resident_worker_reuse_and_output_streaming() {
         .output()
         .expect("run command");
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         output.status.success(),
-        "expected success (stdout: {stdout}, stderr: {})",
+        "expected success (stdout: {}, stderr: {})",
+        String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
 
@@ -410,13 +410,17 @@ fn resident_worker_reuse_and_output_streaming() {
         1,
         "expected single worker PID (resident reuse)"
     );
-    assert!(
-        stdout.contains("a#build") && stdout.contains("yarn-ran workspace=a script=build"),
-        "expected a#build yarn output, got: {stdout}"
+
+    let worker_invocations = fs::read_to_string(&pid_marker).expect("read worker pid marker");
+    assert_eq!(
+        worker_invocations.lines().count(),
+        1,
+        "expected one worker process to service both tasks: {worker_invocations}"
     );
     assert!(
-        stdout.contains("b#build") && stdout.contains("yarn-ran workspace=b script=build"),
-        "expected b#build yarn output, got: {stdout}"
+        String::from_utf8_lossy(&output.stdout).contains("Done: 2 tasks done after "),
+        "expected done summary, got: {}",
+        String::from_utf8_lossy(&output.stdout)
     );
 
     temp.close().expect("cleanup temp dir");
@@ -511,9 +515,13 @@ fn worker_is_reaped_after_run() {
         status.success(),
         "luchta should exit successfully (stdout: {stdout}, stderr: {stderr})"
     );
+    // Successful task output is captured (not streamed) in default mode, so the
+    // worker's "processed" line no longer appears on stdout. The run still emits
+    // the Done summary; that the worker actually ran is asserted below via the
+    // recorded PID/PGID markers.
     assert!(
-        stdout.contains("processed"),
-        "stdout should include worker output: {stdout}"
+        stdout.contains("Done:") && stdout.contains("tasks done after "),
+        "stdout should include the Done summary: {stdout}"
     );
     assert!(
         elapsed < Duration::from_secs(10),
@@ -789,10 +797,8 @@ fn real_yarn_worker_e2e() {
         .arg(temp.path())
         .assert()
         .success()
-        .stdout(predicate::str::contains("myapp#build"))
-        .stdout(predicate::str::contains(
-            "yarn-ran workspace=myapp script=build",
-        ));
+        .stdout(predicate::str::contains("Done: 1 tasks done after "))
+        .stdout(predicate::str::contains("yarn-ran workspace=myapp script=build").not());
 
     temp.close().expect("cleanup temp dir");
 }
@@ -814,7 +820,6 @@ fn tasks_config_without_workers_skips_noop_tasks() {
         .arg(temp.path())
         .assert()
         .success()
-        .stdout(predicate::str::contains("(no command, skipping)"))
         .stdout(predicate::str::contains("built-a").not())
         .stdout(predicate::str::contains("built-b").not());
 
@@ -863,15 +868,9 @@ fn global_task_prunes_packages_missing_the_script() {
         .arg(temp.path())
         .assert()
         .success()
-        // has-build#build runs through the (fake) yarn worker.
-        .stdout(predicate::str::contains(
-            "yarn-ran workspace=has-build script=build",
-        ))
-        // no-build#build is pruned: it is listed as pruned and never executed.
-        .stdout(
-            predicate::str::contains("pruned during resolution")
-                .and(predicate::str::contains("no-build#build")),
-        )
+        .stdout(predicate::str::contains("Done: 1 tasks done after "))
+        .stdout(predicate::str::contains("yarn-ran workspace=has-build").not())
+        // no-build#build is pruned (no prune output on run path).
         .stdout(predicate::str::contains("yarn-ran workspace=no-build").not());
 
     temp.close().expect("cleanup temp dir");
@@ -903,11 +902,9 @@ fn explicit_command_resolves_against_scripts_for_pruning() {
         .arg(temp.path())
         .assert()
         .success()
-        .stdout(predicate::str::contains(
-            "yarn-ran workspace=has-build script=build",
-        ))
-        .stdout(predicate::str::contains("yarn-ran workspace=no-build").not())
-        .stdout(predicate::str::contains("pruned during resolution"));
+        .stdout(predicate::str::contains("Done: 1 tasks done after "))
+        .stdout(predicate::str::contains("yarn-ran workspace=has-build").not())
+        .stdout(predicate::str::contains("yarn-ran workspace=no-build").not());
 
     temp.close().expect("cleanup temp dir");
 }
@@ -983,9 +980,9 @@ fn root_worker_task_resolves_against_root_package_scripts() {
         .arg(temp.path())
         .assert()
         .success()
-        // The root task ran (root workspace => empty workspace hint => `yarn release`),
-        // and was NOT pruned.
-        .stdout(predicate::str::contains("yarn-ran root script=release"))
+        // The root task ran and was NOT pruned; successful worker output stays hidden.
+        .stdout(predicate::str::contains("Done: 1 tasks done after "))
+        .stdout(predicate::str::contains("yarn-ran root script=release").not())
         .stdout(predicate::str::contains("pruned during resolution").not());
 
     temp.close().expect("cleanup temp dir");
@@ -1022,8 +1019,8 @@ fn bash_worker_blank_command_check_fails_and_run_skips() {
         .arg(temp.path())
         .assert()
         .success()
-        .stdout(predicate::str::contains("blank command"))
-        .stdout(predicate::str::contains("pruned during resolution"))
+        .stdout(predicate::str::contains("blank command").not())
+        .stdout(predicate::str::contains("was pruned from every package"))
         .stdout(predicate::str::contains("Running 0 task(s)").not());
 
     temp.close().expect("cleanup temp dir");
@@ -1057,7 +1054,11 @@ fn real_bash_worker_e2e() {
         .arg(temp.path())
         .assert()
         .success()
-        .stdout(predicate::str::contains("bash-ran"))
+        // Successful task output is captured (not streamed) in default mode, so
+        // the worker's "bash-ran" line no longer appears on stdout; assert the
+        // run succeeded via the Done summary and that no stray output leaked.
+        .stdout(predicate::str::contains("Done: 2 tasks done after "))
+        .stdout(predicate::str::contains("bash-ran").not())
         .stdout(predicate::str::contains("package-build-script-unused").not())
         .stdout(predicate::str::contains("pruned during resolution").not());
 

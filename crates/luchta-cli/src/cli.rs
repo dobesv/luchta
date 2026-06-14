@@ -2,6 +2,20 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
+/// How much progress output `luchta run` prints.
+///
+/// Only two modes exist in v1. JSONL and color output are explicit future work
+/// and intentionally absent here.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum OutputMode {
+    /// Periodic wave-bucketed progress (every 5s, only when the run exceeds 5s)
+    /// plus a final summary line.
+    #[default]
+    Default,
+    /// Only the final summary line; no periodic progress.
+    Summary,
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "luchta")]
 #[command(about = "Rust monorepo build orchestration tool")]
@@ -22,6 +36,10 @@ pub enum Commands {
         /// waves) without executing anything.
         #[arg(long)]
         dry_run: bool,
+
+        /// Control how much progress output is printed.
+        #[arg(long, value_enum, default_value_t = OutputMode::Default)]
+        output: OutputMode,
     },
     Check,
 }

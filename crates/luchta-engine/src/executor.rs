@@ -235,6 +235,18 @@ impl WeightedExecutor {
 
     /// Run one task request, respecting weight-based concurrency.
     pub async fn run(&self, request: &ExecutionRequest) -> Result<TaskRunOutcome, ExecutorError> {
+        self.run_with_on_start(request, || {}).await
+    }
+
+    /// Run one task request, firing `on_start` immediately after permit acquisition.
+    pub async fn run_with_on_start<F>(
+        &self,
+        request: &ExecutionRequest,
+        on_start: F,
+    ) -> Result<TaskRunOutcome, ExecutorError>
+    where
+        F: FnOnce(),
+    {
         self.validate_weight(&request.task)?;
 
         let permit = self
@@ -243,6 +255,8 @@ impl WeightedExecutor {
             .acquire_many_owned(request.task.weight)
             .await
             .expect("executor semaphore closed unexpectedly");
+
+        on_start();
 
         let task_name = request.task.id.to_string();
 
@@ -465,7 +479,7 @@ mod tests {
         fs,
         path::Path,
         sync::{
-            atomic::{AtomicU32, Ordering},
+            atomic::{AtomicU32, AtomicUsize, Ordering},
             Arc, Mutex,
         },
         time::Duration,
@@ -591,6 +605,76 @@ mod tests {
                 max_weight: 4
             } if task == oversized.id.to_string()
         ));
+    }
+
+    #[tokio::test]
+    async fn run_with_on_start_fires_only_after_permit_acquired() {
+        let executor = Arc::new(WeightedExecutor::new(1));
+        let temp = TempDir::new().expect("tempdir");
+        let block_path = temp.path().join("blocker.sh");
+        fs::write(
+            &block_path,
+            "#!/bin/sh
+while [ ! -f release ]; do sleep 0.01; done
+",
+        )
+        .expect("blocker script written");
+        let mut permissions = fs::metadata(&block_path).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&block_path, permissions).expect("chmod");
+
+        let request_a =
+            ExecutionRequest::new(task_node("pkg", "a", 1), block_path.display().to_string())
+                .with_cwd(temp.path());
+        let request_b =
+            ExecutionRequest::new(task_node("pkg", "b", 1), "echo second").with_cwd(temp.path());
+
+        let started = Arc::new(AtomicUsize::new(0));
+        let max_started = Arc::new(AtomicUsize::new(0));
+
+        let run_request = |request: ExecutionRequest| {
+            let executor = Arc::clone(&executor);
+            let started = Arc::clone(&started);
+            let max_started = Arc::clone(&max_started);
+            tokio::spawn(async move {
+                let started_for_run = Arc::clone(&started);
+                let max_started_for_run = Arc::clone(&max_started);
+                let outcome = executor
+                    .run_with_on_start(&request, move || {
+                        let current = started_for_run.fetch_add(1, Ordering::SeqCst) + 1;
+                        max_started_for_run.fetch_max(current, Ordering::SeqCst);
+                    })
+                    .await;
+                started.fetch_sub(1, Ordering::SeqCst);
+                outcome
+            })
+        };
+
+        let handle_a = run_request(request_a);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(started.load(Ordering::SeqCst), 1);
+
+        let handle_b = run_request(request_b);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(started.load(Ordering::SeqCst), 1);
+        assert_eq!(max_started.load(Ordering::SeqCst), 1);
+
+        fs::write(temp.path().join("release"), "ok").expect("release file written");
+
+        let outcome_a = handle_a
+            .await
+            .expect("first join succeeds")
+            .expect("first task succeeds");
+        let outcome_b = handle_b
+            .await
+            .expect("second join succeeds")
+            .expect("second task succeeds");
+
+        assert!(outcome_a.status.success());
+        assert!(outcome_b.status.success());
+        assert_eq!(max_started.load(Ordering::SeqCst), 1);
+        assert_eq!(started.load(Ordering::SeqCst), 0);
+        assert_eq!(executor.semaphore().available_permits(), 1);
     }
 
     #[tokio::test]
