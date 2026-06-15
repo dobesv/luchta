@@ -13,8 +13,9 @@ use std::{
 use miette::{bail, miette, Context, IntoDiagnostic, Result};
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader},
-    process::{Child, ChildStderr, Command},
+    process::{Child, ChildStderr, ChildStdout, Command},
     sync::Mutex,
+    task::JoinHandle,
     time::{sleep, timeout},
 };
 
@@ -176,6 +177,7 @@ async fn execute_config_script(
     let mut child = spawn_config_script_with_retry(workspace_root, config_path).await?;
     let stderr_tail = Arc::new(Mutex::new(StderrTail::default()));
     let stderr_task = spawn_stderr_forwarder(child.stderr.take(), Arc::clone(&stderr_tail));
+    let stdout_task = spawn_stdout_reader(child.stdout.take());
 
     let wait_result = timeout(timeout_duration, child.wait()).await;
     match wait_result {
@@ -183,20 +185,7 @@ async fn execute_config_script(
             let status = waited_status.into_diagnostic().wrap_err_with(|| {
                 format!("failed to wait for config script {}", config_path.display())
             })?;
-            let mut stdout = Vec::new();
-            if let Some(mut stdout_reader) = child.stdout.take() {
-                stdout_reader
-                    .read_to_end(&mut stdout)
-                    .await
-                    .into_diagnostic()
-                    .wrap_err_with(|| {
-                        format!(
-                            "failed to read stdout from config script {}",
-                            config_path.display()
-                        )
-                    })?;
-            }
-
+            let stdout = finish_stdout_reader(stdout_task, config_path).await?;
             let stderr = finish_stderr_forwarder(stderr_task, stderr_tail).await;
 
             if !status.success() {
@@ -211,6 +200,7 @@ async fn execute_config_script(
             Ok(stdout)
         }
         Err(_) => {
+            abort_stdout_reader(stdout_task).await;
             terminate_config_script(&mut child).await;
             let stderr = finish_stderr_forwarder(stderr_task, stderr_tail).await;
             bail!(
@@ -397,10 +387,54 @@ fn kill_process_group(pid: u32) -> io::Result<()> {
     }
 }
 
+fn spawn_stdout_reader(stdout: Option<ChildStdout>) -> Option<JoinHandle<io::Result<Vec<u8>>>> {
+    stdout.map(|stdout| tokio::spawn(async move { read_stdout(stdout).await }))
+}
+
+async fn read_stdout<R>(stdout: R) -> io::Result<Vec<u8>>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut reader = BufReader::new(stdout);
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes).await?;
+    Ok(bytes)
+}
+
+async fn finish_stdout_reader(
+    stdout_task: Option<JoinHandle<io::Result<Vec<u8>>>>,
+    config_path: &Path,
+) -> Result<Vec<u8>> {
+    let Some(handle) = stdout_task else {
+        return Ok(Vec::new());
+    };
+
+    let stdout = handle.await.into_diagnostic().wrap_err_with(|| {
+        format!(
+            "failed to join stdout reader for config script {}",
+            config_path.display()
+        )
+    })?;
+
+    stdout.into_diagnostic().wrap_err_with(|| {
+        format!(
+            "failed to read stdout from config script {}",
+            config_path.display()
+        )
+    })
+}
+
+async fn abort_stdout_reader(stdout_task: Option<JoinHandle<io::Result<Vec<u8>>>>) {
+    if let Some(handle) = stdout_task {
+        handle.abort();
+        let _ = handle.await;
+    }
+}
+
 fn spawn_stderr_forwarder(
     stderr: Option<ChildStderr>,
     tail: Arc<Mutex<StderrTail>>,
-) -> Option<tokio::task::JoinHandle<io::Result<()>>> {
+) -> Option<JoinHandle<io::Result<()>>> {
     stderr.map(|stderr| tokio::spawn(async move { forward_stderr(stderr, tail).await }))
 }
 
@@ -427,7 +461,7 @@ where
 }
 
 async fn finish_stderr_forwarder(
-    stderr_task: Option<tokio::task::JoinHandle<io::Result<()>>>,
+    stderr_task: Option<JoinHandle<io::Result<()>>>,
     stderr_tail: Arc<Mutex<StderrTail>>,
 ) -> StderrTail {
     if let Some(handle) = stderr_task {
@@ -597,6 +631,50 @@ echo '{"tasks":{"build":{"dependsOn":["^build"],"weight":2}},"concurrency":{"max
         assert_eq!(config.concurrency.max_weight, 10);
         assert_eq!(config.tasks["build"].weight, 2);
         assert_eq!(config.tasks["build"].depends_on.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn loads_large_config_stdout_without_timeout() {
+        let temp = tempdir().expect("tempdir");
+        fs::write(
+            temp.path().join("luchta-config.py"),
+            r#"#!/usr/bin/env python3
+import json
+
+workers = {}
+for i in range(6000):
+    workers[f"worker-{i:04}"] = {
+        "command": f"echo worker-{i:04}-" + ("x" * 24)
+    }
+
+config = {
+    "tasks": {
+        "build": {
+            "worker": "worker-0000"
+        }
+    },
+    "workers": workers,
+    "concurrency": {
+        "maxWeight": 10
+    }
+}
+
+print(json.dumps(config, separators=(",", ":")))
+"#,
+        )
+        .expect("write script");
+
+        let started = Instant::now();
+        let config = load_config_with_timeout(temp.path(), Duration::from_secs(2))
+            .await
+            .expect("large config should load");
+        let elapsed = started.elapsed();
+
+        assert!(elapsed < Duration::from_millis(500));
+        assert_eq!(config.concurrency.max_weight, 10);
+        assert_eq!(config.tasks["build"].worker.as_deref(), Some("worker-0000"));
+        assert_eq!(config.workers.len(), 6000);
+        assert!(config.workers.contains_key("worker-5999"));
     }
 
     #[cfg(unix)]
