@@ -115,6 +115,7 @@ Example `luchta-config.ts`:
  * - `"^^task"`  transitive upstream packages' task
  * - `"task"`    same-package task
  * - `"pkg#task"` a specific package's task
+ * - `"#task"`    a specific top-level task
  */
 type DependsOn = string;
 
@@ -140,7 +141,7 @@ interface WorkerDefinition {
 }
 
 interface LuchtaConfig {
-  /** Pipeline task definitions, keyed by task name. */
+  /** Pipeline task definitions, keyed by task name (or pkg#task, #task). */
   tasks?: Record<string, TaskDefinition>;
   /** Stay-resident worker definitions, keyed by worker name (Unix only). */
   workers?: Record<string, WorkerDefinition>;
@@ -156,6 +157,13 @@ const config = {
     build: {
       dependsOn: ["^build"],
       weight: 2
+    },
+    "#prep": {
+      command: "echo 'Top-level prep'"
+    },
+    "web#test": {
+      dependsOn: ["build", "#prep"],
+      worker: "yarn"
     },
     test: {
       dependsOn: ["build"],
@@ -187,18 +195,28 @@ The top-level `tasks` map defines the pipeline. Each task may set:
 - `outputs`: relative output paths/globs. These are checked on disk, so missing/deleted outputs invalidate cache entries even if ignored by git.
 - `env`: environment variables passed to task. `value` pins explicit value, omitted `value` inherits from current `luchta` process environment, and `input: false` keeps variable available to task while excluding it from cache hash.
 
-```bash
-# Run the build task for all relevant packages
-luchta run build
-```
+### Task Key Formats
+
+The `tasks` map defines how tasks are applied across the workspace:
+
+- `task` (e.g., `build`): Default definition for all non-top-level packages. Does **not** apply to the workspace root.
+- `pkg#task` (e.g., `web#build`): Specific definition for package `pkg`.
+- `#task` (e.g., `#build`): A top-level task that runs at the workspace root. Only `#`-prefixed keys run at the top level.
+
+### Running Tasks
+
+- `luchta run build`: Runs package `build` tasks. Top-level tasks are never included.
+- `luchta run -T build` (or `--top-level`): Runs the top-level `#build` task.
 
 ### `dependsOn` Syntax
-Luchta supports flexible dependency definitions between tasks:
+
+Luchta supports flexible dependency definitions:
+
 - `^task`: Direct upstream packages' task.
 - `^^task`: Transitive upstream packages' task.
-- `task`: Same-package task.
+- `task`: Same-scope task. Inside a package task, targets the same package; inside a `#task`, targets the top-level.
 - `pkg#task`: Specific package and task.
-- `#task`: Root workspace (monorepo top-level) task.
+- `#task`: Specific top-level (workspace root) task.
 
 ### Workers
 For tools with heavy startup costs (Yarn PnP, Babel, ESLint, Jest), Luchta can

@@ -32,6 +32,11 @@ pub enum Commands {
     Run {
         tasks: Vec<String>,
 
+        /// Match the given task names as top-level (workspace-root) tasks
+        /// instead of package tasks.
+        #[arg(short = 'T', long = "top-level")]
+        top_level: bool,
+
         /// Print the tasks in the order they would run (grouped into parallel
         /// waves) without executing anything.
         #[arg(long)]

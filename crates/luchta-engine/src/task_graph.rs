@@ -643,11 +643,14 @@ impl ResolvedPipeline {
             .map(|package| package.name.clone())
         {
             let mut task_names = HashSet::new();
+            let skip_global_tasks_for_root = package_graph.root_package() == Some(&package_name);
 
-            for (task_name, definition) in &global_tasks {
-                let task_id = TaskId::new(package_name.clone(), task_name.clone());
-                tasks_by_id.insert(task_id, definition.clone());
-                task_names.insert(task_name.clone());
+            if !skip_global_tasks_for_root {
+                for (task_name, definition) in &global_tasks {
+                    let task_id = TaskId::new(package_name.clone(), task_name.clone());
+                    tasks_by_id.insert(task_id, definition.clone());
+                    task_names.insert(task_name.clone());
+                }
             }
 
             for ((package, task_name), definition) in &package_tasks {
@@ -2024,6 +2027,54 @@ mod tests {
             "expected {other_build_node} to depend on {babel_build}, got {deps:?}"
         );
     }
+
+    #[test]
+    fn global_tasks_skip_named_root_package_expansion() {
+        let temp_dir = tempdir().expect("create temp dir");
+        write_package(
+            temp_dir.path().join("package.json"),
+            PackageManifest {
+                name: "repo",
+                dependencies: &[],
+            },
+        );
+        write_package(
+            temp_dir.path().join("packages/app/package.json"),
+            PackageManifest {
+                name: "app",
+                dependencies: &[],
+            },
+        );
+
+        let package_graph = PackageGraph::build(vec![
+            package_node(temp_dir.path(), "repo"),
+            package_node(temp_dir.path().join("packages/app"), "app"),
+        ])
+        .expect("build package graph")
+        .with_root_package(PackageName::from("repo"));
+
+        let pipeline = HashMap::from([(
+            TaskName::from("build"),
+            TaskDefinition {
+                worker: Some("yarn".to_string()),
+                ..TaskDefinition::default()
+            },
+        )]);
+
+        let task_graph = TaskGraph::build(&package_graph, &pipeline).expect("build task graph");
+
+        assert!(
+            task_graph
+                .task_node(&TaskId::new("repo", "build"))
+                .is_none(),
+            "expected bare global task to skip named root package"
+        );
+        assert!(
+            task_graph.task_node(&TaskId::new("app", "build")).is_some(),
+            "expected bare global task to expand to child package"
+        );
+    }
+
     fn package_graph_single(name: &str) -> PackageGraph {
         let temp_dir = tempdir().expect("create temp dir");
         write_package(

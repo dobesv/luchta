@@ -358,19 +358,18 @@ done
         ),
     );
 
-    // Run both tasks (run "build" which depends on "#prep", so both should run)
+    // Run build only; `#prep` is pulled in automatically via the worker's
+    // `dependsOn: ["#prep"]`, so both tasks should run in dependency order.
     assert_cmd::Command::cargo_bin("luchta")
         .expect("find binary")
         .env("NO_COLOR", "1")
         .arg("run")
         .arg("build")
-        .arg("prep")
         .arg("--workspace-root")
         .arg(temp.path())
         .assert()
         .success()
-        // 3 tasks done: #prep runs for each package's build task (1 package with build) + the explicit prep run
-        .stdout(predicate::str::contains("Done:"));
+        .stdout(predicate::str::contains("Done: 2 tasks done after "));
 
     // Verify ordering: prep ran before consumer
     wait_for_file(prep_ran.path(), Duration::from_secs(5));

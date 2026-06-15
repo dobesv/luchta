@@ -384,6 +384,88 @@ fn dry_run_assert(
         .assert()
 }
 
+fn dry_run_assert_top_level(
+    temp: &assert_fs::TempDir,
+    config_json: &str,
+    task: &str,
+) -> assert_cmd::assert::Assert {
+    setup_workspace(temp);
+    temp.child("luchta-config.sh")
+        .write_str(&format!("#!/bin/sh\necho '{config_json}'\n"))
+        .expect("write luchta-config.sh");
+
+    Command::cargo_bin("luchta")
+        .expect("find binary")
+        .arg("run")
+        .arg(task)
+        .arg("-T")
+        .arg("--dry-run")
+        .arg("--workspace-root")
+        .arg(temp.path())
+        .env("NO_COLOR", "1")
+        .assert()
+}
+
+#[test]
+fn dry_run_global_build_excludes_named_root_tasks() {
+    let temp = assert_fs::TempDir::new().expect("create temp dir");
+    setup_workspace(&temp);
+    temp.child("package.json")
+        .write_str(
+            r#"{
+    "name": "root",
+    "private": true,
+    "workspaces": ["packages/*"],
+    "scripts": {
+        "build": "echo root-build"
+    }
+}"#,
+        )
+        .expect("write root package.json");
+    let config = r#"{"concurrency":{"maxWeight":4},"tasks":{"build":{}}}"#;
+
+    temp.child("luchta-config.sh")
+        .write_str(&format!("#!/bin/sh\necho '{config}'\n"))
+        .expect("write luchta-config.sh");
+
+    Command::cargo_bin("luchta")
+        .expect("find binary")
+        .arg("run")
+        .arg("build")
+        .arg("--dry-run")
+        .arg("--workspace-root")
+        .arg(temp.path())
+        .env("NO_COLOR", "1")
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("a#build")
+                .and(predicate::str::contains("b#build"))
+                .and(predicate::str::contains("root#build").not())
+                .and(predicate::str::contains("//root#build").not()),
+        );
+
+    temp.close().expect("cleanup temp dir");
+}
+
+#[test]
+fn dry_run_top_level_build_selects_only_root_task() {
+    let temp = assert_fs::TempDir::new().expect("create temp dir");
+    let config = r##"{"concurrency":{"maxWeight":4},"tasks":{"#build":{}}}"##;
+
+    dry_run_assert_top_level(&temp, config, "build")
+        .success()
+        .stdout(
+            predicate::str::contains("#build")
+                .and(predicate::str::contains("a#build").not())
+                .and(predicate::str::contains("b#build").not())
+                .and(predicate::str::contains("//root#build").not())
+                .and(predicate::str::contains("root#build").not()),
+        );
+
+    temp.close().expect("cleanup temp dir");
+}
+
 #[test]
 fn dry_run_prints_waves_without_executing() {
     let temp = assert_fs::TempDir::new().expect("create temp dir");

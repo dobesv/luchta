@@ -67,8 +67,17 @@ pub async fn prepare_workspace(
     let packages = workspace
         .discover()
         .map_err(|error| miette::miette!("workspace discovery failed: {}", error))?;
+    let root_package = packages
+        .iter()
+        .find(|package| package.path == workspace_root)
+        .map(|package| package.name.clone());
     let package_graph = PackageGraph::build(packages.clone())
         .map_err(|error| miette::miette!("failed to build package graph: {}", error))?;
+    let package_graph = if let Some(root_package) = root_package {
+        package_graph.with_root_package(root_package)
+    } else {
+        package_graph
+    };
 
     let config = crate::config::load_config(workspace_root)
         .await
@@ -110,6 +119,7 @@ pub async fn run_tasks(
     workspace_root: &Path,
     requested_tasks: &[String],
     output: OutputMode,
+    top_level: bool,
 ) -> Result<()> {
     let PreparedWorkspace {
         packages,
@@ -128,7 +138,8 @@ pub async fn run_tasks(
         return Ok(());
     }
 
-    let tasks_to_run = collect_requested_subgraph(&task_graph, requested_tasks, &pruned)?;
+    let tasks_to_run =
+        collect_requested_subgraph(&task_graph, requested_tasks, &pruned, top_level)?;
     let prefix_width = compute_prefix_width(&task_graph, &tasks_to_run);
 
     // Build the progress reporter with wave indices for all tasks to run.
@@ -387,7 +398,11 @@ pub fn report_pruned_tasks(pruned: &[PrunedTask]) {
 /// without executing anything. This is a diagnostic view into the task
 /// dependency graph: every task in a wave only depends on tasks in earlier
 /// waves, so all tasks within a wave could run concurrently.
-pub async fn dry_run_tasks(workspace_root: &Path, requested_tasks: &[String]) -> Result<()> {
+pub async fn dry_run_tasks(
+    workspace_root: &Path,
+    requested_tasks: &[String],
+    top_level: bool,
+) -> Result<()> {
     let PreparedWorkspace {
         packages,
         package_graph: _,
@@ -411,7 +426,8 @@ pub async fn dry_run_tasks(workspace_root: &Path, requested_tasks: &[String]) ->
 
     report_pruned_tasks(&pruned);
 
-    let tasks_to_run = collect_requested_subgraph(&task_graph, requested_tasks, &pruned)?;
+    let tasks_to_run =
+        collect_requested_subgraph(&task_graph, requested_tasks, &pruned, top_level)?;
     let CommandMap { commands, invalid } =
         build_command_map(&task_graph, &packages, workspace_root, &workers);
 
@@ -586,12 +602,14 @@ fn collect_requested_subgraph(
     task_graph: &TaskGraph,
     requested_tasks: &[String],
     pruned: &[PrunedTask],
+    top_level: bool,
 ) -> Result<HashSet<TaskId>> {
     let mut requested_ids = HashSet::new();
     let available_nodes: Vec<&TaskNode> = task_graph.nodes().collect();
 
     for requested in requested_tasks {
-        let matched = collect_matching_task_ids(&available_nodes, requested, &mut requested_ids);
+        let matched =
+            collect_matching_task_ids(&available_nodes, requested, &mut requested_ids, top_level);
         if !matched {
             report_unmatched_request(requested, pruned)?;
         }
@@ -600,16 +618,18 @@ fn collect_requested_subgraph(
     Ok(expand_with_dependencies(task_graph, requested_ids))
 }
 
-/// Adds every node whose task name equals `requested` to `requested_ids`,
-/// returning whether at least one matched.
+/// Adds every node whose task name equals `requested` and whose root/package
+/// scope matches `top_level` to `requested_ids`, returning whether at least one
+/// matched.
 fn collect_matching_task_ids(
     available_nodes: &[&TaskNode],
     requested: &str,
     requested_ids: &mut HashSet<TaskId>,
+    top_level: bool,
 ) -> bool {
     let mut matched = false;
     for node in available_nodes {
-        if node.id.task.as_str() == requested {
+        if node.id.task.as_str() == requested && node.id.is_root() == top_level {
             requested_ids.insert(node.id.clone());
             matched = true;
         }
@@ -1406,6 +1426,42 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn prepare_workspace_sets_root_package_from_workspace_root_package_json() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        std::fs::create_dir_all(temp_dir.path().join("packages/app")).expect("create package dir");
+        std::fs::write(
+            temp_dir.path().join("package.json"),
+            r#"{
+                "name": "root",
+                "private": true,
+                "workspaces": ["packages/*"]
+            }"#,
+        )
+        .expect("write root package.json");
+        std::fs::write(
+            temp_dir.path().join("packages/app/package.json"),
+            r#"{
+                "name": "@repo/app"
+            }"#,
+        )
+        .expect("write app package.json");
+        std::fs::write(
+            temp_dir.path().join("luchta-config.js"),
+            "#!/usr/bin/env node\nconsole.log('{}');\n",
+        )
+        .expect("write config");
+
+        let prepared = prepare_workspace(temp_dir.path(), ResolveMode::Run)
+            .await
+            .expect("prepare workspace");
+
+        assert_eq!(
+            prepared.package_graph.root_package(),
+            Some(&PackageName::from("root"))
+        );
+    }
+
     fn make_task_def(env: std::collections::BTreeMap<String, EnvSpec>) -> TaskDefinition {
         TaskDefinition {
             env,
@@ -1489,6 +1545,88 @@ mod tests {
         assert_eq!(wave_of[&TaskId::new("@repo/c", "build")], 0);
         assert_eq!(wave_of[&TaskId::new("@repo/b", "build")], 1);
         assert_eq!(wave_of[&TaskId::new("@repo/a", "build")], 2);
+    }
+
+    fn matching_scope_task_graph() -> TaskGraph {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let package_dir = temp_dir.path().join("packages/pkg");
+        std::fs::create_dir_all(&package_dir).expect("create package dir");
+        std::fs::write(
+            package_dir.join("package.json"),
+            serde_json::json!({
+                "name": "@repo/pkg",
+                "version": "1.0.0",
+            })
+            .to_string(),
+        )
+        .expect("write package manifest");
+
+        let package_graph = PackageGraph::build(vec![PackageNode::new(
+            PackageName::from("@repo/pkg"),
+            package_dir,
+        )])
+        .expect("build package graph");
+        let pipeline = HashMap::from([
+            (TaskName::from("build"), TaskDefinition::default()),
+            (TaskName::from("#build"), TaskDefinition::default()),
+        ]);
+
+        TaskGraph::build(&package_graph, &pipeline).expect("build task graph")
+    }
+
+    #[test]
+    fn collect_matching_task_ids_excludes_root_tasks_by_default() {
+        let task_graph = matching_scope_task_graph();
+        let available_nodes: Vec<&TaskNode> = task_graph.nodes().collect();
+        let mut requested_ids = HashSet::new();
+
+        let matched =
+            collect_matching_task_ids(&available_nodes, "build", &mut requested_ids, false);
+
+        assert!(matched);
+        assert_eq!(
+            requested_ids,
+            HashSet::from([TaskId::new("@repo/pkg", "build")])
+        );
+    }
+
+    #[test]
+    fn collect_matching_task_ids_selects_only_root_tasks_for_top_level() {
+        let task_graph = matching_scope_task_graph();
+        let available_nodes: Vec<&TaskNode> = task_graph.nodes().collect();
+        let mut requested_ids = HashSet::new();
+
+        let matched =
+            collect_matching_task_ids(&available_nodes, "build", &mut requested_ids, true);
+
+        assert!(matched);
+        assert_eq!(
+            requested_ids,
+            HashSet::from([TaskId::new("//root", "build")])
+        );
+    }
+
+    #[test]
+    fn collect_requested_subgraph_excludes_root_tasks_by_default() {
+        let task_graph = matching_scope_task_graph();
+
+        let requested = collect_requested_subgraph(&task_graph, &["build".to_string()], &[], false)
+            .expect("collect requested tasks");
+
+        assert_eq!(
+            requested,
+            HashSet::from([TaskId::new("@repo/pkg", "build")])
+        );
+    }
+
+    #[test]
+    fn collect_requested_subgraph_selects_only_root_tasks_for_top_level() {
+        let task_graph = matching_scope_task_graph();
+
+        let requested = collect_requested_subgraph(&task_graph, &["build".to_string()], &[], true)
+            .expect("collect requested tasks");
+
+        assert_eq!(requested, HashSet::from([TaskId::new("//root", "build")]));
     }
 
     #[test]
