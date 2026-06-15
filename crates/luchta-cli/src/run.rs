@@ -24,7 +24,10 @@ use luchta_workspace::{PackageGraph, PackageNode, WorkspaceDiscovery, YarnWorksp
 use miette::{bail, Context, IntoDiagnostic, Result};
 use owo_colors::OwoColorize;
 
-use crate::cache_ctx::{build_current_state, gather_pkg_dep_pairs, PackageDirResolver};
+use crate::cache_ctx::{
+    build_current_state, gather_pkg_dep_pairs, load_lockfile_state, LockfileState,
+    PackageDirResolver,
+};
 use crate::cli::OutputMode;
 use crate::progress::ProgressReporter;
 
@@ -157,6 +160,7 @@ pub async fn run_tasks(
     // that jobs killed by the interrupt don't each print a crash/failure error
     // (which would flood the terminal with one line per in-flight task).
     let interrupted = Arc::new(AtomicBool::new(false));
+    let lockfile_state = load_lockfile_state(workspace_root);
 
     let ctx = DispatchContext {
         tasks_to_run: &tasks_to_run,
@@ -172,6 +176,7 @@ pub async fn run_tasks(
         cache: &cache,
         output_hashes: &output_hashes,
         reporter: &reporter,
+        lockfile: &lockfile_state,
     };
     let run_result = dispatch_loop(&mut receiver, &ctx).await;
 
@@ -204,6 +209,7 @@ struct DispatchContext<'a> {
     cache: &'a Arc<Cache>,
     output_hashes: &'a Arc<Mutex<HashMap<TaskId, [u8; 32]>>>,
     reporter: &'a Arc<ProgressReporter>,
+    lockfile: &'a LockfileState,
 }
 
 struct TaskRunContext {
@@ -889,9 +895,9 @@ fn build_cache_write_context(task_id: &TaskId, ctx: &DispatchContext<'_>) -> Cac
         &synthetic_package
     };
     let pkg_dep_pairs = match gather_pkg_dep_pairs(
-        ctx.workspace_root,
         package,
         cache_package.package.map(|_| ctx.package_graph),
+        ctx.lockfile,
     ) {
         Ok(pkg_dep_pairs) => pkg_dep_pairs,
         Err(error) => {
@@ -1054,9 +1060,9 @@ fn try_cache_skip(task_id: &TaskId, ctx: &DispatchContext<'_>) -> Option<Decisio
         &synthetic_package
     };
     let pkg_dep_pairs = match gather_pkg_dep_pairs(
-        ctx.workspace_root,
         package,
         cache_package.package.map(|_| ctx.package_graph),
+        ctx.lockfile,
     ) {
         Ok(pkg_dep_pairs) => pkg_dep_pairs,
         Err(error) => {
