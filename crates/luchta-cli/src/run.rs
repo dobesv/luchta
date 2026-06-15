@@ -611,7 +611,7 @@ fn collect_requested_subgraph(
         let matched =
             collect_matching_task_ids(&available_nodes, requested, &mut requested_ids, top_level);
         if !matched {
-            report_unmatched_request(requested, pruned)?;
+            report_unmatched_request(requested, pruned, top_level)?;
         }
     }
 
@@ -641,10 +641,10 @@ fn collect_matching_task_ids(
 /// nowhere may have been pruned away during resolution (a normal, expected
 /// outcome) — reported informationally — rather than never existing, which is
 /// an error.
-fn report_unmatched_request(requested: &str, pruned: &[PrunedTask]) -> Result<()> {
-    let pruned_away = pruned
-        .iter()
-        .any(|entry| entry.task_id.task.as_str() == requested);
+fn report_unmatched_request(requested: &str, pruned: &[PrunedTask], top_level: bool) -> Result<()> {
+    let pruned_away = pruned.iter().any(|entry| {
+        entry.task_id.task.as_str() == requested && entry.task_id.is_root() == top_level
+    });
     if pruned_away {
         println!(
             "{} task '{}' was pruned from every package during resolution; nothing to run",
@@ -1627,6 +1627,28 @@ mod tests {
             .expect("collect requested tasks");
 
         assert_eq!(requested, HashSet::from([TaskId::new("//root", "build")]));
+    }
+
+    #[test]
+    fn report_unmatched_request_ignores_pruned_task_at_wrong_scope() {
+        // A package task `build` was pruned, but the request is top-level
+        // (`-T build`). The pruned package task must NOT be treated as a match
+        // for the top-level request — it should report "not found" instead.
+        let pruned = vec![PrunedTask {
+            task_id: TaskId::new("@repo/pkg", "build"),
+            outcome: luchta_engine::PruneOutcome::Pruned { reason: None },
+        }];
+
+        let result = report_unmatched_request("build", &pruned, true);
+        assert!(
+            result.is_err(),
+            "top-level request must not match a pruned package task"
+        );
+
+        // The same pruned package task IS a valid explanation for a default
+        // (non-top-level) request of the same name.
+        report_unmatched_request("build", &pruned, false)
+            .expect("default request should treat the pruned package task as a match");
     }
 
     #[test]
