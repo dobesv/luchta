@@ -2,17 +2,42 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fs,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use luchta_cache::{
     env_hash, pkg_dep_hash, resolve_inputs, resolve_outputs, task_spec_hash, CurrentState,
     FileEntry, FileStateResolver,
 };
-use luchta_lockfiles::parse_lockfile;
+use luchta_lockfiles::{parse_lockfile, Lockfile};
 use luchta_types::TaskDefinition;
 use luchta_workspace::{PackageGraph, PackageNode};
 use miette::{IntoDiagnostic, Result};
 use serde::Deserialize;
+
+pub(crate) enum LockfileState {
+    Absent,
+    Parsed(Arc<dyn Lockfile>),
+    Failed(String),
+}
+
+/// Reads and parses `workspace_root/yarn.lock` once, returning the outcome.
+///
+/// Maps the four current per-task outcomes so call sites behave identically:
+/// missing/empty -> `Absent`, parses -> `Parsed`, parse error or non-NotFound
+/// I/O error -> `Failed` (which `gather_pkg_dep_pairs` surfaces as `Err`, so the
+/// caller disables caching for that task).
+pub(crate) fn load_lockfile_state(workspace_root: &Path) -> LockfileState {
+    match fs::read_to_string(workspace_root.join("yarn.lock")) {
+        Ok(contents) if contents.trim().is_empty() => LockfileState::Absent,
+        Ok(contents) => match parse_lockfile(&contents) {
+            Ok(parsed) => LockfileState::Parsed(Arc::<dyn Lockfile>::from(parsed)),
+            Err(e) => LockfileState::Failed(e.to_string()),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => LockfileState::Absent,
+        Err(e) => LockfileState::Failed(format!("failed to read yarn.lock: {e}")),
+    }
+}
 
 pub struct PackageDirResolver {
     package_dir: PathBuf,
@@ -55,21 +80,16 @@ struct PackageJsonExternalDeps {
     optional_dependencies: HashMap<String, String>,
 }
 
-pub fn gather_pkg_dep_pairs(
-    workspace_root: &Path,
+pub(crate) fn gather_pkg_dep_pairs(
     package: &PackageNode,
     package_graph: Option<&PackageGraph>,
+    lockfile: &LockfileState,
 ) -> Result<Vec<(String, String)>> {
-    let lockfile_path = workspace_root.join("yarn.lock");
-    let lockfile_contents = match fs::read_to_string(&lockfile_path) {
-        Ok(contents) => contents,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(err) => return Err(err).into_diagnostic(),
+    let lockfile = match lockfile {
+        LockfileState::Absent => return Ok(Vec::new()),
+        LockfileState::Failed(msg) => return Err(miette::miette!("{msg}")),
+        LockfileState::Parsed(lf) => lf.as_ref(),
     };
-    if lockfile_contents.trim().is_empty() {
-        return Ok(Vec::new());
-    }
-    let lockfile = parse_lockfile(&lockfile_contents).into_diagnostic()?;
     let package_json = fs::read_to_string(package.path.join("package.json")).into_diagnostic()?;
     let package_json: PackageJsonExternalDeps =
         serde_json::from_str(&package_json).into_diagnostic()?;
@@ -97,7 +117,7 @@ pub fn gather_pkg_dep_pairs(
         .chain(package_json.optional_dependencies)
     {
         collect_dep_pairs_for_package(
-            lockfile.as_ref(),
+            lockfile,
             &package.path,
             &workspace_names,
             &workspace_paths,
@@ -167,4 +187,106 @@ fn should_skip_dependency_spec(
         || version.starts_with("file:")
         || workspace_names.contains(name)
         || workspace_paths.iter().any(|path| version.contains(path))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use luchta_types::PackageName;
+    use luchta_workspace::PackageNode;
+    use tempfile::TempDir;
+
+    #[test]
+    fn load_lockfile_state_missing_file_is_absent() {
+        // No yarn.lock at all -> Absent (caching proceeds with empty pairs).
+        let dir = TempDir::new().unwrap();
+        assert!(matches!(
+            load_lockfile_state(dir.path()),
+            LockfileState::Absent
+        ));
+    }
+
+    #[test]
+    fn load_lockfile_state_empty_file_is_absent() {
+        // Present-but-empty (whitespace-only) yarn.lock -> Absent.
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("yarn.lock"), "   \n\t").unwrap();
+        assert!(matches!(
+            load_lockfile_state(dir.path()),
+            LockfileState::Absent
+        ));
+    }
+
+    #[test]
+    fn load_lockfile_state_unparseable_file_is_failed() {
+        // Non-empty but unparseable yarn.lock -> Failed (cache disabled per task).
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("yarn.lock"), "this is not a lockfile {{{").unwrap();
+        assert!(matches!(
+            load_lockfile_state(dir.path()),
+            LockfileState::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn gather_pkg_dep_pairs_absent_lockfile_yields_no_pairs() {
+        // `LockfileState::Absent` (missing/empty yarn.lock) must short-circuit to
+        // an empty pair list before any per-package read, so caching proceeds.
+        let package = PackageNode::new(PackageName::new("pkg"), "/nonexistent");
+        let pairs = gather_pkg_dep_pairs(&package, None, &LockfileState::Absent)
+            .expect("Absent lockfile should yield Ok");
+        assert!(pairs.is_empty());
+    }
+
+    #[test]
+    fn gather_pkg_dep_pairs_failed_lockfile_errors() {
+        // `LockfileState::Failed` (parse error or non-NotFound I/O error) must
+        // surface as `Err` so both call sites disable caching for the task.
+        let package = PackageNode::new(PackageName::new("pkg"), "/nonexistent");
+        let err = gather_pkg_dep_pairs(&package, None, &LockfileState::Failed("boom".into()))
+            .expect_err("Failed lockfile should yield Err");
+        assert!(err.to_string().contains("boom"));
+    }
+
+    #[test]
+    fn should_skip_dependency_spec_returns_true_for_workspace_prefix() {
+        let workspace_names: BTreeSet<String> = BTreeSet::new();
+        let workspace_paths: BTreeSet<String> = BTreeSet::new();
+
+        assert!(should_skip_dependency_spec(
+            "some-dep",
+            "workspace:*",
+            &workspace_names,
+            &workspace_paths
+        ));
+        assert!(should_skip_dependency_spec(
+            "some-dep",
+            "workspace:^1.0.0",
+            &workspace_names,
+            &workspace_paths
+        ));
+    }
+
+    #[test]
+    fn should_skip_dependency_spec_returns_true_for_workspace_name_match() {
+        let mut workspace_names: BTreeSet<String> = BTreeSet::new();
+        workspace_names.insert("internal-pkg".to_string());
+        let workspace_paths: BTreeSet<String> = BTreeSet::new();
+
+        // Workspace name in workspace_names should be skipped
+        assert!(should_skip_dependency_spec(
+            "internal-pkg",
+            "1.0.0",
+            &workspace_names,
+            &workspace_paths
+        ));
+
+        // Non-workspace name should not be skipped
+        assert!(!should_skip_dependency_spec(
+            "external-pkg",
+            "1.0.0",
+            &workspace_names,
+            &workspace_paths
+        ));
+    }
 }
