@@ -72,7 +72,7 @@ cargo build --workspace
 cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
 cargo nextest run --workspace --stress-count=5
-cs delta $(git merge-base HEAD origin/main)   # CodeScene — must be all green
+cs delta origin/HEAD   # CodeScene — must be all green
 ```
 
 The CodeScene `cs delta` check **must be all green** (no new code-health
