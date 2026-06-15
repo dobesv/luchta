@@ -148,6 +148,16 @@ fn run_luchta(temp: &assert_fs::TempDir, task: &str) -> assert_cmd::assert::Asse
         .assert()
 }
 
+fn run_luchta_top_level(temp: &assert_fs::TempDir, task: &str) -> assert_cmd::assert::Assert {
+    let mut cmd = Command::cargo_bin("luchta").unwrap();
+    cmd.arg("run")
+        .arg(task)
+        .arg("-T")
+        .arg("--workspace-root")
+        .arg(temp.path())
+        .assert()
+}
+
 fn yarn_worker_bin() -> PathBuf {
     assert_cmd::cargo::cargo_bin("luchta-yarn-worker")
 }
@@ -981,17 +991,17 @@ fn cache_root_task_skips_unchanged_and_reruns_on_input_edit() {
 }"#,
     );
 
-    run_luchta(&temp, "build").success();
+    run_luchta_top_level(&temp, "build").success();
     temp.child("root-counter.txt").assert("1\n");
     temp.child("root-output.txt").assert("root-one\n");
 
-    run_luchta(&temp, "build").success();
+    run_luchta_top_level(&temp, "build").success();
     temp.child("root-counter.txt").assert("1\n");
 
     temp.child("root-input.txt")
         .write_str("root-two\n")
         .unwrap();
-    run_luchta(&temp, "build").success();
+    run_luchta_top_level(&temp, "build").success();
     temp.child("root-counter.txt").assert("2\n");
     temp.child("root-output.txt").assert("root-two\n");
 }

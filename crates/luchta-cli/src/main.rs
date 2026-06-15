@@ -53,6 +53,7 @@ async fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Commands::Run {
             tasks,
+            top_level,
             dry_run,
             output,
         } => {
@@ -60,9 +61,9 @@ async fn run(cli: Cli) -> Result<()> {
                 return Err(miette::miette!("no tasks specified for run command"));
             }
             if dry_run {
-                run::dry_run_tasks(&workspace_root, &tasks).await
+                run::dry_run_tasks(&workspace_root, &tasks, top_level).await
             } else {
-                run::run_tasks(&workspace_root, &tasks, output).await
+                run::run_tasks(&workspace_root, &tasks, output, top_level).await
             }
         }
         Commands::Check => {

@@ -607,7 +607,7 @@ fn explicit_root_worker_command_sends_empty_workspace_in_request_json() {
     write_config(
         &temp,
         &format!(
-            r#"{{"concurrency":{{"maxWeight":1}},"tasks":{{"build":{{"worker":"capture","command":"install"}}}},"workers":{{"capture":{{"command":"{}"}}}}}}"#,
+            r##"{{"concurrency":{{"maxWeight":1}},"tasks":{{"#build":{{"worker":"capture","command":"install"}}}},"workers":{{"capture":{{"command":"{}"}}}}}}"##,
             worker.display()
         ),
     );
@@ -615,6 +615,7 @@ fn explicit_root_worker_command_sends_empty_workspace_in_request_json() {
     assert_cmd::Command::cargo_bin("luchta")
         .expect("find binary")
         .arg("run")
+        .arg("-T")
         .arg("build")
         .arg("--workspace-root")
         .arg(temp.path())
@@ -646,12 +647,12 @@ fn root_worker_task_without_command_defaults_to_task_name() {
     let capture = temp.child("worker-requests.log");
     capture.write_str("").expect("init capture file");
     let worker = write_capture_worker(&temp, "capture-root-default-worker.sh", capture.path());
-    // Root/top-level worker task with NO command: defaults to the task name and
-    // an empty workspace hint, so the worker runs `yarn build`.
+    // Root `#build` worker task with NO command: defaults to task name and an
+    // empty workspace hint, so worker runs root `build` command.
     write_config(
         &temp,
         &format!(
-            r#"{{"concurrency":{{"maxWeight":1}},"tasks":{{"build":{{"worker":"capture"}}}},"workers":{{"capture":{{"command":"{}"}}}}}}"#,
+            r##"{{"concurrency":{{"maxWeight":1}},"tasks":{{"#build":{{"worker":"capture"}}}},"workers":{{"capture":{{"command":"{}"}}}}}}"##,
             worker.display()
         ),
     );
@@ -659,6 +660,7 @@ fn root_worker_task_without_command_defaults_to_task_name() {
     assert_cmd::Command::cargo_bin("luchta")
         .expect("find binary")
         .arg("run")
+        .arg("-T")
         .arg("build")
         .arg("--workspace-root")
         .arg(temp.path())
@@ -975,6 +977,7 @@ fn root_worker_task_resolves_against_root_package_scripts() {
         .env("PATH", path_with_prepend(&fake_yarn_bin))
         .env("NO_COLOR", "1")
         .arg("run")
+        .arg("-T")
         .arg("release")
         .arg("--workspace-root")
         .arg(temp.path())
@@ -1055,9 +1058,9 @@ fn real_bash_worker_e2e() {
         .assert()
         .success()
         // Successful task output is captured (not streamed) in default mode, so
-        // the worker's "bash-ran" line no longer appears on stdout; assert the
-        // run succeeded via the Done summary and that no stray output leaked.
-        .stdout(predicate::str::contains("Done: 2 tasks done after "))
+        // the worker's "bash-ran" line no longer appears on stdout; root no
+        // longer also contributes a global `build`, so only package build runs.
+        .stdout(predicate::str::contains("Done: 1 tasks done after "))
         .stdout(predicate::str::contains("bash-ran").not())
         .stdout(predicate::str::contains("package-build-script-unused").not())
         .stdout(predicate::str::contains("pruned during resolution").not());

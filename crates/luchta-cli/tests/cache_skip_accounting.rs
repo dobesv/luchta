@@ -254,13 +254,13 @@ echo '{{"concurrency":{{"maxWeight":4}},"workers":{{"shell":{{"command":"{worker
         "run should succeed, stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    // The global `build` expands to 3 tasks: the root `build` aggregator and
-    // `b#build` are ordering-only no-command nodes (counted as done), plus the
-    // cacheable `a#build` which runs. All three count as done; none are skipped
+    // The global `build` now expands only to child packages. `a#build` runs and
+    // `b#build` is an ordering-only no-command node counted as done; root no
+    // longer gets a `build` node from global expansion. None are skipped
     // (no-command nodes are NOT "skipped" — only cache hits are).
     assert!(
-        stdout.contains("Done: 3 tasks done"),
-        "stdout should contain 'Done: 3 tasks done', got: {stdout}"
+        stdout.contains("Done: 2 tasks done"),
+        "stdout should contain 'Done: 2 tasks done', got: {stdout}"
     );
     assert!(
         !stdout.contains("skipped"),
@@ -284,11 +284,12 @@ echo '{{"concurrency":{{"maxWeight":4}},"workers":{{"shell":{{"command":"{worker
         "second run should succeed, stderr: {}",
         String::from_utf8_lossy(&output2.stderr)
     );
-    // Second run: a#build is a cache hit (the only "skipped"); the two
-    // no-command ordering nodes (root `build`, `b#build`) still count as done.
+    // Second run: `a#build` is a cache hit (the only "skipped"); only the
+    // no-command `b#build` still counts as done because root no longer gets a
+    // `build` node from global expansion.
     assert!(
-        stdout2.contains("Done: 2 tasks done"),
-        "second run should show 'Done: 2 tasks done', got: {stdout2}"
+        stdout2.contains("Done: 1 tasks done"),
+        "second run should show 'Done: 1 tasks done', got: {stdout2}"
     );
     assert!(
         stdout2.contains(", 1 skipped"),
