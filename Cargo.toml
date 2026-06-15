@@ -9,6 +9,10 @@ members = [
     "crates/luchta-cli",
     "crates/luchta-yarn-worker",
     "crates/luchta-bash-worker",
+    "crates/luchta-lazy-worker",
+    "crates/luchta-file-exists-filter",
+    "crates/luchta-yarn-filter",
+  "crates/luchta-command-filter",
     "crates/luchta-cache",
     "xtask",
 ]

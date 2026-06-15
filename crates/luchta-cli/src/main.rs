@@ -71,12 +71,11 @@ async fn run(cli: Cli) -> Result<()> {
             let prepared = run::prepare_workspace(&workspace_root, ResolveMode::Check).await?;
             prepared.worker_manager.shutdown().await;
             run::report_pruned_tasks(&prepared.pruned);
-            let worker_names = prepared.workers.keys().cloned().collect();
 
             match TaskGraph::validate_tasks_with_pruned(
                 &prepared.package_graph,
                 &prepared.pipeline,
-                &worker_names,
+                &prepared.workers,
                 &prepared.pruned_ids,
             ) {
                 Ok(()) => {

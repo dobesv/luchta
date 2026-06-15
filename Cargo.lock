@@ -1658,6 +1658,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "luchta-command-filter"
+version = "0.1.0"
+dependencies = [
+ "assert_cmd",
+ "luchta-worker",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "luchta-engine"
 version = "0.1.0"
 dependencies = [
@@ -1673,6 +1684,30 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tokio-util",
+]
+
+[[package]]
+name = "luchta-file-exists-filter"
+version = "0.1.0"
+dependencies = [
+ "assert_cmd",
+ "globset",
+ "luchta-worker",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "walkdir",
+]
+
+[[package]]
+name = "luchta-lazy-worker"
+version = "0.1.0"
+dependencies = [
+ "assert_cmd",
+ "luchta-worker",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
@@ -1698,6 +1733,7 @@ dependencies = [
 name = "luchta-worker"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "luchta-types",
  "serde",
  "serde_json",
@@ -1717,6 +1753,17 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "walkdir",
+]
+
+[[package]]
+name = "luchta-yarn-filter"
+version = "0.1.0"
+dependencies = [
+ "assert_cmd",
+ "luchta-worker",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

@@ -1,3 +1,4 @@
+pub mod proxy;
 mod runtime;
 
 use std::collections::HashMap;
@@ -5,6 +6,9 @@ use std::collections::HashMap;
 use luchta_types::{DependsOn, TaskDefinition};
 use serde::{Deserialize, Serialize};
 
+pub use proxy::{
+    split_current_process_argv, split_delegate_argv, DelegateArgvSplit, DelegateHandle, ProxyError,
+};
 pub use runtime::{run_worker, run_worker_main, shell_single_quote, Worker, WorkerError};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

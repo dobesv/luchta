@@ -549,6 +549,7 @@ fn manager_with_worker_timeout(
         worker.name.to_owned(),
         WorkerDefinition {
             command: worker_path.display().to_string(),
+            depends_on: Vec::new(),
         },
     );
     WorkerManager::with_shutdown_timeout(definitions, timeout)
