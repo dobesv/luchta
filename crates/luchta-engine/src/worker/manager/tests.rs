@@ -161,6 +161,65 @@ wait
         .await;
 }
 
+/// Regression test for issue #64: a worker that emits far more log lines than
+/// the per-job response channel capacity (64) must not lose any of them. The
+/// shared stdout reader applies back-pressure (`send().await`) instead of
+/// dropping responses when the channel is full, so every emitted line is
+/// delivered to the consumer and captured by the sink.
+#[tokio::test]
+async fn high_log_volume_does_not_drop_lines() {
+    const LINE_COUNT: usize = 1000;
+
+    let temp = TempDir::new().expect("tempdir");
+    // For each request, emit LINE_COUNT log lines (each tagged with its
+    // sequence number) and then report done. LINE_COUNT greatly exceeds the
+    // 64-slot per-job channel, so the old `try_send` path would have dropped
+    // lines once the consumer fell behind.
+    let worker_path = write_worker_script(
+        temp.path(),
+        "high-volume-worker.sh",
+        &format!(
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  i=1
+  while [ "$i" -le {count} ]; do
+    printf '{{"type":"log","id":"%s","stream":"stdout","line":"line-%s"}}\n' "$id" "$i"
+    i=$((i + 1))
+  done
+  printf '{{"type":"done","id":"%s","exitCode":0}}\n' "$id"
+done
+"#,
+            count = LINE_COUNT,
+        ),
+    );
+    let manager = manager_with_worker(TestWorkerRef::new("fake"), &worker_path);
+    let sink = crate::ExecutionLogSink::new();
+
+    let outcome = manager
+        .run_job(
+            "fake",
+            WorkerRequest::new("pkg#task", "echo hi"),
+            Some(&sink),
+        )
+        .await
+        .expect("job succeeds");
+    assert_eq!(outcome.0, 0);
+
+    let lines = sink.lines();
+    assert_eq!(
+        lines.len(),
+        LINE_COUNT,
+        "all worker log lines must be captured, none dropped"
+    );
+    // Every line must be present exactly once, in order, with no gaps.
+    for (index, captured) in lines.iter().enumerate() {
+        assert_eq!(captured.line, format!("line-{}", index + 1));
+    }
+
+    manager.shutdown().await;
+}
+
 #[tokio::test]
 async fn concurrent_first_calls_spawn_single_worker_process() {
     let temp = TempDir::new().expect("tempdir");

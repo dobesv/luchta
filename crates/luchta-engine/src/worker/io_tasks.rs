@@ -190,24 +190,20 @@ async fn handle_reader_frame(
 
 async fn route_worker_response(jobs: &JobMap, line: &str) -> Result<(), ()> {
     let response = serde_json::from_str::<WorkerResponse>(line).map_err(|_| ())?;
-    let id = response.id().to_owned();
     let sender = {
         let jobs = jobs.lock().await;
-        jobs.get(&id).cloned()
+        jobs.get(response.id()).cloned()
     };
 
     if let Some(sender) = sender {
-        // Shared stdout reader must keep draining worker output even if one job stops consuming.
-        if let Err(error) = sender.try_send(response) {
-            match error {
-                mpsc::error::TrySendError::Full(response) => eprintln!(
-                    "worker response queue full for job '{}' ; dropping {:?}",
-                    response.id(),
-                    response
-                ),
-                mpsc::error::TrySendError::Closed(_) => {}
-            }
-        }
+        // Back-pressure rather than drop: a build tool must not lose worker
+        // output. Awaiting the bounded send pauses the shared stdout reader
+        // when a job's consumer falls behind, which in turn stalls the worker
+        // process's stdout until the consumer catches up. A `SendError` means
+        // the job already finished and removed its receiver; that is benign and
+        // ignored. Every dispatched job has a dedicated active consumer
+        // (`round_trip`), so this cannot deadlock sibling jobs.
+        let _ = sender.send(response).await;
     }
 
     Ok(())
