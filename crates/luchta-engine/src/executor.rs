@@ -886,6 +886,7 @@ while IFS= read -r line; do
             "fake".to_owned(),
             WorkerDefinition {
                 command: worker_path.display().to_string(),
+                depends_on: Vec::new(),
             },
         );
         WorkerManager::new(definitions)

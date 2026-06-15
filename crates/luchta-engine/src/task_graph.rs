@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use luchta_types::{DependsOn, PackageName, TaskDefinition, TaskId, TaskName};
+use luchta_types::{DependsOn, PackageName, TaskDefinition, TaskId, TaskName, WorkerDefinition};
 use luchta_workspace::{PackageGraph, PackageNode};
 use petgraph::{
     algo::toposort,
@@ -257,15 +257,23 @@ impl TaskGraph {
     /// tasks that were pruned (for CLI/diagnostic reporting). In check mode a
     /// worker `Reject` aborts with [`ResolveError::Rejected`]; in run mode it is
     /// downgraded to a prune entry.
+    ///
+    /// Worker definitions are used to inject native `depends_on` dependencies
+    /// from each worker's configuration into tasks that use that worker. This
+    /// injection happens after resolution (so worker `Modify` decisions cannot
+    /// erase injected deps) but before prune application (so injected deps are
+    /// subject to normal pruning rules).
     pub async fn build_resolved<R: TaskResolver>(
         package_graph: &PackageGraph,
         pipeline: &HashMap<TaskName, TaskDefinition>,
         packages: &HashMap<PackageName, PackageResolveInfo>,
+        worker_definitions: &HashMap<String, WorkerDefinition>,
         resolver: &R,
         mode: ResolveMode,
     ) -> Result<(Self, Vec<PrunedTask>), EngineError> {
         let mut resolved_pipeline = ResolvedPipeline::build(package_graph, pipeline)?;
         let pruned = resolved_pipeline.resolve(packages, resolver, mode).await?;
+        resolved_pipeline.inject_worker_dependencies(worker_definitions);
         resolved_pipeline.apply_prunes(&pruned);
         let graph = Self::from_resolved_pipeline(package_graph, &resolved_pipeline)?;
         Ok((graph, pruned))
@@ -317,9 +325,14 @@ impl TaskGraph {
     pub fn validate_tasks(
         package_graph: &PackageGraph,
         pipeline: &HashMap<TaskName, TaskDefinition>,
-        worker_names: &HashSet<String>,
+        worker_definitions: &HashMap<String, WorkerDefinition>,
     ) -> Result<(), DependencyValidationError> {
-        Self::validate_tasks_with_pruned(package_graph, pipeline, worker_names, &HashSet::new())
+        Self::validate_tasks_with_pruned(
+            package_graph,
+            pipeline,
+            worker_definitions,
+            &HashSet::new(),
+        )
     }
 
     /// Like [`validate_tasks`], but tolerant of references to tasks that were
@@ -332,13 +345,14 @@ impl TaskGraph {
     pub fn validate_tasks_with_pruned(
         package_graph: &PackageGraph,
         pipeline: &HashMap<TaskName, TaskDefinition>,
-        worker_names: &HashSet<String>,
+        worker_definitions: &HashMap<String, WorkerDefinition>,
         pruned: &HashSet<TaskId>,
     ) -> Result<(), DependencyValidationError> {
         let mut resolved_pipeline = ResolvedPipeline::build(package_graph, pipeline)
             .expect("resolved pipeline should match task graph construction");
-        // Apply prunes so surviving tasks are validated against the post-prune
-        // pipeline, while the pruned ids remain known for dependency tolerance.
+        resolved_pipeline.inject_worker_dependencies(worker_definitions);
+        // Apply prunes after worker dependency injection so validation sees the
+        // same dependency shape as graph construction before pruned targets drop.
         if !pruned.is_empty() {
             let pruned_tasks: Vec<PrunedTask> = pruned
                 .iter()
@@ -350,6 +364,7 @@ impl TaskGraph {
                 .collect();
             resolved_pipeline.apply_prunes(&pruned_tasks);
         }
+        let worker_names: HashSet<String> = worker_definitions.keys().cloned().collect();
         let mut diagnostics = Vec::new();
         let dependency_context = DependencyContext::new(package_graph, &resolved_pipeline, pruned);
 
@@ -769,6 +784,37 @@ impl ResolvedPipeline {
         removed
     }
 
+    /// Injects worker-defined dependencies into tasks that use those workers.
+    ///
+    /// For each task with a configured worker, if that worker is defined and has
+    /// non-empty `depends_on`, those dependencies are appended to the task's
+    /// dependency list (deduped). This runs after resolution so worker `Modify`
+    /// decisions cannot override injected deps, but before prune application.
+    fn inject_worker_dependencies(
+        &mut self,
+        worker_definitions: &HashMap<String, WorkerDefinition>,
+    ) {
+        for definition in self.tasks_by_id.values_mut() {
+            let Some(worker_name) = &definition.worker else {
+                continue;
+            };
+            let Some(worker_def) = worker_definitions.get(worker_name) else {
+                continue;
+            };
+            if worker_def.depends_on.is_empty() {
+                continue;
+            }
+            // Dedupe against both the task's existing deps AND any duplicates
+            // within the worker's own depends_on list (insert as we go).
+            let mut existing: HashSet<DependsOn> = definition.depends_on.iter().cloned().collect();
+            for dep in &worker_def.depends_on {
+                if existing.insert(dep.clone()) {
+                    definition.depends_on.push(dep.clone());
+                }
+            }
+        }
+    }
+
     fn contains_package_task(&self, package_name: &PackageName, task_name: &TaskName) -> bool {
         self.task_names_by_package
             .get(package_name)
@@ -1019,7 +1065,9 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use luchta_types::{DependsOn, PackageName, TaskDefinition, TaskId, TaskName};
+    use luchta_types::{
+        DependsOn, PackageName, TaskDefinition, TaskId, TaskName, WorkerDefinition,
+    };
     use luchta_workspace::{PackageGraph, PackageNode};
 
     use super::{
@@ -1279,7 +1327,7 @@ mod tests {
             },
         )]);
 
-        TaskGraph::validate_tasks(&package_graph, &pipeline, &HashSet::new())
+        TaskGraph::validate_tasks(&package_graph, &pipeline, &HashMap::new())
             .expect("blank command without worker should not be a validation error");
     }
 
@@ -1307,7 +1355,7 @@ mod tests {
             root_task_id(TaskName::from("audit")),
         ));
         // ...and validation must not flag it as dead.
-        TaskGraph::validate_tasks(&package_graph, &pipeline, &HashSet::new())
+        TaskGraph::validate_tasks(&package_graph, &pipeline, &HashMap::new())
             .expect("root-to-root same-package dependency should be valid");
     }
 
@@ -1322,7 +1370,7 @@ mod tests {
             },
         )]);
 
-        let error = TaskGraph::validate_tasks(&package_graph, &pipeline, &HashSet::new())
+        let error = TaskGraph::validate_tasks(&package_graph, &pipeline, &HashMap::new())
             .expect_err("undeclared root dependency should fail validation");
 
         assert_eq!(
@@ -1489,7 +1537,7 @@ mod tests {
             },
         )]);
 
-        let error = TaskGraph::validate_tasks(&package_graph, &pipeline, &HashSet::new())
+        let error = TaskGraph::validate_tasks(&package_graph, &pipeline, &HashMap::new())
             .expect_err("dead dependency expected");
 
         assert_eq!(
@@ -1522,7 +1570,7 @@ mod tests {
             },
         )]);
 
-        let error = TaskGraph::validate_tasks(&package_graph, &pipeline, &HashSet::new())
+        let error = TaskGraph::validate_tasks(&package_graph, &pipeline, &HashMap::new())
             .expect_err("dead dependencies expected");
 
         assert_eq!(
@@ -1602,7 +1650,7 @@ mod tests {
             },
         )]);
 
-        let error = TaskGraph::validate_tasks(&package_graph, &pipeline, &HashSet::new())
+        let error = TaskGraph::validate_tasks(&package_graph, &pipeline, &HashMap::new())
             .expect_err("dead root dependency expected");
 
         assert_eq!(
@@ -1632,7 +1680,7 @@ mod tests {
             },
         )]);
 
-        let error = TaskGraph::validate_tasks(&package_graph, &pipeline, &HashSet::new())
+        let error = TaskGraph::validate_tasks(&package_graph, &pipeline, &HashMap::new())
             .expect_err("dead upstream dependency expected");
 
         assert_eq!(
@@ -1682,7 +1730,7 @@ mod tests {
             },
         )]);
 
-        let error = TaskGraph::validate_tasks(&package_graph, &pipeline, &HashSet::new())
+        let error = TaskGraph::validate_tasks(&package_graph, &pipeline, &HashMap::new())
             .expect_err("dead transitive upstream dependency expected");
 
         assert_eq!(
@@ -1735,7 +1783,7 @@ mod tests {
             (TaskName::from("@repo/c#prepare"), TaskDefinition::default()),
         ]);
 
-        TaskGraph::validate_tasks(&package_graph, &pipeline, &HashSet::new())
+        TaskGraph::validate_tasks(&package_graph, &pipeline, &HashMap::new())
             .expect("transitive upstream resolution should be tolerated");
     }
 
@@ -1754,7 +1802,7 @@ mod tests {
             (TaskName::from("@repo/c#prepare"), TaskDefinition::default()),
         ]);
 
-        TaskGraph::validate_tasks(&package_graph, &pipeline, &HashSet::new())
+        TaskGraph::validate_tasks(&package_graph, &pipeline, &HashMap::new())
             .expect("partial upstream resolution should be tolerated");
     }
 
@@ -1776,7 +1824,7 @@ mod tests {
             (TaskName::from("#audit-licenses"), TaskDefinition::default()),
         ]);
 
-        TaskGraph::validate_tasks(&package_graph, &pipeline, &HashSet::new())
+        TaskGraph::validate_tasks(&package_graph, &pipeline, &HashMap::new())
             .expect("declared tasks should satisfy dependency validation");
     }
 
@@ -1791,7 +1839,7 @@ mod tests {
             },
         )]);
 
-        let error = TaskGraph::validate_tasks(&package_graph, &pipeline, &HashSet::new())
+        let error = TaskGraph::validate_tasks(&package_graph, &pipeline, &HashMap::new())
             .expect_err("command without worker should fail validation");
 
         assert_eq!(
@@ -1817,7 +1865,7 @@ mod tests {
         )]);
 
         // No workers are defined, so referencing one is invalid.
-        let error = TaskGraph::validate_tasks(&package_graph, &pipeline, &HashSet::new())
+        let error = TaskGraph::validate_tasks(&package_graph, &pipeline, &HashMap::new())
             .expect_err("unknown worker should fail validation");
 
         assert_eq!(
@@ -1833,7 +1881,13 @@ mod tests {
         );
 
         // A defined worker passes validation.
-        let workers = HashSet::from(["missing".to_string()]);
+        let workers = HashMap::from([(
+            "missing".to_string(),
+            WorkerDefinition {
+                command: "echo".to_string(),
+                depends_on: vec![],
+            },
+        )]);
         TaskGraph::validate_tasks(&package_graph, &pipeline, &workers)
             .expect("defined worker should pass validation");
     }
@@ -2149,6 +2203,7 @@ mod tests {
             &package_graph,
             &pipeline,
             &empty_resolve_info(),
+            &HashMap::new(),
             &resolver,
             ResolveMode::Run,
         )
@@ -2184,6 +2239,7 @@ mod tests {
             &package_graph,
             &pipeline,
             &empty_resolve_info(),
+            &HashMap::new(),
             &resolver,
             ResolveMode::Run,
         )
@@ -2215,6 +2271,7 @@ mod tests {
             &package_graph,
             &pipeline,
             &empty_resolve_info(),
+            &HashMap::new(),
             &resolver,
             ResolveMode::Run,
         )
@@ -2241,6 +2298,7 @@ mod tests {
             &package_graph,
             &pipeline,
             &empty_resolve_info(),
+            &HashMap::new(),
             &resolver,
             ResolveMode::Run,
         )
@@ -2255,6 +2313,7 @@ mod tests {
             &package_graph,
             &pipeline,
             &empty_resolve_info(),
+            &HashMap::new(),
             &resolver,
             ResolveMode::Check,
         )
@@ -2281,11 +2340,19 @@ mod tests {
                 ResolveResult::accept()
             }
         });
+        let workers = HashMap::from([(
+            "yarn".to_string(),
+            WorkerDefinition {
+                command: "yarn".to_string(),
+                depends_on: vec![],
+            },
+        )]);
 
         let (graph, pruned) = TaskGraph::build_resolved(
             &package_graph,
             &pipeline,
             &empty_resolve_info(),
+            &workers,
             &resolver,
             ResolveMode::Run,
         )
@@ -2298,14 +2365,8 @@ mod tests {
 
         // Validation tolerates the reference to the pruned dependency.
         let pruned_ids: HashSet<TaskId> = pruned.iter().map(|e| e.task_id.clone()).collect();
-        let worker_names = HashSet::from(["yarn".to_string()]);
-        TaskGraph::validate_tasks_with_pruned(
-            &package_graph,
-            &pipeline,
-            &worker_names,
-            &pruned_ids,
-        )
-        .expect("dependency on a pruned task is tolerated");
+        TaskGraph::validate_tasks_with_pruned(&package_graph, &pipeline, &workers, &pruned_ids)
+            .expect("dependency on a pruned task is tolerated");
     }
 
     #[test]
@@ -2317,10 +2378,16 @@ mod tests {
             TaskName::from("build"),
             worker_task(vec![DependsOn::Specific(TaskId::new("@repo/a", "ghost"))]),
         )]);
-        let worker_names = HashSet::from(["yarn".to_string()]);
+        let workers = HashMap::from([(
+            "yarn".to_string(),
+            WorkerDefinition {
+                command: "yarn".to_string(),
+                depends_on: vec![],
+            },
+        )]);
 
         let error =
-            TaskGraph::validate_tasks(&package_graph, &pipeline, &worker_names).expect_err("dead");
+            TaskGraph::validate_tasks(&package_graph, &pipeline, &workers).expect_err("dead");
         let DependencyValidationError::InvalidTasks { diagnostics } = error;
         assert!(diagnostics.iter().any(|diagnostic| matches!(
             &diagnostic.reason,
@@ -2329,5 +2396,314 @@ mod tests {
                 ..
             } if task.as_str() == "ghost"
         )));
+    }
+
+    #[test]
+    fn worker_depends_on_unknown_task_fails_validation() {
+        let package_graph = package_graph_single("@repo/app");
+        let pipeline = HashMap::from([(TaskName::from("build"), worker_task(vec![]))]);
+        let workers = HashMap::from([(
+            "yarn".to_string(),
+            WorkerDefinition {
+                command: "yarn".to_string(),
+                depends_on: vec![DependsOn::Root(TaskName::from("missing"))],
+            },
+        )]);
+
+        let error = TaskGraph::validate_tasks(&package_graph, &pipeline, &workers)
+            .expect_err("worker-injected dead dependency should fail validation");
+        let DependencyValidationError::InvalidTasks { diagnostics } = error;
+        assert!(diagnostics.iter().any(|diagnostic| matches!(
+            &diagnostic.reason,
+            TaskValidationReason::DeadDependencyReference {
+                dependency,
+                reason: DeadDependencyReason::UnknownRootTask { task },
+            } if dependency == &DependsOn::Root(TaskName::from("missing")) && task.as_str() == "missing"
+        )));
+    }
+
+    #[test]
+    fn worker_depends_on_pruned_task_is_tolerated_during_validation() {
+        let package_graph = package_graph_pair();
+        let pipeline = HashMap::from([(TaskName::from("build"), worker_task(vec![]))]);
+        let workers = HashMap::from([(
+            "yarn".to_string(),
+            WorkerDefinition {
+                command: "yarn".to_string(),
+                depends_on: vec![DependsOn::Specific(TaskId::new("@repo/a", "build"))],
+            },
+        )]);
+        let pruned_ids = HashSet::from([TaskId::new("@repo/a", "build")]);
+
+        TaskGraph::validate_tasks_with_pruned(&package_graph, &pipeline, &workers, &pruned_ids)
+            .expect("worker-injected dependency on pruned task should be tolerated");
+    }
+
+    // ==========================================================================
+    // Worker dependency injection tests
+    // ==========================================================================
+
+    #[tokio::test]
+    async fn worker_dep_injection_no_worker_or_empty_deps_no_change() {
+        // (a) bare-string worker config (no deps) / worker with empty deps / task with no worker
+        // => task unchanged (no injected edges).
+        let package_graph = package_graph_single("@repo/a");
+
+        // Task with worker that has no depends_on
+        let pipeline = HashMap::from([(TaskName::from("build"), worker_task(vec![]))]);
+
+        let resolver = StubResolver(|_: &ResolveTask| ResolveResult::accept());
+
+        // Worker definition with empty depends_on
+        let workers: HashMap<String, WorkerDefinition> = HashMap::from([(
+            "yarn".to_string(),
+            WorkerDefinition {
+                command: "yarn".to_string(),
+                depends_on: vec![],
+            },
+        )]);
+
+        let (graph, pruned) = TaskGraph::build_resolved(
+            &package_graph,
+            &pipeline,
+            &empty_resolve_info(),
+            &workers,
+            &resolver,
+            ResolveMode::Run,
+        )
+        .await
+        .expect("build resolved graph");
+
+        assert!(pruned.is_empty());
+        // Task has no dependencies
+        let task_id = TaskId::new("@repo/a", "build");
+        let definition = graph.task_definition(&task_id).expect("task exists");
+        assert!(definition.depends_on.is_empty());
+    }
+
+    #[tokio::test]
+    async fn worker_dep_injection_injects_to_all_tasks_using_worker() {
+        // (b) object worker config with dependsOn => deps injected into EVERY task using that worker
+        let package_graph = package_graph_pair();
+
+        let pipeline = HashMap::from([(TaskName::from("build"), worker_task(vec![]))]);
+
+        let resolver = StubResolver(|_: &ResolveTask| ResolveResult::accept());
+
+        // Worker with depends_on = [DirectUpstream("prepare")]
+        let injected_dep = DependsOn::DirectUpstream(TaskName::from("prepare"));
+        let workers: HashMap<String, WorkerDefinition> = HashMap::from([(
+            "yarn".to_string(),
+            WorkerDefinition {
+                command: "yarn".to_string(),
+                depends_on: vec![injected_dep.clone()],
+            },
+        )]);
+
+        let (graph, pruned) = TaskGraph::build_resolved(
+            &package_graph,
+            &pipeline,
+            &empty_resolve_info(),
+            &workers,
+            &resolver,
+            ResolveMode::Run,
+        )
+        .await
+        .expect("build resolved graph");
+
+        assert!(pruned.is_empty());
+
+        // Both @repo/a#build and @repo/b#build should have the injected dep
+        for pkg in ["@repo/a", "@repo/b"] {
+            let task_id = TaskId::new(pkg, "build");
+            let definition = graph.task_definition(&task_id).expect("task exists");
+            assert!(
+                definition.depends_on.contains(&injected_dep),
+                "task {pkg}#build should have injected dep"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_dep_injection_survives_worker_modify() {
+        // (c) injected worker deps SURVIVE a worker `Modify(depends_on=[...])`
+        // (because inject runs after resolve)
+        let package_graph = package_graph_single("@repo/a");
+
+        let pipeline = HashMap::from([(TaskName::from("build"), worker_task(vec![]))]);
+
+        // Worker Modify changes depends_on to something else
+        let resolver = StubResolver(|_: &ResolveTask| {
+            ResolveResult::modify(TaskModification {
+                command: None,
+                depends_on: Some(vec![DependsOn::SamePackage(TaskName::from("other"))]),
+                weight: None,
+            })
+        });
+
+        // Worker definition has its own depends_on
+        let injected_dep = DependsOn::DirectUpstream(TaskName::from("prepare"));
+        let workers: HashMap<String, WorkerDefinition> = HashMap::from([(
+            "yarn".to_string(),
+            WorkerDefinition {
+                command: "yarn".to_string(),
+                depends_on: vec![injected_dep.clone()],
+            },
+        )]);
+
+        let (graph, pruned) = TaskGraph::build_resolved(
+            &package_graph,
+            &pipeline,
+            &empty_resolve_info(),
+            &workers,
+            &resolver,
+            ResolveMode::Run,
+        )
+        .await
+        .expect("build resolved graph");
+
+        assert!(pruned.is_empty());
+
+        let task_id = TaskId::new("@repo/a", "build");
+        let definition = graph.task_definition(&task_id).expect("task exists");
+
+        // The worker's Modify(depends_on) was applied first
+        assert!(
+            definition
+                .depends_on
+                .contains(&DependsOn::SamePackage(TaskName::from("other"))),
+            "worker Modify depends_on should be present"
+        );
+        // And the injected dep is ALSO present (appended after)
+        assert!(
+            definition.depends_on.contains(&injected_dep),
+            "injected worker dep should survive Modify"
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_dep_injection_dedupes_with_existing_dep() {
+        // (d) injected dep + task's OWN identical dep => deduped (single edge, no panic)
+        let package_graph = package_graph_single("@repo/a");
+
+        let injected_dep = DependsOn::DirectUpstream(TaskName::from("prepare"));
+        // Task already has this dep
+        let pipeline = HashMap::from([(
+            TaskName::from("build"),
+            worker_task(vec![injected_dep.clone()]),
+        )]);
+
+        let resolver = StubResolver(|_: &ResolveTask| ResolveResult::accept());
+
+        // Worker tries to inject the same dep
+        let workers: HashMap<String, WorkerDefinition> = HashMap::from([(
+            "yarn".to_string(),
+            WorkerDefinition {
+                command: "yarn".to_string(),
+                depends_on: vec![injected_dep.clone()],
+            },
+        )]);
+
+        let (graph, pruned) = TaskGraph::build_resolved(
+            &package_graph,
+            &pipeline,
+            &empty_resolve_info(),
+            &workers,
+            &resolver,
+            ResolveMode::Run,
+        )
+        .await
+        .expect("build resolved graph");
+
+        assert!(pruned.is_empty());
+
+        let task_id = TaskId::new("@repo/a", "build");
+        let definition = graph.task_definition(&task_id).expect("task exists");
+
+        // Count occurrences: should be exactly 1 (deduped)
+        let count = definition
+            .depends_on
+            .iter()
+            .filter(|d| *d == &injected_dep)
+            .count();
+        assert_eq!(count, 1, "dep should be deduped, not duplicated");
+    }
+
+    #[tokio::test]
+    async fn worker_dep_injection_tolerates_pruned_or_missing_target() {
+        // (e) injected dep pointing at a pruned or nonexistent task => build does NOT fail
+        let package_graph = package_graph_single("@repo/a");
+
+        let pipeline = HashMap::from([(TaskName::from("build"), worker_task(vec![]))]);
+
+        // Prune the build task
+        let resolver = StubResolver(|_: &ResolveTask| ResolveResult::prune(None));
+
+        // Worker definition has depends_on pointing somewhere
+        let workers: HashMap<String, WorkerDefinition> = HashMap::from([(
+            "yarn".to_string(),
+            WorkerDefinition {
+                command: "yarn".to_string(),
+                depends_on: vec![DependsOn::Specific(TaskId::new("@repo/a", "nonexistent"))],
+            },
+        )]);
+
+        // Build should succeed without error
+        let (graph, pruned) = TaskGraph::build_resolved(
+            &package_graph,
+            &pipeline,
+            &empty_resolve_info(),
+            &workers,
+            &resolver,
+            ResolveMode::Run,
+        )
+        .await
+        .expect("build resolved graph");
+
+        // Task was pruned, so graph is empty
+        assert_eq!(graph.node_count(), 0);
+        assert_eq!(pruned.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn worker_dep_injection_for_task_without_worker_unchanged() {
+        // Task without a worker should not get deps injected
+        let package_graph = package_graph_single("@repo/a");
+
+        let pipeline = HashMap::from([(
+            TaskName::from("build"),
+            TaskDefinition {
+                worker: None,
+                ..TaskDefinition::default()
+            },
+        )]);
+
+        let resolver = StubResolver(|_: &ResolveTask| ResolveResult::accept());
+
+        let workers: HashMap<String, WorkerDefinition> = HashMap::from([(
+            "yarn".to_string(),
+            WorkerDefinition {
+                command: "yarn".to_string(),
+                depends_on: vec![DependsOn::DirectUpstream(TaskName::from("prepare"))],
+            },
+        )]);
+
+        let (graph, pruned) = TaskGraph::build_resolved(
+            &package_graph,
+            &pipeline,
+            &empty_resolve_info(),
+            &workers,
+            &resolver,
+            ResolveMode::Run,
+        )
+        .await
+        .expect("build resolved graph");
+
+        assert!(pruned.is_empty());
+
+        let task_id = TaskId::new("@repo/a", "build");
+        let definition = graph.task_definition(&task_id).expect("task exists");
+        // No worker, so no injection
+        assert!(definition.depends_on.is_empty());
     }
 }

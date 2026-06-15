@@ -206,27 +206,89 @@ route tasks to **stay-resident worker processes** instead of spawning a fresh
 process per task. Workers are lazily spawned on first use and reused across
 jobs, then shut down cleanly when the run completes.
 
-Define workers in the top-level `workers` map, keyed by name, each with a
-`command` that launches the long-lived worker process:
+Workers are defined in the top-level `workers` map, keyed by name. They can be
+defined as a bare string (command only) or an object (command + dependencies):
+
 ```typescript
 workers: {
-  yarn: { command: "luchta-yarn-worker" },
-  bash: { command: "luchta-bash-worker" }
+  // Bare string form: command only
+  bash: "luchta-bash-worker",
+  // Object form: command and optional dependencies
+  yarn: {
+    command: "luchta-yarn-worker",
+    dependsOn: ["#prep"]
+  }
 }
 ```
-Then point a task at a worker with its `worker` field. Luchta ships the
-`luchta-yarn-worker` and `luchta-bash-worker` binaries:
 
+Then point a task at a worker with its `worker` field. Luchta ships several
+standard worker binaries and a set of composable filters.
+
+#### Worker `dependsOn`
+Workers can declare their own dependencies in the configuration.
+`workers.<name>.dependsOn` uses the same syntax as task `dependsOn` (see below).
+These dependencies are automatically appended (engine-side) to every task that
+uses that worker.
+
+Injected worker dependencies are:
+- Deduped against existing task dependencies.
+- Persistent even if the worker's `resolve` protocol message tries to modify
+  task dependencies.
+- Tolerant of pointing at pruned or missing tasks.
+
+#### Standard Worker Binaries
 - **luchta-yarn-worker** runs each task through Yarn so that Yarn-injected
   environment variables (`PATH`, `NODE_OPTIONS`, …) are available. For
   yarn-worker tasks, the task's `command` becomes the Yarn subcommand
   (defaulting to the task name) and is invoked as `yarn workspace <pkg> <command>`
   for package tasks, or `yarn <command>` at the workspace root.
-  Worker-reported detected inputs/outputs replace declared cache patterns for next run decisions; yarn worker always adds `package.json` to detected inputs so script changes invalidate cache entries.
+  Worker-reported detected inputs/outputs replace declared cache patterns for
+  next run decisions; yarn worker always adds `package.json` to detected inputs
+  so script changes invalidate cache entries.
 - **luchta-bash-worker** runs arbitrary commands via `sh -c`, useful for
   tasks that don't need Yarn workspace wrapping.
 
-> **Note:** Stay-resident workers are supported on Unix only.
+#### Wrapper & Filter Workers
+Luchta provides a set of composable wrapper workers that can be chained using
+`--` to add laziness or conditional pruning to any worker. Each wrapper spawns
+the next stage in the chain as a child process and forwards the JSONL protocol.
+Composition works from left to right; the rightmost stage is the real worker.
+Pruning is silent.
+
+- **luchta-lazy-worker -- <delegate...>**
+  Answers `resolve` with `Accept` immediately without starting the delegate.
+  Spawns the delegate only on the first `Run` request and reuses it thereafter.
+  Useful for deferring expensive worker startup until a task actually runs.
+- **luchta-file-exists-filter <glob>... -- <delegate...>**
+  During `resolve`, prunes the task unless at least one of the provided file
+  globs matches a file within the task's directory (OR semantics).
+- **luchta-yarn-filter [--script NAME]... [--dependency NAME]... -- <delegate...>**
+  Prunes tasks based on `package.json` content. All conditions must be met (AND):
+  - Default: Prune unless a script matching the task name exists.
+  - `--script NAME`: Prune unless the specified script name(s) exist.
+  - `--dependency NAME`: Prune unless the specified package(s) are present in
+    `dependencies` or `devDependencies`. If only `--dependency` is used, the
+    default script check is skipped.
+- **luchta-command-filter <predicate cmd...> -- <delegate...>**
+  Runs the provided predicate command in the task's directory during `resolve`.
+  If the command exits with code 0, the task is kept; otherwise, it is pruned.
+  Predicate output is kept off the protocol stdout.
+
+**Example: A complex worker chain**
+This example only runs the Babel worker if `package.json` has a `babel`
+dependency, a `babel.config.*` file exists, and the worker startup is deferred
+until needed:
+
+```typescript
+workers: {
+  babel: {
+    command: "luchta-yarn-filter -- luchta-file-exists-filter 'babel.config.*' -- luchta-command-filter jq -e '.dependencies.babel' package.json -- luchta-lazy-worker -- yarn workspace luchta-workers luchta-babel-worker"
+  }
+}
+```
+
+> **Note:** Stay-resident workers and filters are supported on Unix only.
+
 
 ### Build Cache
 Luchta build cache is **opt-in** per task via `cache: {}`. Cached task skips only when prior run succeeded and all cache inputs still match: task spec, significant env, package dependency versions from `yarn.lock`, dependency-task output hashes, declared or worker-detected inputs, and outputs.

@@ -1,13 +1,46 @@
 use std::collections::HashMap;
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
-use crate::TaskDefinition;
+use crate::{DependsOn, TaskDefinition};
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 /// Worker command definition shared across crates.
 pub struct WorkerDefinition {
     pub command: String,
+    pub depends_on: Vec<DependsOn>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum WorkerDefinitionRepr {
+    Command(String),
+    Object {
+        command: String,
+        #[serde(default, rename = "dependsOn", alias = "depends_on")]
+        depends_on: Vec<DependsOn>,
+    },
+}
+
+impl<'de> Deserialize<'de> for WorkerDefinition {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        match WorkerDefinitionRepr::deserialize(deserializer)? {
+            WorkerDefinitionRepr::Command(command) => Ok(Self {
+                command,
+                depends_on: Vec::new(),
+            }),
+            WorkerDefinitionRepr::Object {
+                command,
+                depends_on,
+            } => Ok(Self {
+                command,
+                depends_on,
+            }),
+        }
+    }
 }
 
 /// Canonical config schema shared across crates.
@@ -149,6 +182,69 @@ mod tests {
             config.workers.get("jest-worker"),
             Some(&WorkerDefinition {
                 command: "node worker.js".to_owned(),
+                depends_on: vec![],
+            })
+        );
+    }
+
+    #[test]
+    fn deserializes_worker_object_with_depends_on() {
+        let sample = r##"
+            [workers.babel]
+            command = "luchta-babel-worker"
+            dependsOn = ["luchta-workers#build", "#prep"]
+        "##;
+
+        let config: LuchtaConfig = toml::from_str(sample).expect("config should deserialize");
+
+        assert_eq!(
+            config.workers.get("babel"),
+            Some(&WorkerDefinition {
+                command: "luchta-babel-worker".to_owned(),
+                depends_on: vec![
+                    DependsOn::Specific(TaskId::new(
+                        PackageName::from("luchta-workers"),
+                        TaskName::from("build"),
+                    )),
+                    DependsOn::Root(TaskName::from("prep")),
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn deserializes_worker_object_with_snake_case_depends_on() {
+        let sample = r#"
+            [workers.babel]
+            command = "luchta-babel-worker"
+            depends_on = ["^build"]
+        "#;
+
+        let config: LuchtaConfig = toml::from_str(sample).expect("config should deserialize");
+
+        assert_eq!(
+            config.workers.get("babel"),
+            Some(&WorkerDefinition {
+                command: "luchta-babel-worker".to_owned(),
+                depends_on: vec![DependsOn::DirectUpstream(TaskName::from("build"))],
+            })
+        );
+    }
+
+    #[test]
+    fn deserializes_worker_bare_string_definition() {
+        let sample = r#"
+            [workers]
+            babel = "luchta-babel-worker"
+        "#;
+
+        let config: LuchtaConfig = toml::from_str(sample).expect("config should deserialize");
+
+        assert_eq!(
+            config.workers.get("babel"),
+            Some(&WorkerDefinition {
+                command: "luchta-babel-worker".to_owned(),
+                depends_on: vec![],
             })
         );
     }

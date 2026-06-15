@@ -82,6 +82,7 @@ pub async fn prepare_workspace(
         &package_graph,
         &pipeline,
         &resolve_info,
+        &config.workers,
         worker_manager.as_ref(),
         mode,
     )
