@@ -37,7 +37,7 @@ cargo fmt --all                                          # Auto-format (rustup u
 cargo clippy --workspace --all-targets -- -D warnings    # Lint — treat warnings as errors
 cargo nextest run --workspace                            # Run all tests via nextest
 cargo nextest run --workspace --stress-count=5           # Repeat 5x to catch flaky tests
-cs delta $(git merge-base HEAD origin/main)              # CodeScene quality analysis of branch changes
+cs delta origin/HEAD                                     # CodeScene quality analysis of branch changes
 cargo xtask install                                      # Install all workspace binary crates locally
 ```
 
