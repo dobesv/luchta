@@ -262,7 +262,7 @@ Precedence: flag > env var > default.
 
 Behavior: luchta pauses dispatching **NEW** tasks while process-tree RSS exceeds `--mem-usage-threshold` **or** system available memory drops below `--mem-free-threshold`. In-flight tasks run to completion. There is no timeout or auto-abort while paused; use Ctrl-C to abort.
 
-Status line: while paused, periodic progress output appends ` ⚠️ mem usage high` and/or ` ⚠️ system free memory low`.
+Status line: while paused, periodic progress output appends `⚠️ mem usage high` and/or `⚠️ system free memory low`.
 
 ### `dependsOn` Syntax
 

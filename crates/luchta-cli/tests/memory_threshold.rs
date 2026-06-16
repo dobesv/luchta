@@ -11,6 +11,9 @@ use common::setup_workspace;
 struct MemoryThresholdCase {
     args: &'static [&'static str],
     env: &'static [(&'static str, &'static str)],
+    /// Whether the command is expected to exit successfully (`true`) or fail
+    /// with a non-zero status (`false`).
+    expected_success: bool,
 }
 
 impl MemoryThresholdCase {
@@ -34,7 +37,14 @@ impl MemoryThresholdCase {
 fn assert_threshold_case(case: MemoryThresholdCase, expected: impl predicates::Predicate<str>) {
     let temp = assert_fs::TempDir::new().expect("create temp dir");
     setup_workspace(&temp);
-    case.command(&temp).assert().stderr(expected);
+    let expected_success = case.expected_success;
+    let assert = case.command(&temp).assert();
+    let assert = if expected_success {
+        assert.success()
+    } else {
+        assert.failure()
+    };
+    assert.stderr(expected);
 }
 
 #[test]
@@ -43,6 +53,7 @@ fn invalid_mem_usage_threshold_exits_with_error() {
         MemoryThresholdCase {
             args: &["--mem-usage-threshold", "bogus"],
             env: &[],
+            expected_success: false,
         },
         predicate::str::contains("Invalid --mem-usage-threshold value"),
     );
@@ -54,6 +65,7 @@ fn invalid_mem_free_threshold_exits_with_error() {
         MemoryThresholdCase {
             args: &["--mem-free-threshold", "12XB"],
             env: &[],
+            expected_success: false,
         },
         predicate::str::contains("Invalid --mem-free-threshold value"),
     );
@@ -65,6 +77,7 @@ fn valid_percent_threshold_parses_without_error() {
         MemoryThresholdCase {
             args: &["--mem-usage-threshold", "50%"],
             env: &[],
+            expected_success: false,
         },
         predicate::str::contains("threshold").not(),
     );
@@ -76,6 +89,7 @@ fn valid_absolute_threshold_with_units_parses() {
         MemoryThresholdCase {
             args: &["--mem-free-threshold", "4GiB"],
             env: &[],
+            expected_success: false,
         },
         predicate::str::contains("threshold").not(),
     );
@@ -87,6 +101,7 @@ fn env_var_mem_usage_threshold_honored() {
         MemoryThresholdCase {
             args: &[],
             env: &[("LUCHTA_MEM_USAGE_THRESHOLD", "bogus_env")],
+            expected_success: false,
         },
         predicate::str::contains("Invalid --mem-usage-threshold value 'bogus_env'"),
     );
@@ -98,6 +113,7 @@ fn env_var_mem_free_threshold_honored() {
         MemoryThresholdCase {
             args: &[],
             env: &[("LUCHTA_MEM_FREE_THRESHOLD", "invalid_env")],
+            expected_success: false,
         },
         predicate::str::contains("Invalid --mem-free-threshold value 'invalid_env'"),
     );
@@ -109,6 +125,7 @@ fn cli_flag_overrides_env_var_threshold() {
         MemoryThresholdCase {
             args: &["--mem-usage-threshold", "75%"],
             env: &[("LUCHTA_MEM_USAGE_THRESHOLD", "bogus")],
+            expected_success: false,
         },
         predicate::str::contains("threshold").not(),
     );

@@ -143,10 +143,6 @@ impl ProgressReporter {
     }
 
     // Consumed by final summary print (task 79423739).
-}
-
-impl ProgressReporter {
-    // Consumed by final summary print (task 79423739).
     pub fn render_summary(&self) -> String {
         let done = self.done.load(Ordering::SeqCst);
         let skipped = self.skipped.load(Ordering::SeqCst);
