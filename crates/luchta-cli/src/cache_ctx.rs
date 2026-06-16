@@ -10,7 +10,7 @@ use luchta_cache::{
     FileEntry, FileStateResolver,
 };
 use luchta_lockfiles::{parse_lockfile, Lockfile};
-use luchta_types::TaskDefinition;
+use luchta_types::{EnvSpec, TaskDefinition};
 use luchta_workspace::{PackageGraph, PackageNode};
 use miette::{IntoDiagnostic, Result};
 use serde::Deserialize;
@@ -160,13 +160,17 @@ fn collect_dep_pairs_for_package(
 
 pub fn build_current_state<'a>(
     task_def: &'a TaskDefinition,
+    merged_env: &'a BTreeMap<String, EnvSpec>,
     dep_outputs: BTreeMap<String, [u8; 32]>,
     pkg_dep_pairs: &'a [(String, String)],
     resolver: &'a dyn FileStateResolver,
 ) -> CurrentState<'a> {
     CurrentState {
         task_spec_hash: task_spec_hash(task_def),
-        env_hash: env_hash(&task_def.env, |name| std::env::var(name).ok()),
+        // Hash declared merged EnvSpec only. Built-in passthrough whitelist vars are
+        // injected later into ExecutionRequest.env, so whitelist-only ambient changes
+        // never enter env_hash.
+        env_hash: env_hash(merged_env, |name| std::env::var(name).ok()),
         pkg_dep_hash: pkg_dep_hash(pkg_dep_pairs),
         dep_outputs,
         declared_input_patterns: &task_def.inputs,

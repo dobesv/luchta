@@ -1645,6 +1645,7 @@ dependencies = [
  "luchta-engine",
  "luchta-lockfiles",
  "luchta-types",
+ "luchta-worker",
  "luchta-workspace",
  "miette",
  "owo-colors",

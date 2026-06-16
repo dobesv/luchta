@@ -30,12 +30,9 @@ where
         .filter(|(_name, spec)| spec.input)
         .map(|(name, spec)| SignificantEnvEntry {
             name: name.clone(),
-            value: match &spec.value {
-                Some(value) => ResolvedEnvValue::Present(value.clone()),
-                None => match resolver(name) {
-                    Some(value) => ResolvedEnvValue::Present(value),
-                    None => ResolvedEnvValue::Absent,
-                },
+            value: match spec.resolve_env_value(name, || resolver(name)) {
+                Some(value) => ResolvedEnvValue::Present(value),
+                None => ResolvedEnvValue::Absent,
             },
         })
         .collect::<Vec<_>>();
@@ -194,6 +191,7 @@ mod tests {
             "NODE_ENV".to_owned(),
             EnvSpec {
                 value: Some("test".to_owned()),
+                default: None,
                 input: true,
             },
         );
@@ -203,6 +201,7 @@ mod tests {
             "NODE_ENV".to_owned(),
             EnvSpec {
                 value: Some("production".to_owned()),
+                default: None,
                 input: true,
             },
         );
@@ -217,6 +216,7 @@ mod tests {
             "NODE_ENV".to_owned(),
             EnvSpec {
                 value: Some("test".to_owned()),
+                default: None,
                 input: true,
             },
         );
@@ -226,6 +226,7 @@ mod tests {
             "SECRET".to_owned(),
             EnvSpec {
                 value: Some("abc123".to_owned()),
+                default: None,
                 input: false,
             },
         );
@@ -235,6 +236,7 @@ mod tests {
             "SECRET".to_owned(),
             EnvSpec {
                 value: Some("changed".to_owned()),
+                default: None,
                 input: false,
             },
         );
@@ -249,12 +251,90 @@ mod tests {
     }
 
     #[test]
+    fn env_hash_changes_when_inherited_ambient_value_changes() {
+        let env = BTreeMap::from([(
+            "HOME".to_owned(),
+            EnvSpec {
+                value: None,
+                default: None,
+                input: true,
+            },
+        )]);
+
+        let first = env_hash(&env, |_| Some("/tmp/one".to_owned()));
+        let second = env_hash(&env, |_| Some("/tmp/two".to_owned()));
+
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn env_hash_changes_when_default_fallback_changes() {
+        let first = BTreeMap::from([(
+            "CACHE_KEY".to_owned(),
+            EnvSpec {
+                value: None,
+                default: Some("alpha".to_owned()),
+                input: true,
+            },
+        )]);
+        let second = BTreeMap::from([(
+            "CACHE_KEY".to_owned(),
+            EnvSpec {
+                value: None,
+                default: Some("beta".to_owned()),
+                input: true,
+            },
+        )]);
+
+        assert_ne!(env_hash(&first, |_| None), env_hash(&second, |_| None));
+    }
+
+    #[test]
+    fn env_hash_ignores_whitelist_only_ambient_changes() {
+        let env = BTreeMap::new();
+
+        assert_eq!(
+            env_hash(&env, |_| Some("/path/one".to_owned())),
+            env_hash(&env, |_| Some("/path/two".to_owned()))
+        );
+    }
+
+    #[test]
+    fn env_hash_matches_execution_resolution_for_default_fallback() {
+        let spec = EnvSpec {
+            value: None,
+            default: Some("fallback".to_owned()),
+            input: true,
+        };
+        let env = BTreeMap::from([("DEFAULTED".to_owned(), spec.clone())]);
+
+        let resolved = spec.resolve_env_value("DEFAULTED", || None);
+        assert_eq!(resolved, Some("fallback".to_owned()));
+
+        let hashed = env_hash(&env, |_| None);
+        let expected = env_hash(
+            &BTreeMap::from([(
+                "DEFAULTED".to_owned(),
+                EnvSpec {
+                    value: Some("fallback".to_owned()),
+                    default: None,
+                    input: true,
+                },
+            )]),
+            |_| None,
+        );
+
+        assert_eq!(hashed, expected);
+    }
+
+    #[test]
     fn env_hash_distinguishes_present_from_absent() {
         let mut env = BTreeMap::new();
         env.insert(
             "OPTIONAL_FLAG".to_owned(),
             EnvSpec {
                 value: None,
+                default: None,
                 input: true,
             },
         );
@@ -272,6 +352,7 @@ mod tests {
             "HOME".to_owned(),
             EnvSpec {
                 value: None,
+                default: None,
                 input: true,
             },
         );
@@ -327,6 +408,7 @@ mod tests {
             "NODE_ENV".to_owned(),
             EnvSpec {
                 value: Some("test".to_owned()),
+                default: None,
                 input: true,
             },
         );
@@ -334,6 +416,7 @@ mod tests {
             "API_TOKEN".to_owned(),
             EnvSpec {
                 value: None,
+                default: None,
                 input: false,
             },
         );

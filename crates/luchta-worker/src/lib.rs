@@ -11,6 +11,64 @@ pub use proxy::{
 };
 pub use runtime::{run_worker, run_worker_main, shell_single_quote, Worker, WorkerError};
 
+/// Built-in passthrough environment variables that are always inherited from
+/// the ambient environment into task execution, even under strict env isolation.
+///
+/// These variables are essential for basic system functionality (paths, home dirs,
+/// proxies, locale) and are NOT cache-affecting (they are not EnvSpec entries).
+///
+/// Whitelist rationale:
+/// - PATH/PATHEXT/LD_LIBRARY_PATH/DYLD_FALLBACK_LIBRARY_PATH: Executable discovery
+/// - HOME/USER/LOGNAME/SHELL/USERPROFILE/APPDATA/PROGRAMDATA: User home/data dirs
+/// - XDG_CONFIG_HOME/XDG_DATA_HOME/XDG_CACHE_HOME: XDG base directories (Linux)
+/// - SystemRoot/SYSTEMDRIVE/WINDIR/ProgramFiles/ProgramFiles(x86): Windows system dirs
+/// - TMPDIR/TMP/TEMP: Temporary file locations
+/// - TERM/COLORTERM/FORCE_COLOR/NO_COLOR: Terminal color control
+/// - LANG/LC_ALL/TZ: Locale/timezone
+/// - SSL_CERT_FILE/SSL_CERT_DIR: TLS certificate trust stores
+/// - CI: CI environment detection
+/// - HTTP_PROXY/HTTPS_PROXY/NO_PROXY/http_proxy/https_proxy/no_proxy: Network proxies
+pub const BUILTIN_PASSTHROUGH_ENV: &[&str] = &[
+    "PATH",
+    "PATHEXT",
+    "LD_LIBRARY_PATH",
+    "DYLD_FALLBACK_LIBRARY_PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_CACHE_HOME",
+    "USERPROFILE",
+    "APPDATA",
+    "PROGRAMDATA",
+    "SystemRoot",
+    "SYSTEMDRIVE",
+    "WINDIR",
+    "ProgramFiles",
+    "ProgramFiles(x86)",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "TERM",
+    "COLORTERM",
+    "FORCE_COLOR",
+    "NO_COLOR",
+    "LANG",
+    "LC_ALL",
+    "TZ",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "CI",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+];
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkerRequest {
