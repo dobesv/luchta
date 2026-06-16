@@ -207,6 +207,16 @@ The `tasks` map defines how tasks are applied across the workspace:
 
 - `luchta run build`: Runs package `build` tasks. Top-level tasks are never included.
 - `luchta run -T build` (or `--top-level`): Runs the top-level `#build` task.
+- `luchta run -p <PATTERN> build`: Selects tasks by package **name** (not path). Supports glob wildcards (e.g. `@repo/*`, `pkg-*`). Repeatable.
+- `luchta run 'test*'`: Task arguments also support glob wildcards (e.g. `test:*`, `build*`).
+- `luchta run -T -p app build`: Runs both `@repo/app#build` and the top-level `#build` task (`-T` is additive to `-p`).
+
+Luchta uses a **Goal-not-filter** selection model. Filters select the entry-point goals you want to reach; transitive prerequisites of those goals always run, even if they live in packages or have task names that do not match the filter. Luchta ensures everything needed for your targets is built.
+
+Additional targeting rules:
+- **AND Logic**: Filters across dimensions are combined (e.g., `-p pkg build` matches goals where package name matches `pkg` AND task name matches `build`).
+- **Mandatory Tasks**: At least one task argument is required; `luchta run -p pkg` is an error.
+- **Error Reporting**: If no matches are found, Luchta provides a clear error distinguishing between "no packages matched the pattern" and "no tasks matched within the selected packages".
 
 ### `dependsOn` Syntax
 
