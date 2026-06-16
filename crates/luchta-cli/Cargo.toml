@@ -24,6 +24,7 @@ owo-colors = "4.0"
 petgraph.workspace = true
 globset = { workspace = true }
 thiserror = { workspace = true }
+sysinfo = { workspace = true }
 luchta-types = { path = "../luchta-types" }
 luchta-workspace = { path = "../luchta-workspace" }
 luchta-engine = { path = "../luchta-engine" }
@@ -41,3 +42,4 @@ assert_fs = { workspace = true }
 escargot = "0.5"
 predicates = { workspace = true }
 tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }

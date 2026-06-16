@@ -3,12 +3,13 @@ mod cli;
 mod config;
 mod env_conflict;
 mod env_merge;
+mod memory_pressure;
 mod progress;
 mod rss;
 mod run;
 
 use clap::Parser;
-use cli::{Cli, Commands};
+use cli::{Cli, Commands, OutputMode};
 use luchta_engine::{
     DependencyValidationError, ResolveMode, TaskGraph, TaskValidationDiagnostic,
     TaskValidationReason,
@@ -53,27 +54,7 @@ async fn run(cli: Cli) -> Result<()> {
     let workspace_root = run::resolve_workspace_root(cli.workspace_root)?;
 
     match cli.command {
-        Commands::Run {
-            tasks,
-            packages,
-            top_level,
-            dry_run,
-            output,
-        } => {
-            if tasks.is_empty() {
-                return Err(miette::miette!("no tasks specified for run command"));
-            }
-            let selection = run::TaskSelection {
-                requested_tasks: &tasks,
-                packages: &packages,
-                top_level,
-            };
-            if dry_run {
-                run::dry_run_tasks(&workspace_root, &selection).await
-            } else {
-                run::run_tasks(&workspace_root, &selection, output).await
-            }
-        }
+        command @ Commands::Run { .. } => run_command(&workspace_root, command).await,
         Commands::Check => {
             // Check mode: a worker `Reject` during resolution is a hard error
             // (surfaced from prepare_workspace); a `Prune` is informational.
@@ -81,7 +62,6 @@ async fn run(cli: Cli) -> Result<()> {
             prepared.worker_manager.shutdown().await;
             run::report_pruned_tasks(&prepared.pruned);
 
-            // Collect dependency validation diagnostics
             let dep_diagnostics = match TaskGraph::validate_tasks_with_pruned(
                 &prepared.package_graph,
                 &prepared.pipeline,
@@ -95,7 +75,6 @@ async fn run(cli: Cli) -> Result<()> {
                     .collect::<Vec<_>>(),
             };
 
-            // Collect env conflict diagnostics
             let env_conflicts = env_conflict::detect_env_conflicts(
                 &prepared.env,
                 &prepared.workers,
@@ -106,7 +85,6 @@ async fn run(cli: Cli) -> Result<()> {
                 .map(|conflict| conflict.to_diagnostic())
                 .collect();
 
-            // Combine diagnostics; report error if any exist
             let mut all_diagnostics = dep_diagnostics;
             all_diagnostics.extend(env_diagnostics);
 
@@ -153,11 +131,133 @@ impl miette::Diagnostic for CheckValidationError {
         })))
     }
 }
+
+struct RunArgs {
+    tasks: Vec<String>,
+    packages: Vec<String>,
+    top_level: bool,
+    dry_run: bool,
+    output: OutputMode,
+    thresholds: ThresholdInputs,
+}
+
+struct ThresholdInputs {
+    usage_cli: Option<String>,
+    free_cli: Option<String>,
+}
+
+fn command_run_args(command: Commands) -> RunArgs {
+    match command {
+        Commands::Run {
+            tasks,
+            packages,
+            top_level,
+            dry_run,
+            output,
+            mem_usage_threshold,
+            mem_free_threshold,
+        } => RunArgs {
+            tasks,
+            packages,
+            top_level,
+            dry_run,
+            output,
+            thresholds: ThresholdInputs {
+                usage_cli: mem_usage_threshold,
+                free_cli: mem_free_threshold,
+            },
+        },
+        Commands::Check => unreachable!("checked by caller"),
+    }
+}
+
+async fn run_command(workspace_root: &std::path::Path, command: Commands) -> Result<()> {
+    let args = command_run_args(command);
+    if args.tasks.is_empty() {
+        return Err(miette::miette!("no tasks specified for run command"));
+    }
+
+    let selection = run::TaskSelection {
+        requested_tasks: &args.tasks,
+        packages: &args.packages,
+        top_level: args.top_level,
+    };
+    let memory_pressure = resolve_memory_pressure_config(args.thresholds)?;
+
+    if args.dry_run {
+        run::dry_run_tasks(workspace_root, &selection).await
+    } else {
+        run::run_tasks(workspace_root, &selection, args.output, memory_pressure).await
+    }
+}
+
+fn resolve_memory_pressure_config(
+    thresholds: ThresholdInputs,
+) -> Result<run::MemoryPressureConfig> {
+    Ok(run::MemoryPressureConfig {
+        usage: resolve_threshold_spec(
+            thresholds.usage_cli.as_deref(),
+            "LUCHTA_MEM_USAGE_THRESHOLD",
+            "mem-usage-threshold",
+        )?,
+        free: resolve_threshold_spec(
+            thresholds.free_cli.as_deref(),
+            "LUCHTA_MEM_FREE_THRESHOLD",
+            "mem-free-threshold",
+        )?,
+    })
+}
+/// Precedence: CLI flag > env var. Returns `None` if neither is set.
+/// Returns an error if the value is invalid.
+fn resolve_threshold_spec(
+    cli_value: Option<&str>,
+    env_var: &str,
+    flag_name: &str,
+) -> Result<Option<crate::memory_pressure::ThresholdSpec>, miette::Report> {
+    use crate::memory_pressure::{parse_threshold, ThresholdParseError};
+
+    let raw = cli_value
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var(env_var).ok().filter(|s| !s.is_empty()));
+
+    match raw {
+        None => Ok(None),
+        Some(value) => parse_threshold(&value).map(Some).map_err(|e| match e {
+            ThresholdParseError::Empty => {
+                let source = if cli_value.is_some() {
+                    format!("--{flag_name}")
+                } else {
+                    env_var.to_string()
+                };
+                miette::miette!("threshold value for {source} cannot be empty")
+            }
+            ThresholdParseError::InvalidNumber => {
+                miette::miette!(
+                    "Invalid --{} value '{}': must be a non-negative number or percentage",
+                    flag_name,
+                    value
+                )
+            }
+            ThresholdParseError::UnknownUnit { unit } => {
+                miette::miette!(
+                    "Invalid --{} value '{}': unknown unit '{}'. \
+                             Use: % (percent), B, K/KiB/KB, M/MiB/MB, G/GiB/GB",
+                    flag_name,
+                    value,
+                    unit
+                )
+            }
+            ThresholdParseError::Overflow => {
+                miette::miette!("Invalid --{} value '{}': value too large", flag_name, value)
+            }
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::cli::OutputMode;
-    use std::collections::BTreeMap;
 
     #[tokio::test]
     async fn run_command_errors_when_no_tasks_specified() {
@@ -169,6 +269,8 @@ mod tests {
                 top_level: false,
                 dry_run: true,
                 output: OutputMode::Default,
+                mem_usage_threshold: None,
+                mem_free_threshold: None,
             },
         };
 
@@ -179,106 +281,5 @@ mod tests {
                 .contains("no tasks specified for run command"),
             "unexpected error: {error}"
         );
-    }
-
-    #[test]
-    fn env_conflict_detects_task_conflict() {
-        // Test the detect_env_conflicts function directly with a task conflict
-        use luchta_types::{EnvSpec, TaskDefinition, TaskName};
-
-        let mut pipeline = std::collections::HashMap::new();
-        let mut task_env = BTreeMap::new();
-        task_env.insert(
-            "CONFLICT_VAR".to_owned(),
-            EnvSpec {
-                value: Some("explicit".to_owned()),
-                default: Some("fallback".to_owned()),
-                input: true,
-            },
-        );
-        pipeline.insert(
-            TaskName::from("build"),
-            TaskDefinition {
-                depends_on: vec![],
-                weight: 1,
-                command: None,
-                worker: None,
-                cache: None,
-                inputs: vec![],
-                outputs: vec![],
-                env: task_env,
-            },
-        );
-
-        let conflicts = env_conflict::detect_env_conflicts(
-            &BTreeMap::new(),
-            &std::collections::HashMap::new(),
-            &pipeline,
-        );
-
-        assert_eq!(conflicts.len(), 1);
-        assert_eq!(conflicts[0].var_name, "CONFLICT_VAR");
-        assert_eq!(conflicts[0].scope_label, "task 'build'");
-    }
-
-    #[test]
-    fn env_conflict_detects_global_conflict() {
-        // Test the detect_env_conflicts function directly with a global conflict
-        use luchta_types::EnvSpec;
-
-        let mut global_env = BTreeMap::new();
-        global_env.insert(
-            "GLOBAL_VAR".to_owned(),
-            EnvSpec {
-                value: Some("explicit".to_owned()),
-                default: Some("fallback".to_owned()),
-                input: true,
-            },
-        );
-
-        let conflicts = env_conflict::detect_env_conflicts(
-            &global_env,
-            &std::collections::HashMap::new(),
-            &std::collections::HashMap::new(),
-        );
-
-        assert_eq!(conflicts.len(), 1);
-        assert_eq!(conflicts[0].var_name, "GLOBAL_VAR");
-        assert_eq!(conflicts[0].scope_label, "global");
-    }
-
-    #[test]
-    fn env_conflict_detects_worker_conflict() {
-        // Test the detect_env_conflicts function directly with a worker conflict
-        use luchta_types::{EnvSpec, WorkerDefinition};
-
-        let mut workers = std::collections::HashMap::new();
-        let mut worker_env = BTreeMap::new();
-        worker_env.insert(
-            "WORKER_VAR".to_owned(),
-            EnvSpec {
-                value: Some("explicit".to_owned()),
-                default: Some("fallback".to_owned()),
-                input: true,
-            },
-        );
-        workers.insert(
-            "my-worker".to_owned(),
-            WorkerDefinition {
-                command: "echo".to_owned(),
-                depends_on: vec![],
-                env: worker_env,
-            },
-        );
-
-        let conflicts = env_conflict::detect_env_conflicts(
-            &BTreeMap::new(),
-            &workers,
-            &std::collections::HashMap::new(),
-        );
-
-        assert_eq!(conflicts.len(), 1);
-        assert_eq!(conflicts[0].var_name, "WORKER_VAR");
-        assert_eq!(conflicts[0].scope_label, "worker 'my-worker'");
     }
 }

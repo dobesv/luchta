@@ -245,6 +245,25 @@ Additional targeting rules:
 - **Mandatory Tasks**: At least one task argument is required; `luchta run -p pkg` is an error.
 - **Error Reporting**: If no matches are found, Luchta provides a clear error distinguishing between "no packages matched the pattern" and "no tasks matched within the selected packages".
 
+#### Memory-pressure backpressure
+
+`luchta run` can pause dispatching **new** tasks when memory pressure is high. In-flight tasks keep running to completion.
+
+- `--mem-usage-threshold <BYTES_OR_PERCENT>` / `LUCHTA_MEM_USAGE_THRESHOLD`
+  - Pauses new task dispatch while summed process-tree RSS is greater than threshold.
+  - Accepts percentages like `50%` or absolute values like `4GiB`, `512MiB`, `2GB`, or bare bytes.
+  - Default: `50%` of total system memory.
+- `--mem-free-threshold <BYTES_OR_PERCENT>` / `LUCHTA_MEM_FREE_THRESHOLD`
+  - Pauses new task dispatch while system available memory is less than threshold.
+  - Accepts percentages like `12.5%` or absolute values like `1GiB`, `512MiB`, `500MB`, or bare bytes.
+  - Default: `1/16` of total system memory.
+
+Precedence: flag > env var > default.
+
+Behavior: luchta pauses dispatching **NEW** tasks while process-tree RSS exceeds `--mem-usage-threshold` **or** system available memory drops below `--mem-free-threshold`. In-flight tasks run to completion. There is no timeout or auto-abort while paused; use Ctrl-C to abort.
+
+Status line: while paused, periodic progress output appends `⚠️ mem usage high` and/or `⚠️ system free memory low`.
+
 ### `dependsOn` Syntax
 
 Luchta supports flexible dependency definitions:

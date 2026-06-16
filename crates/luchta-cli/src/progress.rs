@@ -95,7 +95,11 @@ impl ProgressReporter {
         running.len()
     }
 
-    pub fn render_progress(&self, rss_formatted: &str) -> String {
+    pub fn render_progress(
+        &self,
+        rss_formatted: &str,
+        warnings: &[crate::memory_pressure::PressureReason],
+    ) -> String {
         let elapsed_total = self.start.elapsed().as_secs();
         let running = self
             .running
@@ -126,137 +130,16 @@ impl ProgressReporter {
             }
         }
 
-        let mut active_waves = Vec::new();
-        for (wave_index, wave_running) in running_by_wave.iter().enumerate() {
-            if !wave_running.is_empty() {
-                let wave_done = self.wave_done[wave_index].load(Ordering::SeqCst);
-                let wave_total = self.wave_total[wave_index];
-                active_waves.push(format!("W{} {}/{}", wave_index + 1, wave_done, wave_total));
-                if active_waves.len() == 3 {
-                    break;
-                }
-            }
-        }
-
-        let running_str = if running.is_empty() {
-            String::new()
-        } else {
-            let mut running_tasks_list: Vec<&TaskId> = running.keys().collect();
-            running_tasks_list.sort_by_key(|a| a.to_string());
-
-            let total_running = running_tasks_list.len();
-            let shown_count = std::cmp::min(5, total_running);
-            let shown = &running_tasks_list[..shown_count];
-
-            fn get_scope(pkg: &str) -> Option<&str> {
-                if pkg.starts_with('@') {
-                    if let Some(slash_idx) = pkg.find('/') {
-                        return Some(&pkg[..=slash_idx]);
-                    }
-                }
-                None
-            }
-
-            let mut uniform_scope = true;
-            let first_scope = if running_tasks_list[0].is_root() {
-                None
-            } else {
-                get_scope(running_tasks_list[0].package.as_str())
-            };
-            if first_scope.is_none() {
-                uniform_scope = false;
-            } else {
-                for t in &running_tasks_list[1..] {
-                    let scope = if t.is_root() {
-                        None
-                    } else {
-                        get_scope(t.package.as_str())
-                    };
-                    if scope != first_scope {
-                        uniform_scope = false;
-                        break;
-                    }
-                }
-            }
-
-            let inner_str = if uniform_scope {
-                let prefix = first_scope.unwrap();
-                shown
-                    .iter()
-                    .map(|t| {
-                        format!(
-                            "{}#{}",
-                            t.package.as_str().strip_prefix(prefix).unwrap(),
-                            t.task
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            } else {
-                let mut tasks_by_scope: BTreeMap<Option<&str>, Vec<&TaskId>> = BTreeMap::new();
-                for t in shown {
-                    let scope = if t.is_root() {
-                        None
-                    } else {
-                        get_scope(t.package.as_str())
-                    };
-                    tasks_by_scope.entry(scope).or_default().push(*t);
-                }
-
-                // Render scoped groups first (sorted by scope), then any
-                // unscoped tasks last — reads more naturally than the BTreeMap's
-                // natural ordering, which would place `None` (unscoped) first.
-                let mut scope_parts = Vec::new();
-                let mut unscoped_part = None;
-                for (scope, tasks) in tasks_by_scope {
-                    if let Some(s) = scope {
-                        if tasks.len() == 1 {
-                            scope_parts.push(tasks[0].to_string());
-                        } else {
-                            let inner = tasks
-                                .iter()
-                                .map(|t| {
-                                    format!(
-                                        "{}#{}",
-                                        t.package.as_str().strip_prefix(s).unwrap(),
-                                        t.task
-                                    )
-                                })
-                                .collect::<Vec<_>>()
-                                .join(", ");
-                            scope_parts.push(format!("{}{{{}}}", s, inner));
-                        }
-                    } else {
-                        unscoped_part = Some(
-                            tasks
-                                .iter()
-                                .map(|t| t.to_string())
-                                .collect::<Vec<_>>()
-                                .join(", "),
-                        );
-                    }
-                }
-                scope_parts.extend(unscoped_part);
-                scope_parts.join(" · ")
-            };
-
-            if total_running > shown_count {
-                format!(" · running: {} +{}", inner_str, total_running - shown_count)
-            } else {
-                format!(" · running: {}", inner_str)
-            }
-        };
-
-        let active_waves_str = if active_waves.is_empty() {
-            String::new()
-        } else {
-            format!(" · {}", active_waves.join(" · "))
-        };
-
-        format!(
+        let active_waves = render_active_waves(&running_by_wave, &self.wave_done, &self.wave_total);
+        let running_str = render_running_tasks(&running);
+        let active_waves_str = format_active_waves(&active_waves);
+        let mut base = format!(
             "{}{}{} · {}s · RSS {}",
             agg_parts, active_waves_str, running_str, elapsed_total, rss_formatted
-        )
+        );
+        base.push_str(&pressure_suffix(warnings));
+
+        base
     }
 
     // Consumed by final summary print (task 79423739).
@@ -293,12 +176,163 @@ impl ProgressReporter {
                 self.wave_skipped[wave_index].fetch_add(1, Ordering::SeqCst);
                 self.skipped.fetch_add(1, Ordering::SeqCst);
             }
-            // Uncounted outcomes (prev-failure, config-error, not-in-subgraph,
-            // execution failure): removed from the running set above, but not
-            // added to done or skipped.
             TaskOutcome::Uncounted => {}
         }
     }
+}
+
+fn render_active_waves(
+    running_by_wave: &[Vec<&TaskId>],
+    wave_done: &[AtomicUsize],
+    wave_total: &[usize],
+) -> Vec<String> {
+    let mut active_waves = Vec::new();
+    for (wave_index, wave_running) in running_by_wave.iter().enumerate() {
+        if wave_running.is_empty() {
+            continue;
+        }
+        active_waves.push(format!(
+            "W{} {}/{}",
+            wave_index + 1,
+            wave_done[wave_index].load(Ordering::SeqCst),
+            wave_total[wave_index]
+        ));
+        if active_waves.len() == 3 {
+            break;
+        }
+    }
+    active_waves
+}
+
+fn render_running_tasks(running: &HashMap<TaskId, Instant>) -> String {
+    if running.is_empty() {
+        return String::new();
+    }
+
+    let mut all: Vec<&TaskId> = running.keys().collect();
+    all.sort_by_key(|task_id| task_id.to_string());
+    let total_running = all.len();
+    let shown_count = total_running.min(5);
+    let shown = &all[..shown_count];
+    let inner = render_running_task_groups(shown);
+
+    if total_running > shown_count {
+        format!(" · running: {} +{}", inner, total_running - shown_count)
+    } else {
+        format!(" · running: {}", inner)
+    }
+}
+
+fn render_running_task_groups(shown: &[&TaskId]) -> String {
+    let first_scope = shown.iter().find_map(|task| package_scope(task));
+    let uniform_scope =
+        first_scope.is_some() && shown.iter().all(|task| package_scope(task) == first_scope);
+
+    if let Some(prefix) = first_scope.filter(|_| uniform_scope) {
+        shown
+            .iter()
+            .map(|task| {
+                format!(
+                    "{}#{}",
+                    task.package
+                        .as_str()
+                        .trim_start_matches(prefix)
+                        .trim_start_matches('/'),
+                    task.task
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    } else {
+        render_mixed_scope_tasks(shown)
+    }
+}
+
+fn render_mixed_scope_tasks(shown: &[&TaskId]) -> String {
+    let mut tasks_by_scope: BTreeMap<Option<&str>, Vec<&TaskId>> = BTreeMap::new();
+    for task in shown {
+        tasks_by_scope
+            .entry(package_scope(task))
+            .or_default()
+            .push(*task);
+    }
+
+    let mut scope_parts = Vec::new();
+    let mut unscoped_part = None;
+    for (scope, tasks) in tasks_by_scope {
+        match scope {
+            Some(scope) => scope_parts.push(render_scoped_tasks(scope, &tasks)),
+            None => {
+                unscoped_part = Some(
+                    tasks
+                        .iter()
+                        .map(|task| task.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                );
+            }
+        }
+    }
+    scope_parts.extend(unscoped_part);
+    scope_parts.join(" · ")
+}
+
+fn render_scoped_tasks(scope: &str, tasks: &[&TaskId]) -> String {
+    if tasks.len() == 1 {
+        tasks[0].to_string()
+    } else {
+        let inner = tasks
+            .iter()
+            .map(|task| {
+                format!(
+                    "{}#{}",
+                    task.package
+                        .as_str()
+                        .trim_start_matches(scope)
+                        .trim_start_matches('/'),
+                    task.task
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("{}/{{{}}}", scope, inner)
+    }
+}
+
+fn package_scope(task: &TaskId) -> Option<&str> {
+    let package = task.package.as_str();
+    if task.is_root() || !package.starts_with('@') {
+        return None;
+    }
+    package.rsplit_once('/').map(|(scope, _)| scope)
+}
+
+fn format_active_waves(active_waves: &[String]) -> String {
+    if active_waves.is_empty() {
+        String::new()
+    } else {
+        format!(" · {}", active_waves.join(" · "))
+    }
+}
+
+fn pressure_suffix(warnings: &[crate::memory_pressure::PressureReason]) -> String {
+    let mut has_usage = false;
+    let mut has_free = false;
+    for warning in warnings {
+        match warning {
+            crate::memory_pressure::PressureReason::UsageHigh => has_usage = true,
+            crate::memory_pressure::PressureReason::FreeLow => has_free = true,
+        }
+    }
+
+    let mut suffix = String::new();
+    if has_usage {
+        suffix.push_str(" ⚠️ mem usage high");
+    }
+    if has_free {
+        suffix.push_str(" ⚠️ system free memory low");
+    }
+    suffix
 }
 
 #[cfg(test)]
@@ -315,13 +349,13 @@ mod tests {
         let wave_of = HashMap::from([(task_id("pkg-a", "build"), 0)]);
         let reporter = ProgressReporter::new(OutputMode::Default, wave_of, 1);
 
-        let out_zero = reporter.render_progress("10 MB");
+        let out_zero = reporter.render_progress("10 MB", &[]);
         assert!(out_zero.starts_with("0/1 done · 0 running"));
         assert!(!out_zero.contains("skipped"));
         assert!(out_zero.contains("1 pending"));
 
         reporter.task_skipped_cache_hit(&task_id("pkg-a", "build"));
-        let out_skipped = reporter.render_progress("10 MB");
+        let out_skipped = reporter.render_progress("10 MB", &[]);
         assert!(out_skipped.starts_with("0/1 done · 1 skipped · 0 running"));
         assert!(!out_skipped.contains("pending"));
     }
@@ -352,7 +386,7 @@ mod tests {
             .unwrap()
             .insert(task_id("pkg-d", "build"), Instant::now());
 
-        let out = reporter.render_progress("42 MB");
+        let out = reporter.render_progress("42 MB", &[]);
         assert!(!out.contains("W1")); // no running tasks
         assert!(out.contains("W2 0/1"));
         assert!(out.contains("W3 0/1"));
@@ -378,7 +412,7 @@ mod tests {
             .unwrap()
             .insert(task_id("@acme/b", "build"), Instant::now());
 
-        let out = reporter.render_progress("10 MB");
+        let out = reporter.render_progress("10 MB", &[]);
         // Strips @acme/
         assert!(out.contains("running: a#build, b#build"));
         assert!(!out.contains("@acme"));
@@ -414,7 +448,7 @@ mod tests {
             .unwrap()
             .insert(task_id("unscoped", "build"), Instant::now());
 
-        let out = reporter.render_progress("10 MB");
+        let out = reporter.render_progress("10 MB", &[]);
         assert!(
             out.contains("running: @acme/a#build · @formative/{b#build, c#build} · unscoped#build")
         );
@@ -435,7 +469,7 @@ mod tests {
                 .insert(task_id("unscoped", &format!("build{}", i)), Instant::now());
         }
 
-        let out = reporter.render_progress("10 MB");
+        let out = reporter.render_progress("10 MB", &[]);
         // Should show 5 items and +5
         assert!(out.contains(" +5"));
         assert_eq!(out.matches("unscoped#build").count(), 5);
@@ -479,6 +513,45 @@ mod tests {
         assert!(summary.contains(", 1 skipped"));
     }
 
+    #[test]
+    fn render_progress_warnings_usage_only() {
+        let reporter = ProgressReporter::new(OutputMode::Default, HashMap::new(), 0);
+        let out = reporter.render_progress(
+            "10 MB",
+            &[crate::memory_pressure::PressureReason::UsageHigh],
+        );
+        assert!(out.ends_with("⚠️ mem usage high"));
+        assert!(!out.contains("system free memory low"));
+    }
+
+    #[test]
+    fn render_progress_warnings_free_only() {
+        let reporter = ProgressReporter::new(OutputMode::Default, HashMap::new(), 0);
+        let out =
+            reporter.render_progress("10 MB", &[crate::memory_pressure::PressureReason::FreeLow]);
+        assert!(out.ends_with("⚠️ system free memory low"));
+        assert!(!out.contains("mem usage high"));
+    }
+
+    #[test]
+    fn render_progress_warnings_both() {
+        let reporter = ProgressReporter::new(OutputMode::Default, HashMap::new(), 0);
+        let warnings = vec![
+            crate::memory_pressure::PressureReason::UsageHigh,
+            crate::memory_pressure::PressureReason::FreeLow,
+        ];
+        let out = reporter.render_progress("10 MB", &warnings);
+        assert!(out.contains("⚠️ mem usage high"));
+        assert!(out.contains("⚠️ system free memory low"));
+        assert!(out.ends_with("⚠️ system free memory low")); // usage first, then free
+    }
+
+    #[test]
+    fn render_progress_warnings_none() {
+        let reporter = ProgressReporter::new(OutputMode::Default, HashMap::new(), 0);
+        let out = reporter.render_progress("10 MB", &[]);
+        assert!(!out.contains("⚠️"));
+    }
     fn task_id(package: &str, task: &str) -> TaskId {
         TaskId::new(package, task)
     }

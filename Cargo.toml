@@ -50,3 +50,4 @@ tempfile = "3.10.1"
 libc = "0.2.155"
 tokio-util = { version = "0.7", features = ["codec"] }
 tokio-stream = "0.1"
+sysinfo = { version = "0.36.1", default-features = false, features = ["system"] }

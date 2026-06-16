@@ -49,6 +49,24 @@ pub enum Commands {
         /// Control how much progress output is printed.
         #[arg(long, value_enum, default_value_t = OutputMode::Default)]
         output: OutputMode,
+
+        /// Pause NEW task dispatch when process-tree RSS exceeds this threshold.
+        ///
+        /// Accepts percentages like "50%" or absolute values like "4GiB",
+        /// "512MiB", "2GB", or bare bytes. Flag overrides
+        /// `LUCHTA_MEM_USAGE_THRESHOLD`; otherwise defaults to 50% of total
+        /// system memory. In-flight tasks continue until completion.
+        #[arg(long, value_name = "BYTES_OR_PERCENT")]
+        mem_usage_threshold: Option<String>,
+
+        /// Pause NEW task dispatch when system available memory drops below this threshold.
+        ///
+        /// Accepts percentages like "12.5%" or absolute values like "1GiB",
+        /// "512MiB", "500MB", or bare bytes. Flag overrides
+        /// `LUCHTA_MEM_FREE_THRESHOLD`; otherwise defaults to 1/16 of total
+        /// system memory. In-flight tasks continue until completion.
+        #[arg(long, value_name = "BYTES_OR_PERCENT")]
+        mem_free_threshold: Option<String>,
     },
     Check,
 }
