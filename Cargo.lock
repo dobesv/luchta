@@ -1639,6 +1639,7 @@ dependencies = [
  "blake3",
  "clap",
  "escargot",
+ "globset",
  "libc",
  "luchta-cache",
  "luchta-engine",

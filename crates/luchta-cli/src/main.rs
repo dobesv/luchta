@@ -53,6 +53,7 @@ async fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Commands::Run {
             tasks,
+            packages,
             top_level,
             dry_run,
             output,
@@ -60,10 +61,15 @@ async fn run(cli: Cli) -> Result<()> {
             if tasks.is_empty() {
                 return Err(miette::miette!("no tasks specified for run command"));
             }
+            let selection = run::TaskSelection {
+                requested_tasks: &tasks,
+                packages: &packages,
+                top_level,
+            };
             if dry_run {
-                run::dry_run_tasks(&workspace_root, &tasks, top_level).await
+                run::dry_run_tasks(&workspace_root, &selection).await
             } else {
-                run::run_tasks(&workspace_root, &tasks, output, top_level).await
+                run::run_tasks(&workspace_root, &selection, output).await
             }
         }
         Commands::Check => {
@@ -123,5 +129,32 @@ impl miette::Diagnostic for CheckValidationError {
         Some(Box::new(self.diagnostics.iter().map(|diagnostic| {
             diagnostic.as_ref() as &dyn miette::Diagnostic
         })))
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::OutputMode;
+
+    #[tokio::test]
+    async fn run_command_errors_when_no_tasks_specified() {
+        let cli = Cli {
+            workspace_root: None,
+            command: Commands::Run {
+                tasks: Vec::new(),
+                packages: Vec::new(),
+                top_level: false,
+                dry_run: true,
+                output: OutputMode::Default,
+            },
+        };
+
+        let error = run(cli).await.expect_err("run without tasks must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("no tasks specified for run command"),
+            "unexpected error: {error}"
+        );
     }
 }

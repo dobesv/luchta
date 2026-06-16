@@ -10,6 +10,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use globset::{Glob, GlobSet, GlobSetBuilder};
 use luchta_cache::{
     combined_outputs_hash, decide, resolve_cache_dir, resolve_inputs, resolve_outputs, Cache,
     Decision, RunArtifacts, TaskRunRecord, SCHEMA_VERSION_V1,
@@ -30,6 +31,28 @@ use crate::cache_ctx::{
 };
 use crate::cli::OutputMode;
 use crate::progress::ProgressReporter;
+
+/// User's task selection from CLI arguments.
+///
+/// Encapsulates the requested tasks, package filters, and top-level flag into a
+/// single struct to reduce function argument counts and improve API ergonomics.
+#[derive(Debug)]
+pub struct TaskSelection<'a> {
+    pub requested_tasks: &'a [String],
+    pub packages: &'a [String],
+    pub top_level: bool,
+}
+
+/// Internal criteria for matching task nodes.
+///
+/// Pre-built from `TaskSelection` to avoid repeatedly passing the same arguments
+/// to `collect_matching_task_ids` and `package_matches`.
+struct SelectionCriteria<'a> {
+    task_globs: &'a GlobSet,
+    package_globs: &'a GlobSet,
+    match_all_non_root_packages: bool,
+    top_level: bool,
+}
 
 #[derive(Debug)]
 pub struct PreparedWorkspace {
@@ -117,12 +140,11 @@ pub async fn prepare_workspace(
 
 pub async fn run_tasks(
     workspace_root: &Path,
-    requested_tasks: &[String],
+    selection: &TaskSelection<'_>,
     output: OutputMode,
-    top_level: bool,
 ) -> Result<()> {
     let PreparedWorkspace {
-        packages,
+        packages: package_nodes,
         package_graph,
         pipeline: _,
         task_graph,
@@ -133,13 +155,12 @@ pub async fn run_tasks(
         worker_manager,
     } = prepare_workspace(workspace_root, ResolveMode::Run).await?;
 
-    if packages.is_empty() {
+    if package_nodes.is_empty() {
         println!("{}", "No packages found in workspace".yellow());
         return Ok(());
     }
 
-    let tasks_to_run =
-        collect_requested_subgraph(&task_graph, requested_tasks, &pruned, top_level)?;
+    let tasks_to_run = collect_requested_subgraph(&task_graph, selection, &pruned)?;
     let prefix_width = compute_prefix_width(&task_graph, &tasks_to_run);
 
     // Build the progress reporter with wave indices for all tasks to run.
@@ -159,7 +180,7 @@ pub async fn run_tasks(
     let output_hashes: Arc<Mutex<HashMap<TaskId, [u8; 32]>>> = Arc::new(Mutex::new(HashMap::new()));
 
     let CommandMap { commands, invalid } =
-        build_command_map(&task_graph, &packages, workspace_root, &workers);
+        build_command_map(&task_graph, &package_nodes, workspace_root, &workers);
 
     for request in commands.values() {
         executor.register(request.clone());
@@ -182,7 +203,7 @@ pub async fn run_tasks(
         interrupted: &interrupted,
         workspace_root,
         package_graph: &package_graph,
-        packages: &packages,
+        packages: &package_nodes,
         task_graph: &task_graph,
         cache: &cache,
         output_hashes: &output_hashes,
@@ -398,13 +419,9 @@ pub fn report_pruned_tasks(pruned: &[PrunedTask]) {
 /// without executing anything. This is a diagnostic view into the task
 /// dependency graph: every task in a wave only depends on tasks in earlier
 /// waves, so all tasks within a wave could run concurrently.
-pub async fn dry_run_tasks(
-    workspace_root: &Path,
-    requested_tasks: &[String],
-    top_level: bool,
-) -> Result<()> {
+pub async fn dry_run_tasks(workspace_root: &Path, selection: &TaskSelection<'_>) -> Result<()> {
     let PreparedWorkspace {
-        packages,
+        packages: package_nodes,
         package_graph: _,
         pipeline: _,
         task_graph,
@@ -419,17 +436,16 @@ pub async fn dry_run_tasks(
     // graph is built since dry-run executes nothing.
     worker_manager.shutdown().await;
 
-    if packages.is_empty() {
+    if package_nodes.is_empty() {
         println!("{}", "No packages found in workspace".yellow());
         return Ok(());
     }
 
     report_pruned_tasks(&pruned);
 
-    let tasks_to_run =
-        collect_requested_subgraph(&task_graph, requested_tasks, &pruned, top_level)?;
+    let tasks_to_run = collect_requested_subgraph(&task_graph, selection, &pruned)?;
     let CommandMap { commands, invalid } =
-        build_command_map(&task_graph, &packages, workspace_root, &workers);
+        build_command_map(&task_graph, &package_nodes, workspace_root, &workers);
 
     let waves = compute_execution_waves(&task_graph, &tasks_to_run);
 
@@ -598,52 +614,158 @@ fn shutdown_signal() -> Pin<Box<dyn Future<Output = Result<ShutdownSignal>> + Se
     })
 }
 
+fn build_globset(patterns: &[String]) -> Result<GlobSet> {
+    let mut builder = GlobSetBuilder::new();
+    for pattern in patterns {
+        builder.add(
+            Glob::new(pattern).map_err(|error| {
+                miette::miette!("invalid glob pattern '{}': {}", pattern, error)
+            })?,
+        );
+    }
+    builder
+        .build()
+        .into_diagnostic()
+        .wrap_err("failed to build glob set")
+}
+
 fn collect_requested_subgraph(
     task_graph: &TaskGraph,
-    requested_tasks: &[String],
+    selection: &TaskSelection<'_>,
     pruned: &[PrunedTask],
-    top_level: bool,
 ) -> Result<HashSet<TaskId>> {
-    let mut requested_ids = HashSet::new();
+    let package_globs = build_globset(selection.packages)?;
+    let task_globs = build_globset(selection.requested_tasks)?;
     let available_nodes: Vec<&TaskNode> = task_graph.nodes().collect();
+    let matched_package_names =
+        collect_matched_package_names(&available_nodes, selection.packages, &package_globs);
 
-    for requested in requested_tasks {
-        let matched =
-            collect_matching_task_ids(&available_nodes, requested, &mut requested_ids, top_level);
-        if !matched {
-            report_unmatched_request(requested, pruned, top_level)?;
-        }
+    if !selection.packages.is_empty() && matched_package_names.is_empty() {
+        bail!(
+            "No packages matched: [{}]. -p matches package names, not paths.",
+            selection.packages.join(", ")
+        );
+    }
+
+    let criteria = SelectionCriteria {
+        task_globs: &task_globs,
+        package_globs: &package_globs,
+        match_all_non_root_packages: selection.packages.is_empty(),
+        top_level: selection.top_level,
+    };
+
+    let requested_ids = collect_matching_task_ids(&available_nodes, &criteria);
+
+    validate_literal_task_requests(&requested_ids, selection, pruned, &criteria)?;
+
+    if requested_ids.is_empty() && single_literal_task_request(selection.requested_tasks).is_none()
+    {
+        bail!(
+            "No tasks matched filter: packages=[{}] tasks=[{}]",
+            selection.packages.join(", "),
+            selection.requested_tasks.join(", "),
+        );
     }
 
     Ok(expand_with_dependencies(task_graph, requested_ids))
 }
 
-/// Adds every node whose task name equals `requested` and whose root/package
-/// scope matches `top_level` to `requested_ids`, returning whether at least one
-/// matched.
+/// Adds every node whose task name matches `task_globs` and whose package scope
+/// matches selection matrix, returning matched goal ids.
 fn collect_matching_task_ids(
     available_nodes: &[&TaskNode],
-    requested: &str,
-    requested_ids: &mut HashSet<TaskId>,
-    top_level: bool,
-) -> bool {
-    let mut matched = false;
-    for node in available_nodes {
-        if node.id.task.as_str() == requested && node.id.is_root() == top_level {
-            requested_ids.insert(node.id.clone());
-            matched = true;
-        }
-    }
-    matched
+    criteria: &SelectionCriteria<'_>,
+) -> HashSet<TaskId> {
+    available_nodes
+        .iter()
+        .filter(|node| criteria.task_globs.is_match(node.id.task.as_str()))
+        .filter(|node| package_matches(&node.id, criteria))
+        .map(|node| node.id.clone())
+        .collect()
 }
 
-/// Handles a requested task that matched no graph node. A task that survives
+fn collect_matched_package_names(
+    available_nodes: &[&TaskNode],
+    packages: &[String],
+    package_globs: &GlobSet,
+) -> HashSet<PackageName> {
+    if packages.is_empty() {
+        return HashSet::new();
+    }
+
+    available_nodes
+        .iter()
+        .map(|node| &node.id)
+        .filter(|task_id| !task_id.is_root())
+        .map(|task_id| task_id.package.clone())
+        .filter(|package_name| package_globs.is_match(package_name.as_str()))
+        .collect()
+}
+
+fn package_matches(task_id: &TaskId, criteria: &SelectionCriteria<'_>) -> bool {
+    let is_root = task_id.is_root();
+    let matches_non_root_package = if criteria.match_all_non_root_packages {
+        !is_root
+    } else {
+        !is_root && criteria.package_globs.is_match(task_id.package.as_str())
+    };
+
+    match (criteria.top_level, criteria.match_all_non_root_packages) {
+        (true, false) => matches_non_root_package || is_root,
+        (true, true) => is_root,
+        (false, false) => matches_non_root_package,
+        (false, true) => !is_root,
+    }
+}
+
+fn is_literal_pattern(s: &str) -> bool {
+    !s.contains(['*', '?', '[', ']', '{', '}', '!', '\\'])
+}
+
+fn validate_literal_task_requests(
+    requested_ids: &HashSet<TaskId>,
+    selection: &TaskSelection<'_>,
+    pruned: &[PrunedTask],
+    criteria: &SelectionCriteria<'_>,
+) -> Result<()> {
+    for requested in selection
+        .requested_tasks
+        .iter()
+        .map(String::as_str)
+        .filter(|requested| is_literal_pattern(requested))
+    {
+        let matched = requested_ids
+            .iter()
+            .any(|task_id| task_id.task.as_str() == requested);
+        if !matched {
+            report_unmatched_request(requested, pruned, criteria)?;
+        }
+    }
+    Ok(())
+}
+
+fn single_literal_task_request(requested_tasks: &[String]) -> Option<&str> {
+    match requested_tasks {
+        [requested] if is_literal_pattern(requested) => Some(requested.as_str()),
+        _ => None,
+    }
+}
+
+/// Handles literal task request that matched no graph node. A task that survives
 /// nowhere may have been pruned away during resolution (a normal, expected
 /// outcome) — reported informationally — rather than never existing, which is
 /// an error.
-fn report_unmatched_request(requested: &str, pruned: &[PrunedTask], top_level: bool) -> Result<()> {
+///
+/// The pruned-away check honours the active package/scope filter: a pruned task
+/// in a package excluded by `-p` (or at the wrong root scope) must not suppress
+/// the "not found" error for the selected packages.
+fn report_unmatched_request(
+    requested: &str,
+    pruned: &[PrunedTask],
+    criteria: &SelectionCriteria<'_>,
+) -> Result<()> {
     let pruned_away = pruned.iter().any(|entry| {
-        entry.task_id.task.as_str() == requested && entry.task_id.is_root() == top_level
+        entry.task_id.task.as_str() == requested && package_matches(&entry.task_id, criteria)
     });
     if pruned_away {
         println!(
@@ -1385,7 +1507,7 @@ fn resolve_non_worker_command(task_def: Option<&TaskDefinition>) -> NonWorkerCom
 #[cfg(test)]
 mod tests {
     use super::*;
-    use luchta_types::EnvSpec;
+    use luchta_types::{DependsOn, EnvSpec};
     use std::sync::Mutex;
 
     /// Process-wide lock to serialize env-mutating tests.
@@ -1548,42 +1670,124 @@ mod tests {
     }
 
     fn matching_scope_task_graph() -> TaskGraph {
-        let temp_dir = tempfile::tempdir().expect("create temp dir");
-        let package_dir = temp_dir.path().join("packages/pkg");
-        std::fs::create_dir_all(&package_dir).expect("create package dir");
-        std::fs::write(
-            package_dir.join("package.json"),
-            serde_json::json!({
-                "name": "@repo/pkg",
-                "version": "1.0.0",
-            })
-            .to_string(),
+        package_task_graph(
+            vec![("@repo/pkg", "packages/pkg", Vec::new())],
+            vec![
+                task_entry("build", Vec::new()),
+                task_entry("#build", Vec::new()),
+            ],
         )
-        .expect("write package manifest");
+    }
 
-        let package_graph = PackageGraph::build(vec![PackageNode::new(
-            PackageName::from("@repo/pkg"),
-            package_dir,
-        )])
-        .expect("build package graph");
-        let pipeline = HashMap::from([
-            (TaskName::from("build"), TaskDefinition::default()),
-            (TaskName::from("#build"), TaskDefinition::default()),
-        ]);
+    fn package_task_graph(
+        packages: Vec<(&str, &str, Vec<&str>)>,
+        tasks: Vec<(TaskName, TaskDefinition)>,
+    ) -> TaskGraph {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let mut package_nodes = Vec::new();
+
+        for (package_name, relative_dir, dependencies) in packages {
+            let package_dir = temp_dir.path().join(relative_dir);
+            std::fs::create_dir_all(&package_dir).expect("create package dir");
+            std::fs::write(
+                package_dir.join("package.json"),
+                serde_json::json!({
+                    "name": package_name,
+                    "version": "1.0.0",
+                    "dependencies": dependencies
+                        .into_iter()
+                        .map(|name| {
+                            (
+                                name.to_string(),
+                                serde_json::Value::String("1.0.0".to_string()),
+                            )
+                        })
+                        .collect::<serde_json::Map<_, _>>(),
+                })
+                .to_string(),
+            )
+            .expect("write package manifest");
+            package_nodes.push(PackageNode::new(
+                PackageName::from(package_name),
+                package_dir,
+            ));
+        }
+
+        let package_graph = PackageGraph::build(package_nodes).expect("build package graph");
+        let pipeline = HashMap::from_iter(tasks);
 
         TaskGraph::build(&package_graph, &pipeline).expect("build task graph")
+    }
+
+    fn task_entry(name: &str, depends_on: Vec<DependsOn>) -> (TaskName, TaskDefinition) {
+        (
+            TaskName::from(name),
+            TaskDefinition {
+                depends_on,
+                ..TaskDefinition::default()
+            },
+        )
+    }
+
+    fn package_selection_task_graph() -> TaskGraph {
+        package_task_graph(
+            vec![
+                ("@repo/app", "packages/app", vec!["@repo/api"]),
+                ("@repo/api", "packages/api", Vec::new()),
+                ("pkg-foo", "packages/pkg-foo", Vec::new()),
+                ("pkg-bar", "packages/pkg-bar", Vec::new()),
+            ],
+            vec![
+                task_entry(
+                    "build",
+                    vec![DependsOn::DirectUpstream(TaskName::from("build"))],
+                ),
+                task_entry("build-lib", Vec::new()),
+                task_entry(
+                    "test",
+                    vec![DependsOn::SamePackage(TaskName::from("build"))],
+                ),
+                task_entry(
+                    "test:e2e",
+                    vec![DependsOn::SamePackage(TaskName::from("build"))],
+                ),
+                task_entry("#build", Vec::new()),
+            ],
+        )
+    }
+
+    fn goal_model_prereq_task_graph() -> TaskGraph {
+        package_task_graph(
+            vec![
+                ("@repo/app", "packages/app", vec!["@repo/api"]),
+                ("@repo/api", "packages/api", Vec::new()),
+            ],
+            vec![
+                task_entry(
+                    "build",
+                    vec![DependsOn::Specific(TaskId::new("@repo/api", "codegen"))],
+                ),
+                task_entry("codegen", Vec::new()),
+            ],
+        )
     }
 
     #[test]
     fn collect_matching_task_ids_excludes_root_tasks_by_default() {
         let task_graph = matching_scope_task_graph();
         let available_nodes: Vec<&TaskNode> = task_graph.nodes().collect();
-        let mut requested_ids = HashSet::new();
+        let task_globs = build_globset(&["build".to_string()]).expect("build task globs");
+        let package_globs = build_globset(&[]).expect("build package globs");
 
-        let matched =
-            collect_matching_task_ids(&available_nodes, "build", &mut requested_ids, false);
+        let criteria = SelectionCriteria {
+            task_globs: &task_globs,
+            package_globs: &package_globs,
+            match_all_non_root_packages: true,
+            top_level: false,
+        };
 
-        assert!(matched);
+        let requested_ids = collect_matching_task_ids(&available_nodes, &criteria);
+
         assert_eq!(
             requested_ids,
             HashSet::from([TaskId::new("@repo/pkg", "build")])
@@ -1594,39 +1798,65 @@ mod tests {
     fn collect_matching_task_ids_selects_only_root_tasks_for_top_level() {
         let task_graph = matching_scope_task_graph();
         let available_nodes: Vec<&TaskNode> = task_graph.nodes().collect();
-        let mut requested_ids = HashSet::new();
+        let task_globs = build_globset(&["build".to_string()]).expect("build task globs");
+        let package_globs = build_globset(&[]).expect("build package globs");
 
-        let matched =
-            collect_matching_task_ids(&available_nodes, "build", &mut requested_ids, true);
+        let criteria = SelectionCriteria {
+            task_globs: &task_globs,
+            package_globs: &package_globs,
+            match_all_non_root_packages: true,
+            top_level: true,
+        };
 
-        assert!(matched);
+        let requested_ids = collect_matching_task_ids(&available_nodes, &criteria);
+
         assert_eq!(
             requested_ids,
             HashSet::from([TaskId::new("//root", "build")])
         );
     }
 
+    #[path = "run_selection_matrix_tests.rs"]
+    mod run_selection_matrix_tests;
+
     #[test]
-    fn collect_requested_subgraph_excludes_root_tasks_by_default() {
-        let task_graph = matching_scope_task_graph();
+    fn build_globset_reports_invalid_pattern() {
+        let error = build_globset(&["[".to_string()]).expect_err("invalid glob must fail");
+        let message = error.to_string();
 
-        let requested = collect_requested_subgraph(&task_graph, &["build".to_string()], &[], false)
-            .expect("collect requested tasks");
-
-        assert_eq!(
-            requested,
-            HashSet::from([TaskId::new("@repo/pkg", "build")])
-        );
+        assert!(message.contains("invalid glob pattern '['"));
+        assert!(message.contains("["));
     }
 
     #[test]
-    fn collect_requested_subgraph_selects_only_root_tasks_for_top_level() {
-        let task_graph = matching_scope_task_graph();
+    fn collect_requested_subgraph_expands_prereqs_in_unmatched_package() {
+        let task_graph = goal_model_prereq_task_graph();
 
-        let requested = collect_requested_subgraph(&task_graph, &["build".to_string()], &[], true)
-            .expect("collect requested tasks");
+        let selection = TaskSelection {
+            requested_tasks: &["build".to_string()],
+            packages: &["@repo/app".to_string()],
+            top_level: false,
+        };
+        let requested =
+            collect_requested_subgraph(&task_graph, &selection, &[]).expect("collect requested");
 
-        assert_eq!(requested, HashSet::from([TaskId::new("//root", "build")]));
+        assert!(requested.contains(&TaskId::new("@repo/app", "build")));
+        assert!(requested.contains(&TaskId::new("@repo/api", "codegen")));
+    }
+
+    #[test]
+    fn collect_requested_subgraph_package_glob_does_not_select_root_without_top_level() {
+        let task_graph = package_selection_task_graph();
+
+        let selection = TaskSelection {
+            requested_tasks: &["build".to_string()],
+            packages: &["*root*".to_string()],
+            top_level: false,
+        };
+        let error = collect_requested_subgraph(&task_graph, &selection, &[])
+            .expect_err("root sentinel must not satisfy package filter");
+
+        assert!(error.to_string().contains("No packages matched"));
     }
 
     #[test]
@@ -1638,8 +1868,15 @@ mod tests {
             task_id: TaskId::new("@repo/pkg", "build"),
             outcome: luchta_engine::PruneOutcome::Pruned { reason: None },
         }];
+        let empty_globs = build_globset(&[]).expect("build empty globs");
 
-        let result = report_unmatched_request("build", &pruned, true);
+        let top_level_criteria = SelectionCriteria {
+            task_globs: &empty_globs,
+            package_globs: &empty_globs,
+            match_all_non_root_packages: true,
+            top_level: true,
+        };
+        let result = report_unmatched_request("build", &pruned, &top_level_criteria);
         assert!(
             result.is_err(),
             "top-level request must not match a pruned package task"
@@ -1647,8 +1884,47 @@ mod tests {
 
         // The same pruned package task IS a valid explanation for a default
         // (non-top-level) request of the same name.
-        report_unmatched_request("build", &pruned, false)
+        let default_criteria = SelectionCriteria {
+            task_globs: &empty_globs,
+            package_globs: &empty_globs,
+            match_all_non_root_packages: true,
+            top_level: false,
+        };
+        report_unmatched_request("build", &pruned, &default_criteria)
             .expect("default request should treat the pruned package task as a match");
+    }
+
+    #[test]
+    fn report_unmatched_request_ignores_pruned_task_outside_package_filter() {
+        // `build` was pruned in `@repo/other`, but the request is filtered to
+        // `@repo/app` (`-p @repo/app build`). The pruned task in the unrelated
+        // package must NOT suppress the "not found" error for the selection.
+        let pruned = vec![PrunedTask {
+            task_id: TaskId::new("@repo/other", "build"),
+            outcome: luchta_engine::PruneOutcome::Pruned { reason: None },
+        }];
+        let task_globs = build_globset(&["build".to_string()]).expect("build task globs");
+        let package_globs = build_globset(&["@repo/app".to_string()]).expect("build pkg globs");
+
+        let criteria = SelectionCriteria {
+            task_globs: &task_globs,
+            package_globs: &package_globs,
+            match_all_non_root_packages: false,
+            top_level: false,
+        };
+        let result = report_unmatched_request("build", &pruned, &criteria);
+        assert!(
+            result.is_err(),
+            "a pruned task outside the package filter must not suppress the not-found error"
+        );
+
+        // A pruned task INSIDE the package filter does explain the absence.
+        let pruned_in_scope = vec![PrunedTask {
+            task_id: TaskId::new("@repo/app", "build"),
+            outcome: luchta_engine::PruneOutcome::Pruned { reason: None },
+        }];
+        report_unmatched_request("build", &pruned_in_scope, &criteria)
+            .expect("a pruned task within the package filter should be treated as a match");
     }
 
     #[test]
