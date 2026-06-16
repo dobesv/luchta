@@ -1030,7 +1030,7 @@ fn bash_worker_blank_command_check_fails_and_run_skips() {
 }
 
 #[test]
-fn real_bash_worker_e2e() {
+fn real_bash_worker_clears_ambient_env_end_to_end() {
     let temp = assert_fs::TempDir::new().expect("create temp dir");
     write_workspace(
         &temp,
@@ -1040,30 +1040,43 @@ fn real_bash_worker_e2e() {
             depends_on_a: false,
         }],
     );
+    let env_capture = init_marker(&temp, "env_capture.txt");
     write_config(
         &temp,
         &format!(
-            r#"{{"concurrency":{{"maxWeight":1}},"tasks":{{"build":{{"worker":"bash","command":"echo bash-ran"}}}},"workers":{{"bash":{{"command":"{}"}}}}}}"#,
-            bash_worker_bin().display()
+            r#"{{"concurrency":{{"maxWeight":1}},"tasks":{{"build":{{"worker":"bash","command":"env > {capture}","env":{{"DECLARED_VAR":{{"value":"declared-value"}}}}}}}},"workers":{{"bash":{{"command":"{}"}}}}}}"#,
+            bash_worker_bin().display(),
+            capture = env_capture.display()
         ),
     );
 
     assert_cmd::Command::cargo_bin("luchta")
         .expect("find binary")
         .env("NO_COLOR", "1")
+        .env("LUCHTA_AMBIENT_LEAK_TEST", "should-not-appear")
         .arg("run")
         .arg("build")
         .arg("--workspace-root")
         .arg(temp.path())
         .assert()
         .success()
-        // Successful task output is captured (not streamed) in default mode, so
-        // the worker's "bash-ran" line no longer appears on stdout; root no
-        // longer also contributes a global `build`, so only package build runs.
         .stdout(predicate::str::contains("Done: 1 tasks done after "))
-        .stdout(predicate::str::contains("bash-ran").not())
         .stdout(predicate::str::contains("package-build-script-unused").not())
         .stdout(predicate::str::contains("pruned during resolution").not());
+
+    let captured = fs::read_to_string(&env_capture).expect("read env capture");
+    assert!(
+        captured.contains("DECLARED_VAR=declared-value"),
+        "declared env should reach subprocess: {captured}"
+    );
+    assert!(
+        captured.contains("PATH="),
+        "whitelisted PATH should reach subprocess: {captured}"
+    );
+    assert!(
+        !captured.contains("LUCHTA_AMBIENT_LEAK_TEST=should-not-appear"),
+        "ambient env should be cleared before subprocess spawn: {captured}"
+    );
 
     temp.close().expect("cleanup temp dir");
 }

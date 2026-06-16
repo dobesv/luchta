@@ -143,10 +143,49 @@ pub struct EnvSpec {
     /// luchta process environment at run time.
     #[serde(default)]
     pub value: Option<String>,
+    /// Fallback value used only when `value` is None and the variable is
+    /// unset in the inherited environment.
+    #[serde(default)]
+    pub default: Option<String>,
     /// When false, variable is still provided to task but excluded from
     /// significant-environment hash used for cache keys.
     #[serde(default = "default_env_input")]
     pub input: bool,
+}
+
+impl EnvSpec {
+    /// Resolves the effective environment value for this specification.
+    ///
+    /// This is the **single authority** for environment value resolution.
+    /// Both task execution and cache hashing must use this function to ensure
+    /// consistency: the value that executes is exactly the value that hashes.
+    ///
+    /// # Precedence
+    ///
+    /// 1. If `self.value` is `Some`, use it (including empty string as a present value).
+    /// 2. Else, if `ambient(name)` returns `Some`, use that (inherited from process env).
+    /// 3. Else, if `self.default` is `Some`, use it.
+    /// 4. Else, return `None` (omit the variable from the execution environment).
+    ///
+    /// # Note on Empty Strings
+    ///
+    /// Empty string is a **present value**. It is NOT coerced to unset.
+    /// Only `None` or absence triggers fallback to the next priority level.
+    pub fn resolve_env_value<F>(&self, _name: &str, ambient: F) -> Option<String>
+    where
+        F: FnOnce() -> Option<String>,
+    {
+        // 1. Explicit value wins (including empty string as present)
+        if let Some(ref v) = self.value {
+            return Some(v.clone());
+        }
+        // 2. Inherit from ambient environment
+        if let Some(v) = ambient() {
+            return Some(v);
+        }
+        // 3. Fallback to default
+        self.default.clone()
+    }
 }
 
 /// Task configuration shared across package graph and execution layers.
@@ -472,12 +511,13 @@ mod tests {
             with_value,
             EnvSpec {
                 value: Some("x".to_owned()),
+                default: None,
                 input: true,
             }
         );
         assert_eq!(
             serde_json::to_string(&with_value).expect("serialize value variant"),
-            r#"{"value":"x","input":true}"#
+            r#"{"value":"x","default":null,"input":true}"#
         );
 
         let excluded_input: EnvSpec =
@@ -486,12 +526,13 @@ mod tests {
             excluded_input,
             EnvSpec {
                 value: None,
+                default: None,
                 input: false,
             }
         );
         assert_eq!(
             serde_json::to_string(&excluded_input).expect("serialize input variant"),
-            r#"{"value":null,"input":false}"#
+            r#"{"value":null,"default":null,"input":false}"#
         );
 
         let inherited: EnvSpec = serde_json::from_str(r#"{}"#).expect("deserialize empty env spec");
@@ -499,12 +540,37 @@ mod tests {
             inherited,
             EnvSpec {
                 value: None,
+                default: None,
                 input: true,
             }
         );
         assert_eq!(
             serde_json::to_string(&inherited).expect("serialize empty env spec"),
-            r#"{"value":null,"input":true}"#
+            r#"{"value":null,"default":null,"input":true}"#
+        );
+    }
+
+    #[test]
+    fn env_spec_deserializes_default_field() {
+        let with_default: EnvSpec =
+            serde_json::from_str(r#"{"default":"dev"}"#).expect("deserialize default field");
+        assert_eq!(
+            with_default,
+            EnvSpec {
+                value: None,
+                default: Some("dev".to_owned()),
+                input: true,
+            }
+        );
+
+        let empty: EnvSpec = serde_json::from_str(r#"{}"#).expect("deserialize empty env spec");
+        assert_eq!(
+            empty,
+            EnvSpec {
+                value: None,
+                default: None,
+                input: true,
+            }
         );
     }
 
@@ -540,5 +606,83 @@ mod tests {
             .expect_err("boolean cache field must fail");
 
         assert!(error.to_string().contains("invalid type: boolean `true`"));
+    }
+
+    #[test]
+    fn resolve_env_value_value_wins() {
+        let spec = EnvSpec {
+            value: Some("explicit".to_owned()),
+            default: Some("fallback".to_owned()),
+            input: true,
+        };
+        assert_eq!(
+            spec.resolve_env_value("VAR", || Some("ambient".to_owned())),
+            Some("explicit".to_owned())
+        );
+    }
+
+    #[test]
+    fn resolve_env_value_inherits_when_value_none() {
+        let spec = EnvSpec {
+            value: None,
+            default: Some("fallback".to_owned()),
+            input: true,
+        };
+        assert_eq!(
+            spec.resolve_env_value("VAR", || Some("ambient".to_owned())),
+            Some("ambient".to_owned())
+        );
+    }
+
+    #[test]
+    fn resolve_env_value_default_when_all_none() {
+        let spec = EnvSpec {
+            value: None,
+            default: Some("fallback".to_owned()),
+            input: true,
+        };
+        assert_eq!(
+            spec.resolve_env_value("VAR", || None),
+            Some("fallback".to_owned())
+        );
+    }
+
+    #[test]
+    fn resolve_env_value_empty_string_is_present() {
+        // Empty string is present, not coerced to unset
+        let spec = EnvSpec {
+            value: Some("".to_owned()),
+            default: Some("fallback".to_owned()),
+            input: true,
+        };
+        assert_eq!(
+            spec.resolve_env_value("VAR", || Some("ambient".to_owned())),
+            Some("".to_owned())
+        );
+    }
+
+    #[test]
+    fn resolve_env_value_omits_when_all_none() {
+        let spec = EnvSpec {
+            value: None,
+            default: None,
+            input: true,
+        };
+        assert_eq!(spec.resolve_env_value("VAR", || None), None);
+    }
+
+    #[test]
+    fn resolve_env_value_ambient_empty_string_is_present() {
+        // Ambient empty string is a present value, so it is used as-is and
+        // does NOT fall through to `default`.
+        let spec = EnvSpec {
+            value: None,
+            default: Some("fallback".to_owned()),
+            input: true,
+        };
+        assert_eq!(
+            spec.resolve_env_value("VAR", || Some("".to_owned())),
+            Some("".to_owned())
+        );
     }
 }
