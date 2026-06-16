@@ -61,7 +61,8 @@ pub(super) fn report_run_outcome(
         bail!("one or more tasks failed");
     }
 
-    println!("{}", reporter.render_summary());
+    let rss = crate::rss::format_rss(crate::rss::process_tree_rss_bytes());
+    println!("{}", reporter.render_summary(&rss));
     Ok(())
 }
 

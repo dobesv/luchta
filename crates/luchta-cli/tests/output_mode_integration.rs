@@ -5,6 +5,110 @@ use std::fs;
 use assert_cmd::Command;
 use assert_fs::prelude::*;
 
+/// Expected tokens for the emoji done line: `☑️ done/total ⏭️ skipped` plus
+/// `🌊 waves / waves`.
+#[derive(Clone, Copy)]
+struct DoneLine {
+    done: usize,
+    total: usize,
+    skipped: usize,
+    waves: usize,
+}
+
+/// Captured stdout/stderr of a `luchta` invocation, with chainable custom
+/// assertions for the emoji progress output. Encapsulating the repeated
+/// assertion blocks here keeps each test small and cohesive.
+struct ProgressOutput {
+    label: String,
+    stdout: String,
+    stderr: String,
+}
+
+impl ProgressOutput {
+    fn new(label: &str, output: &std::process::Output) -> Self {
+        Self {
+            label: label.to_string(),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        }
+    }
+
+    fn stdout(&self) -> &str {
+        &self.stdout
+    }
+
+    fn stderr(&self) -> &str {
+        &self.stderr
+    }
+
+    /// Asserts the run exited successfully.
+    fn assert_success(&self, status: std::process::ExitStatus) -> &Self {
+        assert!(
+            status.success(),
+            "{} should succeed, stderr: {}",
+            self.label,
+            self.stderr
+        );
+        self
+    }
+
+    /// Asserts the emoji done line (`☑️ … 🌊 …`) is present and the old
+    /// `Done:` text is gone.
+    fn assert_done_line(&self, expected: DoneLine) -> &Self {
+        let label = &self.label;
+        let done_token = format!(
+            "☑️ {}/{} ⏭️ {}",
+            expected.done, expected.total, expected.skipped
+        );
+        let wave_token = format!("🌊 {} / {}", expected.waves, expected.waves);
+        assert!(
+            self.stdout.contains(&done_token),
+            "{label} stdout should contain '{done_token}', got: {}",
+            self.stdout
+        );
+        assert!(
+            self.stdout.contains(&wave_token),
+            "{label} stdout should contain '{wave_token}', got: {}",
+            self.stdout
+        );
+        assert!(
+            !self.stdout.contains("Done:"),
+            "{label} stdout should not contain old 'Done:', got: {}",
+            self.stdout
+        );
+        self
+    }
+
+    /// Asserts neither stream contains wave-progress lines.
+    fn assert_no_wave_progress(&self) -> &Self {
+        for (stream, out) in [("stdout", &self.stdout), ("stderr", &self.stderr)] {
+            assert!(
+                !out.contains("Wave "),
+                "{} {stream} should not emit wave progress, got: {out}",
+                self.label
+            );
+        }
+        self
+    }
+
+    /// Asserts neither stream contains per-task start/finish/skip spam.
+    fn assert_no_per_task_spam(&self) -> &Self {
+        for (stream, out) in [("stdout", &self.stdout), ("stderr", &self.stderr)] {
+            for needle in [
+                "(no command, skipping)",
+                "(skipped due to previous failure)",
+            ] {
+                assert!(
+                    !out.contains(needle),
+                    "{} {stream} should not contain per-task spam '{needle}', got: {out}",
+                    self.label
+                );
+            }
+        }
+        self
+    }
+}
+
 fn make_worker_script(
     temp: &assert_fs::TempDir,
     name: &str,
@@ -84,73 +188,71 @@ fn setup_workspace(temp: &assert_fs::TempDir) {
         .expect("write packages/b/package.json");
 }
 
+fn run_build(
+    temp: &assert_fs::TempDir,
+    worker_body: &str,
+    tasks_json: &str,
+    summary_mode: bool,
+    label: &str,
+    extra_env: &[(&str, &str)],
+) -> ProgressOutput {
+    let worker = make_worker_script(temp, "worker.sh", worker_body);
+    let worker_path = worker.path().display();
+    let config = format!(
+        "#!/bin/sh\necho '{{\"concurrency\":{{\"maxWeight\":4}},\"workers\":{{\"fake\":{{\"command\":\"{worker_path}\"}}}},\"tasks\":{{{tasks_json}}}}}'\n"
+    );
+    temp.child("luchta-config.sh")
+        .write_str(&config)
+        .expect("write luchta-config.sh");
+    let mut cmd = Command::cargo_bin("luchta").expect("find binary");
+    cmd.arg("run").arg("build");
+    if summary_mode {
+        cmd.arg("--output").arg("summary");
+    }
+    cmd.arg("--workspace-root")
+        .arg(temp.path())
+        .env("NO_COLOR", "1");
+    for (key, value) in extra_env {
+        cmd.env(key, value);
+    }
+    let output = cmd.output().expect("run command");
+    let progress = ProgressOutput::new(label, &output);
+    progress.assert_success(output.status);
+    progress
+}
+
 /// Test 1: Summary mode prints ONLY Done line, no wave progress.
 #[test]
 fn summary_mode_prints_only_done_line() {
     let temp = assert_fs::TempDir::new().expect("create temp dir");
     setup_workspace(&temp);
 
-    let worker_script = make_worker_script(
+    let out = run_build(
         &temp,
-        "summary-worker.sh",
         &shell_worker_body(
             r#"{"type":"done","id":"%s","success":true,"exitCode":0}"#,
             "",
         ),
+        r#""build":{"dependsOn":["^build"],"worker":"fake"}"#,
+        true,
+        "summary mode",
+        &[],
     );
 
-    let worker_path = worker_script.path().display();
-    let config_content = format!(
-        r#"#!/bin/sh
-echo '{{"concurrency":{{"maxWeight":4}},"workers":{{"fake":{{"command":"{worker_path}"}}}},"tasks":{{"build":{{"dependsOn":["^build"],"worker":"fake"}}}}}}'
-"#,
-    );
-    temp.child("luchta-config.sh")
-        .write_str(&config_content)
-        .expect("write luchta-config.sh");
-
-    let output = Command::cargo_bin("luchta")
-        .expect("find binary")
-        .arg("run")
-        .arg("build")
-        .arg("--output")
-        .arg("summary")
-        .arg("--workspace-root")
-        .arg(temp.path())
-        .env("NO_COLOR", "1")
-        .output()
-        .expect("run command");
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    // Summary mode: stdout contains Done, no Wave progress
-    assert!(
-        stdout.contains("Done:"),
-        "summary mode stdout should contain 'Done:', got: {stdout}"
-    );
-    assert!(
-        !stdout.contains("Wave "),
-        "summary mode stdout should NOT contain 'Wave ', got: {stdout}"
-    );
-    assert!(
-        !stderr.contains("Wave "),
-        "summary mode stderr should NOT contain 'Wave ', got: {stderr}"
-    );
-
-    // Success
-    assert!(
-        output.status.success(),
-        "run should succeed, stderr: {stderr}"
-    );
+    out.assert_done_line(DoneLine {
+        done: 2,
+        total: 2,
+        skipped: 0,
+        waves: 2,
+    })
+    .assert_no_wave_progress();
 
     temp.close().expect("cleanup temp dir");
 }
 
 #[test]
-fn long_run_emits_periodic_progress_only_in_default_mode() {
+fn long_run_default_mode_emits_periodic_progress() {
     let temp = assert_fs::TempDir::new().expect("create temp dir");
-
     temp.child("package.json")
         .write_str(
             r#"{
@@ -174,84 +276,80 @@ fn long_run_emits_periodic_progress_only_in_default_mode() {
         )
         .expect("write packages/a/package.json");
 
-    let worker_script = make_worker_script(
+    let out = run_build(
         &temp,
-        "slow-worker.sh",
-        // The task sleeps ~1s so the run outlasts the (test-shortened, 100ms)
-        // progress interval and at least one progress tick fires. The extra
-        // statement runs before the worker emits `done`; it must be a complete
-        // line (trailing newline) or it merges into the done printf.
         &shell_worker_body(r#"{"type":"done","id":"%s","exitCode":0}"#, "sleep 1\n"),
+        r#""build":{"worker":"fake"}"#,
+        false,
+        "default run",
+        &[("LUCHTA_PROGRESS_INTERVAL_MS", "100")],
     );
 
-    let worker_path = worker_script.path().display();
-    let config_content = format!(
-        r#"#!/bin/sh
-echo '{{"concurrency":{{"maxWeight":4}},"workers":{{"fake":{{"command":"{worker_path}"}}}},"tasks":{{"build":{{"worker":"fake"}}}}}}'
-"#,
+    assert!(
+        out.stderr().contains("🏃") && out.stderr().contains("☑️"),
+        "default run should emit periodic progress status line markers on stderr, got: {}",
+        out.stderr()
     );
-    temp.child("luchta-config.sh")
-        .write_str(&config_content)
-        .expect("write luchta-config.sh");
+    out.assert_done_line(DoneLine {
+        done: 1,
+        total: 1,
+        skipped: 0,
+        waves: 1,
+    });
 
-    let default_output = Command::cargo_bin("luchta")
-        .expect("find binary")
-        .arg("run")
-        .arg("build")
-        .arg("--workspace-root")
-        .arg(temp.path())
-        .env("NO_COLOR", "1")
-        // Shorten the progress interval so the ~1s task triggers a tick quickly.
-        .env("LUCHTA_PROGRESS_INTERVAL_MS", "100")
-        .output()
-        .expect("run default command");
+    temp.close().expect("cleanup temp dir");
+}
 
-    let default_stdout = String::from_utf8_lossy(&default_output.stdout);
-    let default_stderr = String::from_utf8_lossy(&default_output.stderr);
-    assert!(
-        default_output.status.success(),
-        "default run should succeed, stderr: {default_stderr}"
-    );
-    assert!(
-        default_stderr.contains("running:"),
-        "default run should emit periodic progress on stderr, got: {default_stderr}"
-    );
-    assert!(
-        default_stdout.contains("Done:"),
-        "default run should still print final Done line, got: {default_stdout}"
+#[test]
+fn long_run_summary_mode_still_prints_done_line() {
+    let temp = assert_fs::TempDir::new().expect("create temp dir");
+    temp.child("package.json")
+        .write_str(
+            r#"{
+    "name": "root",
+    "private": true,
+    "workspaces": ["packages/*"]
+}"#,
+        )
+        .expect("write root package.json");
+
+    let pkg_dir = temp.child("packages/a");
+    fs::create_dir_all(pkg_dir.path()).expect("create packages/a dir");
+    temp.child("packages/a/package.json")
+        .write_str(
+            r#"{
+    "name": "a",
+    "scripts": {
+        "build": "echo ignored"
+    }
+}"#,
+        )
+        .expect("write packages/a/package.json");
+
+    let out = run_build(
+        &temp,
+        &shell_worker_body(r#"{"type":"done","id":"%s","exitCode":0}"#, "sleep 1\n"),
+        r#""build":{"worker":"fake"}"#,
+        true,
+        "summary run",
+        &[("LUCHTA_PROGRESS_INTERVAL_MS", "100")],
     );
 
-    let summary_output = Command::cargo_bin("luchta")
-        .expect("find binary")
-        .arg("run")
-        .arg("build")
-        .arg("--output")
-        .arg("summary")
-        .arg("--workspace-root")
-        .arg(temp.path())
-        .env("NO_COLOR", "1")
-        // Same short interval: summary mode must STILL emit no progress lines.
-        .env("LUCHTA_PROGRESS_INTERVAL_MS", "100")
-        .output()
-        .expect("run summary command");
-
-    let summary_stdout = String::from_utf8_lossy(&summary_output.stdout);
-    let summary_stderr = String::from_utf8_lossy(&summary_output.stderr);
+    out.assert_done_line(DoneLine {
+        done: 1,
+        total: 1,
+        skipped: 0,
+        waves: 1,
+    });
     assert!(
-        summary_output.status.success(),
-        "summary run should succeed, stderr: {summary_stderr}"
+        !out.stdout().contains("running:"),
+        "summary stdout should not contain periodic wave progress, got: {}",
+        out.stdout()
     );
     assert!(
-        summary_stdout.contains("Done:"),
-        "summary run should print final Done line, got: {summary_stdout}"
-    );
-    assert!(
-        !summary_stdout.contains("running:"),
-        "summary stdout should not contain periodic wave progress, got: {summary_stdout}"
-    );
-    assert!(
-        !summary_stderr.contains("running:"),
-        "summary stderr should not contain periodic wave progress, got: {summary_stderr}"
+        !out.stderr().contains("running:"),
+        "summary stderr should not contain periodic wave progress, got: {}",
+        out.stderr()
     );
 
     temp.close().expect("cleanup temp dir");
@@ -263,75 +361,26 @@ fn default_mode_fast_run_prints_summary_no_progress() {
     let temp = assert_fs::TempDir::new().expect("create temp dir");
     setup_workspace(&temp);
 
-    let worker_script = make_worker_script(
+    let out = run_build(
         &temp,
-        "default-worker.sh",
         &shell_worker_body(
             r#"{"type":"done","id":"%s","success":true,"exitCode":0}"#,
             "",
         ),
+        r#""build":{"dependsOn":["^build"],"worker":"fake"}"#,
+        false,
+        "default mode",
+        &[],
     );
 
-    let worker_path = worker_script.path().display();
-    let config_content = format!(
-        r#"#!/bin/sh
-echo '{{"concurrency":{{"maxWeight":4}},"workers":{{"fake":{{"command":"{worker_path}"}}}},"tasks":{{"build":{{"dependsOn":["^build"],"worker":"fake"}}}}}}'
-"#,
-    );
-    temp.child("luchta-config.sh")
-        .write_str(&config_content)
-        .expect("write luchta-config.sh");
-
-    let output = Command::cargo_bin("luchta")
-        .expect("find binary")
-        .arg("run")
-        .arg("build")
-        .arg("--workspace-root")
-        .arg(temp.path())
-        .env("NO_COLOR", "1")
-        .output()
-        .expect("run command");
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    // Done summary on stdout
-    assert!(
-        stdout.contains("Done:"),
-        "default mode stdout should contain 'Done:', got: {stdout}"
-    );
-    // Fast run (<5s): no periodic wave progress (either stream)
-    assert!(
-        !stderr.contains("Wave "),
-        "fast run should not emit wave progress on stderr, got: {stderr}"
-    );
-    assert!(
-        !stdout.contains("Wave "),
-        "fast run should not emit wave progress on stdout, got: {stdout}"
-    );
-    // No per-task start/finish spam
-    assert!(
-        !stdout.contains("(no command, skipping)"),
-        "should not contain per-task spam '(no command, skipping)', got: {stdout}"
-    );
-    assert!(
-        !stdout.contains("(skipped due to previous failure)"),
-        "should not contain per-task spam '(skipped due to previous failure)', got: {stdout}"
-    );
-    assert!(
-        !stderr.contains("(no command, skipping)"),
-        "should not contain per-task spam on stderr, got: {stderr}"
-    );
-    assert!(
-        !stderr.contains("(skipped due to previous failure)"),
-        "should not contain per-task spam on stderr, got: {stderr}"
-    );
-
-    // Success
-    assert!(
-        output.status.success(),
-        "run should succeed, stderr: {stderr}"
-    );
+    out.assert_done_line(DoneLine {
+        done: 2,
+        total: 2,
+        skipped: 0,
+        waves: 2,
+    })
+    .assert_no_wave_progress()
+    .assert_no_per_task_spam();
 
     temp.close().expect("cleanup temp dir");
 }
@@ -401,7 +450,7 @@ echo '{{"concurrency":{{"maxWeight":4}},"workers":{{"yarn":{{"command":"{worker_
     // dry-run does NOT print Done summary
     assert!(
         !stdout.contains("Done:"),
-        "dry-run should NOT contain 'Done:' summary, got: {stdout}"
+        "dry-run should NOT contain old 'Done:' summary, got: {stdout}"
     );
 
     // No execution
@@ -498,11 +547,11 @@ echo '{{"concurrency":{{"maxWeight":4}},"workers":{{"fake":{{"command":"{worker_
     // Failure: no Done line
     assert!(
         !stdout.contains("Done:"),
-        "failing run should NOT print 'Done:' on stdout, got: {stdout}"
+        "failing run should NOT print old 'Done:' on stdout, got: {stdout}"
     );
     assert!(
         !stderr.contains("Done:"),
-        "failing run should NOT print 'Done:' on stderr, got: {stderr}"
+        "failing run should NOT print old 'Done:' on stderr, got: {stderr}"
     );
     // Failure: non-zero exit
     assert!(
@@ -682,7 +731,7 @@ echo '{{"concurrency":{{"maxWeight":4}},"workers":{{"sleepy":{{"command":"{worke
     // No Done line
     assert!(
         !stderr.contains("Done:"),
-        "interrupt should NOT print 'Done:', got: {stderr}"
+        "interrupt should NOT print old 'Done:', got: {stderr}"
     );
 
     temp.close().expect("cleanup temp dir");

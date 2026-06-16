@@ -109,50 +109,54 @@ impl ProgressReporter {
         let total_tasks: usize = self.wave_total.iter().sum();
         let done = self.done.load(Ordering::SeqCst);
         let skipped = self.skipped.load(Ordering::SeqCst);
+        let done_or_skipped = done + skipped;
         let running_count = running.len();
-        let pending = total_tasks.saturating_sub(done + skipped + running_count);
+        let pending = total_tasks.saturating_sub(done_or_skipped + running_count);
+        let waves_done = self
+            .wave_total
+            .iter()
+            .enumerate()
+            .filter(|(wave_index, wave_total)| {
+                **wave_total > 0
+                    && self.wave_done[*wave_index].load(Ordering::SeqCst)
+                        + self.wave_skipped[*wave_index].load(Ordering::SeqCst)
+                        == **wave_total
+            })
+            .count();
 
-        let mut agg_parts = format!("{}/{} done", done, total_tasks);
-        if skipped > 0 {
-            agg_parts.push_str(&format!(" · {} skipped", skipped));
-        }
-        agg_parts.push_str(&format!(" · {} running", running_count));
+        let mut segments = vec![
+            format!("☑️ {done_or_skipped}/{total_tasks}"),
+            format!("⏭️ {skipped}"),
+        ];
         if pending > 0 {
-            agg_parts.push_str(&format!(" · {} pending", pending));
+            segments.push(format!("⌛ {pending}"));
         }
-
-        let mut running_by_wave: Vec<Vec<&TaskId>> = vec![Vec::new(); self.total_waves];
-        for task_id in running.keys() {
-            if let Some(&wave_index) = self.wave_of.get(task_id) {
-                if let Some(tasks) = running_by_wave.get_mut(wave_index) {
-                    tasks.push(task_id);
-                }
-            }
+        if running_count > 0 {
+            segments.push(format!(
+                "🏃{running_count} ({})",
+                render_running_task_list(&running)
+            ));
         }
+        segments.push(format!("⏱️ {elapsed_total}s"));
+        segments.push(format!("🐏 {rss_formatted}"));
+        segments.push(format!("🌊 {waves_done} / {}", self.total_waves));
 
-        let active_waves = render_active_waves(&running_by_wave, &self.wave_done, &self.wave_total);
-        let running_str = render_running_tasks(&running);
-        let active_waves_str = format_active_waves(&active_waves);
-        let mut base = format!(
-            "{}{}{} · {}s · RSS {}",
-            agg_parts, active_waves_str, running_str, elapsed_total, rss_formatted
-        );
-        base.push_str(&pressure_suffix(warnings));
-
-        base
+        let mut line = segments.join(" ");
+        line.push_str(&pressure_suffix(warnings));
+        line
     }
 
-    // Consumed by final summary print (task 79423739).
-    pub fn render_summary(&self) -> String {
+    pub fn render_summary(&self, rss_formatted: &str) -> String {
+        let elapsed_total = self.start.elapsed().as_secs();
+        let total_tasks: usize = self.wave_total.iter().sum();
         let done = self.done.load(Ordering::SeqCst);
         let skipped = self.skipped.load(Ordering::SeqCst);
-        let elapsed_total = self.start.elapsed().as_secs();
+        let done_or_skipped = done + skipped;
 
-        let mut summary = format!("Done: {} tasks done after {} seconds.", done, elapsed_total);
-        if skipped > 0 {
-            summary.push_str(&format!(", {} skipped", skipped));
-        }
-        summary
+        format!(
+            "☑️ {done_or_skipped}/{total_tasks} ⏭️ {skipped} ⏱️ {elapsed_total}s 🐏 {rss_formatted} 🌊 {} / {}",
+            self.total_waves, self.total_waves
+        )
     }
 
     fn finish_task(&self, id: &TaskId, kind: TaskOutcome) {
@@ -181,29 +185,6 @@ impl ProgressReporter {
     }
 }
 
-fn render_active_waves(
-    running_by_wave: &[Vec<&TaskId>],
-    wave_done: &[AtomicUsize],
-    wave_total: &[usize],
-) -> Vec<String> {
-    let mut active_waves = Vec::new();
-    for (wave_index, wave_running) in running_by_wave.iter().enumerate() {
-        if wave_running.is_empty() {
-            continue;
-        }
-        active_waves.push(format!(
-            "W{} {}/{}",
-            wave_index + 1,
-            wave_done[wave_index].load(Ordering::SeqCst),
-            wave_total[wave_index]
-        ));
-        if active_waves.len() == 3 {
-            break;
-        }
-    }
-    active_waves
-}
-
 fn render_running_tasks(running: &HashMap<TaskId, Instant>) -> String {
     if running.is_empty() {
         return String::new();
@@ -217,101 +198,139 @@ fn render_running_tasks(running: &HashMap<TaskId, Instant>) -> String {
     let inner = render_running_task_groups(shown);
 
     if total_running > shown_count {
-        format!(" · running: {} +{}", inner, total_running - shown_count)
+        format!("{} +{}", inner, total_running - shown_count)
     } else {
-        format!(" · running: {}", inner)
+        inner
     }
+}
+
+fn render_running_task_list(running: &HashMap<TaskId, Instant>) -> String {
+    render_running_tasks(running)
 }
 
 fn render_running_task_groups(shown: &[&TaskId]) -> String {
-    let first_scope = shown.iter().find_map(|task| package_scope(task));
-    let uniform_scope =
-        first_scope.is_some() && shown.iter().all(|task| package_scope(task) == first_scope);
-
-    if let Some(prefix) = first_scope.filter(|_| uniform_scope) {
-        shown
-            .iter()
-            .map(|task| {
-                format!(
-                    "{}#{}",
-                    task.package
-                        .as_str()
-                        .trim_start_matches(prefix)
-                        .trim_start_matches('/'),
-                    task.task
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(", ")
-    } else {
-        render_mixed_scope_tasks(shown)
-    }
+    let (mut rendered, consumed) = group_by_shared_task_name(shown);
+    rendered.extend(group_remaining_by_package(shown, &consumed));
+    rendered.join(", ")
 }
 
-fn render_mixed_scope_tasks(shown: &[&TaskId]) -> String {
-    let mut tasks_by_scope: BTreeMap<Option<&str>, Vec<&TaskId>> = BTreeMap::new();
-    for task in shown {
-        tasks_by_scope
-            .entry(package_scope(task))
+fn group_by_shared_task_name(shown: &[&TaskId]) -> (Vec<String>, Vec<bool>) {
+    let mut tasks_by_name: BTreeMap<&str, Vec<(usize, &TaskId)>> = BTreeMap::new();
+    for (index, task) in shown.iter().copied().enumerate() {
+        tasks_by_name
+            .entry(task.task.as_ref())
             .or_default()
-            .push(*task);
+            .push((index, task));
     }
 
-    let mut scope_parts = Vec::new();
-    let mut unscoped_part = None;
-    for (scope, tasks) in tasks_by_scope {
-        match scope {
-            Some(scope) => scope_parts.push(render_scoped_tasks(scope, &tasks)),
-            None => {
-                unscoped_part = Some(
-                    tasks
-                        .iter()
-                        .map(|task| task.to_string())
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                );
-            }
+    let mut consumed = vec![false; shown.len()];
+    let mut rendered = Vec::new();
+    for (task_name, tasks) in tasks_by_name {
+        let packages = shared_task_name_packages(&tasks);
+        if packages.len() < 2 {
+            continue;
         }
+
+        rendered.push(format!("{}:{}", format_package_set(&packages), task_name));
+        mark_consumed(&mut consumed, &tasks);
     }
-    scope_parts.extend(unscoped_part);
-    scope_parts.join(" · ")
+
+    (rendered, consumed)
 }
 
-fn render_scoped_tasks(scope: &str, tasks: &[&TaskId]) -> String {
-    if tasks.len() == 1 {
-        tasks[0].to_string()
-    } else {
-        let inner = tasks
+fn shared_task_name_packages<'a>(
+    tasks: &'a [(usize, &'a TaskId)],
+) -> std::collections::BTreeSet<&'a str> {
+    tasks
+        .iter()
+        .filter(|(_, task)| !task.package.is_root())
+        .map(|(_, task)| task.package.as_str())
+        .collect()
+}
+
+/// Renders the set of packages sharing a task name. When every package shares a
+/// common npm scope (e.g. `@acme/`), the scope is factored out:
+/// `@acme/{web,api}` instead of `{@acme/web,@acme/api}`. Otherwise the full
+/// package names are listed: `{a,b}`.
+fn format_package_set(packages: &std::collections::BTreeSet<&str>) -> String {
+    if let Some(scope) = common_scope(packages) {
+        let inner = packages
             .iter()
-            .map(|task| {
-                format!(
-                    "{}#{}",
-                    task.package
-                        .as_str()
-                        .trim_start_matches(scope)
-                        .trim_start_matches('/'),
-                    task.task
-                )
-            })
+            .map(|package| package.trim_start_matches(scope).trim_start_matches('/'))
             .collect::<Vec<_>>()
-            .join(", ");
-        format!("{}/{{{}}}", scope, inner)
+            .join(",");
+        format!("{scope}/{{{inner}}}", scope = scope, inner = inner)
+    } else {
+        format!(
+            "{{{}}}",
+            packages.iter().copied().collect::<Vec<_>>().join(",")
+        )
     }
 }
 
-fn package_scope(task: &TaskId) -> Option<&str> {
-    let package = task.package.as_str();
-    if task.is_root() || !package.starts_with('@') {
+/// Returns the npm scope (`@scope`) shared by every package, if any. A package's
+/// scope is the segment before its last `/`; only scoped packages (`@`-prefixed)
+/// qualify. Returns `None` unless all packages share the same scope.
+fn common_scope<'a>(packages: &std::collections::BTreeSet<&'a str>) -> Option<&'a str> {
+    let mut scopes = packages.iter().map(|package| scope_of(package));
+    let first = scopes.next().flatten()?;
+    scopes.all(|scope| scope == Some(first)).then_some(first)
+}
+
+/// The npm scope (`@scope`) of a single package: the segment before its last
+/// `/`, only for `@`-prefixed packages. `None` otherwise.
+fn scope_of(package: &str) -> Option<&str> {
+    if !package.starts_with('@') {
         return None;
     }
     package.rsplit_once('/').map(|(scope, _)| scope)
 }
 
-fn format_active_waves(active_waves: &[String]) -> String {
-    if active_waves.is_empty() {
-        String::new()
+fn mark_consumed(consumed: &mut [bool], tasks: &[(usize, &TaskId)]) {
+    for (index, task) in tasks {
+        if !task.package.is_root() {
+            consumed[*index] = true;
+        }
+    }
+}
+
+fn group_remaining_by_package(shown: &[&TaskId], consumed: &[bool]) -> Vec<String> {
+    let mut tasks_by_package: BTreeMap<&str, Vec<&TaskId>> = BTreeMap::new();
+    for (index, task) in shown.iter().copied().enumerate() {
+        if consumed[index] {
+            continue;
+        }
+        tasks_by_package
+            .entry(task.package.as_str())
+            .or_default()
+            .push(task);
+    }
+
+    tasks_by_package
+        .into_values()
+        .map(render_package_group)
+        .collect()
+}
+
+fn render_package_group(mut tasks: Vec<&TaskId>) -> String {
+    tasks.sort_by_key(|task| task.task.to_string());
+    if tasks.len() == 1 {
+        return tasks[0].to_string();
+    }
+
+    let names = tasks
+        .iter()
+        .map(|task| task.task.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+
+    // The synthetic `//root` package id is an internal detail and must never be
+    // shown (matching `TaskId`'s Display contract). Render the root group with
+    // the `#{...}` config syntax instead of leaking the sentinel package name.
+    if tasks[0].package.is_root() {
+        format!("#{{{names}}}")
     } else {
-        format!(" · {}", active_waves.join(" · "))
+        format!("{}:{{{names}}}", tasks[0].package.as_str())
     }
 }
 
@@ -337,161 +356,289 @@ fn pressure_suffix(warnings: &[crate::memory_pressure::PressureReason]) -> Strin
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, time::Instant};
+    use std::collections::HashMap;
 
     use luchta_types::TaskId;
 
-    use super::ProgressReporter;
+    use super::{render_running_task_groups, ProgressReporter};
     use crate::cli::OutputMode;
 
-    #[test]
-    fn test_render_progress_aggregate_counts() {
-        let wave_of = HashMap::from([(task_id("pkg-a", "build"), 0)]);
-        let reporter = ProgressReporter::new(OutputMode::Default, wave_of, 1);
-
-        let out_zero = reporter.render_progress("10 MB", &[]);
-        assert!(out_zero.starts_with("0/1 done · 0 running"));
-        assert!(!out_zero.contains("skipped"));
-        assert!(out_zero.contains("1 pending"));
-
-        reporter.task_skipped_cache_hit(&task_id("pkg-a", "build"));
-        let out_skipped = reporter.render_progress("10 MB", &[]);
-        assert!(out_skipped.starts_with("0/1 done · 1 skipped · 0 running"));
-        assert!(!out_skipped.contains("pending"));
+    struct DoneSummaryExpectation {
+        done: usize,
+        total: usize,
+        skipped: usize,
+        waves: usize,
     }
 
-    #[test]
-    fn test_render_progress_frontier_waves_and_rss() {
-        let wave_of = HashMap::from([
-            (task_id("pkg-a", "build"), 0),
-            (task_id("pkg-b", "build"), 1),
-            (task_id("pkg-c", "build"), 2),
-            (task_id("pkg-d", "build"), 3),
-        ]);
-        let reporter = ProgressReporter::new(OutputMode::Default, wave_of, 4);
-
-        reporter
-            .running
-            .lock()
-            .unwrap()
-            .insert(task_id("pkg-b", "build"), Instant::now());
-        reporter
-            .running
-            .lock()
-            .unwrap()
-            .insert(task_id("pkg-c", "build"), Instant::now());
-        reporter
-            .running
-            .lock()
-            .unwrap()
-            .insert(task_id("pkg-d", "build"), Instant::now());
-
-        let out = reporter.render_progress("42 MB", &[]);
-        assert!(!out.contains("W1")); // no running tasks
-        assert!(out.contains("W2 0/1"));
-        assert!(out.contains("W3 0/1"));
-        assert!(out.contains("W4 0/1"));
-        assert!(out.contains("RSS 42 MB"));
+    impl DoneSummaryExpectation {
+        fn assert_in(&self, out: &str) {
+            assert!(
+                out.contains(&format!(
+                    "☑️ {}/{} ⏭️ {}",
+                    self.done, self.total, self.skipped
+                )),
+                "expected done summary '☑️ {}/{} ⏭️ {}', got: {out}",
+                self.done,
+                self.total,
+                self.skipped
+            );
+            assert!(
+                out.contains(&format!("🌊 {} / {}", self.waves, self.waves)),
+                "expected wave summary '🌊 {} / {}', got: {out}",
+                self.waves,
+                self.waves
+            );
+            assert!(
+                !out.contains("Done:"),
+                "should not contain old 'Done:', got: {out}"
+            );
+        }
     }
 
-    #[test]
-    fn test_render_progress_scope_uniform_stripping() {
-        let wave_of = HashMap::from([
-            (task_id("@acme/a", "build"), 0),
-            (task_id("@acme/b", "build"), 0),
-        ]);
-        let reporter = ProgressReporter::new(OutputMode::Default, wave_of, 1);
-        reporter
-            .running
-            .lock()
-            .unwrap()
-            .insert(task_id("@acme/a", "build"), Instant::now());
-        reporter
-            .running
-            .lock()
-            .unwrap()
-            .insert(task_id("@acme/b", "build"), Instant::now());
-
-        let out = reporter.render_progress("10 MB", &[]);
-        // Strips @acme/
-        assert!(out.contains("running: a#build, b#build"));
-        assert!(!out.contains("@acme"));
-    }
-
-    #[test]
-    fn test_render_progress_scope_mixed_grouping() {
-        let wave_of = HashMap::from([
-            (task_id("@acme/a", "build"), 0),
-            (task_id("@formative/b", "build"), 0),
-            (task_id("@formative/c", "build"), 0),
-            (task_id("unscoped", "build"), 0),
-        ]);
-        let reporter = ProgressReporter::new(OutputMode::Default, wave_of, 1);
-        reporter
-            .running
-            .lock()
-            .unwrap()
-            .insert(task_id("@acme/a", "build"), Instant::now());
-        reporter
-            .running
-            .lock()
-            .unwrap()
-            .insert(task_id("@formative/b", "build"), Instant::now());
-        reporter
-            .running
-            .lock()
-            .unwrap()
-            .insert(task_id("@formative/c", "build"), Instant::now());
-        reporter
-            .running
-            .lock()
-            .unwrap()
-            .insert(task_id("unscoped", "build"), Instant::now());
-
-        let out = reporter.render_progress("10 MB", &[]);
+    fn assert_progress_line_shape(
+        out: &str,
+        expected_prefix: &str,
+        rss: &str,
+        wave_progress: &str,
+    ) {
         assert!(
-            out.contains("running: @acme/a#build · @formative/{b#build, c#build} · unscoped#build")
+            out.starts_with(expected_prefix),
+            "expected prefix '{expected_prefix}', got: {out}"
+        );
+        assert!(
+            out.contains(&format!("🐏 {rss}")),
+            "expected RSS '{rss}', got: {out}"
+        );
+        assert!(
+            out.contains(&format!("🌊 {wave_progress}")),
+            "expected wave progress '{wave_progress}', got: {out}"
+        );
+        assert!(
+            !out.contains("done ·"),
+            "should not contain old 'done ·', got: {out}"
         );
     }
 
     #[test]
-    fn test_render_progress_cap_running() {
-        let mut wave_of = HashMap::new();
-        for i in 0..10 {
-            wave_of.insert(task_id("unscoped", &format!("build{}", i)), 0);
-        }
+    fn render_progress_shows_zero_skipped_and_pending_when_work_remains() {
+        let wave_of = HashMap::from([(task_id("pkg-a", "build"), 0)]);
         let reporter = ProgressReporter::new(OutputMode::Default, wave_of, 1);
-        for i in 0..10 {
-            reporter
-                .running
-                .lock()
-                .unwrap()
-                .insert(task_id("unscoped", &format!("build{}", i)), Instant::now());
-        }
 
         let out = reporter.render_progress("10 MB", &[]);
-        // Should show 5 items and +5
-        assert!(out.contains(" +5"));
-        assert_eq!(out.matches("unscoped#build").count(), 5);
+        assert_progress_line_shape(&out, "☑️ 0/1 ⏭️ 0 ⌛ 1 ⏱️ ", "10 MB", "0 / 1");
+        assert!(!out.contains("🏃"));
     }
 
     #[test]
-    fn render_summary_omits_skipped_suffix_when_zero() {
+    fn render_progress_numerator_includes_skipped_and_pending_omits_at_zero() {
         let task_a = task_id("pkg-a", "build");
         let task_b = task_id("pkg-b", "build");
+        let task_c = task_id("pkg-c", "build");
         let reporter = ProgressReporter::new(
-            OutputMode::Summary,
-            HashMap::from([(task_a.clone(), 0), (task_b.clone(), 0)]),
+            OutputMode::Default,
+            HashMap::from([
+                (task_a.clone(), 0),
+                (task_b.clone(), 0),
+                (task_c.clone(), 0),
+            ]),
             1,
         );
 
         reporter.task_ran(&task_a);
-        reporter.task_ran(&task_b);
+        reporter.task_skipped_cache_hit(&task_b);
+        reporter.task_started(&task_c);
 
-        let summary = reporter.render_summary();
+        let out = reporter.render_progress("10 MB", &[]);
+        assert_progress_line_shape(&out, "☑️ 2/3 ⏭️ 1 🏃1 (pkg-c#build) ⏱️ ", "10 MB", "0 / 1");
+        assert!(!out.contains("⌛"));
+    }
 
-        assert!(summary.starts_with("Done: 2 tasks done after "));
-        assert!(!summary.contains("skipped"));
+    #[test]
+    fn render_progress_running_segment_uses_grouped_list() {
+        let wave_of = HashMap::from([
+            (task_id("a", "lint"), 0),
+            (task_id("b", "lint"), 0),
+            (task_id("c", "lint"), 0),
+            (task_id("d", "test"), 0),
+            (task_id("d", "tsc"), 0),
+            (task_id("e", "babel"), 0),
+        ]);
+        let reporter = ProgressReporter::new(OutputMode::Default, wave_of.clone(), 1);
+        for task in wave_of.keys() {
+            reporter.task_started(task);
+        }
+
+        let out = reporter.render_progress("42 MB", &[]);
+        assert_progress_line_shape(
+            &out,
+            "☑️ 0/6 ⏭️ 0 🏃6 ({a,b,c}:lint, d:{test,tsc} +1) ⏱️ ",
+            "42 MB",
+            "0 / 1",
+        );
+        assert!(!out.contains("running:"));
+    }
+
+    #[test]
+    fn render_progress_counts_completed_waves_from_done_plus_skipped() {
+        let wave_of = HashMap::from([
+            (task_id("pkg-a", "build"), 0),
+            (task_id("pkg-b", "build"), 0),
+            (task_id("pkg-c", "build"), 1),
+            (task_id("pkg-d", "build"), 1),
+            (task_id("pkg-e", "build"), 2),
+        ]);
+        let reporter = ProgressReporter::new(OutputMode::Default, wave_of, 3);
+
+        reporter.task_ran(&task_id("pkg-a", "build"));
+        reporter.task_skipped_cache_hit(&task_id("pkg-b", "build"));
+        reporter.task_ran(&task_id("pkg-c", "build"));
+        reporter.task_started(&task_id("pkg-d", "build"));
+
+        let out = reporter.render_progress("24 MB", &[]);
+        assert!(out.contains("🌊 1 / 3"));
+        assert!(!out.contains("W1 "));
+        assert!(!out.contains("done ·"));
+    }
+
+    #[test]
+    fn render_running_task_groups_issue_example() {
+        let tasks = running_tasks(&[
+            ("a", "lint"),
+            ("b", "lint"),
+            ("c", "lint"),
+            ("d", "test"),
+            ("d", "tsc"),
+            ("e", "babel"),
+        ]);
+
+        assert_eq!(
+            render_running_task_groups(&tasks),
+            "{a,b,c}:lint, d:{test,tsc}, e#babel"
+        );
+    }
+
+    #[test]
+    fn render_running_task_groups_all_same_task_across_packages() {
+        let tasks = running_tasks(&[("a", "build"), ("b", "build"), ("c", "build")]);
+
+        assert_eq!(render_running_task_groups(&tasks), "{a,b,c}:build");
+    }
+
+    #[test]
+    fn render_running_task_groups_all_different() {
+        let tasks = running_tasks(&[("a", "lint"), ("b", "test"), ("c", "tsc")]);
+
+        assert_eq!(render_running_task_groups(&tasks), "a#lint, b#test, c#tsc");
+    }
+
+    #[test]
+    fn render_running_task_groups_single_leftover() {
+        let tasks = running_tasks(&[("pkg", "task")]);
+
+        assert_eq!(render_running_task_groups(&tasks), "pkg#task");
+    }
+
+    #[test]
+    fn render_running_task_groups_root_package_never_enters_braces() {
+        let tasks = running_tasks(&[("//root", "lint"), ("a", "lint"), ("b", "lint")]);
+
+        assert_eq!(render_running_task_groups(&tasks), "{a,b}:lint, #lint");
+    }
+
+    #[test]
+    fn render_running_task_groups_root_only_package_groups_normally() {
+        let tasks = running_tasks(&[("//root", "build"), ("//root", "test")]);
+
+        // The synthetic `//root` package id must never leak into the output.
+        assert_eq!(render_running_task_groups(&tasks), "#{build,test}");
+    }
+
+    #[test]
+    fn render_running_task_groups_shared_task_with_root_still_groups_non_root_packages() {
+        let tasks = running_tasks(&[("//root", "lint"), ("a", "lint"), ("b", "lint")]);
+
+        assert_eq!(render_running_task_groups(&tasks), "{a,b}:lint, #lint");
+    }
+
+    #[test]
+    fn render_running_task_groups_mixed_shared_and_package_leftovers() {
+        let tasks = running_tasks(&[
+            ("a", "build"),
+            ("b", "build"),
+            ("c", "lint"),
+            ("c", "test"),
+            ("d", "check"),
+        ]);
+
+        assert_eq!(
+            render_running_task_groups(&tasks),
+            "{a,b}:build, c:{lint,test}, d#check"
+        );
+    }
+
+    #[test]
+    fn render_running_task_groups_deterministic_sorting() {
+        let tasks = running_tasks(&[("z", "lint"), ("a", "build"), ("m", "build")]);
+
+        assert_eq!(render_running_task_groups(&tasks), "{a,m}:build, z#lint");
+    }
+
+    #[test]
+    fn render_running_task_groups_shared_scope_is_factored_out() {
+        let tasks = running_tasks(&[
+            ("@acme/web", "lint"),
+            ("@acme/api", "lint"),
+            ("@acme/admin", "lint"),
+        ]);
+
+        assert_eq!(
+            render_running_task_groups(&tasks),
+            "@acme/{admin,api,web}:lint"
+        );
+    }
+
+    #[test]
+    fn render_running_task_groups_mixed_scopes_keep_full_names() {
+        let tasks = running_tasks(&[("@acme/web", "lint"), ("@other/api", "lint")]);
+
+        assert_eq!(
+            render_running_task_groups(&tasks),
+            "{@acme/web,@other/api}:lint"
+        );
+    }
+
+    #[test]
+    fn render_running_task_groups_scope_with_unscoped_keeps_full_names() {
+        let tasks = running_tasks(&[("@acme/web", "lint"), ("api", "lint")]);
+
+        assert_eq!(render_running_task_groups(&tasks), "{@acme/web,api}:lint");
+    }
+
+    #[test]
+    fn render_running_task_groups_scoped_single_leftover_uses_display() {
+        let tasks = running_tasks(&[("@acme/web", "build"), ("@acme/web", "test")]);
+
+        assert_eq!(render_running_task_groups(&tasks), "@acme/web:{build,test}");
+    }
+
+    #[test]
+    fn render_summary_omits_skipped_suffix_when_zero() {
+        let task = task_id("pkg-a", "build");
+        let reporter =
+            ProgressReporter::new(OutputMode::Summary, HashMap::from([(task.clone(), 0)]), 1);
+
+        reporter.task_ran(&task);
+
+        let summary = reporter.render_summary("10 MB");
+
+        DoneSummaryExpectation {
+            done: 1,
+            total: 1,
+            skipped: 0,
+            waves: 1,
+        }
+        .assert_in(&summary);
+        assert!(summary.contains("🐏 10 MB"));
     }
 
     #[test]
@@ -507,10 +654,16 @@ mod tests {
         reporter.task_ran(&task_a);
         reporter.task_skipped_cache_hit(&task_b);
 
-        let summary = reporter.render_summary();
+        let summary = reporter.render_summary("10 MB");
 
-        assert!(summary.starts_with("Done: 1 tasks done after "));
-        assert!(summary.contains(", 1 skipped"));
+        DoneSummaryExpectation {
+            done: 2,
+            total: 2,
+            skipped: 1,
+            waves: 2,
+        }
+        .assert_in(&summary);
+        assert!(summary.contains("🐏 10 MB"));
     }
 
     #[test]
@@ -543,7 +696,7 @@ mod tests {
         let out = reporter.render_progress("10 MB", &warnings);
         assert!(out.contains("⚠️ mem usage high"));
         assert!(out.contains("⚠️ system free memory low"));
-        assert!(out.ends_with("⚠️ system free memory low")); // usage first, then free
+        assert!(out.ends_with("⚠️ system free memory low"));
     }
 
     #[test]
@@ -552,6 +705,17 @@ mod tests {
         let out = reporter.render_progress("10 MB", &[]);
         assert!(!out.contains("⚠️"));
     }
+    fn running_tasks(tasks: &[(&str, &str)]) -> Vec<&'static TaskId> {
+        let leaked = Box::leak(
+            tasks
+                .iter()
+                .map(|(package, task)| task_id(package, task))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        );
+        leaked.iter().collect()
+    }
+
     fn task_id(package: &str, task: &str) -> TaskId {
         TaskId::new(package, task)
     }
