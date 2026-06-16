@@ -1,7 +1,6 @@
-use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
-use sysinfo::{Pid, Process, ProcessRefreshKind, ProcessesToUpdate, System};
+use sysinfo::{Pid, System};
 use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -55,31 +54,55 @@ pub(crate) struct MemoryPressure {
 ///
 /// Used by `dispatch_loop` to check pressure before dispatching, and by the
 /// progress-rendering path to display warnings (Task 5).
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct PressureState {
-    /// The reasons from the most recent `check()` call.
-    /// Empty when not paused.
-    latest_reasons: std::sync::RwLock<Vec<PressureReason>>,
+    latest: std::sync::RwLock<LatestPressureState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PressureSnapshot {
+    pub(crate) reasons: Vec<PressureReason>,
+    pub(crate) sample: Option<MemorySample>,
+    pub(crate) usage_threshold: u64,
+    pub(crate) free_threshold: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LatestPressureState {
+    reasons: Vec<PressureReason>,
+    sample: Option<MemorySample>,
+    usage_threshold: u64,
+    free_threshold: u64,
 }
 
 impl PressureState {
-    pub(crate) fn new() -> Self {
-        Self::default()
+    pub(crate) fn new(usage_threshold: u64, free_threshold: u64) -> Self {
+        Self {
+            latest: std::sync::RwLock::new(LatestPressureState {
+                reasons: Vec::new(),
+                sample: None,
+                usage_threshold,
+                free_threshold,
+            }),
+        }
     }
 
     /// Update with the latest pressure check result.
     pub(crate) fn update(&self, pressure: &MemoryPressure) {
-        *self
-            .latest_reasons
-            .write()
-            .expect("pressure state lock poisoned") = pressure.reasons.clone();
+        let mut latest = self.latest.write().expect("pressure state lock poisoned");
+        latest.reasons = pressure.reasons.clone();
+        latest.sample = Some(pressure.sample);
     }
 
-    /// Get the current pressure reasons (for Task 5 status-line rendering).
-    pub(crate) fn reasons(&self) -> std::sync::RwLockReadGuard<'_, Vec<PressureReason>> {
-        self.latest_reasons
-            .read()
-            .expect("pressure state lock poisoned")
+    /// Get current pressure details for status-line rendering.
+    pub(crate) fn snapshot(&self) -> PressureSnapshot {
+        let latest = self.latest.read().expect("pressure state lock poisoned");
+        PressureSnapshot {
+            reasons: latest.reasons.clone(),
+            sample: latest.sample,
+            usage_threshold: latest.usage_threshold,
+            free_threshold: latest.free_threshold,
+        }
     }
 }
 
@@ -203,15 +226,9 @@ impl MemoryMonitor {
     fn recompute_sample(&mut self) -> MemorySample {
         self.recompute_count += 1;
         self.sys.refresh_memory();
-        self.sys.refresh_processes_specifics(
-            ProcessesToUpdate::All,
-            true,
-            ProcessRefreshKind::nothing().with_memory(),
-        );
 
         MemorySample {
-            // sysinfo 0.36 `Process::memory()` returns bytes, not KiB.
-            tree_rss: compute_tree_rss(self.sys.processes(), self.root_pid).unwrap_or(0),
+            tree_rss: crate::rss::process_tree_rss_bytes_for(self.root_pid.as_u32()).unwrap_or(0),
             system_available: self.sys.available_memory(),
         }
     }
@@ -236,43 +253,6 @@ impl MemoryMonitor {
     ) {
         self.test_override = override_fn;
     }
-}
-
-fn compute_tree_rss(
-    processes: &std::collections::HashMap<Pid, Process>,
-    root_pid: Pid,
-) -> Option<u64> {
-    if !processes.contains_key(&root_pid) {
-        return None;
-    }
-
-    // Build a parent -> children adjacency map in a single linear pass, then
-    // walk downward from `root_pid` to discover every descendant. This is O(n)
-    // versus the prior O(n²) ancestry check that re-walked parent chains.
-    let mut children: std::collections::HashMap<Pid, Vec<Pid>> = std::collections::HashMap::new();
-    for (pid, process) in processes {
-        if let Some(parent) = process.parent() {
-            children.entry(parent).or_default().push(*pid);
-        }
-    }
-
-    let mut tree_rss = 0_u64;
-    let mut visited = HashSet::with_capacity(processes.len());
-    let mut stack = vec![root_pid];
-
-    while let Some(pid) = stack.pop() {
-        if !visited.insert(pid) {
-            continue;
-        }
-        if let Some(process) = processes.get(&pid) {
-            tree_rss = tree_rss.saturating_add(process.memory());
-        }
-        if let Some(kids) = children.get(&pid) {
-            stack.extend(kids.iter().copied());
-        }
-    }
-
-    Some(tree_rss)
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -368,10 +348,9 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        compute_tree_rss, parse_threshold, MemoryMonitor, PressureReason, ThresholdParseError,
-        ThresholdSpec,
+        parse_threshold, MemoryMonitor, PressureReason, ThresholdParseError, ThresholdSpec,
     };
-    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate};
+    use sysinfo::Pid;
 
     #[test]
     fn parses_percent_threshold() {
@@ -517,32 +496,10 @@ mod tests {
         assert!(pressure.reasons.contains(&PressureReason::FreeLow));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
-    fn missing_process_memory_counts_as_zero() {
-        let sys = sysinfo::System::new();
-        assert_eq!(
-            compute_tree_rss(sys.processes(), Pid::from_u32(u32::MAX)),
-            None
-        );
-    }
-
-    #[test]
-    fn tree_rss_excludes_unrelated_processes() {
-        // A process that is its own root should yield exactly its own RSS,
-        // never folding in unrelated processes from the table.
-        let mut sys = sysinfo::System::new();
-        sys.refresh_processes_specifics(
-            ProcessesToUpdate::All,
-            true,
-            ProcessRefreshKind::nothing().with_memory(),
-        );
-        let own = Pid::from_u32(std::process::id());
-        if let Some(proc) = sys.processes().get(&own) {
-            let expected = proc.memory();
-            // The current process likely has children in CI; the descendant
-            // walk must include at least its own memory and never panic/loop.
-            let total = compute_tree_rss(sys.processes(), own).expect("own pid present");
-            assert!(total >= expected);
-        }
+    fn process_tree_rss_for_current_process_is_available() {
+        let rss = crate::rss::process_tree_rss_bytes_for(std::process::id());
+        assert!(rss.is_some_and(|bytes| bytes > 0));
     }
 }
