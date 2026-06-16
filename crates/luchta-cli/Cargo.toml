@@ -29,6 +29,7 @@ luchta-workspace = { path = "../luchta-workspace" }
 luchta-engine = { path = "../luchta-engine" }
 luchta-cache = { path = "../luchta-cache" }
 luchta-lockfiles = { path = "../luchta-lockfiles" }
+luchta-worker = { path = "../luchta-worker" }
 blake3 = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]

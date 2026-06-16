@@ -119,6 +119,15 @@ Example `luchta-config.ts`:
  */
 type DependsOn = string;
 
+interface EnvSpec {
+  /** Explicit value for the variable. Pins the value and is cache-relevant. */
+  value?: string;
+  /** Fallback value if the variable is unset in the ambient environment. Cache-relevant. */
+  default?: string;
+  /** Whether the variable should be included in the build cache hash. Defaults to true. */
+  input?: boolean;
+}
+
 interface TaskDefinition {
   /** Tasks that must finish before this one runs. */
   dependsOn?: DependsOn[];
@@ -133,14 +142,20 @@ interface TaskDefinition {
   command?: string;
   /** Name of a worker (from `workers`) that should execute this task. */
   worker?: string;
+  /** Environment variables for this task. Overrides worker and global env. */
+  env?: Record<string, EnvSpec>;
 }
 
 interface WorkerDefinition {
   /** Command that launches the long-lived worker process. */
   command: string;
+  /** Environment variables for all tasks running on this worker. Overrides global env. */
+  env?: Record<string, EnvSpec>;
 }
 
 interface LuchtaConfig {
+  /** Global environment variables for all tasks. */
+  env?: Record<string, EnvSpec>;
   /** Pipeline task definitions, keyed by task name (or pkg#task, #task). */
   tasks?: Record<string, TaskDefinition>;
   /** Stay-resident worker definitions, keyed by worker name (Unix only). */
@@ -153,17 +168,26 @@ interface LuchtaConfig {
 }
 
 const config = {
+  env: {
+    NODE_ENV: { value: "production" }
+  },
   tasks: {
     build: {
       dependsOn: ["^build"],
-      weight: 2
+      weight: 2,
+      env: {
+        BUILD_TYPE: { value: "full" }
+      }
     },
     "#prep": {
       command: "echo 'Top-level prep'"
     },
     "web#test": {
       dependsOn: ["build", "#prep"],
-      worker: "yarn"
+      worker: "yarn",
+      env: {
+        CI: { input: false } // Passed to task but doesn't affect cache hash
+      }
     },
     test: {
       dependsOn: ["build"],
@@ -172,7 +196,10 @@ const config = {
   },
   workers: {
     yarn: {
-      command: "luchta-yarn-worker"
+      command: "luchta-yarn-worker",
+      env: {
+        YARN_CACHE_FOLDER: { default: "./.yarn-cache" }
+      }
     }
   },
   concurrency: {
@@ -193,7 +220,7 @@ The top-level `tasks` map defines the pipeline. Each task may set:
 - `cache`: opt-in build cache. Provide an object (`cache: {}`) to enable change-detection skips for successful prior runs; omit the field to disable. (Reserved for future per-task cache options.)
 - `inputs`: relative input paths/globs. Literal paths and glob matches are hashed from git-tracked files, so `.gitignore` is respected.
 - `outputs`: relative output paths/globs. These are checked on disk, so missing/deleted outputs invalidate cache entries even if ignored by git.
-- `env`: environment variables passed to task. `value` pins explicit value, omitted `value` inherits from current `luchta` process environment, and `input: false` keeps variable available to task while excluding it from cache hash.
+- `env`: environment variables for the task. See [Environment Variables](#environment-variables) for details on scopes and resolution modes.
 
 ### Task Key Formats
 
@@ -228,6 +255,38 @@ Luchta supports flexible dependency definitions:
 - `pkg#task`: Specific package and task.
 - `#task`: Specific top-level (workspace root) task.
 
+
+### Environment Variables
+
+Environment variables can be declared at three scopes, with the following precedence:
+**Task > Worker > Global**. A variable defined in a more specific scope overrides the same variable name from a broader scope.
+
+Each variable in an `env` map follows one of four modes based on the fields provided:
+
+| Mode | Configuration | Description | Cache-Relevant? |
+| --- | --- | --- | --- |
+| **Set** | `value: "..."` | Use the exact provided value. | Yes |
+| **Inherit** | *(neither `value` nor `default`)* | Inherit from the ambient environment of the `luchta` process. | Yes |
+| **Set Default** | `default: "..."` | Use ambient environment if present, otherwise fall back to the default. | Yes |
+| **Cache Ignore** | `input: false` | Inherit from ambient environment, but exclude from the build cache hash. | No |
+
+**Notes:**
+- An empty string (`value: ""`) counts as a present value and does not fall through to a default.
+- `luchta check` will report an error if both `value` and `default` are set for the same variable in a single scope.
+- The build cache hash uses the **effective** resolved value (including the `default` fallback).
+
+#### Strict Mode & Passthrough Whitelist
+
+Luchta executes task subprocesses in a **strict environment**. The ambient environment is cleared, and only the following are injected:
+1. Resolved variables declared in your `luchta-config`.
+2. A built-in **passthrough whitelist** of essential variables.
+
+Variables in the passthrough whitelist are provided to the subprocess but **do not affect the build cache hash**, ensuring that caches remain portable across different machines.
+
+**Passthrough Whitelist:**
+`PATH`, `PATHEXT`, `LD_LIBRARY_PATH`, `DYLD_FALLBACK_LIBRARY_PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_CACHE_HOME`, `USERPROFILE`, `APPDATA`, `PROGRAMDATA`, `SystemRoot`, `SYSTEMDRIVE`, `WINDIR`, `ProgramFiles`, `ProgramFiles(x86)`, `TMPDIR`, `TMP`, `TEMP`, `TERM`, `COLORTERM`, `FORCE_COLOR`, `NO_COLOR`, `LANG`, `LC_ALL`, `TZ`, `SSL_CERT_FILE`, `SSL_CERT_DIR`, `CI`, `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, `http_proxy`, `https_proxy`, `no_proxy`.
+
+Declared variables always override whitelist variables on name collision.
 ### Workers
 For tools with heavy startup costs (Yarn PnP, Babel, ESLint, Jest), Luchta can
 route tasks to **stay-resident worker processes** instead of spawning a fresh

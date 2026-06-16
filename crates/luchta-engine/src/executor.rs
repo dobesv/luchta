@@ -411,9 +411,10 @@ fn spawn_shell_child(
         command.current_dir(cwd);
     }
 
-    if !request.env.is_empty() {
-        command.envs(&request.env);
-    }
+    // Clear all inherited environment variables for strict isolation.
+    // The request.env already contains the full effective env (whitelist + declared).
+    command.env_clear();
+    command.envs(&request.env);
 
     command.spawn().map_err(|source| ExecutorError::Spawn {
         task: task_name.to_owned(),
@@ -887,6 +888,7 @@ while IFS= read -r line; do
             WorkerDefinition {
                 command: worker_path.display().to_string(),
                 depends_on: Vec::new(),
+                env: std::collections::BTreeMap::new(),
             },
         );
         WorkerManager::new(definitions)

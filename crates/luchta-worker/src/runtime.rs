@@ -189,6 +189,9 @@ fn spawn_child<W: Worker>(
     command.stdin(Stdio::null());
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
+    // Clear all inherited environment variables for strict isolation.
+    // The request.env contains the full effective env (whitelist + declared).
+    command.env_clear();
     command.envs(&request.env);
 
     if let Some(cwd) = &request.cwd {

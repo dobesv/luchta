@@ -20,7 +20,8 @@ use luchta_engine::{
     PackageResolveInfo, PrunedTask, ReadyTaskMessage, ResolveMode, TaskGraph, TaskNode,
     TaskRunOutcome, Walker, WeightedExecutor, WorkerManager,
 };
-use luchta_types::{PackageName, TaskDefinition, TaskId, TaskName, WorkerDefinition};
+use luchta_types::{EnvSpec, PackageName, TaskDefinition, TaskId, TaskName, WorkerDefinition};
+use luchta_worker::BUILTIN_PASSTHROUGH_ENV;
 use luchta_workspace::{PackageGraph, PackageNode, WorkspaceDiscovery, YarnWorkspace};
 use miette::{bail, Context, IntoDiagnostic, Result};
 use owo_colors::OwoColorize;
@@ -30,6 +31,7 @@ use crate::cache_ctx::{
     PackageDirResolver,
 };
 use crate::cli::OutputMode;
+use crate::env_merge::merge_env;
 use crate::progress::ProgressReporter;
 
 /// User's task selection from CLI arguments.
@@ -60,6 +62,7 @@ pub struct PreparedWorkspace {
     pub package_graph: PackageGraph,
     pub pipeline: HashMap<TaskName, TaskDefinition>,
     pub task_graph: TaskGraph,
+    pub env: BTreeMap<String, EnvSpec>,
     pub workers: HashMap<String, WorkerDefinition>,
     pub max_weight: u32,
     /// Tasks excluded from the graph during the worker-mediated resolution
@@ -130,6 +133,7 @@ pub async fn prepare_workspace(
         package_graph,
         pipeline,
         task_graph,
+        env: config.env,
         workers: config.workers,
         max_weight: config.concurrency.max_weight,
         pruned,
@@ -148,6 +152,7 @@ pub async fn run_tasks(
         package_graph,
         pipeline: _,
         task_graph,
+        env,
         workers,
         max_weight,
         pruned,
@@ -179,8 +184,11 @@ pub async fn run_tasks(
     );
     let output_hashes: Arc<Mutex<HashMap<TaskId, [u8; 32]>>> = Arc::new(Mutex::new(HashMap::new()));
 
-    let CommandMap { commands, invalid } =
-        build_command_map(&task_graph, &package_nodes, workspace_root, &workers);
+    let CommandMap {
+        commands,
+        invalid,
+        task_envs,
+    } = build_command_map(&task_graph, &package_nodes, workspace_root, &env, &workers);
 
     for request in commands.values() {
         executor.register(request.clone());
@@ -209,6 +217,7 @@ pub async fn run_tasks(
         output_hashes: &output_hashes,
         reporter: &reporter,
         lockfile: &lockfile_state,
+        task_envs: &task_envs,
     };
     let run_result = dispatch_loop(&mut receiver, &ctx).await;
 
@@ -242,6 +251,7 @@ struct DispatchContext<'a> {
     output_hashes: &'a Arc<Mutex<HashMap<TaskId, [u8; 32]>>>,
     reporter: &'a Arc<ProgressReporter>,
     lockfile: &'a LockfileState,
+    task_envs: &'a HashMap<TaskId, BTreeMap<String, EnvSpec>>,
 }
 
 struct TaskRunContext {
@@ -425,6 +435,7 @@ pub async fn dry_run_tasks(workspace_root: &Path, selection: &TaskSelection<'_>)
         package_graph: _,
         pipeline: _,
         task_graph,
+        env,
         workers,
         max_weight: _,
         pruned,
@@ -444,8 +455,11 @@ pub async fn dry_run_tasks(workspace_root: &Path, selection: &TaskSelection<'_>)
     report_pruned_tasks(&pruned);
 
     let tasks_to_run = collect_requested_subgraph(&task_graph, selection, &pruned)?;
-    let CommandMap { commands, invalid } =
-        build_command_map(&task_graph, &package_nodes, workspace_root, &workers);
+    let CommandMap {
+        commands,
+        invalid,
+        task_envs: _,
+    } = build_command_map(&task_graph, &package_nodes, workspace_root, &env, &workers);
 
     let waves = compute_execution_waves(&task_graph, &tasks_to_run);
 
@@ -1050,8 +1064,16 @@ fn build_cache_write_context(task_id: &TaskId, ctx: &DispatchContext<'_>) -> Cac
         }
     };
     let resolver = PackageDirResolver::new(cache_package.package_path.clone());
+    let empty_env = BTreeMap::new();
+    let merged_env = ctx.task_envs.get(task_id).unwrap_or(&empty_env);
 
-    let current = build_current_state(&task_def, dep_outputs.clone(), &pkg_dep_pairs, &resolver);
+    let current = build_current_state(
+        &task_def,
+        merged_env,
+        dep_outputs.clone(),
+        &pkg_dep_pairs,
+        &resolver,
+    );
     let task_spec_hash = current.task_spec_hash;
     let env_hash = current.env_hash;
     let pkg_dep_hash = current.pkg_dep_hash;
@@ -1214,7 +1236,9 @@ fn try_cache_skip(task_id: &TaskId, ctx: &DispatchContext<'_>) -> Option<Decisio
             return Some(Decision::Run);
         }
     };
-    let current = build_current_state(task_def, dep_outputs, &pkg_dep_pairs, &resolver);
+    let empty_env = BTreeMap::new();
+    let merged_env = ctx.task_envs.get(task_id).unwrap_or(&empty_env);
+    let current = build_current_state(task_def, merged_env, dep_outputs, &pkg_dep_pairs, &resolver);
     let prior = ctx.cache.read(&task_id.to_string());
     let decision = decide(prior.as_ref(), &current);
     if matches!(decision, Decision::Skip) {
@@ -1379,17 +1403,20 @@ fn compute_prefix_width(task_graph: &TaskGraph, tasks_to_run: &HashSet<TaskId>) 
 struct CommandMap {
     commands: HashMap<TaskId, ExecutionRequest>,
     invalid: HashMap<TaskId, String>,
+    task_envs: HashMap<TaskId, BTreeMap<String, EnvSpec>>,
 }
 
 fn build_command_map(
     task_graph: &TaskGraph,
     packages: &[PackageNode],
     workspace_root: &Path,
+    global_env: &BTreeMap<String, EnvSpec>,
     workers: &HashMap<String, WorkerDefinition>,
 ) -> CommandMap {
     let package_by_name: HashMap<_, _> = packages.iter().map(|pkg| (&pkg.name, pkg)).collect();
     let mut commands = HashMap::new();
     let mut invalid = HashMap::new();
+    let mut task_envs = HashMap::new();
 
     for node in task_graph.nodes() {
         let task_id = &node.id;
@@ -1404,6 +1431,13 @@ fn build_command_map(
         };
 
         let worker = task_def.and_then(|def| def.worker.clone());
+        let empty_env = BTreeMap::new();
+        let worker_env = worker
+            .as_ref()
+            .and_then(|worker_name| workers.get(worker_name))
+            .map(|worker_def| &worker_def.env);
+        let task_env = task_def.map(|def| &def.env).unwrap_or(&empty_env);
+        let merged_env = merge_env(global_env, worker_env, task_env);
 
         let (command, workspace) = if let Some(worker_name) = &worker {
             if !workers.contains_key(worker_name) {
@@ -1442,15 +1476,20 @@ fn build_command_map(
             task: node.clone(),
             command,
             cwd: Some(cwd),
-            env: resolve_task_env(task_def),
+            env: build_execution_env(&merged_env),
             log_sink: None,
             worker,
             workspace,
         };
+        task_envs.insert(task_id.clone(), merged_env);
         commands.insert(task_id.clone(), request);
     }
 
-    CommandMap { commands, invalid }
+    CommandMap {
+        commands,
+        invalid,
+        task_envs,
+    }
 }
 
 /// Outcome of resolving the command for a non-worker task.
@@ -1463,30 +1502,45 @@ enum NonWorkerCommand {
     CommandWithoutWorker,
 }
 
-/// Resolves environment variables from a task definition for execution.
+/// Resolves environment variables from merged env config for execution.
 ///
-/// For each `(name, EnvSpec)` in `task_def.env`:
+/// For each `(name, EnvSpec)` in merged env map:
+/// - Uses `EnvSpec::resolve_env_value` for resolution (single authority).
 /// - If `value` is `Some`, use that value.
 /// - Otherwise, inherit from the luchta process environment via `std::env::var(name)`.
-///   If the variable is unset in the process environment, omit it (do not insert).
+///   If the variable is unset in the process environment, use `default` if present.
+///   If all are absent, omit it (do not insert).
 /// - The `input` flag only affects cache hashing, NOT this resolution —
 ///   `input: false` vars are still present in the resulting map.
-fn resolve_task_env(task_def: Option<&TaskDefinition>) -> HashMap<String, String> {
-    let Some(task_def) = task_def else {
-        return HashMap::new();
-    };
-
-    task_def
-        .env
-        .iter()
+fn resolve_task_env(env: &BTreeMap<String, EnvSpec>) -> HashMap<String, String> {
+    env.iter()
         .filter_map(|(name, spec)| {
-            let value = match &spec.value {
-                Some(v) => Some(v.clone()),
-                None => std::env::var(name).ok(),
-            };
-            value.map(|v| (name.clone(), v))
+            spec.resolve_env_value(name, || std::env::var(name).ok())
+                .map(|v| (name.clone(), v))
         })
         .collect()
+}
+
+/// Collects built-in passthrough env vars from ambient environment.
+///
+/// For each name in `BUILTIN_PASSTHROUGH_ENV`, if present in the current
+/// process environment, include it in the result. Absent vars are omitted.
+fn collect_builtin_passthrough_env() -> HashMap<String, String> {
+    BUILTIN_PASSTHROUGH_ENV
+        .iter()
+        .filter_map(|&name| std::env::var(name).ok().map(|v| (name.to_owned(), v)))
+        .collect()
+}
+
+/// Builds the full execution environment for a task.
+///
+/// Starts with built-in passthrough vars (present-only), then overlays
+/// resolved declared vars from the merged EnvSpec map. Declared vars
+/// override whitelist passthrough on name collision.
+fn build_execution_env(merged_env: &BTreeMap<String, EnvSpec>) -> HashMap<String, String> {
+    let mut env = collect_builtin_passthrough_env();
+    env.extend(resolve_task_env(merged_env));
+    env
 }
 
 fn resolve_non_worker_command(task_def: Option<&TaskDefinition>) -> NonWorkerCommand {
@@ -1934,12 +1988,13 @@ mod tests {
             "FOO".to_string(),
             EnvSpec {
                 value: Some("bar".to_string()),
+                default: None,
                 input: true,
             },
         );
         let task_def = make_task_def(env);
 
-        let resolved = resolve_task_env(Some(&task_def));
+        let resolved = resolve_task_env(&task_def.env);
         assert_eq!(resolved.get("FOO"), Some(&"bar".to_string()));
     }
 
@@ -1953,12 +2008,13 @@ mod tests {
             "LUCHTA_TEST_INHERIT_VAR".to_string(),
             EnvSpec {
                 value: None,
+                default: None,
                 input: true,
             },
         );
         let task_def = make_task_def(env);
 
-        let resolved = resolve_task_env(Some(&task_def));
+        let resolved = resolve_task_env(&task_def.env);
         assert_eq!(
             resolved.get("LUCHTA_TEST_INHERIT_VAR"),
             Some(&"inherited_value".to_string())
@@ -1975,12 +2031,13 @@ mod tests {
             "LUCHTA_TEST_UNDEF_VAR".to_string(),
             EnvSpec {
                 value: None,
+                default: None,
                 input: true,
             },
         );
         let task_def = make_task_def(env);
 
-        let resolved = resolve_task_env(Some(&task_def));
+        let resolved = resolve_task_env(&task_def.env);
         assert!(!resolved.contains_key("LUCHTA_TEST_UNDEF_VAR"));
     }
 
@@ -1995,12 +2052,13 @@ mod tests {
             "LUCHTA_TEST_INPUT_FALSE_VAR".to_string(),
             EnvSpec {
                 value: None,
+                default: None,
                 input: false,
             },
         );
         let task_def = make_task_def(env);
 
-        let resolved = resolve_task_env(Some(&task_def));
+        let resolved = resolve_task_env(&task_def.env);
         assert_eq!(
             resolved.get("LUCHTA_TEST_INPUT_FALSE_VAR"),
             Some(&"still_present".to_string())
@@ -2017,15 +2075,159 @@ mod tests {
             "LUCHTA_TEST_OVERRIDE_VAR".to_string(),
             EnvSpec {
                 value: Some("explicit_value".to_string()),
+                default: None,
                 input: true,
             },
         );
         let task_def = make_task_def(env);
 
-        let resolved = resolve_task_env(Some(&task_def));
+        let resolved = resolve_task_env(&task_def.env);
         assert_eq!(
             resolved.get("LUCHTA_TEST_OVERRIDE_VAR"),
             Some(&"explicit_value".to_string())
         );
+    }
+
+    #[test]
+    fn resolve_task_env_default_fallback_when_value_none_and_ambient_unset() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvVarGuard::remove("LUCHTA_TEST_DEFAULT_VAR");
+
+        let mut env = std::collections::BTreeMap::new();
+        env.insert(
+            "LUCHTA_TEST_DEFAULT_VAR".to_string(),
+            EnvSpec {
+                value: None,
+                default: Some("default_value".to_string()),
+                input: true,
+            },
+        );
+
+        let resolved = resolve_task_env(&env);
+        assert_eq!(
+            resolved.get("LUCHTA_TEST_DEFAULT_VAR"),
+            Some(&"default_value".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_task_env_ambient_wins_over_default() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvVarGuard::set("LUCHTA_TEST_AMBIENT_VAR", "ambient_value");
+
+        let mut env = std::collections::BTreeMap::new();
+        env.insert(
+            "LUCHTA_TEST_AMBIENT_VAR".to_string(),
+            EnvSpec {
+                value: None,
+                default: Some("default_value".to_string()),
+                input: true,
+            },
+        );
+
+        let resolved = resolve_task_env(&env);
+        assert_eq!(
+            resolved.get("LUCHTA_TEST_AMBIENT_VAR"),
+            Some(&"ambient_value".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_task_env_empty_string_is_present() {
+        let _lock = ENV_LOCK.lock().unwrap();
+
+        let mut env = std::collections::BTreeMap::new();
+        env.insert(
+            "LUCHTA_TEST_EMPTY_VAR".to_string(),
+            EnvSpec {
+                value: Some("".to_string()),
+                default: Some("default_value".to_string()),
+                input: true,
+            },
+        );
+
+        let resolved = resolve_task_env(&env);
+        assert_eq!(resolved.get("LUCHTA_TEST_EMPTY_VAR"), Some(&"".to_string()));
+    }
+
+    #[test]
+    fn build_execution_env_includes_whitelist_vars() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard_path = EnvVarGuard::set("PATH", "/test/path");
+
+        let env = std::collections::BTreeMap::new();
+
+        let resolved = build_execution_env(&env);
+        // PATH is in the whitelist and should be included
+        assert!(resolved.contains_key("PATH"));
+    }
+
+    #[test]
+    fn build_execution_env_excludes_non_whitelist_ambient() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvVarGuard::set("LUCHTA_TEST_AMBIENT_EXCLUDED", "ambient_value");
+
+        let env = std::collections::BTreeMap::new();
+
+        let resolved = build_execution_env(&env);
+        // Non-whitelisted ambient var should NOT be present
+        assert!(!resolved.contains_key("LUCHTA_TEST_AMBIENT_EXCLUDED"));
+    }
+
+    #[test]
+    fn build_execution_env_declared_overrides_whitelist() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvVarGuard::set("PATH", "/original/path");
+
+        let mut env = std::collections::BTreeMap::new();
+        env.insert(
+            "PATH".to_string(),
+            EnvSpec {
+                value: Some("/declared/path".to_string()),
+                default: None,
+                input: true,
+            },
+        );
+
+        let resolved = build_execution_env(&env);
+        // Declared PATH should override whitelist PATH
+        assert_eq!(resolved.get("PATH"), Some(&"/declared/path".to_string()));
+    }
+
+    #[test]
+    fn build_execution_env_combines_whitelist_and_declared() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard_path = EnvVarGuard::set("PATH", "/test/path");
+
+        let mut env = std::collections::BTreeMap::new();
+        env.insert(
+            "DECLARED_VAR".to_string(),
+            EnvSpec {
+                value: Some("declared_value".to_string()),
+                default: None,
+                input: true,
+            },
+        );
+
+        let resolved = build_execution_env(&env);
+        // Both whitelist and declared vars should be present
+        assert!(resolved.contains_key("PATH"));
+        assert_eq!(
+            resolved.get("DECLARED_VAR"),
+            Some(&"declared_value".to_string())
+        );
+    }
+
+    #[test]
+    fn build_execution_env_omits_non_whitelist_ambient_whose_name_is_reserved() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        // LUFTA_TEST_NON_WHITELISTED is not in whitelist
+        let _guard = EnvVarGuard::set("LUCHTA_TEST_NON_WHITELISTED", "ambient_value");
+
+        let env = std::collections::BTreeMap::new();
+
+        let resolved = build_execution_env(&env);
+        // Non-whitelisted ambient var should NOT be present (no declared vars)
+        assert!(!resolved.contains_key("LUCHTA_TEST_NON_WHITELISTED"));
     }
 }

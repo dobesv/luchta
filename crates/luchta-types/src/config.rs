@@ -1,14 +1,15 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Deserializer};
 
-use crate::{DependsOn, TaskDefinition};
+use crate::{DependsOn, EnvSpec, TaskDefinition};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// Worker command definition shared across crates.
 pub struct WorkerDefinition {
     pub command: String,
     pub depends_on: Vec<DependsOn>,
+    pub env: BTreeMap<String, EnvSpec>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -19,6 +20,8 @@ enum WorkerDefinitionRepr {
         command: String,
         #[serde(default, rename = "dependsOn", alias = "depends_on")]
         depends_on: Vec<DependsOn>,
+        #[serde(default)]
+        env: BTreeMap<String, EnvSpec>,
     },
 }
 
@@ -31,13 +34,16 @@ impl<'de> Deserialize<'de> for WorkerDefinition {
             WorkerDefinitionRepr::Command(command) => Ok(Self {
                 command,
                 depends_on: Vec::new(),
+                env: BTreeMap::new(),
             }),
             WorkerDefinitionRepr::Object {
                 command,
                 depends_on,
+                env,
             } => Ok(Self {
                 command,
                 depends_on,
+                env,
             }),
         }
     }
@@ -58,6 +64,9 @@ pub struct LuchtaConfig {
     /// Worker definitions keyed by worker name.
     #[serde(default)]
     pub workers: HashMap<String, WorkerDefinition>,
+    /// Environment variables provided to all tasks, keyed by variable name.
+    #[serde(default)]
+    pub env: BTreeMap<String, EnvSpec>,
 }
 
 /// Scheduler concurrency settings from `[concurrency]` table.
@@ -79,8 +88,12 @@ impl Default for ConcurrencyConfig {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::{ConcurrencyConfig, LuchtaConfig};
-    use crate::{DependsOn, PackageName, TaskDefinition, TaskId, TaskName, WorkerDefinition};
+    use crate::{
+        DependsOn, EnvSpec, PackageName, TaskDefinition, TaskId, TaskName, WorkerDefinition,
+    };
 
     #[test]
     fn deserializes_luchta_toml_tasks_with_defaults_and_commands() {
@@ -183,6 +196,7 @@ mod tests {
             Some(&WorkerDefinition {
                 command: "node worker.js".to_owned(),
                 depends_on: vec![],
+                env: BTreeMap::new(),
             })
         );
     }
@@ -208,6 +222,7 @@ mod tests {
                     )),
                     DependsOn::Root(TaskName::from("prep")),
                 ],
+                env: BTreeMap::new(),
             })
         );
     }
@@ -227,6 +242,7 @@ mod tests {
             Some(&WorkerDefinition {
                 command: "luchta-babel-worker".to_owned(),
                 depends_on: vec![DependsOn::DirectUpstream(TaskName::from("build"))],
+                env: BTreeMap::new(),
             })
         );
     }
@@ -245,6 +261,7 @@ mod tests {
             Some(&WorkerDefinition {
                 command: "luchta-babel-worker".to_owned(),
                 depends_on: vec![],
+                env: BTreeMap::new(),
             })
         );
     }
@@ -295,6 +312,79 @@ mod tests {
                 .expect("root task")
                 .depends_on,
             vec![DependsOn::Root(TaskName::from("audit-licenses"))]
+        );
+    }
+
+    #[test]
+    fn deserializes_global_env_worker_env_and_task_env() {
+        let sample = r#"
+            [env]
+            NODE_ENV = { value = "production" }
+            API_KEY = {}
+
+            [workers.babel]
+            command = "luchta-babel-worker"
+            [workers.babel.env]
+            BABEL_ENV = { value = "development" }
+
+            [tasks.build]
+            command = "npm run build"
+            [tasks.build.env]
+            BUILD_TARGET = { value = "es2020" }
+            OVERRIDE_VAR = { value = "worker-override", input = false }
+        "#;
+
+        let config: LuchtaConfig = toml::from_str(sample).expect("config should deserialize");
+
+        // Check global env
+        assert_eq!(config.env.len(), 2);
+        assert_eq!(
+            config.env.get("NODE_ENV"),
+            Some(&EnvSpec {
+                value: Some("production".to_owned()),
+                default: None,
+                input: true,
+            })
+        );
+        assert_eq!(
+            config.env.get("API_KEY"),
+            Some(&EnvSpec {
+                value: None,
+                default: None,
+                input: true,
+            })
+        );
+
+        // Check worker env
+        let babel_worker = config.workers.get("babel").expect("babel worker");
+        assert_eq!(babel_worker.env.len(), 1);
+        assert_eq!(
+            babel_worker.env.get("BABEL_ENV"),
+            Some(&EnvSpec {
+                value: Some("development".to_owned()),
+                default: None,
+                input: true,
+            })
+        );
+
+        // Check task env
+        let build_task = config.tasks.get("build").expect("build task");
+        assert_eq!(build_task.env.len(), 2);
+        assert_eq!(
+            build_task.env.get("BUILD_TARGET"),
+            Some(&EnvSpec {
+                value: Some("es2020".to_owned()),
+                default: None,
+                input: true,
+            })
+        );
+        assert_eq!(
+            build_task.env.get("OVERRIDE_VAR"),
+            Some(&EnvSpec {
+                value: Some("worker-override".to_owned()),
+                default: None,
+                input: false,
+            })
         );
     }
 }

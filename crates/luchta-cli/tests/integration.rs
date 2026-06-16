@@ -307,6 +307,223 @@ fn check_reports_command_without_worker() {
 }
 
 #[test]
+fn check_reports_env_conflict_in_task() {
+    let temp = assert_fs::TempDir::new().expect("create temp dir");
+    temp.child("package.json")
+        .write_str(
+            r#"{
+    "name": "root",
+    "private": true,
+    "workspaces": ["packages/*"]
+}"#,
+        )
+        .expect("write root package.json");
+
+    fs::create_dir_all(temp.child("packages/a").path()).expect("create packages/a dir");
+    temp.child("packages/a/package.json")
+        .write_str(
+            r#"{
+    "name": "a",
+    "scripts": {
+        "build": "echo built-a"
+    }
+}"#,
+        )
+        .expect("write packages/a/package.json");
+
+    let worker_script = make_worker_script(
+        &temp,
+        "fake-worker-env-check.sh",
+        &shell_worker_body(r#"{"type":"done","id":"%s","success":true}"#, ""),
+    );
+
+    // Task with env that has BOTH value and default set (conflict)
+    temp.child("luchta-config.sh")
+        .write_str(&format!(
+            "#!/bin/sh\necho '{{\"concurrency\":{{\"maxWeight\":4}},\"workers\":{{\"fake\":{{\"command\":\"{}\"}}}},\"tasks\":{{\"build\":{{\"worker\":\"fake\",\"env\":{{\"MY_VAR\":{{\"value\":\"explicit\",\"default\":\"fallback\"}}}}}}}}}}'\n",
+            worker_script.path().display()
+        ))
+        .expect("write luchta-config.sh");
+
+    let mut cmd = Command::cargo_bin("luchta").expect("find binary");
+    cmd.arg("check")
+        .arg("--workspace-root")
+        .arg(temp.path())
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("task validation failed")
+                .and(predicate::str::contains("MY_VAR"))
+                .and(predicate::str::contains("task 'build'"))
+                .and(predicate::str::contains("setDefault conflict")),
+        );
+
+    temp.close().expect("cleanup temp dir");
+}
+
+#[test]
+fn check_reports_env_conflict_in_global() {
+    let temp = assert_fs::TempDir::new().expect("create temp dir");
+    temp.child("package.json")
+        .write_str(
+            r#"{
+    "name": "root",
+    "private": true,
+    "workspaces": ["packages/*"]
+}"#,
+        )
+        .expect("write root package.json");
+
+    fs::create_dir_all(temp.child("packages/a").path()).expect("create packages/a dir");
+    temp.child("packages/a/package.json")
+        .write_str(
+            r#"{
+    "name": "a",
+    "scripts": {
+        "build": "echo built-a"
+    }
+}"#,
+        )
+        .expect("write packages/a/package.json");
+
+    let worker_script = make_worker_script(
+        &temp,
+        "fake-worker-global-env.sh",
+        &shell_worker_body(r#"{"type":"done","id":"%s","success":true}"#, ""),
+    );
+
+    // Global env with conflict (value + default)
+    temp.child("luchta-config.sh")
+        .write_str(&format!(
+            "#!/bin/sh\necho '{{\"concurrency\":{{\"maxWeight\":4}},\"workers\":{{\"fake\":{{\"command\":\"{}\"}}}},\"env\":{{\"GLOBAL_VAR\":{{\"value\":\"x\",\"default\":\"y\"}}}},\"tasks\":{{\"build\":{{\"worker\":\"fake\"}}}}}}'\n",
+            worker_script.path().display()
+        ))
+        .expect("write luchta-config.sh");
+
+    let mut cmd = Command::cargo_bin("luchta").expect("find binary");
+    cmd.arg("check")
+        .arg("--workspace-root")
+        .arg(temp.path())
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("task validation failed")
+                .and(predicate::str::contains("GLOBAL_VAR"))
+                .and(predicate::str::contains("global"))
+                .and(predicate::str::contains("setDefault conflict")),
+        );
+
+    temp.close().expect("cleanup temp dir");
+}
+
+#[test]
+fn check_reports_env_conflict_in_worker() {
+    let temp = assert_fs::TempDir::new().expect("create temp dir");
+    temp.child("package.json")
+        .write_str(
+            r#"{
+    "name": "root",
+    "private": true,
+    "workspaces": ["packages/*"]
+}"#,
+        )
+        .expect("write root package.json");
+
+    fs::create_dir_all(temp.child("packages/a").path()).expect("create packages/a dir");
+    temp.child("packages/a/package.json")
+        .write_str(
+            r#"{
+    "name": "a",
+    "scripts": {
+        "build": "echo built-a"
+    }
+}"#,
+        )
+        .expect("write packages/a/package.json");
+
+    let worker_script = make_worker_script(
+        &temp,
+        "fake-worker-conflict.sh",
+        &shell_worker_body(r#"{"type":"done","id":"%s","success":true}"#, ""),
+    );
+
+    // Worker with env conflict
+    temp.child("luchta-config.sh")
+        .write_str(&format!(
+            "#!/bin/sh\necho '{{\"concurrency\":{{\"maxWeight\":4}},\"workers\":{{\"fake\":{{\"command\":\"{}\",\"env\":{{\"WORKER_VAR\":{{\"value\":\"x\",\"default\":\"y\"}}}}}}}},\"tasks\":{{\"build\":{{\"worker\":\"fake\"}}}}}}'\n",
+            worker_script.path().display()
+        ))
+        .expect("write luchta-config.sh");
+
+    let mut cmd = Command::cargo_bin("luchta").expect("find binary");
+    cmd.arg("check")
+        .arg("--workspace-root")
+        .arg(temp.path())
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("task validation failed")
+                .and(predicate::str::contains("WORKER_VAR"))
+                .and(predicate::str::contains("worker 'fake'"))
+                .and(predicate::str::contains("setDefault conflict")),
+        );
+
+    temp.close().expect("cleanup temp dir");
+}
+
+#[test]
+fn run_ignores_env_conflict() {
+    // `luchta run` must NOT error on env conflicts - arbitrary runtime behavior accepted
+    let temp = assert_fs::TempDir::new().expect("create temp dir");
+    temp.child("package.json")
+        .write_str(
+            r#"{
+    "name": "root",
+    "private": true,
+    "workspaces": ["packages/*"]
+}"#,
+        )
+        .expect("write root package.json");
+
+    fs::create_dir_all(temp.child("packages/a").path()).expect("create packages/a dir");
+    temp.child("packages/a/package.json")
+        .write_str(
+            r#"{
+    "name": "a",
+    "scripts": {
+        "build": "echo built-a"
+    }
+}"#,
+        )
+        .expect("write packages/a/package.json");
+
+    let worker_script = make_worker_script(
+        &temp,
+        "fake-worker-run-ignore.sh",
+        &shell_worker_body(r#"{"type":"done","id":"%s","exitCode":0}"#, ""),
+    );
+
+    // Task with env conflict, but run should still succeed
+    temp.child("luchta-config.sh")
+        .write_str(&format!(
+            "#!/bin/sh\necho '{{\"concurrency\":{{\"maxWeight\":4}},\"workers\":{{\"fake\":{{\"command\":\"{}\"}}}},\"tasks\":{{\"build\":{{\"worker\":\"fake\",\"env\":{{\"MY_VAR\":{{\"value\":\"explicit\",\"default\":\"fallback\"}}}}}}}}}}'\n",
+            worker_script.path().display()
+        ))
+        .expect("write luchta-config.sh");
+
+    let mut cmd = Command::cargo_bin("luchta").expect("find binary");
+    // `luchta run` should succeed despite the conflict
+    cmd.arg("run")
+        .arg("build")
+        .arg("--workspace-root")
+        .arg(temp.path())
+        .assert()
+        .success();
+
+    temp.close().expect("cleanup temp dir");
+}
+
+#[test]
 #[ignore = "covered by worker_integration; shell worker fixture can hang under cargo test harness"]
 fn run_fails_on_script_failure() {
     let temp = assert_fs::TempDir::new().expect("create temp dir");
