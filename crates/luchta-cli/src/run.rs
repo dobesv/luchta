@@ -237,7 +237,7 @@ pub async fn run_tasks(
 
     finalize_run(&worker_manager, walker, receiver, run_result.is_err()).await?;
 
-    report_run_outcome(run_result, &any_failed, &reporter)
+    report_run_outcome(run_result, &any_failed, &reporter, &pressure_state)
 }
 
 /// Shared, read-only context the dispatch loop hands to each ready task.

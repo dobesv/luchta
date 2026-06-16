@@ -5,7 +5,7 @@ use miette::Result;
 use super::{dispatch_ready_task, shutdown_signal, DispatchContext, ShutdownSignal};
 use crate::{
     cli::OutputMode,
-    memory_pressure::{MemoryMonitor, MemoryPressure, PressureReason, PressureState},
+    memory_pressure::{MemoryMonitor, MemoryPressure, PressureState},
 };
 use luchta_engine::ReadyTaskMessage;
 
@@ -119,24 +119,32 @@ impl<'a> PressureEnv for ProdPressureEnv<'a> {
     }
 
     fn render_progress(&self) {
-        render_status_line(self.progress_reporter, self.pressure_state);
+        render_status_line(self.progress_reporter, self.pressure_state, true);
     }
 }
 
-/// Emits the periodic status line (with any memory-pressure warning suffix),
-/// but only in default output mode while tasks are running. Shared by the
-/// outer dispatch loop and the in-pause progress tick so the formatting stays
+/// Emits periodic status line (with any memory-pressure warning suffix).
+/// Shared by outer dispatch loop and in-pause progress tick so formatting stays
 /// in one place.
 fn render_status_line(
     reporter: &crate::progress::ProgressReporter,
     pressure_state: &PressureState,
+    paused: bool,
 ) {
-    if reporter.mode == OutputMode::Default && reporter.running_count() > 0 {
-        let rss = crate::rss::format_rss(crate::rss::process_tree_rss_bytes());
-        let reasons_guard = pressure_state.reasons();
-        let reasons: &[PressureReason] = &reasons_guard;
-        eprintln!("{}", reporter.render_progress(&rss, reasons));
+    if !should_render(paused, reporter.running_count(), reporter.mode) {
+        return;
     }
+
+    let pressure = pressure_state.snapshot();
+    let rss = crate::rss::format_rss(pressure.sample.map(|sample| sample.tree_rss));
+    eprintln!(
+        "{}",
+        reporter.render_progress(&rss, &pressure.reasons, &pressure)
+    );
+}
+
+fn should_render(paused: bool, running_count: usize, mode: OutputMode) -> bool {
+    mode == OutputMode::Default && (paused || running_count > 0)
 }
 
 pub(super) async fn dispatch_loop(
@@ -158,12 +166,17 @@ pub(super) async fn dispatch_loop(
             signal_result = signal.as_mut() => {
                 let shutdown = signal_result?;
                 ctx.interrupted.store(true, std::sync::atomic::Ordering::SeqCst);
+                let pressure = pressure_state.snapshot();
+                let rss = pressure
+                    .sample
+                    .map(|sample| sample.tree_rss)
+                    .or_else(crate::rss::process_tree_rss_bytes);
                 eprintln!(
                     "Interrupted by {}: {} tasks running after {}s; RSS: {}",
                     shutdown.name(),
                     ctx.reporter.running_count(),
                     ctx.reporter.start.elapsed().as_secs(),
-                    crate::rss::format_rss(crate::rss::process_tree_rss_bytes()),
+                    crate::rss::format_rss(rss),
                 );
                 break Err(miette::miette!("interrupted"));
             }
@@ -181,22 +194,32 @@ pub(super) async fn dispatch_loop(
                 };
                 match await_pressure_clearance(&mut env).await {
                     PressureClearance::Dispatch => dispatch_ready_task(task_node, done_tx, ctx),
-                    PressureClearance::Shutdown => return interrupted_during_pause(ctx),
+                    PressureClearance::Shutdown => {
+                        return interrupted_during_pause(ctx, pressure_state);
+                    }
                 }
             }
-            _ = progress_interval.tick() => render_status_line(ctx.reporter, pressure_state),
+            _ = progress_interval.tick() => render_status_line(ctx.reporter, pressure_state, false),
         }
     }
 }
 
-fn interrupted_during_pause(ctx: &DispatchContext<'_>) -> Result<()> {
+fn interrupted_during_pause(
+    ctx: &DispatchContext<'_>,
+    pressure_state: &PressureState,
+) -> Result<()> {
     ctx.interrupted
         .store(true, std::sync::atomic::Ordering::SeqCst);
+    let pressure = pressure_state.snapshot();
+    let rss = pressure
+        .sample
+        .map(|sample| sample.tree_rss)
+        .or_else(crate::rss::process_tree_rss_bytes);
     eprintln!(
         "Interrupted: {} tasks running after {}s; RSS: {}",
         ctx.reporter.running_count(),
         ctx.reporter.start.elapsed().as_secs(),
-        crate::rss::format_rss(crate::rss::process_tree_rss_bytes()),
+        crate::rss::format_rss(rss),
     );
     Err(miette::miette!("interrupted"))
 }
@@ -207,7 +230,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
-    use crate::memory_pressure::{MemoryPressure, MemorySample};
+    use crate::memory_pressure::{MemoryPressure, MemorySample, PressureReason};
 
     /// Fake implementation of PressureEnv for deterministic testing.
     ///
@@ -354,5 +377,54 @@ mod tests {
         assert_eq!(out.checks, 1);
         assert_eq!(out.renders, 0);
         assert_eq!(out.remaining_ticks, 2);
+    }
+
+    #[test]
+    fn render_status_line_uses_decision_tree_rss() {
+        let reporter = crate::progress::ProgressReporter::new(
+            OutputMode::Default,
+            std::collections::HashMap::new(),
+            0,
+        );
+        let pressure_state = PressureState::new(30 * 1024 * 1024, 0);
+        pressure_state.update(&MemoryPressure {
+            sample: MemorySample {
+                tree_rss: 32 * 1024 * 1024,
+                system_available: u64::MAX,
+            },
+            reasons: vec![crate::memory_pressure::PressureReason::UsageHigh],
+            paused: true,
+        });
+
+        let pressure = pressure_state.snapshot();
+        let line = reporter.render_progress(
+            &crate::rss::format_rss(pressure.sample.map(|sample| sample.tree_rss)),
+            &pressure.reasons,
+            &pressure,
+        );
+
+        assert!(line.contains("🐏 32 MB"));
+        assert!(line.contains("mem usage high (32 MB / 30 MB)"));
+    }
+
+    #[test]
+    fn should_render_status_line_in_default_mode_for_pause_or_running_matrix() {
+        assert!(should_render(true, 0, OutputMode::Default));
+        assert!(should_render(true, 2, OutputMode::Default));
+        assert!(!should_render(false, 0, OutputMode::Default));
+        assert!(should_render(false, 2, OutputMode::Default));
+    }
+
+    #[tokio::test]
+    async fn pause_loop_renders_while_paused_with_zero_running_tasks() {
+        let out = drive(
+            vec![paused_pressure(), clear_pressure()],
+            vec![PauseTick::ProgressDue, PauseTick::ReCheck],
+        )
+        .await;
+
+        assert_eq!(out.clearance, PressureClearance::Dispatch);
+        assert_eq!(out.renders, 1);
+        assert_eq!(out.checks, 2);
     }
 }

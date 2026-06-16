@@ -10,7 +10,10 @@ use std::{
 
 use luchta_types::TaskId;
 
-use crate::cli::OutputMode;
+use crate::{
+    cli::OutputMode,
+    memory_pressure::{PressureReason, PressureSnapshot},
+};
 
 /// Outcome of a task as recorded by the progress reporter.
 ///
@@ -98,7 +101,8 @@ impl ProgressReporter {
     pub fn render_progress(
         &self,
         rss_formatted: &str,
-        warnings: &[crate::memory_pressure::PressureReason],
+        warnings: &[PressureReason],
+        pressure: &PressureSnapshot,
     ) -> String {
         let elapsed_total = self.start.elapsed().as_secs();
         let running = self
@@ -142,7 +146,7 @@ impl ProgressReporter {
         segments.push(format!("🌊 {waves_done} / {}", self.total_waves));
 
         let mut line = segments.join(" ");
-        line.push_str(&pressure_suffix(warnings));
+        line.push_str(&pressure_suffix(warnings, pressure));
         line
     }
 
@@ -334,22 +338,24 @@ fn render_package_group(mut tasks: Vec<&TaskId>) -> String {
     }
 }
 
-fn pressure_suffix(warnings: &[crate::memory_pressure::PressureReason]) -> String {
-    let mut has_usage = false;
-    let mut has_free = false;
+fn pressure_suffix(warnings: &[PressureReason], pressure: &PressureSnapshot) -> String {
+    let mut suffix = String::new();
+    let sample = pressure.sample;
     for warning in warnings {
         match warning {
-            crate::memory_pressure::PressureReason::UsageHigh => has_usage = true,
-            crate::memory_pressure::PressureReason::FreeLow => has_free = true,
+            PressureReason::UsageHigh => {
+                let measured = crate::rss::format_rss(sample.map(|sample| sample.tree_rss));
+                let threshold = crate::rss::format_rss(Some(pressure.usage_threshold));
+                suffix.push_str(&format!(" ⚠️ mem usage high ({measured} / {threshold})"));
+            }
+            PressureReason::FreeLow => {
+                let measured = crate::rss::format_rss(sample.map(|sample| sample.system_available));
+                let threshold = crate::rss::format_rss(Some(pressure.free_threshold));
+                suffix.push_str(&format!(
+                    " ⚠️ system free memory low ({measured} / {threshold})"
+                ));
+            }
         }
-    }
-
-    let mut suffix = String::new();
-    if has_usage {
-        suffix.push_str(" ⚠️ mem usage high");
-    }
-    if has_free {
-        suffix.push_str(" ⚠️ system free memory low");
     }
     suffix
 }
@@ -361,7 +367,11 @@ mod tests {
     use luchta_types::TaskId;
 
     use super::{render_running_task_groups, ProgressReporter};
-    use crate::cli::OutputMode;
+    use crate::{
+        cli::OutputMode,
+        memory_pressure::{MemorySample, PressureSnapshot},
+        rss,
+    };
 
     struct DoneSummaryExpectation {
         done: usize,
@@ -395,6 +405,19 @@ mod tests {
         }
     }
 
+    fn pressure_snapshot(
+        sample: Option<MemorySample>,
+        usage_threshold: u64,
+        free_threshold: u64,
+    ) -> PressureSnapshot {
+        PressureSnapshot {
+            reasons: Vec::new(),
+            sample,
+            usage_threshold,
+            free_threshold,
+        }
+    }
+
     fn assert_progress_line_shape(
         out: &str,
         expected_prefix: &str,
@@ -424,7 +447,7 @@ mod tests {
         let wave_of = HashMap::from([(task_id("pkg-a", "build"), 0)]);
         let reporter = ProgressReporter::new(OutputMode::Default, wave_of, 1);
 
-        let out = reporter.render_progress("10 MB", &[]);
+        let out = reporter.render_progress("10 MB", &[], &pressure_snapshot(None, 0, 0));
         assert_progress_line_shape(&out, "☑️ 0/1 ⏭️ 0 ⌛ 1 ⏱️ ", "10 MB", "0 / 1");
         assert!(!out.contains("🏃"));
     }
@@ -448,7 +471,7 @@ mod tests {
         reporter.task_skipped_cache_hit(&task_b);
         reporter.task_started(&task_c);
 
-        let out = reporter.render_progress("10 MB", &[]);
+        let out = reporter.render_progress("10 MB", &[], &pressure_snapshot(None, 0, 0));
         assert_progress_line_shape(&out, "☑️ 2/3 ⏭️ 1 🏃1 (pkg-c#build) ⏱️ ", "10 MB", "0 / 1");
         assert!(!out.contains("⌛"));
     }
@@ -468,7 +491,16 @@ mod tests {
             reporter.task_started(task);
         }
 
-        let out = reporter.render_progress("42 MB", &[]);
+        let out = reporter.render_progress(
+            "42 MB",
+            &[],
+            &PressureSnapshot {
+                reasons: Vec::new(),
+                sample: None,
+                usage_threshold: 0,
+                free_threshold: 0,
+            },
+        );
         assert_progress_line_shape(
             &out,
             "☑️ 0/6 ⏭️ 0 🏃6 ({a,b,c}:lint, d:{test,tsc} +1) ⏱️ ",
@@ -494,7 +526,16 @@ mod tests {
         reporter.task_ran(&task_id("pkg-c", "build"));
         reporter.task_started(&task_id("pkg-d", "build"));
 
-        let out = reporter.render_progress("24 MB", &[]);
+        let out = reporter.render_progress(
+            "24 MB",
+            &[],
+            &PressureSnapshot {
+                reasons: Vec::new(),
+                sample: None,
+                usage_threshold: 0,
+                free_threshold: 0,
+            },
+        );
         assert!(out.contains("🌊 1 / 3"));
         assert!(!out.contains("W1 "));
         assert!(!out.contains("done ·"));
@@ -669,20 +710,38 @@ mod tests {
     #[test]
     fn render_progress_warnings_usage_only() {
         let reporter = ProgressReporter::new(OutputMode::Default, HashMap::new(), 0);
+        let sample = MemorySample {
+            tree_rss: 32 * 1024 * 1024,
+            system_available: 99 * 1024 * 1024,
+        };
+        let threshold = 30 * 1024 * 1024;
         let out = reporter.render_progress(
             "10 MB",
             &[crate::memory_pressure::PressureReason::UsageHigh],
+            &pressure_snapshot(Some(sample), threshold, 0),
         );
-        assert!(out.ends_with("⚠️ mem usage high"));
+        assert!(out.contains("mem usage high ("));
+        assert!(out.contains(&rss::format_rss(Some(sample.tree_rss))));
+        assert!(out.contains(&rss::format_rss(Some(threshold))));
         assert!(!out.contains("system free memory low"));
     }
 
     #[test]
     fn render_progress_warnings_free_only() {
         let reporter = ProgressReporter::new(OutputMode::Default, HashMap::new(), 0);
-        let out =
-            reporter.render_progress("10 MB", &[crate::memory_pressure::PressureReason::FreeLow]);
-        assert!(out.ends_with("⚠️ system free memory low"));
+        let sample = MemorySample {
+            tree_rss: 32 * 1024 * 1024,
+            system_available: 8 * 1024 * 1024,
+        };
+        let threshold = 16 * 1024 * 1024;
+        let out = reporter.render_progress(
+            "10 MB",
+            &[crate::memory_pressure::PressureReason::FreeLow],
+            &pressure_snapshot(Some(sample), 0, threshold),
+        );
+        assert!(out.contains("system free memory low ("));
+        assert!(out.contains(&rss::format_rss(Some(sample.system_available))));
+        assert!(out.contains(&rss::format_rss(Some(threshold))));
         assert!(!out.contains("mem usage high"));
     }
 
@@ -693,16 +752,28 @@ mod tests {
             crate::memory_pressure::PressureReason::UsageHigh,
             crate::memory_pressure::PressureReason::FreeLow,
         ];
-        let out = reporter.render_progress("10 MB", &warnings);
-        assert!(out.contains("⚠️ mem usage high"));
-        assert!(out.contains("⚠️ system free memory low"));
-        assert!(out.ends_with("⚠️ system free memory low"));
+        let sample = MemorySample {
+            tree_rss: 32 * 1024 * 1024,
+            system_available: 8 * 1024 * 1024,
+        };
+        let out = reporter.render_progress(
+            "10 MB",
+            &warnings,
+            &pressure_snapshot(Some(sample), 30 * 1024 * 1024, 16 * 1024 * 1024),
+        );
+        assert!(out.contains("⚠️ mem usage high ("));
+        assert!(out.contains("⚠️ system free memory low ("));
+        assert!(out.ends_with(&format!(
+            "⚠️ system free memory low ({} / {})",
+            rss::format_rss(Some(sample.system_available)),
+            rss::format_rss(Some(16 * 1024 * 1024))
+        )));
     }
 
     #[test]
     fn render_progress_warnings_none() {
         let reporter = ProgressReporter::new(OutputMode::Default, HashMap::new(), 0);
-        let out = reporter.render_progress("10 MB", &[]);
+        let out = reporter.render_progress("10 MB", &[], &pressure_snapshot(None, 0, 0));
         assert!(!out.contains("⚠️"));
     }
     fn running_tasks(tasks: &[(&str, &str)]) -> Vec<&'static TaskId> {

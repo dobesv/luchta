@@ -1,5 +1,9 @@
 pub fn process_tree_rss_bytes() -> Option<u64> {
-    platform::process_tree_rss_bytes()
+    process_tree_rss_bytes_for(std::process::id())
+}
+
+pub fn process_tree_rss_bytes_for(root_pid: u32) -> Option<u64> {
+    platform::process_tree_rss_bytes_for(root_pid)
 }
 
 pub fn format_rss(bytes: Option<u64>) -> String {
@@ -38,54 +42,65 @@ mod platform {
     use std::fs;
     use std::path::PathBuf;
 
-    pub(super) fn process_tree_rss_bytes() -> Option<u64> {
-        let root_pid = std::process::id();
+    pub(super) fn process_tree_rss_bytes_for(root_pid: u32) -> Option<u64> {
+        let mut total = process_rss_bytes(root_pid)?;
         let mut visited = HashSet::from([root_pid]);
         let mut queue = VecDeque::from([root_pid]);
-        let mut total = read_status_rss_bytes(status_path(root_pid))?;
 
         while let Some(pid) = queue.pop_front() {
-            // Best-effort: a child can exit between enumeration and read, leaving
-            // its children file unreadable. Skip such entries rather than failing
-            // the whole tree walk.
-            let Some(children) = read_children(task_children_path(pid)) else {
-                continue;
-            };
-            for child_pid in children {
+            for child_pid in process_children(pid) {
                 if !visited.insert(child_pid) {
                     continue;
                 }
 
-                if let Some(child_rss) = read_status_rss_bytes(status_path(child_pid)) {
-                    total = total.saturating_add(child_rss);
-                    queue.push_back(child_pid);
-                }
+                let Some(child_rss) = process_rss_bytes(child_pid) else {
+                    continue;
+                };
+
+                total = total.saturating_add(child_rss);
+                queue.push_back(child_pid);
             }
         }
 
         Some(total)
     }
 
+    fn process_rss_bytes(pid: u32) -> Option<u64> {
+        let status = fs::read_to_string(status_path(pid)).ok()?;
+        parse_status_rss_bytes(&status)
+    }
+
+    fn process_children(pid: u32) -> Vec<u32> {
+        let mut children = HashSet::new();
+        let Ok(task_entries) = fs::read_dir(task_dir_path(pid)) else {
+            return Vec::new();
+        };
+
+        for task_entry in task_entries.flatten() {
+            let Some(tid) = task_entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+
+            let Ok(task_children) = fs::read_to_string(task_children_path(pid, &tid)) else {
+                continue;
+            };
+
+            children.extend(parse_children(&task_children));
+        }
+
+        children.into_iter().collect()
+    }
+
     fn status_path(pid: u32) -> PathBuf {
         PathBuf::from("/proc").join(pid.to_string()).join("status")
     }
 
-    fn task_children_path(pid: u32) -> PathBuf {
-        PathBuf::from("/proc")
-            .join(pid.to_string())
-            .join("task")
-            .join(pid.to_string())
-            .join("children")
+    fn task_dir_path(pid: u32) -> PathBuf {
+        PathBuf::from("/proc").join(pid.to_string()).join("task")
     }
 
-    fn read_status_rss_bytes(path: PathBuf) -> Option<u64> {
-        let status = fs::read_to_string(path).ok()?;
-        parse_status_rss_bytes(&status)
-    }
-
-    fn read_children(path: PathBuf) -> Option<Vec<u32>> {
-        let children = fs::read_to_string(path).ok()?;
-        parse_children(&children)
+    fn task_children_path(pid: u32, tid: &str) -> PathBuf {
+        task_dir_path(pid).join(tid).join("children")
     }
 
     fn parse_status_rss_bytes(status: &str) -> Option<u64> {
@@ -106,21 +121,105 @@ mod platform {
         }
     }
 
-    fn parse_children(children: &str) -> Option<Vec<u32>> {
+    /// Parse the space-separated PIDs from a `/proc/<pid>/task/<tid>/children`
+    /// file. Best-effort: skip any token that does not parse as a PID rather
+    /// than discarding the whole (kernel-generated) list, so one odd token
+    /// can't drop an entire thread's children from the RSS walk.
+    fn parse_children(children: &str) -> Vec<u32> {
         children
             .split_whitespace()
-            .map(|pid| pid.parse::<u32>().ok())
+            .filter_map(|pid| pid.parse::<u32>().ok())
             .collect()
     }
 
     #[cfg(test)]
     mod tests {
-        use super::{parse_children, parse_status_rss_bytes};
+        use std::io;
+        use std::process::{Child, Command};
+        use std::thread;
+        use std::time::Duration;
+
+        use std::collections::{HashSet, VecDeque};
+
+        use super::{
+            parse_children, parse_status_rss_bytes, process_children, process_rss_bytes,
+            process_tree_rss_bytes_for,
+        };
+
+        /// Walk the descendant tree of `root_pid` (same discovery as
+        /// `process_tree_rss_bytes_for`) and report whether `needle` is in it.
+        fn process_tree_contains(root_pid: u32, needle: u32) -> bool {
+            let mut visited = HashSet::from([root_pid]);
+            let mut queue = VecDeque::from([root_pid]);
+            while let Some(pid) = queue.pop_front() {
+                if pid == needle {
+                    return true;
+                }
+                for child_pid in process_children(pid) {
+                    if visited.insert(child_pid) {
+                        queue.push_back(child_pid);
+                    }
+                }
+            }
+            visited.contains(&needle)
+        }
+
+        fn wait_for_process_absence(pid: u32, attempts: usize, delay: Duration) {
+            for _ in 0..attempts {
+                if process_rss_bytes(pid).is_none() {
+                    return;
+                }
+                thread::sleep(delay);
+            }
+        }
 
         #[test]
         fn process_tree_rss_is_available_for_current_process() {
-            let rss = super::process_tree_rss_bytes();
+            let rss = process_tree_rss_bytes_for(std::process::id());
             assert!(rss.is_some_and(|bytes| bytes > 0));
+        }
+
+        #[test]
+        fn invalid_root_pid_returns_none() {
+            assert_eq!(process_tree_rss_bytes_for(u32::MAX), None);
+        }
+
+        #[test]
+        fn process_tree_rss_includes_child_spawned_from_non_main_thread() {
+            let root_pid = std::process::id();
+            let self_rss = process_rss_bytes(root_pid).expect("current process rss should exist");
+            let mut child =
+                spawn_sleep_from_non_main_thread().expect("spawn child from worker thread");
+            wait_for_process_presence(child.id(), 50, Duration::from_millis(100))
+                .expect("child should appear in /proc");
+
+            let tree_rss = process_tree_rss_bytes_for(root_pid).expect("tree rss should exist");
+            let child_rss = process_rss_bytes(child.id()).expect("child rss should exist");
+
+            // Core regression guard: a child spawned from a NON-main thread must be
+            // discovered. The old main-TID-only walk would miss it, so tree RSS would
+            // not reflect the child at all. With the all-threads walk it is included.
+            assert!(tree_rss > self_rss);
+            assert!(tree_rss >= self_rss.saturating_add(child_rss));
+            assert!(
+                process_tree_contains(root_pid, child.id()),
+                "child pid {} spawned from a non-main thread must appear in the tree walk",
+                child.id()
+            );
+
+            terminate_child(&mut child);
+
+            // Statelessness guard: each call re-reads /proc, so once the child is gone
+            // and reaped it must no longer be counted. We avoid asserting on the total
+            // byte delta (the parent's own RSS can move between samples, making a strict
+            // `tree_after <= tree_rss - child_rss` bound flaky); instead assert the dead
+            // child pid is no longer part of the descendant set.
+            wait_for_process_absence(child.id(), 50, Duration::from_millis(100));
+            assert!(
+                !process_tree_contains(root_pid, child.id()),
+                "reaped child pid {} must not be counted after exit",
+                child.id()
+            );
         }
 
         #[test]
@@ -130,8 +229,32 @@ mod platform {
         }
 
         #[test]
-        fn malformed_children_returns_none() {
-            assert_eq!(parse_children("123 abc 456"), None);
+        fn malformed_children_skips_bad_tokens() {
+            // A single unparseable token must not discard the whole list; the
+            // valid PIDs are still returned so the walk doesn't lose children.
+            assert_eq!(parse_children("123 abc 456"), vec![123, 456]);
+            assert_eq!(parse_children(""), Vec::<u32>::new());
+        }
+
+        fn spawn_sleep_from_non_main_thread() -> io::Result<Child> {
+            thread::spawn(|| Command::new("sleep").arg("30").spawn())
+                .join()
+                .expect("worker thread should not panic")
+        }
+
+        fn wait_for_process_presence(pid: u32, attempts: usize, delay: Duration) -> Option<u64> {
+            for _ in 0..attempts {
+                if let Some(rss) = process_rss_bytes(pid) {
+                    return Some(rss);
+                }
+                thread::sleep(delay);
+            }
+            None
+        }
+
+        fn terminate_child(child: &mut Child) {
+            let _ = child.kill();
+            let _ = child.wait();
         }
     }
 }
@@ -139,7 +262,7 @@ mod platform {
 #[cfg(not(target_os = "linux"))]
 mod platform {
     #[allow(dead_code)] // Stub compiled on non-Linux; Linux /proc implementation is unavailable there.
-    pub(super) fn process_tree_rss_bytes() -> Option<u64> {
+    pub(super) fn process_tree_rss_bytes_for(_root_pid: u32) -> Option<u64> {
         None
     }
 }

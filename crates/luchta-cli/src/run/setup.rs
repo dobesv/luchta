@@ -42,10 +42,11 @@ pub(super) fn build_memory_pressure(
         config.usage,
         config.free,
     );
-    (
-        monitor,
-        Arc::new(crate::memory_pressure::PressureState::new()),
-    )
+    let pressure_state = Arc::new(crate::memory_pressure::PressureState::new(
+        monitor.usage_threshold,
+        monitor.free_threshold,
+    ));
+    (monitor, pressure_state)
 }
 
 /// Resolves the dispatch loop's result into the run's final outcome: propagate
@@ -54,6 +55,7 @@ pub(super) fn report_run_outcome(
     run_result: Result<()>,
     any_failed: &AtomicBool,
     reporter: &ProgressReporter,
+    pressure_state: &crate::memory_pressure::PressureState,
 ) -> Result<()> {
     run_result?;
 
@@ -61,9 +63,19 @@ pub(super) fn report_run_outcome(
         bail!("one or more tasks failed");
     }
 
-    let rss = crate::rss::format_rss(crate::rss::process_tree_rss_bytes());
-    println!("{}", reporter.render_summary(&rss));
+    let rss = select_summary_rss(
+        pressure_state.snapshot().sample,
+        crate::rss::process_tree_rss_bytes,
+    );
+    println!("{}", reporter.render_summary(&crate::rss::format_rss(rss)));
     Ok(())
+}
+
+fn select_summary_rss(
+    sample: Option<crate::memory_pressure::MemorySample>,
+    fallback: impl FnOnce() -> Option<u64>,
+) -> Option<u64> {
+    sample.map(|sample| sample.tree_rss).or_else(fallback)
 }
 
 /// Inputs for [`build_execution_resources`].
@@ -129,4 +141,26 @@ pub(super) fn build_execution_resources(
         invalid,
         task_envs,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::select_summary_rss;
+    use crate::memory_pressure::MemorySample;
+
+    #[test]
+    fn select_summary_rss_prefers_snapshot_sample_over_fallback() {
+        let sample = MemorySample {
+            tree_rss: 123,
+            system_available: 456,
+        };
+        let rss = select_summary_rss(Some(sample), || panic!("fallback should not run"));
+        assert_eq!(rss, Some(123));
+    }
+
+    #[test]
+    fn select_summary_rss_falls_back_when_snapshot_missing() {
+        let rss = select_summary_rss(None, || Some(789));
+        assert_eq!(rss, Some(789));
+    }
 }
