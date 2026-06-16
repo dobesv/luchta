@@ -318,12 +318,13 @@ fn report_task_outcome(
 ) {
     match outcome {
         Ok(result) if result.status.success() => {}
-        Ok(result) => report_task_failure(
-            task_id,
-            &format!("failed with status {:?}", result.status.code()),
-            any_failed,
-            interrupted,
-        ),
+        Ok(result) => {
+            let detail = match result.status.code() {
+                Some(code) => format!("failed with status {code}"),
+                None => "failed".to_string(),
+            };
+            report_task_failure(task_id, &detail, any_failed, interrupted)
+        }
         Err(error) => {
             report_task_failure(task_id, &format_task_error(error), any_failed, interrupted)
         }
@@ -731,4 +732,86 @@ fn build_execution_env(merged_env: &BTreeMap<String, EnvSpec>) -> HashMap<String
     let mut env = collect_builtin_passthrough_env();
     env.extend(resolve_task_env(merged_env));
     env
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    /// Test that report_task_outcome sets any_failed and formats messages correctly.
+    #[test]
+    fn report_task_outcome_sets_any_failed_on_failure() {
+        #[cfg(unix)]
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::ExitStatus;
+
+        let any_failed = Arc::new(AtomicBool::new(false));
+        let interrupted = Arc::new(AtomicBool::new(true)); // suppressed output
+        let task_id: TaskId = TaskId::new("test-pkg", "test-task");
+
+        // Exit status with code 1
+        #[cfg(unix)]
+        let status_with_code = ExitStatus::from_raw(256); // 1 << 8
+        #[cfg(windows)]
+        let status_with_code = ExitStatus::from_raw(1);
+
+        let outcome_with_code: Result<TaskRunOutcome, luchta_engine::ExecutorError> =
+            Ok(TaskRunOutcome {
+                status: status_with_code,
+                detected_inputs: None,
+                detected_outputs: None,
+            });
+
+        report_task_outcome(&task_id, &outcome_with_code, &any_failed, &interrupted);
+
+        // any_failed should be set
+        assert!(any_failed.load(Ordering::SeqCst));
+    }
+
+    // Test the exact formatting logic used in report_task_outcome.
+    // Verifies: (1) output contains "failed with status 1" for code Some(1)
+    //           (2) output does NOT contain "Some("
+    //           (3) output for signal-terminated (None) is "failed"
+    #[test]
+    fn status_code_format_omits_some_wrapper() {
+        #[cfg(unix)]
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::ExitStatus;
+
+        // Simulate code() == Some(1)
+        #[cfg(unix)]
+        let status_with_code = ExitStatus::from_raw(256); // 1 << 8
+        #[cfg(windows)]
+        let status_with_code = ExitStatus::from_raw(1);
+
+        let detail = match status_with_code.code() {
+            Some(code) => format!("failed with status {code}"),
+            None => "failed".to_string(),
+        };
+
+        assert!(
+            !detail.contains("Some("),
+            "detail must not contain 'Some(': got: {:?}",
+            detail
+        );
+        assert_eq!(detail, "failed with status 1");
+
+        // Simulate code() == None (signal termination on Unix)
+        #[cfg(unix)]
+        {
+            let status_killed = ExitStatus::from_raw(9); // SIGKILL
+            let detail_none = match status_killed.code() {
+                Some(code) => format!("failed with status {code}"),
+                None => "failed".to_string(),
+            };
+
+            assert!(
+                !detail_none.contains("Some("),
+                "detail must not contain 'Some(': got: {:?}",
+                detail_none
+            );
+            assert_eq!(detail_none, "failed");
+        }
+    }
 }

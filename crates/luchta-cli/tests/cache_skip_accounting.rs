@@ -6,6 +6,35 @@ use std::path::Path;
 use assert_cmd::Command;
 use assert_fs::prelude::*;
 
+/// Expected tokens for emoji done line. Keeps repeated done-summary checks small.
+#[derive(Clone, Copy)]
+struct DoneLine {
+    done: usize,
+    total: usize,
+    skipped: usize,
+    waves: usize,
+}
+
+fn assert_done_line(out: &str, label: &str, expected: DoneLine) {
+    let done_token = format!(
+        "☑️ {}/{} ⏭️ {}",
+        expected.done, expected.total, expected.skipped
+    );
+    let wave_token = format!("🌊 {} / {}", expected.waves, expected.waves);
+    assert!(
+        out.contains(&done_token),
+        "{label} stdout should contain '{done_token}', got: {out}"
+    );
+    assert!(
+        out.contains(&wave_token),
+        "{label} stdout should contain '{wave_token}', got: {out}"
+    );
+    assert!(
+        !out.contains("Done:"),
+        "{label} stdout should not mention 'Done:', got: {out}"
+    );
+}
+
 fn set_executable(path: &Path) {
     #[cfg(unix)]
     {
@@ -152,12 +181,16 @@ fn skip_count_is_cache_hit_only() {
     );
     // First run: 1 done, 0 skipped
     assert!(
-        stdout1.contains("Done: 1 tasks done"),
-        "first run stdout should contain 'Done: 1 tasks done', got: {stdout1}"
+        stdout1.contains("☑️ 1/1 ⏭️ 0"),
+        "first run stdout should contain '☑️ 1/1 ⏭️ 0', got: {stdout1}"
     );
     assert!(
-        !stdout1.contains("skipped"),
-        "first run should not mention 'skipped', got: {stdout1}"
+        stdout1.contains("🌊 1 / 1"),
+        "first run stdout should contain '🌊 1 / 1', got: {stdout1}"
+    );
+    assert!(
+        !stdout1.contains("Done:"),
+        "first run should not mention 'Done:', got: {stdout1}"
     );
     temp.child("packages/app/counter.txt").assert("1\n");
 
@@ -180,12 +213,16 @@ fn skip_count_is_cache_hit_only() {
     );
     // Second run: 0 done, 1 skipped (cache-hit)
     assert!(
-        stdout2.contains("Done: 0 tasks done"),
-        "second run stdout should contain 'Done: 0 tasks done', got: {stdout2}"
+        stdout2.contains("☑️ 1/1 ⏭️ 1"),
+        "second run stdout should contain '☑️ 1/1 ⏭️ 1', got: {stdout2}"
     );
     assert!(
-        stdout2.contains(", 1 skipped"),
-        "second run should show ', 1 skipped' (cache-hit), got: {stdout2}"
+        stdout2.contains("🌊 1 / 1"),
+        "second run stdout should contain '🌊 1 / 1', got: {stdout2}"
+    );
+    assert!(
+        !stdout2.contains("Done:"),
+        "second run should not mention 'Done:', got: {stdout2}"
     );
     // Counter unchanged (cache hit, not re-executed)
     temp.child("packages/app/counter.txt").assert("1\n");
@@ -199,33 +236,17 @@ fn no_command_tasks_not_counted_as_skipped() {
     let temp = assert_fs::TempDir::new().unwrap();
     write_root_workspace(&temp);
     temp.child("yarn.lock").write_str("").unwrap();
-
-    // Two packages: a with cacheable task, b with no-command task
-    temp.child("packages/a").create_dir_all().unwrap();
-    temp.child("packages/a/package.json")
-        .write_str(
-            r#"{
-  "name": "a",
-  "scripts": {
-    "build": "echo ignored"
-  }
-}"#,
-        )
-        .unwrap();
+    for name in ["a", "b"] {
+        temp.child(format!("packages/{name}"))
+            .create_dir_all()
+            .unwrap();
+        temp.child(format!("packages/{name}/package.json"))
+            .write_str(&format!(
+                "{{\n  \"name\": \"{name}\",\n  \"scripts\": {{\n    \"build\": \"echo ignored\"\n  }}\n}}"
+            ))
+            .unwrap();
+    }
     temp.child("packages/a/src.txt").write_str("one\n").unwrap();
-
-    temp.child("packages/b").create_dir_all().unwrap();
-    temp.child("packages/b/package.json")
-        .write_str(
-            r#"{
-  "name": "b",
-  "scripts": {
-    "build": "echo ignored"
-  }
-}"#,
-        )
-        .unwrap();
-
     let worker = shell_worker_with_done_fields(&temp, Some(",\"outputs\":[\"counter.txt\"]"));
     let worker_path = worker.path().display();
     let config_content = format!(
@@ -234,66 +255,46 @@ echo '{{"concurrency":{{"maxWeight":4}},"workers":{{"shell":{{"command":"{worker
 "#,
     );
     write_executable(temp.child("luchta-config.sh").path(), &config_content);
-
     init_git(&temp);
 
-    // Run build task - a#build runs (cacheable), b#build has no command
-    let output = Command::cargo_bin("luchta")
-        .unwrap()
-        .arg("run")
-        .arg("build")
-        .arg("--workspace-root")
-        .arg(temp.path())
-        .env("NO_COLOR", "1")
-        .output()
-        .expect("run build");
+    // `a#build` runs (cacheable) and the no-command `b#build` counts as done; no
+    // skips on the first run. On rerun `a#build` is a cache hit (the only
+    // "skipped"), so the numerator stays 2/2 with one skip.
+    let run = |label: &str, expected: DoneLine| {
+        let output = Command::cargo_bin("luchta")
+            .unwrap()
+            .arg("run")
+            .arg("build")
+            .arg("--workspace-root")
+            .arg(temp.path())
+            .env("NO_COLOR", "1")
+            .output()
+            .expect("run build");
+        assert!(
+            output.status.success(),
+            "{label} should succeed, stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_done_line(&String::from_utf8_lossy(&output.stdout), label, expected);
+    };
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        output.status.success(),
-        "run should succeed, stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
+    run(
+        "first run",
+        DoneLine {
+            done: 2,
+            total: 2,
+            skipped: 0,
+            waves: 1,
+        },
     );
-    // The global `build` now expands only to child packages. `a#build` runs and
-    // `b#build` is an ordering-only no-command node counted as done; root no
-    // longer gets a `build` node from global expansion. None are skipped
-    // (no-command nodes are NOT "skipped" — only cache hits are).
-    assert!(
-        stdout.contains("Done: 2 tasks done"),
-        "stdout should contain 'Done: 2 tasks done', got: {stdout}"
-    );
-    assert!(
-        !stdout.contains("skipped"),
-        "no-command tasks should not be counted as 'skipped', got: {stdout}"
-    );
-
-    // Second run: a#build is cache-hit, b#build still has no command
-    let output2 = Command::cargo_bin("luchta")
-        .unwrap()
-        .arg("run")
-        .arg("build")
-        .arg("--workspace-root")
-        .arg(temp.path())
-        .env("NO_COLOR", "1")
-        .output()
-        .expect("second run");
-
-    let stdout2 = String::from_utf8_lossy(&output2.stdout);
-    assert!(
-        output2.status.success(),
-        "second run should succeed, stderr: {}",
-        String::from_utf8_lossy(&output2.stderr)
-    );
-    // Second run: `a#build` is a cache hit (the only "skipped"); only the
-    // no-command `b#build` still counts as done because root no longer gets a
-    // `build` node from global expansion.
-    assert!(
-        stdout2.contains("Done: 1 tasks done"),
-        "second run should show 'Done: 1 tasks done', got: {stdout2}"
-    );
-    assert!(
-        stdout2.contains(", 1 skipped"),
-        "second run should show ', 1 skipped' (only cache-hit), got: {stdout2}"
+    run(
+        "second run",
+        DoneLine {
+            done: 2,
+            total: 2,
+            skipped: 1,
+            waves: 1,
+        },
     );
 
     temp.close().expect("cleanup temp dir");
