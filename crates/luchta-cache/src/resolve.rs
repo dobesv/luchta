@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap, HashSet},
     fs,
     io::Read,
     path::{Path, PathBuf},
@@ -8,31 +8,100 @@ use std::{
 
 use gix::bstr::ByteSlice;
 use globset::{Glob, GlobSet, GlobSetBuilder};
+use luchta_types::{classify_pattern, InputSemantics};
 use walkdir::WalkDir;
 
 use crate::{CacheError, FileEntry, Result};
 
 const COMBINED_OUTPUTS_HASH_DOMAIN: &[u8] = b"luchta-cache:combined-outputs:v1";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PatternKind {
-    Literal,
-    Glob,
-}
-
-#[must_use]
-pub fn classify_pattern(pattern: &str) -> PatternKind {
-    if pattern.contains(['*', '?', '[', '{']) {
-        PatternKind::Glob
-    } else {
-        PatternKind::Literal
-    }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolveRequest {
+    pub base_dir: PathBuf,
+    pub pattern: String,
+    pub semantics: InputSemantics,
 }
 
 pub fn resolve_inputs(base_dir: &Path, patterns: &[String]) -> Result<Vec<FileEntry>> {
+    let requests = patterns
+        .iter()
+        .cloned()
+        .map(|pattern| ResolveRequest {
+            semantics: classify_pattern(&pattern),
+            base_dir: base_dir.to_path_buf(),
+            pattern,
+        })
+        .collect::<Vec<_>>();
+    resolve_inputs_with_semantics(&requests)
+}
+
+pub fn resolve_inputs_with_semantics(requests: &[ResolveRequest]) -> Result<Vec<FileEntry>> {
+    if requests.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut candidate_cache = HashMap::<PathBuf, Vec<PathBuf>>::new();
+    let mut merged_entries = Vec::new();
+    let mut base_dirs = Vec::new();
+
+    for request in requests {
+        if !base_dirs.contains(&request.base_dir) {
+            base_dirs.push(request.base_dir.clone());
+        }
+
+        merged_entries.extend(resolve_single_request(
+            request,
+            &mut candidate_cache,
+            &StdFs,
+        )?);
+    }
+
+    Ok(dedupe_and_sort_entries(merged_entries, &base_dirs))
+}
+
+fn resolve_single_request(
+    request: &ResolveRequest,
+    candidate_cache: &mut HashMap<PathBuf, Vec<PathBuf>>,
+    file_reader: &dyn FileReader,
+) -> Result<Vec<FileEntry>> {
+    match request.semantics {
+        InputSemantics::Literal => resolve_literal_request(request, file_reader),
+        InputSemantics::Wildcard => resolve_wildcard_request(request, candidate_cache, file_reader),
+    }
+}
+
+fn resolve_literal_request(
+    request: &ResolveRequest,
+    file_reader: &dyn FileReader,
+) -> Result<Vec<FileEntry>> {
+    Ok(vec![file_entry_from_path(
+        &request.base_dir,
+        PathBuf::from(&request.pattern),
+        file_reader,
+    )?])
+}
+
+fn resolve_wildcard_request(
+    request: &ResolveRequest,
+    candidate_cache: &mut HashMap<PathBuf, Vec<PathBuf>>,
+    file_reader: &dyn FileReader,
+) -> Result<Vec<FileEntry>> {
+    let candidates = cached_input_candidates(&request.base_dir, candidate_cache)?;
+    resolve_wildcard_with_candidates(&request.base_dir, &request.pattern, candidates, file_reader)
+}
+
+fn cached_input_candidates(
+    base_dir: &Path,
+    candidate_cache: &mut HashMap<PathBuf, Vec<PathBuf>>,
+) -> Result<Vec<PathBuf>> {
+    if let Some(candidates) = candidate_cache.get(base_dir) {
+        return Ok(candidates.clone());
+    }
+
     let base_prefix = worktree_relative_base_dir(base_dir)?;
-    let package_paths = GitTrackedInputLister::new(base_prefix).list(base_dir)?;
-    resolve_with_candidates(base_dir, patterns, package_paths, &StdFs)
+    let candidates = GitTrackedInputLister::new(base_prefix).list(base_dir)?;
+    candidate_cache.insert(base_dir.to_path_buf(), candidates.clone());
+    Ok(candidates)
 }
 
 pub fn resolve_outputs(base_dir: &Path, patterns: &[String]) -> Result<Vec<FileEntry>> {
@@ -51,13 +120,13 @@ fn resolve_with_candidates(
 
     let literal_paths = patterns
         .iter()
-        .filter(|pattern| classify_pattern(pattern) == PatternKind::Literal)
+        .filter(|pattern| classify_pattern(pattern) == InputSemantics::Literal)
         .map(PathBuf::from)
         .collect::<Vec<_>>();
 
     let glob_patterns = patterns
         .iter()
-        .filter(|pattern| classify_pattern(pattern) == PatternKind::Glob)
+        .filter(|pattern| classify_pattern(pattern) == InputSemantics::Wildcard)
         .cloned()
         .collect::<Vec<_>>();
 
@@ -77,6 +146,47 @@ fn resolve_with_candidates(
         .into_iter()
         .map(|path| file_entry_from_path(base_dir, path, file_reader))
         .collect()
+}
+
+fn resolve_wildcard_with_candidates(
+    base_dir: &Path,
+    pattern: &str,
+    candidates: Vec<PathBuf>,
+    file_reader: &dyn FileReader,
+) -> Result<Vec<FileEntry>> {
+    let globset = build_globset(&[pattern.to_string()])?;
+    candidates
+        .into_iter()
+        .filter(|candidate| globset.is_match(candidate.as_path()))
+        .map(|path| file_entry_from_path(base_dir, path, file_reader))
+        .collect()
+}
+
+fn dedupe_and_sort_entries(entries: Vec<FileEntry>, base_dirs: &[PathBuf]) -> Vec<FileEntry> {
+    let mut seen_present = HashSet::new();
+    let mut seen_absent = HashSet::new();
+    let mut deduped = Vec::new();
+
+    for entry in entries {
+        if entry.absent {
+            if seen_absent.insert(entry.path.clone()) {
+                deduped.push(entry);
+            }
+            continue;
+        }
+
+        let canonical_path = base_dirs
+            .iter()
+            .map(|base_dir| base_dir.join(&entry.path))
+            .find_map(|path| fs::canonicalize(path).ok())
+            .unwrap_or_else(|| PathBuf::from(&entry.path));
+        if seen_present.insert(normalize_path(&canonical_path)) {
+            deduped.push(entry);
+        }
+    }
+
+    deduped.sort_by(|left, right| left.path.cmp(&right.path));
+    deduped
 }
 
 #[must_use]
@@ -319,8 +429,11 @@ mod tests {
 
     use tempfile::TempDir;
 
+    use luchta_types::{classify_pattern, InputSemantics};
+
     use super::{
-        classify_pattern, combined_outputs_hash, resolve_inputs, resolve_outputs, PatternKind,
+        combined_outputs_hash, resolve_inputs, resolve_inputs_with_semantics, resolve_outputs,
+        ResolveRequest,
     };
     use crate::FileEntry;
 
@@ -502,10 +615,106 @@ mod tests {
 
     #[test]
     fn classify_pattern_detects_wildcards() {
-        assert_eq!(classify_pattern("src/main.ts"), PatternKind::Literal);
+        assert_eq!(classify_pattern("src/main.ts"), InputSemantics::Literal);
         for pattern in ["src/*.ts", "src/?.ts", "src/[ab].ts", "src/{a,b}.ts"] {
-            assert_eq!(classify_pattern(pattern), PatternKind::Glob);
+            assert_eq!(classify_pattern(pattern), InputSemantics::Wildcard);
         }
+    }
+
+    #[test]
+    fn resolve_inputs_with_semantics_literal_missing_returns_absent_entry() {
+        let repo = TestRepo::new();
+        repo.write_file("present.txt", "present\n");
+        repo.git_add_and_commit_all();
+
+        let entries =
+            resolve_inputs_with_semantics(&[repo.request("missing.txt", InputSemantics::Literal)])
+                .unwrap();
+
+        assert_eq!(entries, vec![FileEntry::absent("missing.txt")]);
+    }
+
+    #[test]
+    fn resolve_inputs_with_semantics_wildcard_zero_match_returns_empty() {
+        let repo = TestRepo::new();
+        repo.write_file("present.txt", "present\n");
+        repo.git_add_and_commit_all();
+
+        let entries =
+            resolve_inputs_with_semantics(&[repo.request("src/**/*.ts", InputSemantics::Wildcard)])
+                .unwrap();
+
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn resolve_inputs_with_semantics_wildcard_literal_looking_missing_returns_empty() {
+        let repo = TestRepo::new();
+        repo.write_file("present.txt", "present\n");
+        repo.git_add_and_commit_all();
+
+        let entries =
+            resolve_inputs_with_semantics(&[repo.request("cfg", InputSemantics::Wildcard)])
+                .unwrap();
+
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn resolve_inputs_with_semantics_dedupes_same_canonical_file() {
+        let repo = TestRepo::new();
+        repo.write_file("shared/file.txt", "shared\n");
+        repo.write_file("pkg-a/anchor.txt", "anchor\n");
+        repo.write_file("pkg-b/anchor.txt", "anchor\n");
+        repo.git_add_and_commit_all();
+
+        let entries = resolve_inputs_with_semantics(&[
+            repo.request_from("pkg-a", "../shared/file.txt", InputSemantics::Literal),
+            repo.request_from("pkg-b", "../shared/file.txt", InputSemantics::Literal),
+        ])
+        .unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, "../shared/file.txt");
+        assert!(!entries[0].absent);
+    }
+
+    #[test]
+    fn resolve_inputs_with_semantics_sorts_by_relative_path() {
+        let repo = TestRepo::new();
+        repo.write_file("a.txt", "a\n");
+        repo.write_file("b.txt", "b\n");
+        repo.git_add_and_commit_all();
+
+        let entries = resolve_inputs_with_semantics(&[
+            repo.request("b.txt", InputSemantics::Literal),
+            repo.request("a.txt", InputSemantics::Literal),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            entries.iter().map(|e| e.path.as_str()).collect::<Vec<_>>(),
+            vec!["a.txt", "b.txt"]
+        );
+    }
+
+    #[test]
+    fn resolve_inputs_with_semantics_handles_multiple_base_dirs() {
+        let repo = TestRepo::new();
+        repo.write_file("pkg-a/src/a.txt", "a\n");
+        repo.write_file("pkg-b/src/b.txt", "b\n");
+        repo.git_add_and_commit_all();
+
+        let entries = resolve_inputs_with_semantics(&[
+            repo.request_from("pkg-a", "src/*.txt", InputSemantics::Wildcard),
+            repo.request_from("pkg-b", "src/*.txt", InputSemantics::Wildcard),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            entries.iter().map(|e| e.path.as_str()).collect::<Vec<_>>(),
+            vec!["src/a.txt", "src/b.txt"]
+        );
     }
 
     struct TestRepo {
@@ -555,6 +764,29 @@ mod tests {
                 COUNTER.fetch_add(1, Ordering::Relaxed)
             );
             git(self.path(), ["commit", "-m", &message]);
+        }
+
+        /// Create a ResolveRequest from repo root with given pattern and semantics.
+        fn request(&self, pattern: &str, semantics: InputSemantics) -> ResolveRequest {
+            ResolveRequest {
+                base_dir: self.path().to_path_buf(),
+                pattern: pattern.to_string(),
+                semantics,
+            }
+        }
+
+        /// Create a ResolveRequest from a subdirectory within the repo.
+        fn request_from(
+            &self,
+            subdir: &str,
+            pattern: &str,
+            semantics: InputSemantics,
+        ) -> ResolveRequest {
+            ResolveRequest {
+                base_dir: self.path().join(subdir),
+                pattern: pattern.to_string(),
+                semantics,
+            }
         }
     }
 

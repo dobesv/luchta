@@ -964,10 +964,15 @@ impl<'a> DependencyContext<'a> {
     }
 }
 
-fn transitive_upstream_packages(
+pub(crate) fn transitive_upstream_packages(
     package_graph: &PackageGraph,
     package_name: &PackageName,
 ) -> Result<Vec<PackageName>, EngineError> {
+    // Root package has no upstream dependencies
+    if package_name.is_root() {
+        return Ok(Vec::new());
+    }
+
     let mut visited = HashSet::new();
     let mut queue = VecDeque::new();
 

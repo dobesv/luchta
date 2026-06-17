@@ -60,7 +60,7 @@ impl PackageNode {
 type GraphNodes = (DiGraph<PackageNode, ()>, HashMap<PackageName, NodeIndex>);
 
 /// Directed graph of workspace packages and their dependency edges.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct PackageGraph {
     graph: DiGraph<PackageNode, ()>,
     indices_by_name: HashMap<PackageName, NodeIndex>,

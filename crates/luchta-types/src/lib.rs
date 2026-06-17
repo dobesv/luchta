@@ -308,6 +308,124 @@ impl fmt::Display for ParseDependsOnError {
 
 impl std::error::Error for ParseDependsOnError {}
 
+impl From<String> for ParseDependsOnError {
+    fn from(message: String) -> Self {
+        Self { message }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InputSemantics {
+    Literal,
+    Wildcard,
+}
+
+/// Input pattern reference used in task cache input definitions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InputPattern {
+    /// `#path`: path resolved from workspace root.
+    Root(String),
+    /// `pkg#path`: path resolved from specific package.
+    Specific(PackageName, String),
+    /// `^path`: path resolved from direct upstream workspace packages.
+    DirectUpstream(String),
+    /// `^^path`: path resolved from transitive upstream workspace packages.
+    TransitiveUpstream(String),
+    /// `path`: path resolved from same package.
+    SamePackage(String),
+}
+
+impl InputPattern {
+    pub fn path(&self) -> &str {
+        match self {
+            Self::Root(path)
+            | Self::DirectUpstream(path)
+            | Self::TransitiveUpstream(path)
+            | Self::SamePackage(path) => path,
+            Self::Specific(_, path) => path,
+        }
+    }
+
+    pub fn semantics(&self) -> InputSemantics {
+        match self {
+            Self::DirectUpstream(_) | Self::TransitiveUpstream(_) => InputSemantics::Wildcard,
+            Self::Root(_) | Self::Specific(_, _) | Self::SamePackage(_) => {
+                classify_pattern(self.path())
+            }
+        }
+    }
+}
+
+impl FromStr for InputPattern {
+    type Err = ParseInputPatternError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        // `^^` must be tried before `^` since latter is prefix of former.
+        if let Some(parsed) = parse_input_upstream(
+            value,
+            "^^",
+            Self::TransitiveUpstream,
+            "transitive upstream input must include path",
+        ) {
+            return parsed;
+        }
+
+        if let Some(parsed) = parse_input_upstream(
+            value,
+            "^",
+            Self::DirectUpstream,
+            "direct upstream input must include path",
+        ) {
+            return parsed;
+        }
+
+        if let Some(parsed) = parse_root_input(value) {
+            return parsed;
+        }
+
+        if let Some(parsed) = parse_specific_input(value) {
+            return parsed;
+        }
+
+        parse_same_package_input(value)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseInputPatternError {
+    message: String,
+}
+
+impl ParseInputPatternError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for ParseInputPatternError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ParseInputPatternError {}
+
+impl From<String> for ParseInputPatternError {
+    fn from(message: String) -> Self {
+        Self { message }
+    }
+}
+
+pub fn classify_pattern(pattern: &str) -> InputSemantics {
+    if pattern.contains(['*', '?', '[', '{']) {
+        InputSemantics::Wildcard
+    } else {
+        InputSemantics::Literal
+    }
+}
+
 /// Dependency reference used in task pipeline definitions.
 ///
 /// Serde representation is string-based for config UX:
@@ -415,6 +533,66 @@ fn parse_upstream(
     Some(Ok(construct(TaskName::from(task))))
 }
 
+fn parse_prefixed_value<T, E>(
+    value: &str,
+    prefix: &str,
+    ctor: impl FnOnce(String) -> T,
+    empty_message: &str,
+) -> Option<Result<T, E>>
+where
+    E: From<String>,
+{
+    value.strip_prefix(prefix).map(|remainder| {
+        if remainder.is_empty() {
+            Err(E::from(empty_message.to_owned()))
+        } else {
+            Ok(ctor(remainder.to_owned()))
+        }
+    })
+}
+
+fn parse_input_upstream(
+    value: &str,
+    prefix: &str,
+    construct: fn(String) -> InputPattern,
+    empty_message: &str,
+) -> Option<Result<InputPattern, ParseInputPatternError>> {
+    parse_prefixed_value(value, prefix, construct, empty_message)
+}
+
+fn parse_root_input(value: &str) -> Option<Result<InputPattern, ParseInputPatternError>> {
+    parse_prefixed_value(
+        value,
+        "#",
+        InputPattern::Root,
+        "root input must include path",
+    )
+}
+
+fn parse_specific_input(value: &str) -> Option<Result<InputPattern, ParseInputPatternError>> {
+    let (package, path) = value.split_once('#')?;
+    if package.is_empty() || path.is_empty() {
+        return Some(Err(ParseInputPatternError::new(
+            "specific input must be `package#path`",
+        )));
+    }
+
+    Some(Ok(InputPattern::Specific(
+        PackageName::from(package),
+        path.to_owned(),
+    )))
+}
+
+fn parse_same_package_input(value: &str) -> Result<InputPattern, ParseInputPatternError> {
+    if value.is_empty() {
+        return Err(ParseInputPatternError::new(
+            "same-package input must include path",
+        ));
+    }
+
+    Ok(InputPattern::SamePackage(value.to_owned()))
+}
+
 impl Serialize for DependsOn {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -439,8 +617,8 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        resolve_script_name, CacheConfig, DependsOn, EnvSpec, PackageName, TaskDefinition, TaskId,
-        TaskName, ROOT_PACKAGE_NAME,
+        classify_pattern, resolve_script_name, CacheConfig, DependsOn, EnvSpec, InputPattern,
+        InputSemantics, PackageName, TaskDefinition, TaskId, TaskName, ROOT_PACKAGE_NAME,
     };
 
     #[test]
@@ -491,6 +669,124 @@ mod tests {
             DependsOn::Root(TaskName::from("test")).as_config_string(),
             "#test"
         );
+    }
+
+    #[test]
+    fn parses_input_pattern_variants() {
+        let cases = [
+            ("#path", InputPattern::Root("path".to_owned())),
+            (
+                "@scope/pkg#path",
+                InputPattern::Specific(PackageName::from("@scope/pkg"), "path".to_owned()),
+            ),
+            (
+                "pkg#path",
+                InputPattern::Specific(PackageName::from("pkg"), "path".to_owned()),
+            ),
+            ("^path", InputPattern::DirectUpstream("path".to_owned())),
+            (
+                "^^path",
+                InputPattern::TransitiveUpstream("path".to_owned()),
+            ),
+            ("path", InputPattern::SamePackage("path".to_owned())),
+        ];
+
+        for (input, expected) in cases {
+            assert_eq!(
+                input.parse::<InputPattern>(),
+                Ok(expected),
+                "input: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn parses_transitive_input_before_direct_upstream() {
+        assert_eq!(
+            "^^foo"
+                .parse::<InputPattern>()
+                .expect("transitive upstream input"),
+            InputPattern::TransitiveUpstream("foo".to_owned())
+        );
+    }
+
+    #[test]
+    fn rejects_empty_input_paths_after_prefix() {
+        // Table-driven test for patterns that must fail to parse due to missing paths
+        let cases: &[(&str, &str)] = &[
+            ("#", "root input must include path"),
+            ("pkg#", "specific input must be `package#path`"),
+            ("^", "direct upstream input must include path"),
+            ("^^", "transitive upstream input must include path"),
+            ("", "same-package input must include path"),
+        ];
+
+        for (input, expected_error) in cases {
+            let err = input
+                .parse::<InputPattern>()
+                .expect_err(&format!("expected parse error for input: {:?}", input));
+            assert_eq!(
+                err.to_string(),
+                *expected_error,
+                "wrong error for input: {:?}",
+                input
+            );
+        }
+    }
+
+    #[test]
+    fn input_pattern_semantics_follow_prefix_and_wildcards() {
+        assert_eq!(
+            "^src/main.ts"
+                .parse::<InputPattern>()
+                .expect("direct upstream input")
+                .semantics(),
+            InputSemantics::Wildcard
+        );
+        assert_eq!(
+            "^^src/main.ts"
+                .parse::<InputPattern>()
+                .expect("transitive upstream input")
+                .semantics(),
+            InputSemantics::Wildcard
+        );
+        assert_eq!(
+            "src/*.ts"
+                .parse::<InputPattern>()
+                .expect("same-package glob")
+                .semantics(),
+            InputSemantics::Wildcard
+        );
+        assert_eq!(
+            "src/main.ts"
+                .parse::<InputPattern>()
+                .expect("same-package literal")
+                .semantics(),
+            InputSemantics::Literal
+        );
+        assert_eq!(
+            "#config.json"
+                .parse::<InputPattern>()
+                .expect("root literal")
+                .semantics(),
+            InputSemantics::Literal
+        );
+        assert_eq!(
+            "#*.json"
+                .parse::<InputPattern>()
+                .expect("root glob")
+                .semantics(),
+            InputSemantics::Wildcard
+        );
+    }
+
+    #[test]
+    fn classify_pattern_detects_wildcards() {
+        assert_eq!(classify_pattern("src/main.ts"), InputSemantics::Literal);
+        assert_eq!(classify_pattern("src/*.ts"), InputSemantics::Wildcard);
+        assert_eq!(classify_pattern("src/file?.ts"), InputSemantics::Wildcard);
+        assert_eq!(classify_pattern("src/[ab].ts"), InputSemantics::Wildcard);
+        assert_eq!(classify_pattern("src/{a,b}.ts"), InputSemantics::Wildcard);
     }
 
     #[test]

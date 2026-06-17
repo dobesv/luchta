@@ -21,6 +21,7 @@ libc = { workspace = true }
 luchta-types = { path = "../luchta-types" }
 luchta-worker = { path = "../luchta-worker" }
 luchta-workspace = { path = "../luchta-workspace" }
+luchta-cache = { path = "../luchta-cache" }
 
 [dev-dependencies]
 tempfile = { workspace = true }
