@@ -1676,6 +1676,7 @@ name = "luchta-engine"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "luchta-cache",
  "luchta-types",
  "luchta-worker",
  "luchta-workspace",

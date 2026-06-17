@@ -8,10 +8,12 @@
 
 use super::*;
 
+use luchta_cache::FileEntry;
 use luchta_types::EnvSpec;
 use luchta_worker::BUILTIN_PASSTHROUGH_ENV;
 
 use crate::env_merge::merge_env;
+use luchta_workspace::PackageGraph;
 
 fn split_captured_logs(sink: &ExecutionLogSink) -> (Vec<u8>, Vec<u8>) {
     let (mut out, mut err) = (Vec::new(), Vec::new());
@@ -189,7 +191,12 @@ fn build_cache_write_context(task_id: &TaskId, ctx: &DispatchContext<'_>) -> Cac
             return CacheInputState::Disabled;
         }
     };
-    let resolver = PackageDirResolver::new(cache_package.package_path.clone());
+    let resolver = PackageDirResolver::new(
+        cache_package.package_path.clone(),
+        ctx.workspace_root.to_path_buf(),
+        cache_package.package_name.clone(),
+        ctx.package_graph.clone(),
+    );
 
     let empty = BTreeMap::new();
     let merged_env = ctx.task_envs.get(task_id).unwrap_or(&empty);
@@ -213,7 +220,18 @@ fn build_cache_write_context(task_id: &TaskId, ctx: &DispatchContext<'_>) -> Cac
         env_hash,
         pkg_dep_hash,
         start_unix_ms: now_unix_ms(),
+        repo_root: ctx.workspace_root.to_path_buf(),
+        source_pkg: cache_package.package_name.clone(),
+        package_graph: ctx.package_graph.clone(),
     }))
+}
+
+/// Result of building a run record for cache write.
+/// Distinguishes between success, expansion errors (fatal), and IO/other errors (skip).
+enum BuildRecordResult {
+    Ok(Box<TaskRunRecord>),
+    ExpansionError(String),
+    Skip,
 }
 
 fn build_run_record(
@@ -221,37 +239,25 @@ fn build_run_record(
     outcome: Option<&TaskRunOutcome>,
     succeeded: bool,
     end_unix_ms: u64,
-) -> Option<TaskRunRecord> {
+) -> BuildRecordResult {
     let (output_patterns, detected_output_patterns) =
         effective_output_patterns(&cache_ctx.task_def, outcome);
     let (input_patterns, detected_input_patterns) =
         effective_input_patterns(&cache_ctx.task_def, outcome);
-    let inputs = match resolve_inputs(&cache_ctx.package_path, &input_patterns) {
-        Ok(inputs) => inputs,
-        Err(error) => {
-            eprintln!(
-                "warning: skipping cache write for task '{}': failed to resolve cache inputs: {error}",
-                cache_ctx.task_id
-            );
-            return None;
-        }
+    let inputs = match resolve_cache_inputs(cache_ctx, &input_patterns) {
+        CacheInputResult::Ok(entries) => entries,
+        CacheInputResult::ExpansionError(msg) => return BuildRecordResult::ExpansionError(msg),
+        CacheInputResult::IoError => return BuildRecordResult::Skip,
     };
-    let outputs = match resolve_outputs(&cache_ctx.package_path, &output_patterns) {
-        Ok(outputs) => outputs,
-        Err(error) => {
-            eprintln!(
-                "warning: skipping cache write for task '{}': failed to resolve cache outputs: {error}",
-                cache_ctx.task_id
-            );
-            return None;
-        }
+    let Some(outputs) = resolve_cache_outputs(cache_ctx, &output_patterns) else {
+        return BuildRecordResult::Skip;
     };
     let outputs_hash = combined_outputs_hash(&outputs);
     let exit_status = outcome
         .map(|result| result.status.code().unwrap_or(1))
         .unwrap_or(1);
 
-    Some(TaskRunRecord {
+    BuildRecordResult::Ok(Box::new(TaskRunRecord {
         schema_version: SCHEMA_VERSION_V1,
         task_spec_hash: cache_ctx.task_spec_hash,
         input_patterns,
@@ -268,7 +274,71 @@ fn build_run_record(
         succeeded,
         start_unix_ms: cache_ctx.start_unix_ms,
         end_unix_ms,
-    })
+    }))
+}
+
+/// Result of cache input resolution for the write path.
+/// Distinguishes between expansion errors (fatal) and IO errors (warn + skip).
+enum CacheInputResult {
+    Ok(Vec<FileEntry>),
+    ExpansionError(String),
+    IoError,
+}
+
+fn resolve_cache_inputs(
+    cache_ctx: &CacheWriteContext,
+    input_patterns: &[String],
+) -> CacheInputResult {
+    let requests = match expand_input_patterns(
+        input_patterns,
+        &cache_ctx.source_pkg,
+        &cache_ctx.package_graph,
+        &cache_ctx.repo_root,
+    ) {
+        Ok(reqs) => reqs,
+        Err(error) => {
+            return CacheInputResult::ExpansionError(format!(
+                "input \"{}\" in package \"{}\": {}",
+                error.pattern(),
+                cache_ctx.source_pkg,
+                error
+            ));
+        }
+    };
+
+    match resolve_inputs_with_semantics(&requests) {
+        Ok(inputs) => CacheInputResult::Ok(inputs),
+        Err(error) => {
+            eprintln!(
+                "warning: skipping cache write for task '{}': failed to resolve cache inputs: {error}",
+                cache_ctx.task_id
+            );
+            CacheInputResult::IoError
+        }
+    }
+}
+
+fn resolve_cache_outputs(
+    cache_ctx: &CacheWriteContext,
+    output_patterns: &[String],
+) -> Option<Vec<FileEntry>> {
+    match resolve_outputs(&cache_ctx.package_path, output_patterns) {
+        Ok(outputs) => Some(outputs),
+        Err(error) => {
+            eprintln!(
+                "warning: skipping cache write for task '{}': failed to resolve cache outputs: {error}",
+                cache_ctx.task_id
+            );
+            None
+        }
+    }
+}
+
+/// Result of writing a run record to cache.
+/// ExpansionError signals a fatal security error that must fail the task.
+enum WriteRecordResult {
+    Ok,
+    ExpansionError(String),
 }
 
 async fn write_run_record(
@@ -279,9 +349,11 @@ async fn write_run_record(
     outcome: Option<&TaskRunOutcome>,
     succeeded: bool,
     end_unix_ms: u64,
-) {
-    let Some(record) = build_run_record(&cache_ctx, outcome, succeeded, end_unix_ms) else {
-        return;
+) -> WriteRecordResult {
+    let record = match build_run_record(&cache_ctx, outcome, succeeded, end_unix_ms) {
+        BuildRecordResult::Ok(record) => record,
+        BuildRecordResult::ExpansionError(msg) => return WriteRecordResult::ExpansionError(msg),
+        BuildRecordResult::Skip => return WriteRecordResult::Ok,
     };
     record_output_hash(&output_hashes, &cache_ctx.task_id, record.outputs_hash);
     let (stdout, stderr) = log_sink.map(split_captured_logs).unwrap_or_default();
@@ -308,6 +380,7 @@ async fn write_run_record(
             cache_ctx.task_id
         ),
     }
+    WriteRecordResult::Ok
 }
 
 fn report_task_outcome(
@@ -338,7 +411,12 @@ fn format_task_error(error: &luchta_engine::ExecutorError) -> String {
 fn try_cache_skip(task_id: &TaskId, ctx: &DispatchContext<'_>) -> Option<Decision> {
     let task_def = ctx.task_graph.task_definition(task_id)?;
     let cache_package = cache_package_context_for(ctx.packages, ctx.workspace_root, task_id)?;
-    let resolver = PackageDirResolver::new(cache_package.package_path.clone());
+    let resolver = PackageDirResolver::new(
+        cache_package.package_path.clone(),
+        ctx.workspace_root.to_path_buf(),
+        cache_package.package_name.clone(),
+        ctx.package_graph.clone(),
+    );
     let dep_outputs = dependency_output_hashes(task_id, ctx.task_graph, ctx.output_hashes);
     let synthetic_package;
     let package = if let Some(package) = cache_package.package {
@@ -430,7 +508,7 @@ fn spawn_task_runner(ready: ReadyTask, ctx: &DispatchContext<'_>) {
         let output_hash_record = output_hash_record
             .map(|record| record.with_effective_patterns(outcome_res.as_ref().ok()));
 
-        persist_cache_state(CachePersistInputs {
+        let expansion_error = persist_cache_state(CachePersistInputs {
             cache,
             cache_write,
             output_hashes: &output_hashes,
@@ -441,6 +519,17 @@ fn spawn_task_runner(ready: ReadyTask, ctx: &DispatchContext<'_>) {
             end_unix_ms,
         })
         .await;
+
+        // Handle expansion errors as hard failures
+        if let Some(expansion_error) = expansion_error {
+            any_failed.store(true, Ordering::SeqCst);
+            if !interrupted.load(Ordering::SeqCst) {
+                eprintln!("{} {}", "✖".red(), expansion_error.red());
+            }
+            reporter.task_finished_other(&task_id);
+            let _ = done_tx.send(false);
+            return;
+        }
 
         let interrupted_run = interrupted.load(Ordering::SeqCst);
         let failed = !succeeded;
@@ -476,7 +565,8 @@ struct CachePersistInputs<'a> {
 
 /// Records the run record (cached tasks) or just the resolved output hash
 /// (uncached tasks) so downstream dependency coupling stays correct.
-async fn persist_cache_state(inputs: CachePersistInputs<'_>) {
+/// Returns an expansion error message if one occurred (for caller to handle).
+async fn persist_cache_state(inputs: CachePersistInputs<'_>) -> Option<String> {
     let CachePersistInputs {
         cache,
         cache_write,
@@ -489,7 +579,7 @@ async fn persist_cache_state(inputs: CachePersistInputs<'_>) {
     } = inputs;
 
     if let Some(cache_ctx) = cache_write {
-        write_run_record(
+        let result = write_run_record(
             cache,
             cache_ctx,
             Arc::clone(output_hashes),
@@ -499,13 +589,21 @@ async fn persist_cache_state(inputs: CachePersistInputs<'_>) {
             end_unix_ms,
         )
         .await;
-        return;
+        return cache_write_error(result);
     }
 
     if succeeded {
         if let Some(record) = output_hash_record {
             record_resolved_output_hash(output_hashes, record);
         }
+    }
+    None
+}
+
+fn cache_write_error(result: WriteRecordResult) -> Option<String> {
+    match result {
+        WriteRecordResult::Ok => None,
+        WriteRecordResult::ExpansionError(msg) => Some(msg),
     }
 }
 
@@ -632,6 +730,7 @@ pub(super) fn build_command_map(
     workspace_root: &Path,
     global_env: &BTreeMap<String, EnvSpec>,
     workers: &HashMap<String, WorkerDefinition>,
+    package_graph: Option<&PackageGraph>,
 ) -> CommandMap {
     let package_by_name: HashMap<_, _> = packages.iter().map(|pkg| (&pkg.name, pkg)).collect();
     let mut commands = HashMap::new();
@@ -658,6 +757,27 @@ pub(super) fn build_command_map(
         let empty_task_env = BTreeMap::new();
         let task_env = task_def.map(|def| &def.env).unwrap_or(&empty_task_env);
         let merged_env = merge_env(global_env, worker_env, task_env);
+
+        // Validate declared input patterns eagerly when we have the package graph
+        if let (Some(def), Some(graph)) = (task_def, package_graph) {
+            if !def.inputs.is_empty() {
+                let source_pkg = task_id.package.clone();
+                if let Err(error) =
+                    expand_input_patterns(&def.inputs, &source_pkg, graph, workspace_root)
+                {
+                    invalid.insert(
+                        task_id.clone(),
+                        format!(
+                            "input \"{}\" in package \"{}\": {}",
+                            error.pattern(),
+                            source_pkg,
+                            error
+                        ),
+                    );
+                    continue;
+                }
+            }
+        }
 
         let (command, workspace) = if let Some(worker_name) = &worker {
             if !workers.contains_key(worker_name) {

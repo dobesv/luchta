@@ -12,12 +12,12 @@ use std::{
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use luchta_cache::{
-    combined_outputs_hash, decide, resolve_cache_dir, resolve_inputs, resolve_outputs, Cache,
-    Decision, RunArtifacts, TaskRunRecord, SCHEMA_VERSION_V1,
+    combined_outputs_hash, decide, resolve_cache_dir, resolve_inputs_with_semantics,
+    resolve_outputs, Cache, Decision, RunArtifacts, TaskRunRecord, SCHEMA_VERSION_V1,
 };
 use luchta_engine::{
-    is_root_task, CompletionSignal, ExecutionLogSink, ExecutionRequest, LogStream,
-    PackageResolveInfo, PrunedTask, ReadyTaskMessage, ResolveMode, TaskGraph, TaskNode,
+    expand_input_patterns, is_root_task, CompletionSignal, ExecutionLogSink, ExecutionRequest,
+    LogStream, PackageResolveInfo, PrunedTask, ReadyTaskMessage, ResolveMode, TaskGraph, TaskNode,
     TaskRunOutcome, Walker, WeightedExecutor, WorkerManager,
 };
 use luchta_types::{EnvSpec, PackageName, TaskDefinition, TaskId, TaskName, WorkerDefinition};
@@ -184,7 +184,6 @@ pub async fn run_tasks(
     }
 
     let tasks_to_run = collect_requested_subgraph(&task_graph, selection, &pruned)?;
-    let prefix_width = compute_prefix_width(&task_graph, &tasks_to_run);
 
     // Build the progress reporter with wave indices for all tasks to run.
     let (wave_of, total_waves) = compute_wave_indices(&task_graph, &tasks_to_run);
@@ -205,39 +204,83 @@ pub async fn run_tasks(
         env: &env,
         worker_manager: &worker_manager,
         max_weight,
-        prefix_width,
+        prefix_width: compute_prefix_width(&task_graph, &tasks_to_run),
+        package_graph: Some(&package_graph),
     })?;
 
-    let (walker, mut receiver) = Walker::new(&task_graph);
+    run_dispatch_loop(RunDispatch {
+        task_graph: &task_graph,
+        tasks_to_run: &tasks_to_run,
+        package_nodes: &package_nodes,
+        package_graph: &package_graph,
+        workspace_root,
+        worker_manager: &worker_manager,
+        reporter: &reporter,
+        commands: &commands,
+        invalid: &invalid,
+        task_envs: &task_envs,
+        executor: &executor,
+        cache: &cache,
+        output_hashes: &output_hashes,
+        memory_monitor: &mut memory_monitor,
+        pressure_state: &pressure_state,
+    })
+    .await
+}
+
+/// Bundles the borrowed state needed to drive the dispatch loop, so
+/// `run_tasks` stays small and the many shared references travel as one unit.
+struct RunDispatch<'a> {
+    task_graph: &'a TaskGraph,
+    tasks_to_run: &'a HashSet<TaskId>,
+    package_nodes: &'a [PackageNode],
+    package_graph: &'a PackageGraph,
+    workspace_root: &'a Path,
+    worker_manager: &'a Arc<WorkerManager>,
+    reporter: &'a Arc<ProgressReporter>,
+    commands: &'a HashMap<TaskId, ExecutionRequest>,
+    invalid: &'a HashMap<TaskId, String>,
+    task_envs: &'a HashMap<TaskId, BTreeMap<String, EnvSpec>>,
+    executor: &'a Arc<WeightedExecutor>,
+    cache: &'a Arc<Cache>,
+    output_hashes: &'a Arc<Mutex<HashMap<TaskId, [u8; 32]>>>,
+    memory_monitor: &'a mut crate::memory_pressure::MemoryMonitor,
+    pressure_state: &'a Arc<crate::memory_pressure::PressureState>,
+}
+
+/// Constructs the dispatch context, runs the dispatch loop to completion, and
+/// finalizes the run (worker shutdown + outcome reporting).
+async fn run_dispatch_loop(d: RunDispatch<'_>) -> Result<()> {
+    let (walker, mut receiver) = Walker::new(d.task_graph);
     let any_failed = Arc::new(AtomicBool::new(false));
     // Set once a shutdown signal arrives. Spawned task runners consult this so
     // that jobs killed by the interrupt don't each print a crash/failure error
     // (which would flood the terminal with one line per in-flight task).
     let interrupted = Arc::new(AtomicBool::new(false));
-    let lockfile_state = load_lockfile_state(workspace_root);
+    let lockfile_state = load_lockfile_state(d.workspace_root);
 
     let ctx = DispatchContext {
-        tasks_to_run: &tasks_to_run,
-        commands: &commands,
-        invalid: &invalid,
-        task_envs: &task_envs,
-        executor: &executor,
+        tasks_to_run: d.tasks_to_run,
+        commands: d.commands,
+        invalid: d.invalid,
+        task_envs: d.task_envs,
+        executor: d.executor,
         any_failed: &any_failed,
         interrupted: &interrupted,
-        workspace_root,
-        package_graph: &package_graph,
-        packages: &package_nodes,
-        task_graph: &task_graph,
-        cache: &cache,
-        output_hashes: &output_hashes,
-        reporter: &reporter,
+        workspace_root: d.workspace_root,
+        package_graph: d.package_graph,
+        packages: d.package_nodes,
+        task_graph: d.task_graph,
+        cache: d.cache,
+        output_hashes: d.output_hashes,
+        reporter: d.reporter,
         lockfile: &lockfile_state,
     };
-    let run_result = dispatch_loop(&mut receiver, &ctx, &mut memory_monitor, &pressure_state).await;
+    let run_result = dispatch_loop(&mut receiver, &ctx, d.memory_monitor, d.pressure_state).await;
 
-    finalize_run(&worker_manager, walker, receiver, run_result.is_err()).await?;
+    finalize_run(d.worker_manager, walker, receiver, run_result.is_err()).await?;
 
-    report_run_outcome(run_result, &any_failed, &reporter, &pressure_state)
+    report_run_outcome(run_result, &any_failed, d.reporter, d.pressure_state)
 }
 
 /// Shared, read-only context the dispatch loop hands to each ready task.
@@ -278,6 +321,9 @@ struct CacheWriteContext {
     env_hash: [u8; 32],
     pkg_dep_hash: [u8; 32],
     start_unix_ms: u64,
+    repo_root: PathBuf,
+    source_pkg: PackageName,
+    package_graph: PackageGraph,
 }
 
 struct OutputHashRecordContext {
@@ -392,7 +438,7 @@ pub fn report_pruned_tasks(pruned: &[PrunedTask]) {
 pub async fn dry_run_tasks(workspace_root: &Path, selection: &TaskSelection<'_>) -> Result<()> {
     let PreparedWorkspace {
         packages: package_nodes,
-        package_graph: _,
+        package_graph,
         pipeline: _,
         env,
         task_graph,
@@ -419,7 +465,14 @@ pub async fn dry_run_tasks(workspace_root: &Path, selection: &TaskSelection<'_>)
         commands,
         invalid,
         task_envs: _,
-    } = build_command_map(&task_graph, &package_nodes, workspace_root, &env, &workers);
+    } = build_command_map(
+        &task_graph,
+        &package_nodes,
+        workspace_root,
+        &env,
+        &workers,
+        Some(&package_graph),
+    );
 
     let waves = compute_execution_waves(&task_graph, &tasks_to_run);
 

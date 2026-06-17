@@ -6,11 +6,12 @@ use std::{
 };
 
 use luchta_cache::{
-    env_hash, pkg_dep_hash, resolve_inputs, resolve_outputs, task_spec_hash, CurrentState,
-    FileEntry, FileStateResolver,
+    env_hash, pkg_dep_hash, resolve_inputs_with_semantics, resolve_outputs, task_spec_hash,
+    CurrentState, FileEntry, FileStateResolver,
 };
+use luchta_engine::{expand_input_patterns, InputExpansionError};
 use luchta_lockfiles::{parse_lockfile, Lockfile};
-use luchta_types::{EnvSpec, TaskDefinition};
+use luchta_types::{EnvSpec, PackageName, TaskDefinition};
 use luchta_workspace::{PackageGraph, PackageNode};
 use miette::{IntoDiagnostic, Result};
 use serde::Deserialize;
@@ -41,18 +42,42 @@ pub(crate) fn load_lockfile_state(workspace_root: &Path) -> LockfileState {
 
 pub struct PackageDirResolver {
     package_dir: PathBuf,
+    repo_root: PathBuf,
+    source_pkg: PackageName,
+    package_graph: PackageGraph,
 }
 
 impl PackageDirResolver {
     #[must_use]
-    pub fn new(package_dir: PathBuf) -> Self {
-        Self { package_dir }
+    pub fn new(
+        package_dir: PathBuf,
+        repo_root: PathBuf,
+        source_pkg: PackageName,
+        package_graph: PackageGraph,
+    ) -> Self {
+        Self {
+            package_dir,
+            repo_root,
+            source_pkg,
+            package_graph,
+        }
     }
+}
+
+fn format_expansion_error(error: &InputExpansionError) -> String {
+    error.to_string()
 }
 
 impl FileStateResolver for PackageDirResolver {
     fn resolve_inputs(&self, patterns: &[String]) -> luchta_cache::Result<Vec<FileEntry>> {
-        resolve_inputs(&self.package_dir, patterns)
+        let requests = expand_input_patterns(
+            patterns,
+            &self.source_pkg,
+            &self.package_graph,
+            &self.repo_root,
+        )
+        .map_err(|e| luchta_cache::CacheError::InputExpansion(format_expansion_error(&e)))?;
+        resolve_inputs_with_semantics(&requests)
     }
 
     fn resolve_outputs(&self, patterns: &[String]) -> luchta_cache::Result<Vec<FileEntry>> {

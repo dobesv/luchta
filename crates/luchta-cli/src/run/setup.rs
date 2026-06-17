@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use luchta_cache::Cache;
 use luchta_engine::{ExecutionRequest, TaskGraph, WeightedExecutor, WorkerManager};
 use luchta_types::{EnvSpec, TaskId, WorkerDefinition};
-use luchta_workspace::PackageNode;
+use luchta_workspace::{PackageGraph, PackageNode};
 use miette::{bail, Context, IntoDiagnostic, Result};
 
 use super::{
@@ -88,6 +88,7 @@ pub(super) struct BuildResourcesInputs<'a> {
     pub(super) worker_manager: &'a Arc<WorkerManager>,
     pub(super) max_weight: u32,
     pub(super) prefix_width: usize,
+    pub(super) package_graph: Option<&'a PackageGraph>,
 }
 
 /// Execution resources shared across the dispatch loop and task runners.
@@ -127,6 +128,7 @@ pub(super) fn build_execution_resources(
         inputs.workspace_root,
         inputs.env,
         inputs.workers,
+        inputs.package_graph,
     );
 
     for request in commands.values() {

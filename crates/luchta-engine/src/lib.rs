@@ -1,4 +1,5 @@
 pub mod executor;
+pub mod input_expansion;
 pub mod task_graph;
 pub mod walker;
 pub mod worker;
@@ -11,6 +12,7 @@ pub use executor::{
     ExecutionLogSink, ExecutionRequest, ExecutorError, TaskExecutor, TaskRunOutcome,
     WeightedExecutor,
 };
+pub use input_expansion::{expand_input_patterns, InputExpansionError};
 pub use luchta_worker::{
     CapturedLogLine, LogStream, ResolveDecision, ResolveMode, ResolveResult, ResolveTask,
     TaskModification, WorkerMessage, WorkerRequest, WorkerResponse,
