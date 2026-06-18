@@ -7,6 +7,7 @@ mod memory_pressure;
 mod progress;
 mod rss;
 mod run;
+mod since;
 
 use clap::Parser;
 use cli::{Cli, Commands, OutputMode};
@@ -139,6 +140,7 @@ struct RunArgs {
     dry_run: bool,
     output: OutputMode,
     thresholds: ThresholdInputs,
+    since: Option<String>,
 }
 
 struct ThresholdInputs {
@@ -156,6 +158,7 @@ fn command_run_args(command: Commands) -> RunArgs {
             output,
             mem_usage_threshold,
             mem_free_threshold,
+            since,
         } => RunArgs {
             tasks,
             packages,
@@ -166,6 +169,7 @@ fn command_run_args(command: Commands) -> RunArgs {
                 usage_cli: mem_usage_threshold,
                 free_cli: mem_free_threshold,
             },
+            since,
         },
         Commands::Check => unreachable!("checked by caller"),
     }
@@ -181,6 +185,7 @@ async fn run_command(workspace_root: &std::path::Path, command: Commands) -> Res
         requested_tasks: &args.tasks,
         packages: &args.packages,
         top_level: args.top_level,
+        since: args.since.as_deref(),
     };
     let memory_pressure = resolve_memory_pressure_config(args.thresholds)?;
 
@@ -271,6 +276,7 @@ mod tests {
                 output: OutputMode::Default,
                 mem_usage_threshold: None,
                 mem_free_threshold: None,
+                since: None,
             },
         };
 

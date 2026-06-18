@@ -253,13 +253,16 @@ The `tasks` map defines how tasks are applied across the workspace:
 - `luchta run build`: Runs package `build` tasks. Top-level tasks are never included.
 - `luchta run -T build` (or `--top-level`): Runs the top-level `#build` task.
 - `luchta run -p <PATTERN> build`: Selects tasks by package **name** (not path). Supports glob wildcards (e.g. `@repo/*`, `pkg-*`). Repeatable.
+- `luchta run --since <GIT_REF> build`: Restricts goal tasks to packages changed since `GIT_REF`, plus their transitive dependents.
 - `luchta run 'test*'`: Task arguments also support glob wildcards (e.g. `test:*`, `build*`).
 - `luchta run -T -p app build`: Runs both `@repo/app#build` and the top-level `#build` task (`-T` is additive to `-p`).
 
 Luchta uses a **Goal-not-filter** selection model. Filters select the entry-point goals you want to reach; transitive prerequisites of those goals always run, even if they live in packages or have task names that do not match the filter. Luchta ensures everything needed for your targets is built.
 
+`--since <GIT_REF>` checks for package-folder changes from committed history (`GIT_REF..HEAD`), staged changes, unstaged changes, and untracked files that are not gitignored. The affected set is `changed packages ∪ transitive dependents`, then normal dependency expansion still runs prerequisites needed by those goals. If no packages are affected, `luchta run` exits 0 immediately and prints that nothing will run — **unless** top-level mode (`-T`) is requested. Top-level `-T` / `#task` goals bypass both the since filter and that early exit, so they still run regardless of whether the affected set is empty or non-empty.
+
 Additional targeting rules:
-- **AND Logic**: Filters across dimensions are combined (e.g., `-p pkg build` matches goals where package name matches `pkg` AND task name matches `build`).
+- **AND Logic**: Filters across dimensions are combined, including `--since` (e.g. `-p pkg --since main build` matches goals where package name matches `pkg`, task name matches `build`, and package is in affected set).
 - **Mandatory Tasks**: At least one task argument is required; `luchta run -p pkg` is an error.
 - **Error Reporting**: If no matches are found, Luchta provides a clear error distinguishing between "no packages matched the pattern" and "no tasks matched within the selected packages".
 

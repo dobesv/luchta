@@ -57,6 +57,7 @@ pub struct TaskSelection<'a> {
     pub requested_tasks: &'a [String],
     pub packages: &'a [String],
     pub top_level: bool,
+    pub since: Option<&'a str>,
 }
 
 /// Internal criteria for matching task nodes.
@@ -68,6 +69,7 @@ struct SelectionCriteria<'a> {
     package_globs: &'a GlobSet,
     match_all_non_root_packages: bool,
     top_level: bool,
+    since_affected: Option<&'a HashSet<PackageName>>,
 }
 
 #[derive(Debug)]
@@ -87,6 +89,13 @@ pub struct PreparedWorkspace {
     /// The resident worker manager used for resolution; reused for execution so
     /// resolve and run share the same worker processes.
     pub worker_manager: Arc<WorkerManager>,
+}
+
+enum SinceSelection {
+    /// No affected packages — caller should no-op with exit 0.
+    NoOp,
+    /// Continue with optional affected-package filter (`None` when `--since` absent).
+    Proceed(Option<HashSet<PackageName>>),
 }
 
 pub fn resolve_workspace_root(workspace_root: Option<PathBuf>) -> Result<PathBuf> {
@@ -156,38 +165,35 @@ pub async fn prepare_workspace(
     })
 }
 
+struct RunContext {
+    package_nodes: Vec<PackageNode>,
+    package_graph: PackageGraph,
+    env: BTreeMap<String, EnvSpec>,
+    task_graph: TaskGraph,
+    workers: HashMap<String, WorkerDefinition>,
+    max_weight: u32,
+    pruned: Vec<PrunedTask>,
+    worker_manager: Arc<WorkerManager>,
+    since_affected: Option<HashSet<PackageName>>,
+}
+
 pub async fn run_tasks(
     workspace_root: &Path,
     selection: &TaskSelection<'_>,
     output: OutputMode,
     memory_pressure: MemoryPressureConfig,
 ) -> Result<()> {
-    // Construct the memory monitor + shared pressure state once before the
-    // dispatch loop (used by the loop and by the status-line warning suffix).
     let (mut memory_monitor, pressure_state) = build_memory_pressure(memory_pressure);
-
-    let PreparedWorkspace {
-        packages: package_nodes,
-        package_graph,
-        pipeline: _,
-        env,
-        task_graph,
-        workers,
-        max_weight,
-        pruned,
-        pruned_ids: _,
-        worker_manager,
-    } = prepare_workspace(workspace_root, ResolveMode::Run).await?;
-
-    if package_nodes.is_empty() {
-        println!("{}", "No packages found in workspace".yellow());
+    let Some(run) = prepare_run_context(workspace_root, selection).await? else {
         return Ok(());
-    }
-
-    let tasks_to_run = collect_requested_subgraph(&task_graph, selection, &pruned)?;
-
-    // Build the progress reporter with wave indices for all tasks to run.
-    let (wave_of, total_waves) = compute_wave_indices(&task_graph, &tasks_to_run);
+    };
+    let tasks_to_run = collect_requested_subgraph(
+        &run.task_graph,
+        selection,
+        &run.pruned,
+        run_since_affected(&run),
+    )?;
+    let (wave_of, total_waves) = compute_wave_indices(&run.task_graph, &tasks_to_run);
     let reporter = Arc::new(ProgressReporter::new(output, wave_of, total_waves));
 
     let ExecutionResources {
@@ -199,24 +205,24 @@ pub async fn run_tasks(
         task_envs,
         shared_cache,
     } = build_execution_resources(BuildResourcesInputs {
-        task_graph: &task_graph,
-        packages: &package_nodes,
+        task_graph: &run.task_graph,
+        packages: &run.package_nodes,
         workspace_root,
-        workers: &workers,
-        env: &env,
-        worker_manager: &worker_manager,
-        max_weight,
-        prefix_width: compute_prefix_width(&task_graph, &tasks_to_run),
-        package_graph: Some(&package_graph),
+        workers: &run.workers,
+        env: &run.env,
+        worker_manager: &run.worker_manager,
+        max_weight: run.max_weight,
+        prefix_width: compute_prefix_width(&run.task_graph, &tasks_to_run),
+        package_graph: Some(&run.package_graph),
     })?;
 
     run_dispatch_loop(RunDispatch {
-        task_graph: &task_graph,
+        task_graph: &run.task_graph,
         tasks_to_run: &tasks_to_run,
-        package_nodes: &package_nodes,
-        package_graph: &package_graph,
+        package_nodes: &run.package_nodes,
+        package_graph: &run.package_graph,
         workspace_root,
-        worker_manager: &worker_manager,
+        worker_manager: &run.worker_manager,
         reporter: &reporter,
         commands: &commands,
         invalid: &invalid,
@@ -250,6 +256,58 @@ struct RunDispatch<'a> {
     memory_monitor: &'a mut crate::memory_pressure::MemoryMonitor,
     pressure_state: &'a Arc<crate::memory_pressure::PressureState>,
     shared_cache: Option<Arc<SharedCache>>,
+}
+
+async fn prepare_run_context(
+    workspace_root: &Path,
+    selection: &TaskSelection<'_>,
+) -> Result<Option<RunContext>> {
+    let PreparedWorkspace {
+        packages,
+        package_graph,
+        pipeline: _,
+        env,
+        task_graph,
+        workers,
+        max_weight,
+        pruned,
+        pruned_ids: _,
+        worker_manager,
+    } = prepare_workspace(workspace_root, ResolveMode::Run).await?;
+
+    if packages.is_empty() {
+        println!("{}", "No packages found in workspace".yellow());
+        // Resolution may have spawned resident workers; shut them down on this
+        // early exit so we do not leak worker processes.
+        worker_manager.shutdown().await;
+        return Ok(None);
+    }
+
+    let since_affected = match resolve_since_selection(selection, workspace_root, &package_graph)? {
+        SinceSelection::NoOp => {
+            // Same reasoning as above: tear down any resident workers before
+            // the no-op early return.
+            worker_manager.shutdown().await;
+            return Ok(None);
+        }
+        SinceSelection::Proceed(set) => set,
+    };
+
+    Ok(Some(RunContext {
+        package_nodes: packages,
+        package_graph,
+        env,
+        task_graph,
+        workers,
+        max_weight,
+        pruned,
+        worker_manager,
+        since_affected,
+    }))
+}
+
+fn run_since_affected(run: &RunContext) -> Option<&HashSet<PackageName>> {
+    run.since_affected.as_ref()
 }
 
 /// Constructs the dispatch context, runs the dispatch loop to completion, and
@@ -469,7 +527,13 @@ pub async fn dry_run_tasks(workspace_root: &Path, selection: &TaskSelection<'_>)
 
     report_pruned_tasks(&pruned);
 
-    let tasks_to_run = collect_requested_subgraph(&task_graph, selection, &pruned)?;
+    let since_affected = match resolve_since_selection(selection, workspace_root, &package_graph)? {
+        SinceSelection::NoOp => return Ok(()),
+        SinceSelection::Proceed(set) => set,
+    };
+
+    let tasks_to_run =
+        collect_requested_subgraph(&task_graph, selection, &pruned, since_affected.as_ref())?;
     let CommandMap {
         commands,
         invalid,
@@ -526,6 +590,33 @@ fn describe_planned_action(
     }
 }
 
+fn resolve_since_selection(
+    selection: &TaskSelection<'_>,
+    workspace_root: &Path,
+    package_graph: &PackageGraph,
+) -> Result<SinceSelection> {
+    let Some(since_ref) = selection.since else {
+        return Ok(SinceSelection::Proceed(None));
+    };
+
+    let repo_root = crate::since::discover_repo_root(workspace_root)?;
+    let affected =
+        crate::since::affected_packages(workspace_root, &repo_root, since_ref, package_graph)?;
+    // An empty affected set means no package changed since the ref. Normally
+    // that is a no-op, but top-level (`-T`) requests target workspace-root
+    // tasks which bypass the since filter entirely — those must still run.
+    // In that case proceed with the (empty) affected set so `package_matches`
+    // selects the root tasks and excludes every non-root task.
+    if affected.is_empty() && !selection.top_level {
+        println!(
+            "{}",
+            format!("No packages changed since {since_ref}; nothing to run.").yellow()
+        );
+        return Ok(SinceSelection::NoOp);
+    }
+
+    Ok(SinceSelection::Proceed(Some(affected)))
+}
 /// Compute longest-path wave indices over subgraph induced by `tasks_to_run`.
 ///
 /// A task lands in wave `N` where `N` is one greater than deepest wave of any
@@ -669,6 +760,7 @@ fn collect_requested_subgraph(
     task_graph: &TaskGraph,
     selection: &TaskSelection<'_>,
     pruned: &[PrunedTask],
+    since_affected: Option<&HashSet<PackageName>>,
 ) -> Result<HashSet<TaskId>> {
     let package_globs = build_globset(selection.packages)?;
     let task_globs = build_globset(selection.requested_tasks)?;
@@ -688,6 +780,7 @@ fn collect_requested_subgraph(
         package_globs: &package_globs,
         match_all_non_root_packages: selection.packages.is_empty(),
         top_level: selection.top_level,
+        since_affected,
     };
 
     let requested_ids = collect_matching_task_ids(&available_nodes, &criteria);
@@ -740,18 +833,31 @@ fn collect_matched_package_names(
 
 fn package_matches(task_id: &TaskId, criteria: &SelectionCriteria<'_>) -> bool {
     let is_root = task_id.is_root();
+
     let matches_non_root_package = if criteria.match_all_non_root_packages {
         !is_root
     } else {
         !is_root && criteria.package_globs.is_match(task_id.package.as_str())
     };
 
-    match (criteria.top_level, criteria.match_all_non_root_packages) {
+    let base_match = match (criteria.top_level, criteria.match_all_non_root_packages) {
         (true, false) => matches_non_root_package || is_root,
         (true, true) => is_root,
         (false, false) => matches_non_root_package,
         (false, true) => !is_root,
+    };
+
+    // The `--since` filter is an additional intersection that applies only to
+    // non-root tasks: a non-root task is kept only if its package is in the
+    // affected set. Root/top-level tasks bypass this check entirely so that an
+    // aggregate root task still runs when the affected set is non-empty.
+    if is_root {
+        return base_match;
     }
+    let passes_since = criteria
+        .since_affected
+        .map_or(true, |set| set.contains(&task_id.package));
+    base_match && passes_since
 }
 
 fn is_literal_pattern(s: &str) -> bool {
@@ -1144,6 +1250,7 @@ mod tests {
             package_globs: &package_globs,
             match_all_non_root_packages: true,
             top_level: false,
+            since_affected: None,
         };
 
         let requested_ids = collect_matching_task_ids(&available_nodes, &criteria);
@@ -1166,6 +1273,7 @@ mod tests {
             package_globs: &package_globs,
             match_all_non_root_packages: true,
             top_level: true,
+            since_affected: None,
         };
 
         let requested_ids = collect_matching_task_ids(&available_nodes, &criteria);
@@ -1196,9 +1304,10 @@ mod tests {
             requested_tasks: &["build".to_string()],
             packages: &["@repo/app".to_string()],
             top_level: false,
+            since: None,
         };
-        let requested =
-            collect_requested_subgraph(&task_graph, &selection, &[]).expect("collect requested");
+        let requested = collect_requested_subgraph(&task_graph, &selection, &[], None)
+            .expect("collect requested");
 
         assert!(requested.contains(&TaskId::new("@repo/app", "build")));
         assert!(requested.contains(&TaskId::new("@repo/api", "codegen")));
@@ -1212,8 +1321,9 @@ mod tests {
             requested_tasks: &["build".to_string()],
             packages: &["*root*".to_string()],
             top_level: false,
+            since: None,
         };
-        let error = collect_requested_subgraph(&task_graph, &selection, &[])
+        let error = collect_requested_subgraph(&task_graph, &selection, &[], None)
             .expect_err("root sentinel must not satisfy package filter");
 
         assert!(error.to_string().contains("No packages matched"));
@@ -1235,6 +1345,7 @@ mod tests {
             package_globs: &empty_globs,
             match_all_non_root_packages: true,
             top_level: true,
+            since_affected: None,
         };
         let result = report_unmatched_request("build", &pruned, &top_level_criteria);
         assert!(
@@ -1249,6 +1360,7 @@ mod tests {
             package_globs: &empty_globs,
             match_all_non_root_packages: true,
             top_level: false,
+            since_affected: None,
         };
         report_unmatched_request("build", &pruned, &default_criteria)
             .expect("default request should treat the pruned package task as a match");
@@ -1271,6 +1383,7 @@ mod tests {
             package_globs: &package_globs,
             match_all_non_root_packages: false,
             top_level: false,
+            since_affected: None,
         };
         let result = report_unmatched_request("build", &pruned, &criteria);
         assert!(
@@ -1285,6 +1398,77 @@ mod tests {
         }];
         report_unmatched_request("build", &pruned_in_scope, &criteria)
             .expect("a pruned task within the package filter should be treated as a match");
+    }
+
+    // =========================================================================
+    // package_matches / since_affected tests
+    // =========================================================================
+
+    #[test]
+    fn package_matches_since_filter_cases() {
+        struct Case {
+            name: &'static str,
+            task_id: TaskId,
+            top_level: bool,
+            match_all_non_root_packages: bool,
+            since_affected: Option<HashSet<PackageName>>,
+            expected: bool,
+        }
+
+        let task_globs = build_globset(&["build".to_string()]).expect("task globs");
+        let package_globs = build_globset(&[]).expect("package globs");
+
+        let cases = [
+            Case {
+                name: "non-root task in affected set should match",
+                task_id: TaskId::new("@repo/app", "build"),
+                top_level: false,
+                match_all_non_root_packages: true,
+                since_affected: Some([PackageName::from("@repo/app")].into_iter().collect()),
+                expected: true,
+            },
+            Case {
+                name: "non-root task not in affected set should be excluded",
+                task_id: TaskId::new("@repo/other", "build"),
+                top_level: false,
+                match_all_non_root_packages: true,
+                since_affected: Some([PackageName::from("@repo/app")].into_iter().collect()),
+                expected: false,
+            },
+            Case {
+                name: "root task should bypass since filter under -T",
+                task_id: TaskId::new("//root", "build"),
+                top_level: true,
+                match_all_non_root_packages: true,
+                since_affected: Some([PackageName::from("@repo/app")].into_iter().collect()),
+                expected: true,
+            },
+            Case {
+                name: "non-root task should match when since_affected is None",
+                task_id: TaskId::new("@repo/app", "build"),
+                top_level: false,
+                match_all_non_root_packages: true,
+                since_affected: None,
+                expected: true,
+            },
+        ];
+
+        for case in cases {
+            let criteria = SelectionCriteria {
+                task_globs: &task_globs,
+                package_globs: &package_globs,
+                match_all_non_root_packages: case.match_all_non_root_packages,
+                top_level: case.top_level,
+                since_affected: case.since_affected.as_ref(),
+            };
+
+            assert_eq!(
+                package_matches(&case.task_id, &criteria),
+                case.expected,
+                "{}",
+                case.name
+            );
+        }
     }
 
     #[test]

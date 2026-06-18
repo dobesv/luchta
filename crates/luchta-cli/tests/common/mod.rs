@@ -232,12 +232,13 @@ pub fn write_basic_package(temp: &assert_fs::TempDir, script_name: &str) {
 
 /// Invoke `luchta run <task>` with `extra_args` inserted after the task, scoped
 /// to `temp` via `--workspace-root`. Shared by the public runners below.
-fn run_luchta_with_args(
+pub fn run_luchta_with_args(
     temp: &assert_fs::TempDir,
     task: &str,
     extra_args: &[&str],
 ) -> assert_cmd::assert::Assert {
     let mut cmd = Command::cargo_bin("luchta").unwrap();
+    cmd.env("NO_COLOR", "1");
     cmd.arg("run").arg(task).args(extra_args);
     cmd.arg("--workspace-root").arg(temp.path()).assert()
 }
