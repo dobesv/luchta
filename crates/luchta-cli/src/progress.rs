@@ -18,17 +18,19 @@ use crate::{
 /// Outcome of a task as recorded by the progress reporter.
 ///
 /// A successful run (including ordering-only no-command nodes) increments the
-/// wave's `done` bucket; a cache hit increments `skipped` (the only thing
-/// counted as "skipped"). Everything else — previous-failure skips,
-/// config errors, tasks outside the requested subgraph, and execution
-/// failures — is `Uncounted`: removed from the running set but not added to the
-/// done or skipped totals.
+/// wave's `done` bucket; a cache hit increments `skipped`. Shared-cache hits
+/// also increment a dedicated `shared_hits` counter. Everything else —
+/// previous-failure skips, config errors, tasks outside the requested subgraph,
+/// and execution failures — is `Uncounted`: removed from the running set but
+/// not added to the done or skipped totals.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskOutcome {
     /// Task executed successfully (increments the wave's done count).
     Ran,
-    /// Task skipped due to a cache hit (the ONLY "skipped" counted in progress).
-    SkippedCacheHit,
+    /// Task skipped due to a local cache hit.
+    SkippedLocalCache,
+    /// Task skipped due to a shared cache hit.
+    SkippedSharedCache,
     /// Outcome that contributes to neither the done nor the skipped totals.
     Uncounted,
 }
@@ -41,6 +43,7 @@ pub struct ProgressReporter {
     pub running: Mutex<HashMap<TaskId, Instant>>,
     done: AtomicUsize,
     skipped: AtomicUsize,
+    shared_hits: AtomicUsize,
     pub mode: OutputMode,
     pub total_waves: usize,
     pub wave_total: Vec<usize>,
@@ -67,6 +70,7 @@ impl ProgressReporter {
             start: Instant::now(),
             done: AtomicUsize::new(0),
             skipped: AtomicUsize::new(0),
+            shared_hits: AtomicUsize::new(0),
         }
     }
 
@@ -83,7 +87,11 @@ impl ProgressReporter {
     }
 
     pub fn task_skipped_cache_hit(&self, id: &TaskId) {
-        self.finish_task(id, TaskOutcome::SkippedCacheHit);
+        self.finish_task(id, TaskOutcome::SkippedLocalCache);
+    }
+
+    pub fn task_skipped_shared_cache(&self, id: &TaskId) {
+        self.finish_task(id, TaskOutcome::SkippedSharedCache);
     }
 
     pub fn task_finished_other(&self, id: &TaskId) {
@@ -113,6 +121,7 @@ impl ProgressReporter {
         let total_tasks: usize = self.wave_total.iter().sum();
         let done = self.done.load(Ordering::SeqCst);
         let skipped = self.skipped.load(Ordering::SeqCst);
+        let shared_hits = self.shared_hits.load(Ordering::SeqCst);
         let done_or_skipped = done + skipped;
         let running_count = running.len();
         let pending = total_tasks.saturating_sub(done_or_skipped + running_count);
@@ -132,6 +141,9 @@ impl ProgressReporter {
             format!("☑️ {done_or_skipped}/{total_tasks}"),
             format!("⏭️ {skipped}"),
         ];
+        if shared_hits > 0 {
+            segments.push(format!("📦 shared: {shared_hits}"));
+        }
         if pending > 0 {
             segments.push(format!("⌛ {pending}"));
         }
@@ -155,10 +167,16 @@ impl ProgressReporter {
         let total_tasks: usize = self.wave_total.iter().sum();
         let done = self.done.load(Ordering::SeqCst);
         let skipped = self.skipped.load(Ordering::SeqCst);
+        let shared_hits = self.shared_hits.load(Ordering::SeqCst);
         let done_or_skipped = done + skipped;
+        let shared_segment = if shared_hits > 0 {
+            format!(" 📦 shared: {shared_hits}")
+        } else {
+            String::new()
+        };
 
         format!(
-            "☑️ {done_or_skipped}/{total_tasks} ⏭️ {skipped} ⏱️ {elapsed_total}s 🐏 {rss_formatted} 🌊 {} / {}",
+            "☑️ {done_or_skipped}/{total_tasks} ⏭️ {skipped}{shared_segment} ⏱️ {elapsed_total}s 🐏 {rss_formatted} 🌊 {} / {}",
             self.total_waves, self.total_waves
         )
     }
@@ -180,9 +198,14 @@ impl ProgressReporter {
                 self.wave_done[wave_index].fetch_add(1, Ordering::SeqCst);
                 self.done.fetch_add(1, Ordering::SeqCst);
             }
-            TaskOutcome::SkippedCacheHit => {
+            TaskOutcome::SkippedLocalCache => {
                 self.wave_skipped[wave_index].fetch_add(1, Ordering::SeqCst);
                 self.skipped.fetch_add(1, Ordering::SeqCst);
+            }
+            TaskOutcome::SkippedSharedCache => {
+                self.wave_skipped[wave_index].fetch_add(1, Ordering::SeqCst);
+                self.skipped.fetch_add(1, Ordering::SeqCst);
+                self.shared_hits.fetch_add(1, Ordering::SeqCst);
             }
             TaskOutcome::Uncounted => {}
         }
@@ -477,6 +500,25 @@ mod tests {
     }
 
     #[test]
+    fn render_progress_includes_shared_hits_segment_when_present() {
+        let task_a = task_id("pkg-a", "build");
+        let task_b = task_id("pkg-b", "build");
+        let reporter = ProgressReporter::new(
+            OutputMode::Default,
+            HashMap::from([(task_a.clone(), 0), (task_b.clone(), 0)]),
+            1,
+        );
+
+        reporter.task_ran(&task_a);
+        reporter.task_skipped_shared_cache(&task_b);
+
+        let out = reporter.render_progress("10 MB", &[], &pressure_snapshot(None, 0, 0));
+
+        assert!(out.contains("📦 shared: 1"), "output was: {out}");
+        assert!(out.contains("⏭️ 1"), "output was: {out}");
+    }
+
+    #[test]
     fn render_progress_running_segment_uses_grouped_list() {
         let wave_of = HashMap::from([
             (task_id("a", "lint"), 0),
@@ -705,6 +747,27 @@ mod tests {
         }
         .assert_in(&summary);
         assert!(summary.contains("🐏 10 MB"));
+    }
+
+    #[test]
+    fn render_summary_includes_shared_hits_suffix_when_present() {
+        let task_a = task_id("pkg-a", "build");
+        let task_b = task_id("pkg-b", "build");
+        let reporter = ProgressReporter::new(
+            OutputMode::Default,
+            HashMap::from([(task_a.clone(), 0), (task_b.clone(), 0)]),
+            1,
+        );
+
+        reporter.task_ran(&task_a);
+        reporter.task_skipped_shared_cache(&task_b);
+
+        let summary = reporter.render_summary("10 MB");
+
+        assert!(
+            summary.contains("☑️ 2/2 ⏭️ 1 📦 shared: 1"),
+            "summary was: {summary}"
+        );
     }
 
     #[test]

@@ -442,9 +442,50 @@ build: {
 ```
 
 
+
+### Shared Build Cache
+
+The shared build cache is a cross-worktree, cross-clone cache that restores task **outputs** and logs from prior builds. While the standard [Build Cache](#build-cache) is local to a single workspace, the shared cache allows developers and CI to reuse results across different checkouts of the same repository.
+
+#### Concept
+- **Commit-Keyed:** Results are indexed by git commit hash.
+- **Content-Addressed Blobs:** Build outputs are compressed and stored in a deduped blob store.
+- **Read Window:** On cache lookup, Luchta consults the last 20 commits (configurable) to find a match, allowing for hits even if the current commit hasn't been cached yet.
+- **Remote-Ready:** The on-disk format is designed for easy synchronization. Remote/S3/rclone sync is planned for future work.
+
+#### Layout
+By default, the cache is stored at `~/.cache/luchta` (on Linux/macOS):
+- `blobs/<outputs_hash>.tar.zst` — Content-addressed compressed output archives.
+- `snapshots/<commit>.bincode` — Metadata snapshots for all cached tasks at a specific commit.
+
+#### Configuration (Environment Variables)
+The shared cache is **OPT-IN** and is only active when `LUCHTA_SHARED_CACHE` is enabled. It is configured exclusively via environment variables (there are no CLI flags or project config settings for this feature):
+
+- `LUCHTA_SHARED_CACHE` — Set to `1`, `true`, or `on` (case-insensitive) to enable. Default: `off`.
+- `LUCHTA_SHARED_CACHE_DIR` — Override the cache root directory.
+- `LUCHTA_SHARED_CACHE_GC_DAYS` — Retention period for cache entries. Default: `14`.
+- `LUCHTA_SHARED_CACHE_MAX_OUTPUT_MB` — Maximum size for a single task's output to be cached. Default: `250`.
+- `LUCHTA_SHARED_CACHE_HISTORY` — Number of recent commits to check for snapshots. Default: `20`.
+
+Invalid numeric values for these variables will trigger a warning and fall back to their defaults.
+
+#### Cacheability
+A task is eligible for the shared cache if all the following are true:
+- The task succeeded.
+- It took at least 100ms to run.
+- Its total output size is within the `LUCHTA_SHARED_CACHE_MAX_OUTPUT_MB` limit.
+- All its outputs are contained within its own package directory (outputs escaping the repository root are a hard error).
+- The working tree is "clean" (bare `<commit>` key) or "dirty" (staged or unstaged changes to tracked files; ignored files don't count). Both clean and dirty entries are reusable (content-validated on restore), though dirty entries are kept out of any future remote sync.
+
+#### Maintenance
+Luchta automatically performs throttled garbage collection of old cache entries and blobs (those older than `LUCHTA_SHARED_CACHE_GC_DAYS`). The cache is read-tolerant; if a blob is missing due to GC or other reasons, it is treated as a cache miss.
+
+#### Stats
+Shared cache hits are shown in the build summary: `📦 shared: <n>`.
+
 ## Roadmap
 
 - **Phase 1 (Current):** Multi-crate workspace skeleton, CI, and release tooling (nextest, knope changesets, GitHub release workflows).
 - **Phase 2:** Foundation libraries (workspace discovery, lockfile parsing, graph construction, weighted parallel execution).
-- **Phase 3 (Current):** Opt-in build change-detection cache (blake3 hashing, filesystem-backed) — see "Build cache" above.
-- **Future:** Cross-process build locking and remote cache.
+- **Phase 3 (Current):** Opt-in build change-detection cache (blake3 hashing, local and shared) — see "Build cache" and "Shared Build Cache" above.
+- **Future:** Cross-process build locking and remote (S3/rclone) sync.

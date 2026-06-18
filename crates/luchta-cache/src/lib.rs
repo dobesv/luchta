@@ -2,9 +2,10 @@ mod decide;
 mod hashing;
 mod record;
 mod resolve;
+pub mod shared;
 mod store;
 
-pub use decide::{decide, CurrentState, Decision, FileStateResolver};
+pub use decide::{decide, decide_shared_restore, CurrentState, Decision, FileStateResolver};
 pub use hashing::{env_hash, pkg_dep_hash, task_spec_hash};
 pub use luchta_types::{classify_pattern, InputSemantics};
 pub use record::{FileEntry, TaskRunRecord, SCHEMA_VERSION_V1};

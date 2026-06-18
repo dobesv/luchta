@@ -18,6 +18,11 @@ gix = { workspace = true }
 globset = { workspace = true }
 thiserror = { workspace = true }
 walkdir = { workspace = true }
+zstd = { workspace = true }
+tar = { workspace = true }
+dirs = { workspace = true }
+fs2 = { workspace = true }
+tempfile = { workspace = true }
 
 [dev-dependencies]
-tempfile = { workspace = true }
+filetime = "0.2"
