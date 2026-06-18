@@ -8,7 +8,10 @@
 
 use super::*;
 
-use luchta_cache::FileEntry;
+use luchta_cache::shared::{
+    combined_dep_outputs_hash, derive_input_key, RestoredHit, StoreOutcome,
+};
+use luchta_cache::{decide_shared_restore, FileEntry, RunArtifacts};
 use luchta_types::EnvSpec;
 use luchta_worker::BUILTIN_PASSTHROUGH_ENV;
 
@@ -82,11 +85,19 @@ pub(super) fn dispatch_ready_task(
         .is_some_and(TaskDefinition::cache_enabled);
     if cache_enabled {
         if let Some(decision) = try_cache_skip(&task_id, ctx) {
-            if matches!(decision, Decision::Skip) {
-                // Cache hit — this IS the "skipped" count.
-                ctx.reporter.task_skipped_cache_hit(&task_id);
-                let _ = done_tx.send(true);
-                return;
+            match decision {
+                Decision::Skip => {
+                    // Local cache hit — this IS the legacy "skipped" count.
+                    ctx.reporter.task_skipped_cache_hit(&task_id);
+                    let _ = done_tx.send(true);
+                    return;
+                }
+                Decision::SharedHit => {
+                    ctx.reporter.task_skipped_shared_cache(&task_id);
+                    let _ = done_tx.send(true);
+                    return;
+                }
+                Decision::Run => {}
             }
         }
     }
@@ -126,6 +137,7 @@ fn build_task_run_context(
         output_hashes: Arc::clone(ctx.output_hashes),
         cache_write,
         output_hash_record,
+        shared_cache: ctx.shared_cache.clone(),
     }
 }
 
@@ -341,6 +353,7 @@ enum WriteRecordResult {
     ExpansionError(String),
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn write_run_record(
     cache: Arc<Cache>,
     cache_ctx: CacheWriteContext,
@@ -349,6 +362,8 @@ async fn write_run_record(
     outcome: Option<&TaskRunOutcome>,
     succeeded: bool,
     end_unix_ms: u64,
+    shared_cache: Option<Arc<SharedCache>>,
+    repo_root: PathBuf,
 ) -> WriteRecordResult {
     let record = match build_run_record(&cache_ctx, outcome, succeeded, end_unix_ms) {
         BuildRecordResult::Ok(record) => record,
@@ -358,23 +373,89 @@ async fn write_run_record(
     record_output_hash(&output_hashes, &cache_ctx.task_id, record.outputs_hash);
     let (stdout, stderr) = log_sink.map(split_captured_logs).unwrap_or_default();
     let cache_key = cache_ctx.task_id.to_string();
+
+    // Clone values needed for shared cache store before moving into spawn_blocking
+    let task_id_str = cache_ctx.task_id.to_string();
+    let package_dir = cache_ctx.package_path.clone();
+    let task_spec_hash = cache_ctx.task_spec_hash;
+    let env_hash = cache_ctx.env_hash;
+    let pkg_dep_hash = cache_ctx.pkg_dep_hash;
+    let dep_outputs = cache_ctx.dep_outputs.clone();
+    let start_unix_ms = cache_ctx.start_unix_ms;
+    let outputs_hash = record.outputs_hash;
+    let record_for_local = (*record).clone();
+    let record_for_shared = record_for_local.clone();
+    let task_id_for_error = cache_ctx.task_id.clone();
+
     match tokio::task::spawn_blocking(move || {
-        cache.write(
+        // Local cache write (unchanged)
+        if let Err(error) = cache.write(
             &cache_key,
             RunArtifacts {
-                record: &record,
+                record: &record_for_local,
                 stdout: &stdout,
                 stderr: &stderr,
             },
-        )
+        ) {
+            eprintln!(
+                "warning: failed to write cache record for task '{}': {error}",
+                task_id_for_error
+            );
+        }
+
+        // Shared cache store (after local write, only if enabled)
+        // Path-escape at this point is FATAL and propagates as expansion error.
+        if let Some(shared) = shared_cache {
+            let _duration_ms = end_unix_ms.saturating_sub(start_unix_ms);
+            let input_key = derive_input_key(
+                task_spec_hash,
+                env_hash,
+                pkg_dep_hash,
+                combined_dep_outputs_hash(&dep_outputs),
+            );
+
+            // Gather package-relative output paths from record.outputs (skip absent entries)
+            let rel_output_paths: Vec<std::path::PathBuf> = record_for_shared
+                .outputs
+                .iter()
+                .filter(|f| !f.absent)
+                .map(|f| std::path::PathBuf::from(&f.path))
+                .collect();
+
+            match shared.store(
+                &task_id_str,
+                &input_key,
+                &outputs_hash,
+                &package_dir,
+                &rel_output_paths,
+                &record_for_shared,
+                &stdout,
+                &stderr,
+                &repo_root,
+            ) {
+                Ok(StoreOutcome::Stored) => {}
+                Ok(StoreOutcome::SkippedNotSucceeded) => {}
+                Ok(StoreOutcome::SkippedTooFast { duration_ms: _ }) => {}
+                Ok(StoreOutcome::SkippedTooLarge { bytes: _ }) => {}
+                Ok(StoreOutcome::SkippedCrossPackage) => {}
+                Ok(StoreOutcome::SkippedLockUnavailable) => {}
+                Ok(StoreOutcome::Disabled) => {}
+                Err(e) => {
+                    // Path-escape is a security hard-fail
+                    return Some(format!(
+                        "shared cache store failed for task '{}': {}",
+                        task_id_str, e
+                    ));
+                }
+            }
+        }
+
+        None
     })
     .await
     {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => eprintln!(
-            "warning: failed to write cache record for task '{}': {error}",
-            cache_ctx.task_id
-        ),
+        Ok(Some(expansion_error)) => return WriteRecordResult::ExpansionError(expansion_error),
+        Ok(None) => {}
         Err(error) => eprintln!(
             "warning: cache write task panicked for task '{}': {error}",
             cache_ctx.task_id
@@ -443,14 +524,84 @@ fn try_cache_skip(task_id: &TaskId, ctx: &DispatchContext<'_>) -> Option<Decisio
     };
     let empty = BTreeMap::new();
     let merged_env = ctx.task_envs.get(task_id).unwrap_or(&empty);
-    let current = build_current_state(task_def, merged_env, dep_outputs, &pkg_dep_pairs, &resolver);
+    let current = build_current_state(
+        task_def,
+        merged_env,
+        dep_outputs.clone(),
+        &pkg_dep_pairs,
+        &resolver,
+    );
     let prior = ctx.cache.read(&task_id.to_string());
     let decision = decide(prior.as_ref(), &current);
     if matches!(decision, Decision::Skip) {
         if let Some(p) = prior {
             record_output_hash(ctx.output_hashes, task_id, p.outputs_hash);
         }
+        return Some(decision);
     }
+
+    // Local cache miss -> try shared cache if available.
+    // Read-time scope gate: skip shared cache for tasks with outputs that lexically
+    // escape the package directory (e.g. absolute paths or patterns starting with ../).
+    if let Some(ref shared_cache) = ctx.shared_cache {
+        if !outputs_lexically_in_package(&task_def.outputs) {
+            // Outputs may escape package dir -> not read-eligible for shared cache.
+            // Falls through to run normally (write-time scope check in P4.3).
+            return Some(Decision::Run);
+        }
+
+        // Compute input_key from the SAME hashes used for local cache.
+        let dep_outputs_hash = combined_dep_outputs_hash(&dep_outputs);
+        let input_key = derive_input_key(
+            current.task_spec_hash,
+            current.env_hash,
+            current.pkg_dep_hash,
+            dep_outputs_hash,
+        );
+
+        // Try restore from shared cache with validation.
+        // Iterate candidates newest-first; validate each before committing.
+        for candidate in shared_cache.try_restore_candidates(
+            &task_id.to_string(),
+            &input_key,
+            &cache_package.package_path,
+        ) {
+            // VALIDATE: Use decide_shared_restore to check if this candidate matches current tree state.
+            // Unlike full decide(), this does NOT require outputs to exist in the tree —
+            // we're ABOUT to restore outputs from the blob.
+            if decide_shared_restore(&candidate.record, &current) {
+                // Candidate is VALID - inputs match current tree.
+                // Commit the staged restore.
+                match candidate.commit() {
+                    Ok(hit) => {
+                        // Shared cache HIT (validated):
+                        // (a) Outputs now restored to package dir.
+                        // (b) Hydrate local cache for next build.
+                        hydrate_local_cache(ctx.cache.clone(), task_id.clone(), &hit);
+                        // (c) Replay logs via reporter (so output appears as if task ran).
+                        replay_logs(&hit, ctx.reporter);
+                        // (d) Record output hash for downstream invalidation.
+                        record_output_hash(ctx.output_hashes, task_id, hit.outputs_hash);
+                        // (e) Return dedicated shared-hit decision so dispatcher can count it.
+                        return Some(Decision::SharedHit);
+                    }
+                    Err(e) => {
+                        // Commit failed - log and continue to next candidate
+                        eprintln!("warning: shared cache restore commit failed: {e}");
+                        continue;
+                    }
+                }
+            } else {
+                // Candidate is STALE - inputs do not match current tree.
+                // Discard staging and try next candidate.
+                if let Err(e) = candidate.discard() {
+                    eprintln!("warning: shared cache discard failed: {e}");
+                }
+                continue;
+            }
+        }
+    }
+
     Some(decision)
 }
 
@@ -483,6 +634,7 @@ fn spawn_task_runner(ready: ReadyTask, ctx: &DispatchContext<'_>) {
         output_hashes,
         cache_write,
         output_hash_record,
+        shared_cache,
     } = build_task_run_context(&task_id, cache_enabled, ctx);
 
     let log_sink = ExecutionLogSink::new();
@@ -492,6 +644,7 @@ fn spawn_task_runner(ready: ReadyTask, ctx: &DispatchContext<'_>) {
     let reporter = Arc::clone(ctx.reporter);
 
     let started_task_id = task_id.clone();
+    let repo_root = ctx.workspace_root.to_path_buf();
 
     tokio::spawn(async move {
         let outcome_res = executor
@@ -517,6 +670,8 @@ fn spawn_task_runner(ready: ReadyTask, ctx: &DispatchContext<'_>) {
             outcome: outcome_res.as_ref().ok(),
             succeeded,
             end_unix_ms,
+            shared_cache,
+            repo_root,
         })
         .await;
 
@@ -561,11 +716,22 @@ struct CachePersistInputs<'a> {
     outcome: Option<&'a TaskRunOutcome>,
     succeeded: bool,
     end_unix_ms: u64,
+    /// Shared cache for storing successful task results.
+    shared_cache: Option<Arc<SharedCache>>,
+    /// Repo root for scope classification during shared cache write.
+    repo_root: PathBuf,
 }
 
 /// Records the run record (cached tasks) or just the resolved output hash
 /// (uncached tasks) so downstream dependency coupling stays correct.
 /// Returns an expansion error message if one occurred (for caller to handle).
+///
+/// Shared-cache store happens AFTER local cache write. The store runs
+/// synchronously within `spawn_blocking` (shared with the local write) because:
+/// - Correctness first: no races between local write and shared store.
+/// - Simplicity: avoids complex async dance with compression overhead.
+/// - The local write already uses spawn_blocking, so we piggy-back.
+/// - Path-escape at shared-store time is FATAL (propagated as expansion error).
 async fn persist_cache_state(inputs: CachePersistInputs<'_>) -> Option<String> {
     let CachePersistInputs {
         cache,
@@ -576,6 +742,8 @@ async fn persist_cache_state(inputs: CachePersistInputs<'_>) -> Option<String> {
         outcome,
         succeeded,
         end_unix_ms,
+        shared_cache,
+        repo_root,
     } = inputs;
 
     if let Some(cache_ctx) = cache_write {
@@ -587,6 +755,8 @@ async fn persist_cache_state(inputs: CachePersistInputs<'_>) -> Option<String> {
             outcome,
             succeeded,
             end_unix_ms,
+            shared_cache,
+            repo_root,
         )
         .await;
         return cache_write_error(result);
@@ -854,6 +1024,78 @@ fn build_execution_env(merged_env: &BTreeMap<String, EnvSpec>) -> HashMap<String
     env
 }
 
+/// Check if output patterns lexically stay inside package directory.
+///
+/// Read-time scope gate (Momus B2): at READ time outputs don't exist yet,
+/// so we gate on the DECLARED output patterns. If any pattern is absolute
+/// (starts with /) or lexically escapes the package (starts with ../ or
+/// contains /../), the task is read-INELIGIBLE.
+///
+/// This is a conservative guard; the full resolved-path scope check is
+/// WRITE-time (P4.3). Correctness rests on write-time (only InPackage
+/// tasks are ever stored), so this read gate is an optimization.
+fn outputs_lexically_in_package(output_patterns: &[String]) -> bool {
+    for pattern in output_patterns {
+        // Absolute path
+        if pattern.starts_with('/') {
+            return false;
+        }
+        // Explicit parent traversal
+        if pattern.starts_with("../") || pattern.contains("/../") {
+            return false;
+        }
+        // Pattern ends with parent reference
+        if pattern == ".." || pattern.ends_with("/..") {
+            return false;
+        }
+    }
+    true
+}
+
+/// Hydrate local cache from a shared-cache hit.
+///
+/// Writes the restored record and logs so the next build in the same
+/// worktree gets a normal local skip with correct downstream invalidation.
+fn hydrate_local_cache(cache: Arc<Cache>, task_id: TaskId, hit: &RestoredHit) {
+    let cache_key = task_id.to_string();
+    if let Err(e) = cache.write(
+        &cache_key,
+        RunArtifacts {
+            record: &hit.record,
+            stdout: &hit.stdout,
+            stderr: &hit.stderr,
+        },
+    ) {
+        eprintln!(
+            "warning: failed to hydrate local cache for task '{}': {e}",
+            task_id
+        );
+    }
+}
+
+/// Replay restored logs to the progress reporter.
+///
+/// This mirrors how the normal run path emits logs so output appears
+/// as if the task actually ran.
+fn replay_logs(hit: &RestoredHit, _reporter: &Arc<ProgressReporter>) {
+    // Replay stdout
+    if !hit.stdout.is_empty() {
+        if let Ok(stdout_str) = std::str::from_utf8(&hit.stdout) {
+            for line in stdout_str.lines() {
+                println!("{line}");
+            }
+        }
+    }
+    // Replay stderr
+    if !hit.stderr.is_empty() {
+        if let Ok(stderr_str) = std::str::from_utf8(&hit.stderr) {
+            for line in stderr_str.lines() {
+                eprintln!("{line}");
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -933,5 +1175,88 @@ mod tests {
             );
             assert_eq!(detail_none, "failed");
         }
+    }
+
+    // Tests for outputs_lexically_in_package read-time scope gate.
+    // This gate determines shared-cache eligibility before outputs exist.
+
+    #[test]
+    fn in_package_outputs_are_eligible() {
+        // Simple relative paths within package are eligible
+        let outputs = vec![
+            "out.txt".to_string(),
+            "dist/bundle.js".to_string(),
+            "build/output.wasm".to_string(),
+        ];
+        assert!(
+            outputs_lexically_in_package(&outputs),
+            "simple relative paths should be eligible"
+        );
+    }
+
+    #[test]
+    fn absolute_path_output_is_ineligible() {
+        // Absolute paths escape package boundary
+        let outputs = vec!["/tmp/output.txt".to_string()];
+        assert!(
+            !outputs_lexically_in_package(&outputs),
+            "absolute path should be ineligible"
+        );
+    }
+
+    #[test]
+    fn parent_traversal_output_is_ineligible() {
+        // Starting with ../ escapes package
+        let outputs = vec!["../escape.txt".to_string()];
+        assert!(
+            !outputs_lexically_in_package(&outputs),
+            "path starting with ../ should be ineligible"
+        );
+    }
+
+    #[test]
+    fn embedded_parent_traversal_is_ineligible() {
+        // Embedded /../ in middle of path also escapes
+        let outputs = vec!["subdir/../escape.txt".to_string()];
+        assert!(
+            !outputs_lexically_in_package(&outputs),
+            "path containing /../ should be ineligible"
+        );
+    }
+
+    #[test]
+    fn trailing_parent_is_ineligible() {
+        // Path ending in /.. or being ".." is escape
+        let outputs1 = vec!["subdir/..".to_string()];
+        assert!(
+            !outputs_lexically_in_package(&outputs1),
+            "path ending in /.. should be ineligible"
+        );
+
+        let outputs2 = vec!["..".to_string()];
+        assert!(
+            !outputs_lexically_in_package(&outputs2),
+            "bare '..' should be ineligible"
+        );
+    }
+
+    #[test]
+    fn mixed_outputs_one_escape_makes_ineligible() {
+        // Even if one output is safe, any escape makes task ineligible
+        let outputs = vec!["safe.txt".to_string(), "../escape.txt".to_string()];
+        assert!(
+            !outputs_lexically_in_package(&outputs),
+            "any escaping pattern makes task ineligible"
+        );
+    }
+
+    #[test]
+    fn empty_outputs_are_eligible() {
+        // Empty output list has no escapes
+        let outputs: Vec<String> = vec![];
+        assert!(
+            outputs_lexically_in_package(&outputs),
+            "empty outputs should be eligible (no escapes)"
+        );
     }
 }

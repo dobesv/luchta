@@ -1,18 +1,17 @@
 use std::env;
-use std::fs::{self, File};
+use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use crate::record::TaskRunRecord;
+use crate::shared::atomic_write;
 use crate::{CacheError, Result};
 
 const META_FILE_NAME: &str = "meta.bincode";
 const STDOUT_FILE_NAME: &str = "stdout.log";
 const STDERR_FILE_NAME: &str = "stderr.log";
 const TMP_SUFFIX: &str = ".tmp";
-static TMP_PATH_NONCE: AtomicU64 = AtomicU64::new(0);
 pub const CACHE_DIR_ENV: &str = "LUCHTA_CACHE_DIR";
 pub const LUCHTA_DIR_NAME: &str = ".luchta";
 pub const CACHE_DIR_NAME: &str = "cache";
@@ -103,35 +102,6 @@ pub fn resolve_cache_dir(workspace_root: &Path) -> PathBuf {
 #[must_use]
 pub fn task_cache_key(task_id: &str) -> String {
     blake3::hash(task_id.as_bytes()).to_hex().to_string()
-}
-
-fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
-    let tmp_path = tmp_path(path);
-    let mut file = File::create(&tmp_path)?;
-    io::Write::write_all(&mut file, contents)?;
-    file.sync_all()?;
-    drop(file);
-    fs::rename(&tmp_path, path)?;
-    sync_parent_dir(path)?;
-    Ok(())
-}
-
-fn tmp_path(path: &Path) -> PathBuf {
-    let name = path
-        .file_name()
-        .expect("cache files always have file names")
-        .to_string_lossy();
-    let pid = std::process::id();
-    let nonce = TMP_PATH_NONCE.fetch_add(1, Ordering::Relaxed);
-    path.with_file_name(format!("{name}.{pid}.{nonce}{TMP_SUFFIX}"))
-}
-
-fn sync_parent_dir(path: &Path) -> Result<()> {
-    let Some(parent) = path.parent() else {
-        return Ok(());
-    };
-    File::open(parent)?.sync_all()?;
-    Ok(())
 }
 
 fn ensure_luchta_gitignore(cache_dir: &Path) -> Result<()> {
@@ -242,7 +212,7 @@ fn is_tmp_file(path: &Path) -> bool {
 mod tests {
     use std::collections::BTreeMap;
     use std::fs;
-    use std::fs::FileTimes;
+    use std::fs::{File, FileTimes};
     use std::time::{Duration, SystemTime};
 
     use tempfile::tempdir;
@@ -322,18 +292,6 @@ mod tests {
             Cache::open(&temp_dir.path().join(LUCHTA_DIR_NAME).join(CACHE_DIR_NAME)).unwrap();
 
         assert_eq!(cache.read("pkg#missing"), None);
-    }
-
-    #[test]
-    fn tmp_path_is_unique_and_keeps_tmp_suffix() {
-        let path = Path::new("meta.bincode");
-
-        let first = tmp_path(path);
-        let second = tmp_path(path);
-
-        assert_ne!(first, second);
-        assert!(first.to_string_lossy().ends_with(TMP_SUFFIX));
-        assert!(second.to_string_lossy().ends_with(TMP_SUFFIX));
     }
 
     #[test]

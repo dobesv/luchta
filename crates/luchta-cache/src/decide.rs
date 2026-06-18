@@ -5,6 +5,7 @@ use crate::{FileEntry, TaskRunRecord};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Decision {
     Skip,
+    SharedHit,
     Run,
 }
 
@@ -57,6 +58,40 @@ pub fn decide(prior: Option<&TaskRunRecord>, current: &CurrentState<'_>) -> Deci
     }
 
     Decision::Skip
+}
+
+/// Validates a shared-cache candidate for RESTORE: like `decide` but does NOT
+/// require the current-tree OUTPUTS to be present/match (the restore will
+/// provide them from the content-addressed blob).
+///
+/// This is the correct validation for a shared restore because:
+/// - On a shared restore, outputs DON'T EXIST in the work tree yet (we're
+///   ABOUT to restore them from the blob).
+/// - Full `decide()` would return `Run` because outputs are absent → legitimate
+///   shared hits get REJECTED.
+/// - Output integrity is inherent: the blob is content-addressed by
+///   `outputs_hash`, so restored outputs are exactly what was stored.
+///
+/// Returns `true` if the candidate is content-valid to restore.
+pub fn decide_shared_restore(record: &TaskRunRecord, current: &CurrentState<'_>) -> bool {
+    // 1. Check cacheable_prior (succeeded, task_spec_hash, env_hash, pkg_dep_hash, dep_outputs)
+    if !cacheable_prior(record, current) {
+        return false;
+    }
+
+    // 2. Resolve and check INPUTS only (not outputs)
+    let input_patterns = effective_input_patterns(record, current);
+    if !patterns_unchanged(
+        &record.inputs,
+        &input_patterns,
+        current.resolver,
+        FileEntryKind::Inputs,
+    ) {
+        return false;
+    }
+
+    // 3. Skip output validation — outputs will be restored from content-addressed blob
+    true
 }
 
 fn cacheable_prior(prior: &TaskRunRecord, current: &CurrentState<'_>) -> bool {
@@ -658,5 +693,127 @@ mod tests {
     enum ChangeTarget {
         Inputs,
         Outputs,
+    }
+
+    // === Tests for decide_shared_restore ===
+
+    #[test]
+    fn shared_restore_inputs_match_outputs_absent_returns_true() {
+        // KEY CASE: inputs match, outputs ABSENT in current tree → should return true
+        // This is the case full decide() got wrong (it would return Run because outputs absent)
+        let prior = sample_record();
+        // Empty outputs = outputs don't exist in current tree
+        let resolver = FixtureResolver::new(prior.inputs.clone(), vec![]);
+        let current = current_state(&prior, &resolver);
+
+        assert!(
+            super::decide_shared_restore(&prior, &current),
+            "should allow restore when inputs match and outputs absent"
+        );
+        // Verify: full decide() would return Run because outputs don't match
+        assert_eq!(
+            decide(Some(&prior), &current),
+            Decision::Run,
+            "sanity check: full decide() returns Run when outputs absent"
+        );
+    }
+
+    #[test]
+    fn shared_restore_input_content_differs_returns_false() {
+        // Input content hash differs → should reject restore
+        let prior = sample_record();
+        let mut changed_inputs = prior.inputs.clone();
+        changed_inputs[0].hash = [9; 32]; // Different content hash
+        let resolver = FixtureResolver::new(changed_inputs, vec![]);
+        let current = current_state(&prior, &resolver);
+
+        assert!(
+            !super::decide_shared_restore(&prior, &current),
+            "should reject restore when input content differs"
+        );
+    }
+
+    #[test]
+    fn shared_restore_task_spec_mismatch_returns_false() {
+        // task_spec_hash mismatch → should reject
+        let prior = sample_record();
+        let resolver = FixtureResolver::new(prior.inputs.clone(), vec![]);
+        let mut current = current_state(&prior, &resolver);
+        current.task_spec_hash = [9; 32];
+
+        assert!(
+            !super::decide_shared_restore(&prior, &current),
+            "should reject restore when task_spec_hash differs"
+        );
+    }
+
+    #[test]
+    fn shared_restore_env_mismatch_returns_false() {
+        // env_hash mismatch → should reject
+        let prior = sample_record();
+        let resolver = FixtureResolver::new(prior.inputs.clone(), vec![]);
+        let mut current = current_state(&prior, &resolver);
+        current.env_hash = [9; 32];
+
+        assert!(
+            !super::decide_shared_restore(&prior, &current),
+            "should reject restore when env_hash differs"
+        );
+    }
+
+    #[test]
+    fn shared_restore_pkg_dep_mismatch_returns_false() {
+        // pkg_dep_hash mismatch → should reject
+        let prior = sample_record();
+        let resolver = FixtureResolver::new(prior.inputs.clone(), vec![]);
+        let mut current = current_state(&prior, &resolver);
+        current.pkg_dep_hash = [9; 32];
+
+        assert!(
+            !super::decide_shared_restore(&prior, &current),
+            "should reject restore when pkg_dep_hash differs"
+        );
+    }
+
+    #[test]
+    fn shared_restore_dep_outputs_mismatch_returns_false() {
+        // dep_outputs mismatch → should reject
+        let prior = sample_record();
+        let resolver = FixtureResolver::new(prior.inputs.clone(), vec![]);
+        let mut current = current_state(&prior, &resolver);
+        current.dep_outputs.insert("dep#build".to_owned(), [9; 32]);
+
+        assert!(
+            !super::decide_shared_restore(&prior, &current),
+            "should reject restore when dep_outputs differs"
+        );
+    }
+
+    #[test]
+    fn shared_restore_failed_prior_returns_false() {
+        // Prior task failed → should reject
+        let mut prior = sample_record();
+        prior.succeeded = false;
+        let resolver = FixtureResolver::new(prior.inputs.clone(), vec![]);
+        let current = current_state(&prior, &resolver);
+
+        assert!(
+            !super::decide_shared_restore(&prior, &current),
+            "should reject restore when prior failed"
+        );
+    }
+
+    #[test]
+    fn shared_restore_outputs_present_also_returns_true() {
+        // Outputs already present and matching → should also allow restore
+        // (This handles same-commit restore case where outputs exist)
+        let prior = sample_record();
+        let resolver = FixtureResolver::new(prior.inputs.clone(), prior.outputs.clone());
+        let current = current_state(&prior, &resolver);
+
+        assert!(
+            super::decide_shared_restore(&prior, &current),
+            "should allow restore when inputs match and outputs present"
+        );
     }
 }

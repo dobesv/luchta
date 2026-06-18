@@ -7,7 +7,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
+use luchta_cache::shared::{maybe_run_gc, SharedCache, DEFAULT_GC_RETENTION, DEFAULT_GC_THROTTLE};
 use luchta_cache::Cache;
 use luchta_engine::{ExecutionRequest, TaskGraph, WeightedExecutor, WorkerManager};
 use luchta_types::{EnvSpec, TaskId, WorkerDefinition};
@@ -99,6 +101,73 @@ pub(super) struct ExecutionResources {
     pub(super) commands: HashMap<TaskId, ExecutionRequest>,
     pub(super) invalid: HashMap<TaskId, String>,
     pub(super) task_envs: HashMap<TaskId, BTreeMap<String, EnvSpec>>,
+    pub(super) shared_cache: Option<Arc<SharedCache>>,
+}
+
+/// Environment variable enabling shared cache.
+const SHARED_CACHE_ENABLED_ENV: &str = "LUCHTA_SHARED_CACHE";
+/// Environment variable overriding shared cache GC retention, in days.
+const SHARED_CACHE_GC_DAYS_ENV: &str = "LUCHTA_SHARED_CACHE_GC_DAYS";
+/// Environment variable overriding shared cache output size cap, in megabytes.
+const SHARED_CACHE_MAX_OUTPUT_MB_ENV: &str = "LUCHTA_SHARED_CACHE_MAX_OUTPUT_MB";
+/// Environment variable overriding shared cache recent-commit history length.
+const SHARED_CACHE_HISTORY_ENV: &str = "LUCHTA_SHARED_CACHE_HISTORY";
+
+/// Default shared cache size cap in megabytes.
+const DEFAULT_SHARED_CACHE_SIZE_CAP_MB: u64 = 250;
+/// Default shared cache history length (number of commits).
+const DEFAULT_SHARED_CACHE_HISTORY_LEN: usize = 20;
+
+fn parse_truthy_env_value(value: Option<&str>) -> bool {
+    matches!(value.map(str::trim), Some(raw) if raw.eq_ignore_ascii_case("1") || raw.eq_ignore_ascii_case("true") || raw.eq_ignore_ascii_case("on"))
+}
+
+fn shared_cache_enabled() -> bool {
+    parse_truthy_env_value(std::env::var(SHARED_CACHE_ENABLED_ENV).ok().as_deref())
+}
+
+fn parse_env_u64_or(var: &str, value: Option<&str>, default: u64) -> u64 {
+    match value.map(str::trim) {
+        None | Some("") => default,
+        Some(raw) => match raw.parse::<u64>() {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                eprintln!(
+                    "warning: invalid {}={:?}: {}; using {}",
+                    var, raw, err, default
+                );
+                default
+            }
+        },
+    }
+}
+
+fn shared_cache_gc_retention() -> Duration {
+    let days = parse_env_u64_or(
+        SHARED_CACHE_GC_DAYS_ENV,
+        std::env::var(SHARED_CACHE_GC_DAYS_ENV).ok().as_deref(),
+        DEFAULT_GC_RETENTION.as_secs() / (24 * 60 * 60),
+    );
+    Duration::from_secs(days.saturating_mul(24 * 60 * 60))
+}
+
+fn shared_cache_size_cap_bytes() -> u64 {
+    let mb = parse_env_u64_or(
+        SHARED_CACHE_MAX_OUTPUT_MB_ENV,
+        std::env::var(SHARED_CACHE_MAX_OUTPUT_MB_ENV)
+            .ok()
+            .as_deref(),
+        DEFAULT_SHARED_CACHE_SIZE_CAP_MB,
+    );
+    mb.saturating_mul(1024 * 1024)
+}
+
+fn shared_cache_history_len() -> usize {
+    parse_env_u64_or(
+        SHARED_CACHE_HISTORY_ENV,
+        std::env::var(SHARED_CACHE_HISTORY_ENV).ok().as_deref(),
+        DEFAULT_SHARED_CACHE_HISTORY_LEN as u64,
+    ) as usize
 }
 
 /// Builds the executor (with all task commands registered), the build cache,
@@ -117,6 +186,27 @@ pub(super) fn build_execution_resources(
             .wrap_err("open cache")?,
     );
     let output_hashes: Arc<Mutex<HashMap<TaskId, [u8; 32]>>> = Arc::new(Mutex::new(HashMap::new()));
+
+    let shared_cache = if shared_cache_enabled() {
+        let shared_cache = SharedCache::open(
+            inputs.workspace_root,
+            shared_cache_size_cap_bytes(),
+            shared_cache_history_len(),
+        )
+        .map(Arc::new);
+
+        if let Some(shared_cache) = shared_cache.as_ref() {
+            let _ = maybe_run_gc(
+                shared_cache.paths(),
+                shared_cache_gc_retention(),
+                DEFAULT_GC_THROTTLE,
+            );
+        }
+
+        shared_cache
+    } else {
+        None
+    };
 
     let CommandMap {
         commands,
@@ -142,13 +232,126 @@ pub(super) fn build_execution_resources(
         commands,
         invalid,
         task_envs,
+        shared_cache,
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::select_summary_rss;
+    use super::*;
     use crate::memory_pressure::MemorySample;
+
+    #[test]
+    fn parse_truthy_env_value_accepts_expected_values() {
+        for value in ["1", "true", "on", "TRUE", "On"] {
+            assert!(
+                parse_truthy_env_value(Some(value)),
+                "expected {value} to enable"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_truthy_env_value_rejects_non_truthy_values() {
+        for value in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some("off"),
+            Some("nope"),
+        ] {
+            assert!(
+                !parse_truthy_env_value(value),
+                "expected {value:?} to disable"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_env_u64_or_uses_default_for_unset_or_empty() {
+        assert_eq!(parse_env_u64_or("TEST_VAR", None, 14), 14);
+        assert_eq!(parse_env_u64_or("TEST_VAR", Some(""), 14), 14);
+        assert_eq!(parse_env_u64_or("TEST_VAR", Some("   "), 14), 14);
+    }
+
+    #[test]
+    fn parse_env_u64_or_parses_valid_values() {
+        assert_eq!(parse_env_u64_or("TEST_VAR", Some("42"), 14), 42);
+        assert_eq!(parse_env_u64_or("TEST_VAR", Some(" 7 "), 14), 7);
+    }
+
+    #[test]
+    fn parse_env_u64_or_falls_back_for_invalid_values() {
+        assert_eq!(parse_env_u64_or("TEST_VAR", Some("abc"), 14), 14);
+        assert_eq!(parse_env_u64_or("TEST_VAR", Some("-3"), 14), 14);
+    }
+
+    #[test]
+    fn parse_shared_cache_gc_retention_uses_default_when_unset() {
+        assert_eq!(
+            parse_env_u64_or(
+                SHARED_CACHE_GC_DAYS_ENV,
+                None,
+                DEFAULT_GC_RETENTION.as_secs() / (24 * 60 * 60),
+            ),
+            14
+        );
+        assert_eq!(Duration::from_secs(14 * 24 * 60 * 60), DEFAULT_GC_RETENTION);
+    }
+
+    #[test]
+    fn parse_shared_cache_gc_retention_overrides_when_set() {
+        let days = parse_env_u64_or(SHARED_CACHE_GC_DAYS_ENV, Some("3"), 14);
+        assert_eq!(
+            Duration::from_secs(days * 24 * 60 * 60),
+            Duration::from_secs(3 * 24 * 60 * 60)
+        );
+    }
+
+    #[test]
+    fn parse_shared_cache_size_cap_defaults_and_overrides() {
+        assert_eq!(
+            parse_env_u64_or(
+                SHARED_CACHE_MAX_OUTPUT_MB_ENV,
+                None,
+                DEFAULT_SHARED_CACHE_SIZE_CAP_MB
+            ),
+            250
+        );
+        assert_eq!(
+            parse_env_u64_or(
+                SHARED_CACHE_MAX_OUTPUT_MB_ENV,
+                Some("512"),
+                DEFAULT_SHARED_CACHE_SIZE_CAP_MB
+            ),
+            512
+        );
+        assert_eq!(
+            DEFAULT_SHARED_CACHE_SIZE_CAP_MB * 1024 * 1024,
+            250 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn parse_shared_cache_history_defaults_and_overrides() {
+        assert_eq!(
+            parse_env_u64_or(
+                SHARED_CACHE_HISTORY_ENV,
+                None,
+                DEFAULT_SHARED_CACHE_HISTORY_LEN as u64
+            ),
+            20
+        );
+        assert_eq!(
+            parse_env_u64_or(
+                SHARED_CACHE_HISTORY_ENV,
+                Some("64"),
+                DEFAULT_SHARED_CACHE_HISTORY_LEN as u64
+            ),
+            64
+        );
+    }
 
     #[test]
     fn select_summary_rss_prefers_snapshot_sample_over_fallback() {

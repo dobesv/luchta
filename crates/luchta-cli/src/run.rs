@@ -11,9 +11,10 @@ use std::{
 };
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
+use luchta_cache::shared::SharedCache;
 use luchta_cache::{
     combined_outputs_hash, decide, resolve_cache_dir, resolve_inputs_with_semantics,
-    resolve_outputs, Cache, Decision, RunArtifacts, TaskRunRecord, SCHEMA_VERSION_V1,
+    resolve_outputs, Cache, Decision, TaskRunRecord, SCHEMA_VERSION_V1,
 };
 use luchta_engine::{
     expand_input_patterns, is_root_task, CompletionSignal, ExecutionLogSink, ExecutionRequest,
@@ -196,6 +197,7 @@ pub async fn run_tasks(
         commands,
         invalid,
         task_envs,
+        shared_cache,
     } = build_execution_resources(BuildResourcesInputs {
         task_graph: &task_graph,
         packages: &package_nodes,
@@ -224,6 +226,7 @@ pub async fn run_tasks(
         output_hashes: &output_hashes,
         memory_monitor: &mut memory_monitor,
         pressure_state: &pressure_state,
+        shared_cache,
     })
     .await
 }
@@ -246,6 +249,7 @@ struct RunDispatch<'a> {
     output_hashes: &'a Arc<Mutex<HashMap<TaskId, [u8; 32]>>>,
     memory_monitor: &'a mut crate::memory_pressure::MemoryMonitor,
     pressure_state: &'a Arc<crate::memory_pressure::PressureState>,
+    shared_cache: Option<Arc<SharedCache>>,
 }
 
 /// Constructs the dispatch context, runs the dispatch loop to completion, and
@@ -275,6 +279,7 @@ async fn run_dispatch_loop(d: RunDispatch<'_>) -> Result<()> {
         output_hashes: d.output_hashes,
         reporter: d.reporter,
         lockfile: &lockfile_state,
+        shared_cache: d.shared_cache.clone(),
     };
     let run_result = dispatch_loop(&mut receiver, &ctx, d.memory_monitor, d.pressure_state).await;
 
@@ -300,6 +305,8 @@ struct DispatchContext<'a> {
     output_hashes: &'a Arc<Mutex<HashMap<TaskId, [u8; 32]>>>,
     reporter: &'a Arc<ProgressReporter>,
     lockfile: &'a LockfileState,
+    /// Shared cache for cross-worktree cache hits. `None` if shared cache disabled.
+    shared_cache: Option<Arc<SharedCache>>,
 }
 
 struct TaskRunContext {
@@ -310,6 +317,8 @@ struct TaskRunContext {
     output_hashes: Arc<Mutex<HashMap<TaskId, [u8; 32]>>>,
     cache_write: Option<CacheWriteContext>,
     output_hash_record: Option<OutputHashRecordContext>,
+    /// Shared cache for cross-worktree cache hits. `None` if shared cache disabled.
+    shared_cache: Option<Arc<SharedCache>>,
 }
 
 struct CacheWriteContext {
