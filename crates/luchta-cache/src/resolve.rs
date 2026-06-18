@@ -1,7 +1,6 @@
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     fs,
-    io::Read,
     path::{Path, PathBuf},
     time::UNIX_EPOCH,
 };
@@ -404,17 +403,7 @@ struct StdFs;
 
 impl FileReader for StdFs {
     fn blake3_file(&self, path: &Path) -> Result<[u8; 32]> {
-        let mut file = fs::File::open(path)?;
-        let mut hasher = blake3::Hasher::new();
-        let mut buffer = [0_u8; 8192];
-        loop {
-            let read = file.read(&mut buffer)?;
-            if read == 0 {
-                break;
-            }
-            hasher.update(&buffer[..read]);
-        }
-        Ok(*hasher.finalize().as_bytes())
+        crate::blake3_file(path)
     }
 }
 
