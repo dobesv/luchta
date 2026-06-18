@@ -24,6 +24,7 @@ owo-colors = "4.0"
 petgraph.workspace = true
 globset = { workspace = true }
 thiserror = { workspace = true }
+gix = { workspace = true }
 sysinfo = { workspace = true }
 luchta-types = { path = "../luchta-types" }
 luchta-workspace = { path = "../luchta-workspace" }

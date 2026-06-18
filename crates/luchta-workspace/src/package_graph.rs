@@ -175,6 +175,37 @@ impl PackageGraph {
             .collect())
     }
 
+    /// Returns seeds plus all packages that transitively depend on them.
+    pub fn transitive_dependents_of(
+        &self,
+        seeds: impl IntoIterator<Item = PackageName>,
+    ) -> Result<HashSet<PackageName>, WorkspaceError> {
+        let mut visited = HashSet::new();
+        let mut pending = Vec::new();
+
+        for seed in seeds {
+            let Some(&index) = self.indices_by_name.get(&seed) else {
+                continue;
+            };
+            if visited.insert(index) {
+                pending.push(index);
+            }
+        }
+
+        while let Some(index) = pending.pop() {
+            for dependent_index in self.graph.neighbors_directed(index, Direction::Incoming) {
+                if visited.insert(dependent_index) {
+                    pending.push(dependent_index);
+                }
+            }
+        }
+
+        Ok(visited
+            .into_iter()
+            .map(|index| self.graph[index].name.clone())
+            .collect())
+    }
+
     /// Returns build-order topological sequence with dependencies before dependents.
     pub fn topological_order(&self) -> Result<Vec<&PackageNode>, WorkspaceError> {
         let mut order = toposort(&self.graph, None).map_err(|cycle| {
@@ -243,7 +274,7 @@ fn read_workspace_dependency_names(
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::Path};
+    use std::{collections::HashSet, fs, path::Path, path::PathBuf};
 
     use tempfile::tempdir;
 
@@ -255,27 +286,27 @@ mod tests {
         let temp_dir = tempdir().expect("create temp dir");
         write_package(
             temp_dir.path().join("packages/a/package.json"),
-            "@repo/a",
-            &["@repo/b"],
+            package_name("@repo/a"),
+            &[package_name("@repo/b")],
             &[],
         );
         write_package(
             temp_dir.path().join("packages/b/package.json"),
-            "@repo/b",
-            &["@repo/c"],
+            package_name("@repo/b"),
+            &[package_name("@repo/c")],
             &[],
         );
         write_package(
             temp_dir.path().join("packages/c/package.json"),
-            "@repo/c",
+            package_name("@repo/c"),
             &[],
             &[],
         );
 
         let graph = PackageGraph::build(vec![
-            package_node(temp_dir.path().join("packages/a"), "@repo/a"),
-            package_node(temp_dir.path().join("packages/b"), "@repo/b"),
-            package_node(temp_dir.path().join("packages/c"), "@repo/c"),
+            package_node(temp_dir.path().join("packages/a"), package_name("@repo/a")),
+            package_node(temp_dir.path().join("packages/b"), package_name("@repo/b")),
+            package_node(temp_dir.path().join("packages/c"), package_name("@repo/c")),
         ])
         .expect("build graph");
 
@@ -301,13 +332,53 @@ mod tests {
     }
 
     #[test]
+    fn returns_transitive_dependents_for_linear_chain_seeds() {
+        let graph = transitive_dependents_graph();
+
+        assert_transitive_dependents(
+            &graph,
+            [package_name("@repo/a")],
+            ["@repo/a", "@repo/b", "@repo/c"],
+        );
+        assert_transitive_dependents(&graph, [package_name("@repo/b")], ["@repo/b", "@repo/c"]);
+        assert_transitive_dependents(&graph, [package_name("@repo/c")], ["@repo/c"]);
+        assert!(!graph
+            .transitive_dependents_of([package_name("@repo/a")])
+            .expect("transitive dependents")
+            .contains(&package_name("@repo/d")));
+    }
+
+    #[test]
+    fn transitive_dependents_skip_unknown_seed_packages() {
+        let graph = transitive_dependents_graph();
+
+        assert_transitive_dependents(
+            &graph,
+            [package_name("@repo/a"), package_name("@repo/missing")],
+            ["@repo/a", "@repo/b", "@repo/c"],
+        );
+    }
+
+    #[test]
+    fn transitive_dependents_handle_cycles_without_looping() {
+        let graph = transitive_dependents_graph();
+
+        assert_transitive_dependents(&graph, [package_name("@repo/e")], ["@repo/e", "@repo/f"]);
+    }
+
+    #[test]
     fn stores_root_package_name() {
         let temp_dir = tempdir().expect("create temp dir");
-        write_package(temp_dir.path().join("package.json"), "root", &[], &[]);
+        write_package(
+            temp_dir.path().join("package.json"),
+            package_name("root"),
+            &[],
+            &[],
+        );
 
-        let graph = PackageGraph::build(vec![package_node(temp_dir.path(), "root")])
+        let graph = PackageGraph::build(vec![package_node(temp_dir.path(), package_name("root"))])
             .expect("build graph")
-            .with_root_package(PackageName::from("root"));
+            .with_root_package(package_name("root"));
 
         assert_eq!(graph.root_package(), Some(&PackageName::from("root")));
     }
@@ -317,20 +388,20 @@ mod tests {
         let temp_dir = tempdir().expect("create temp dir");
         write_package(
             temp_dir.path().join("packages/a/package.json"),
-            "@repo/a",
-            &["@repo/b"],
+            package_name("@repo/a"),
+            &[package_name("@repo/b")],
             &[],
         );
         write_package(
             temp_dir.path().join("packages/b/package.json"),
-            "@repo/b",
-            &["@repo/a"],
+            package_name("@repo/b"),
+            &[package_name("@repo/a")],
             &[],
         );
 
         let graph = PackageGraph::build(vec![
-            package_node(temp_dir.path().join("packages/a"), "@repo/a"),
-            package_node(temp_dir.path().join("packages/b"), "@repo/b"),
+            package_node(temp_dir.path().join("packages/a"), package_name("@repo/a")),
+            package_node(temp_dir.path().join("packages/b"), package_name("@repo/b")),
         ])
         .expect("build graph");
 
@@ -343,20 +414,20 @@ mod tests {
         let temp_dir = tempdir().expect("create temp dir");
         write_package(
             temp_dir.path().join("packages/a/package.json"),
-            "@repo/a",
-            &["react"],
-            &["eslint"],
+            package_name("@repo/a"),
+            &[package_name("react")],
+            &[package_name("eslint")],
         );
         write_package(
             temp_dir.path().join("packages/b/package.json"),
-            "@repo/b",
+            package_name("@repo/b"),
             &[],
             &[],
         );
 
         let graph = PackageGraph::build(vec![
-            package_node(temp_dir.path().join("packages/a"), "@repo/a"),
-            package_node(temp_dir.path().join("packages/b"), "@repo/b"),
+            package_node(temp_dir.path().join("packages/a"), package_name("@repo/a")),
+            package_node(temp_dir.path().join("packages/b"), package_name("@repo/b")),
         ])
         .expect("build graph");
 
@@ -371,8 +442,77 @@ mod tests {
         assert_eq!(graph.as_graph().edge_count(), 0);
     }
 
-    fn package_node(path: impl AsRef<Path>, name: &str) -> PackageNode {
-        PackageNode::new(PackageName::from(name), path.as_ref())
+    fn transitive_dependents_graph() -> PackageGraph {
+        let temp_dir = tempdir().expect("create temp dir");
+        write_package(
+            temp_dir.path().join("packages/a/package.json"),
+            package_name("@repo/a"),
+            &[],
+            &[],
+        );
+        write_package(
+            temp_dir.path().join("packages/b/package.json"),
+            package_name("@repo/b"),
+            &[package_name("@repo/a")],
+            &[],
+        );
+        write_package(
+            temp_dir.path().join("packages/c/package.json"),
+            package_name("@repo/c"),
+            &[package_name("@repo/b")],
+            &[],
+        );
+        write_package(
+            temp_dir.path().join("packages/d/package.json"),
+            package_name("@repo/d"),
+            &[],
+            &[],
+        );
+        write_package(
+            temp_dir.path().join("packages/e/package.json"),
+            package_name("@repo/e"),
+            &[package_name("@repo/f")],
+            &[],
+        );
+        write_package(
+            temp_dir.path().join("packages/f/package.json"),
+            package_name("@repo/f"),
+            &[package_name("@repo/e")],
+            &[],
+        );
+
+        PackageGraph::build(vec![
+            package_node(temp_dir.path().join("packages/a"), package_name("@repo/a")),
+            package_node(temp_dir.path().join("packages/b"), package_name("@repo/b")),
+            package_node(temp_dir.path().join("packages/c"), package_name("@repo/c")),
+            package_node(temp_dir.path().join("packages/d"), package_name("@repo/d")),
+            package_node(temp_dir.path().join("packages/e"), package_name("@repo/e")),
+            package_node(temp_dir.path().join("packages/f"), package_name("@repo/f")),
+        ])
+        .expect("build graph")
+    }
+
+    fn assert_transitive_dependents(
+        graph: &PackageGraph,
+        seeds: impl IntoIterator<Item = PackageName>,
+        expected: impl IntoIterator<Item = &'static str>,
+    ) {
+        assert_eq!(
+            package_name_set(
+                graph
+                    .transitive_dependents_of(seeds)
+                    .expect("transitive dependents")
+            ),
+            hashset(expected)
+        );
+    }
+
+    fn package_name(value: &'static str) -> PackageName {
+        PackageName::from(value)
+    }
+
+    fn package_node(path: impl Into<PathBuf>, name: PackageName) -> PackageNode {
+        PackageNode::new(name, path.into())
     }
 
     fn package_names(packages: Vec<&PackageNode>) -> Vec<String> {
@@ -382,11 +522,22 @@ mod tests {
             .collect()
     }
 
+    fn package_name_set(packages: HashSet<PackageName>) -> HashSet<String> {
+        packages
+            .into_iter()
+            .map(|package| package.to_string())
+            .collect()
+    }
+
+    fn hashset(entries: impl IntoIterator<Item = &'static str>) -> HashSet<String> {
+        entries.into_iter().map(str::to_string).collect()
+    }
+
     fn write_package(
         path: impl AsRef<Path>,
-        name: &str,
-        dependencies: &[&str],
-        dev_dependencies: &[&str],
+        name: PackageName,
+        dependencies: &[PackageName],
+        dev_dependencies: &[PackageName],
     ) {
         let dependencies_json = dependency_entries_json(dependencies);
         let dev_dependencies_json = dependency_entries_json(dev_dependencies);
@@ -403,7 +554,7 @@ mod tests {
         );
     }
 
-    fn dependency_entries_json(entries: &[&str]) -> String {
+    fn dependency_entries_json(entries: &[PackageName]) -> String {
         if entries.is_empty() {
             return "{}".to_string();
         }

@@ -67,6 +67,10 @@ pub enum Commands {
         /// system memory. In-flight tasks continue until completion.
         #[arg(long, value_name = "BYTES_OR_PERCENT")]
         mem_free_threshold: Option<String>,
+
+        /// Only run tasks for packages changed since this git ref (plus their dependents).
+        #[arg(long, value_name = "GIT_REF")]
+        since: Option<String>,
     },
     Check,
 }
