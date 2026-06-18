@@ -470,12 +470,12 @@ The shared cache is **OPT-IN** and is only active when `LUCHTA_SHARED_CACHE` is 
 Invalid numeric values for these variables will trigger a warning and fall back to their defaults.
 
 #### Cacheability
-A task is eligible for the shared cache if all of the following are true:
+A task is eligible for the shared cache if all the following are true:
 - The task succeeded.
 - It took at least 100ms to run.
 - Its total output size is within the `LUCHTA_SHARED_CACHE_MAX_OUTPUT_MB` limit.
 - All its outputs are contained within its own package directory (outputs escaping the repository root are a hard error).
-- The working tree is "clean". If the tree is "dirty" (staged or unstaged changes to tracked files), the result is stored under a `<commit>-dirty` key and is kept local-only.
+- The working tree is "clean" (bare `<commit>` key) or "dirty" (staged or unstaged changes to tracked files; ignored files don't count). Both clean and dirty entries are reusable (content-validated on restore), though dirty entries are kept out of any future remote sync.
 
 #### Maintenance
 Luchta automatically performs throttled garbage collection of old cache entries and blobs (those older than `LUCHTA_SHARED_CACHE_GC_DAYS`). The cache is read-tolerant; if a blob is missing due to GC or other reasons, it is treated as a cache miss.

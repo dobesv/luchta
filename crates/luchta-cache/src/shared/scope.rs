@@ -14,9 +14,6 @@ pub enum OutputScope {
     InPackage,
     /// At least one output leaves package directory but stays inside repo root.
     CrossPackage,
-    /// Conceptual escape class. `classify_outputs` signals this via `Err` so
-    /// callers cannot silently ignore repo-root escape.
-    Escape,
 }
 
 /// Errors from output scope validation.

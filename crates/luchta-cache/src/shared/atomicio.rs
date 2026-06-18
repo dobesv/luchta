@@ -48,7 +48,17 @@ fn sync_parent_dir(path: &Path) -> Result<()> {
     let Some(parent) = path.parent() else {
         return Ok(());
     };
-    File::open(parent)?.sync_all()?;
+
+    #[cfg(unix)]
+    {
+        File::open(parent)?.sync_all()?;
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = parent;
+    }
+
     Ok(())
 }
 

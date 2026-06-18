@@ -441,11 +441,18 @@ async fn write_run_record(
                 Ok(StoreOutcome::SkippedLockUnavailable) => {}
                 Ok(StoreOutcome::Disabled) => {}
                 Err(e) => {
-                    // Path-escape is a security hard-fail
-                    return Some(format!(
-                        "shared cache store failed for task '{}': {}",
+                    if e.kind() == std::io::ErrorKind::InvalidData {
+                        // Path-escape is a security hard-fail.
+                        return Some(format!(
+                            "shared cache store failed for task '{}': {}",
+                            task_id_str, e
+                        ));
+                    }
+
+                    eprintln!(
+                        "warning: shared cache store failed for task '{}': {}; continuing with local cache",
                         task_id_str, e
-                    ));
+                    );
                 }
             }
         }

@@ -24,7 +24,7 @@ Shared build cache used a coarse `input_key` that omitted resolved input file co
 
 ## Symptoms
 
-```
+```text
 # Stale restore: input content changed but pattern unchanged → identical input_key
 Task at commit A: input "src.txt" content "v1" → cached
 Edit "src.txt" to "v2" at commit C → input_key UNCHANGED → shared cache restored stale "v1" output

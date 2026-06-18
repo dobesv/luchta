@@ -391,13 +391,6 @@ impl SharedCache {
                     "output path escapes repository root",
                 ));
             }
-            Ok(OutputScope::Escape) => {
-                // This branch shouldn't be reachable; Escape is signaled via Err.
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "output path escapes repository root",
-                ));
-            }
         }
 
         // Prepare meta files.
