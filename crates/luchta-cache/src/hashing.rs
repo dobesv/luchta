@@ -1,7 +1,23 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, fs::File, io::Read, path::Path};
 
 use luchta_types::{DependsOn, EnvSpec, TaskDefinition};
 use serde::Serialize;
+
+pub fn blake3_file(path: &Path) -> crate::Result<[u8; 32]> {
+    let mut file = File::open(path)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = [0u8; 8192];
+
+    loop {
+        let bytes_read = file.read(&mut buffer)?;
+        if bytes_read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..bytes_read]);
+    }
+
+    Ok(*hasher.finalize().as_bytes())
+}
 
 #[must_use]
 pub fn task_spec_hash(task_def: &TaskDefinition) -> [u8; 32] {
@@ -88,12 +104,26 @@ enum ResolvedEnvValue {
 
 #[cfg(test)]
 mod tests {
-    use super::{env_hash, pkg_dep_hash, task_spec_hash};
-    use std::collections::BTreeMap;
+    use super::{blake3_file, env_hash, pkg_dep_hash, task_spec_hash};
+    use std::{collections::BTreeMap, fs};
 
     use luchta_types::{
         CacheConfig, DependsOn, EnvSpec, PackageName, TaskDefinition, TaskId, TaskName,
     };
+    use tempfile::TempDir;
+
+    #[test]
+    fn blake3_file_matches_in_memory_hash() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("artifact.bin");
+        let bytes = (0..25_000).map(|n| (n % 251) as u8).collect::<Vec<_>>();
+        fs::write(&path, &bytes).unwrap();
+
+        assert_eq!(
+            blake3_file(&path).unwrap(),
+            *blake3::hash(&bytes).as_bytes()
+        );
+    }
 
     #[test]
     fn task_spec_hash_changes_when_command_changes() {

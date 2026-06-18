@@ -90,8 +90,7 @@ impl FileStateResolver for PackageDirResolver {
         } else {
             self.package_dir.join(path)
         };
-        let bytes = fs::read(&full_path)?;
-        Ok(*blake3::hash(&bytes).as_bytes())
+        luchta_cache::blake3_file(&full_path)
     }
 }
 
