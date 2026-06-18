@@ -111,6 +111,7 @@ pub fn resolve_workspace_root(workspace_root: Option<PathBuf>) -> Result<PathBuf
 pub async fn prepare_workspace(
     workspace_root: &Path,
     mode: ResolveMode,
+    max_weight_override: Option<u32>,
 ) -> Result<PreparedWorkspace> {
     let workspace = YarnWorkspace::new(workspace_root);
     let packages = workspace
@@ -158,7 +159,7 @@ pub async fn prepare_workspace(
         env: config.env,
         task_graph,
         workers: config.workers,
-        max_weight: config.concurrency.max_weight,
+        max_weight: max_weight_override.unwrap_or(config.concurrency.max_weight),
         pruned,
         pruned_ids,
         worker_manager,
@@ -182,9 +183,11 @@ pub async fn run_tasks(
     selection: &TaskSelection<'_>,
     output: OutputMode,
     memory_pressure: MemoryPressureConfig,
+    max_weight_override: Option<u32>,
 ) -> Result<()> {
     let (mut memory_monitor, pressure_state) = build_memory_pressure(memory_pressure);
-    let Some(run) = prepare_run_context(workspace_root, selection).await? else {
+    let Some(run) = prepare_run_context(workspace_root, selection, max_weight_override).await?
+    else {
         return Ok(());
     };
     let tasks_to_run = collect_requested_subgraph(
@@ -261,6 +264,7 @@ struct RunDispatch<'a> {
 async fn prepare_run_context(
     workspace_root: &Path,
     selection: &TaskSelection<'_>,
+    max_weight_override: Option<u32>,
 ) -> Result<Option<RunContext>> {
     let PreparedWorkspace {
         packages,
@@ -273,7 +277,7 @@ async fn prepare_run_context(
         pruned,
         pruned_ids: _,
         worker_manager,
-    } = prepare_workspace(workspace_root, ResolveMode::Run).await?;
+    } = prepare_workspace(workspace_root, ResolveMode::Run, max_weight_override).await?;
 
     if packages.is_empty() {
         println!("{}", "No packages found in workspace".yellow());
@@ -514,7 +518,7 @@ pub async fn dry_run_tasks(workspace_root: &Path, selection: &TaskSelection<'_>)
         pruned,
         pruned_ids: _,
         worker_manager,
-    } = prepare_workspace(workspace_root, ResolveMode::Run).await?;
+    } = prepare_workspace(workspace_root, ResolveMode::Run, None).await?;
 
     // Resolution may have spawned resident workers; shut them down once the
     // graph is built since dry-run executes nothing.
@@ -1040,7 +1044,7 @@ mod tests {
         )
         .expect("write config");
 
-        let prepared = prepare_workspace(temp_dir.path(), ResolveMode::Run)
+        let prepared = prepare_workspace(temp_dir.path(), ResolveMode::Run, None)
             .await
             .expect("prepare workspace");
 

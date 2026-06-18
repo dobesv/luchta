@@ -59,7 +59,8 @@ async fn run(cli: Cli) -> Result<()> {
         Commands::Check => {
             // Check mode: a worker `Reject` during resolution is a hard error
             // (surfaced from prepare_workspace); a `Prune` is informational.
-            let prepared = run::prepare_workspace(&workspace_root, ResolveMode::Check).await?;
+            let prepared =
+                run::prepare_workspace(&workspace_root, ResolveMode::Check, None).await?;
             prepared.worker_manager.shutdown().await;
             run::report_pruned_tasks(&prepared.pruned);
 
@@ -140,6 +141,7 @@ struct RunArgs {
     dry_run: bool,
     output: OutputMode,
     thresholds: ThresholdInputs,
+    max_weight_cli: Option<String>,
     since: Option<String>,
 }
 
@@ -157,6 +159,7 @@ fn command_run_args(command: Commands) -> RunArgs {
             dry_run,
             output,
             mem_usage_threshold,
+            max_weight,
             mem_free_threshold,
             since,
         } => RunArgs {
@@ -169,6 +172,7 @@ fn command_run_args(command: Commands) -> RunArgs {
                 usage_cli: mem_usage_threshold,
                 free_cli: mem_free_threshold,
             },
+            max_weight_cli: max_weight,
             since,
         },
         Commands::Check => unreachable!("checked by caller"),
@@ -188,11 +192,23 @@ async fn run_command(workspace_root: &std::path::Path, command: Commands) -> Res
         since: args.since.as_deref(),
     };
     let memory_pressure = resolve_memory_pressure_config(args.thresholds)?;
+    let max_weight_override = resolve_max_weight_override(
+        args.max_weight_cli.as_deref(),
+        "LUCHTA_MAX_WEIGHT",
+        "max-weight",
+    )?;
 
     if args.dry_run {
         run::dry_run_tasks(workspace_root, &selection).await
     } else {
-        run::run_tasks(workspace_root, &selection, args.output, memory_pressure).await
+        run::run_tasks(
+            workspace_root,
+            &selection,
+            args.output,
+            memory_pressure,
+            max_weight_override,
+        )
+        .await
     }
 }
 
@@ -259,6 +275,48 @@ fn resolve_threshold_spec(
     }
 }
 
+fn resolve_max_weight_override(
+    cli_value: Option<&str>,
+    env_var: &str,
+    flag_name: &str,
+) -> Result<Option<u32>, miette::Report> {
+    let raw = cli_value
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var(env_var).ok().filter(|s| !s.is_empty()));
+
+    match raw {
+        None => Ok(None),
+        Some(value) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                return Err(miette::miette!(
+                    "Invalid --{} value '{}': must be a positive integer",
+                    flag_name,
+                    value
+                ));
+            }
+
+            let parsed = trimmed.parse::<u32>().map_err(|_| {
+                miette::miette!(
+                    "Invalid --{} value '{}': must be a positive integer",
+                    flag_name,
+                    value
+                )
+            })?;
+
+            if parsed == 0 {
+                return Err(miette::miette!(
+                    "Invalid --{} value '{}': must be greater than 0",
+                    flag_name,
+                    value
+                ));
+            }
+
+            Ok(Some(parsed))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -275,6 +333,7 @@ mod tests {
                 dry_run: true,
                 output: OutputMode::Default,
                 mem_usage_threshold: None,
+                max_weight: None,
                 mem_free_threshold: None,
                 since: None,
             },

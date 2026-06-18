@@ -59,6 +59,13 @@ pub enum Commands {
         #[arg(long, value_name = "BYTES_OR_PERCENT")]
         mem_usage_threshold: Option<String>,
 
+        /// Override maximum cumulative task weight allowed to run at once.
+        ///
+        /// Flag overrides `LUCHTA_MAX_WEIGHT`; otherwise uses config
+        /// `concurrency.maxWeight`, falling back to available parallelism.
+        #[arg(long, value_name = "WEIGHT")]
+        max_weight: Option<String>,
+
         /// Pause NEW task dispatch when system available memory drops below this threshold.
         ///
         /// Accepts percentages like "12.5%" or absolute values like "1GiB",
