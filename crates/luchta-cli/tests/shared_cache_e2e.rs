@@ -465,11 +465,11 @@ fn e2e_cross_build_shared_cache_hit() {
     temp.child("packages/app/counter.txt").assert("1\n");
 
     assert!(
-        second_stdout.contains("📦 shared: 1"),
+        second_stdout.contains("📥 shared: 1"),
         "second build should report shared hit stats, stdout was:\n{second_stdout}"
     );
     assert!(
-        second_stdout.contains("⏭️ 1 📦 shared: 1"),
+        second_stdout.contains("⏭️ 1 📥 shared: 1"),
         "second build summary should report shared hit stats, stdout was:\n{second_stdout}"
     );
 
@@ -496,7 +496,7 @@ fn e2e_cross_build_shared_cache_hit() {
         "third build should still report skip total, stdout was:\n{third_stdout}"
     );
     assert!(
-        !third_stdout.contains("📦 shared:"),
+        !third_stdout.contains("📥 shared:"),
         "third build should be local skip, not shared, stdout was:\n{third_stdout}"
     );
 }
@@ -594,7 +594,7 @@ fn cross_worktree_shared_cache_hit() {
     worktree_b.child("packages/app/counter.txt").assert("1\n");
 
     assert!(
-        stdout_b.contains("📦 shared: 1"),
+        stdout_b.contains("📥 shared: 1"),
         "worktree B should report shared hit, stdout was:\n{stdout_b}"
     );
 

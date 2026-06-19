@@ -142,7 +142,7 @@ impl ProgressReporter {
             format!("⏭️ {skipped}"),
         ];
         if shared_hits > 0 {
-            segments.push(format!("📦 shared: {shared_hits}"));
+            segments.push(format!("📥 shared: {shared_hits}"));
         }
         if pending > 0 {
             segments.push(format!("⌛ {pending}"));
@@ -170,7 +170,7 @@ impl ProgressReporter {
         let shared_hits = self.shared_hits.load(Ordering::SeqCst);
         let done_or_skipped = done + skipped;
         let shared_segment = if shared_hits > 0 {
-            format!(" 📦 shared: {shared_hits}")
+            format!(" 📥 shared: {shared_hits}")
         } else {
             String::new()
         };
@@ -514,7 +514,7 @@ mod tests {
 
         let out = reporter.render_progress("10 MB", &[], &pressure_snapshot(None, 0, 0));
 
-        assert!(out.contains("📦 shared: 1"), "output was: {out}");
+        assert!(out.contains("📥 shared: 1"), "output was: {out}");
         assert!(out.contains("⏭️ 1"), "output was: {out}");
     }
 
@@ -765,7 +765,7 @@ mod tests {
         let summary = reporter.render_summary("10 MB");
 
         assert!(
-            summary.contains("☑️ 2/2 ⏭️ 1 📦 shared: 1"),
+            summary.contains("☑️ 2/2 ⏭️ 1 📥 shared: 1"),
             "summary was: {summary}"
         );
     }
