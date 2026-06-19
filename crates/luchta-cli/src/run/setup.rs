@@ -9,9 +9,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use luchta_cache::shared::{
-    maybe_run_gc, OpenExtras, RemoteConfig, SharedCache, DEFAULT_GC_RETENTION, DEFAULT_GC_THROTTLE,
-};
+use luchta_cache::shared::{maybe_run_gc, SharedCache, DEFAULT_GC_RETENTION, DEFAULT_GC_THROTTLE};
+#[cfg(unix)]
+use luchta_cache::shared::{OpenExtras, RemoteConfig};
 use luchta_cache::Cache;
 use luchta_engine::{ExecutionRequest, TaskGraph, WeightedExecutor, WorkerManager};
 use luchta_types::{EnvSpec, TaskId, WorkerDefinition};
@@ -245,19 +245,34 @@ pub(super) fn build_execution_resources(
             shared_cache_history_len(),
         )
         .map(Arc::new),
-        SharedCacheMode::Remote { fs_base } => SharedCache::open_with_remote(
-            inputs.workspace_root,
-            shared_cache_size_cap_bytes(),
-            shared_cache_history_len(),
-            OpenExtras {
-                cache_dir: None,
-                remote: Some(RemoteConfig {
-                    fs_base: fs_base.clone(),
-                    sync_timeout: shared_cache_settings.sync_timeout,
-                }),
-            },
-        )
-        .map(Arc::new),
+        SharedCacheMode::Remote { fs_base } => {
+            #[cfg(unix)]
+            {
+                SharedCache::open_with_remote(
+                    inputs.workspace_root,
+                    shared_cache_size_cap_bytes(),
+                    shared_cache_history_len(),
+                    OpenExtras {
+                        cache_dir: None,
+                        remote: Some(RemoteConfig {
+                            fs_base: fs_base.clone(),
+                            sync_timeout: shared_cache_settings.sync_timeout,
+                        }),
+                    },
+                )
+                .map(Arc::new)
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = fs_base;
+                SharedCache::open(
+                    inputs.workspace_root,
+                    shared_cache_size_cap_bytes(),
+                    shared_cache_history_len(),
+                )
+                .map(Arc::new)
+            }
+        }
     };
 
     if let Some(shared_cache) = shared_cache.as_ref() {

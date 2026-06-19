@@ -37,6 +37,12 @@ pub enum ScopeError {
 ///
 /// Escape is returned as `Err(ScopeError::PathEscape)` rather than
 /// `Ok(OutputScope::Escape)` so repo-root escape is a hard-fail at call sites.
+// `ScopeError` carries four `PathBuf`s for diagnostics. On Windows `PathBuf`
+// is wide (UTF-16) and larger, so the single variant crosses clippy's
+// `result_large_err` 128-byte threshold there (it stays under on Unix). The
+// type has exactly one variant and one call site that matches it directly, so
+// boxing buys nothing — allow the lint instead of churning the public signature.
+#[allow(clippy::result_large_err)]
 pub fn classify_outputs(
     repo_root: &Path,
     package_dir: &Path,

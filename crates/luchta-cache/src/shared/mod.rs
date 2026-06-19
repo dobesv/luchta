@@ -3,7 +3,9 @@ pub mod blob;
 pub mod gc;
 pub mod git;
 pub mod paths;
+#[cfg(unix)]
 pub mod rclone;
+#[cfg(unix)]
 mod remote;
 pub mod scope;
 pub mod snapshot;
@@ -19,8 +21,11 @@ pub use paths::{
     open_shared_paths, resolve_shared_cache_dir, SharedCachePaths, BLOBS_DIR_NAME,
     SHARED_CACHE_DIR_ENV, SNAPSHOTS_DIR_NAME,
 };
+#[cfg(unix)]
 pub use rclone::RcloneRcd;
+#[cfg(unix)]
 pub use remote::RemoteConfig;
+#[cfg(unix)]
 pub(crate) use remote::RemoteSync;
 pub use scope::{classify_outputs, OutputScope, ScopeError};
 pub use snapshot::{
@@ -135,6 +140,7 @@ pub struct SharedCache {
     /// Snapshot store for merge_entry.
     snapshot_store: SnapshotStore,
     /// Optional remote sync for on-demand restore pull.
+    #[cfg(unix)]
     remote: Option<RemoteSync>,
     /// Lazily-built merged index.
     index: OnceLock<MergedIndex>,
@@ -158,6 +164,7 @@ impl Drop for SharedCache {
         // process is orphaned. SIGKILL skips Drop, but that is mitigated by the
         // per-run unique temp socket — any orphaned daemon is bound to a stale
         // socket path that is never reused by a later run.
+        #[cfg(unix)]
         if let Some(remote) = &self.remote {
             remote.shutdown();
         }
@@ -173,6 +180,7 @@ pub struct OpenExtras<'a> {
     /// Explicit cache directory; `None` resolves from env/platform defaults.
     pub cache_dir: Option<&'a Path>,
     /// Remote sync config; `None` keeps the cache local-only.
+    #[cfg(unix)]
     pub remote: Option<RemoteConfig>,
 }
 
@@ -207,6 +215,7 @@ impl SharedCache {
             history_len,
             OpenExtras {
                 cache_dir,
+                #[cfg(unix)]
                 remote: None,
             },
         )
@@ -234,6 +243,7 @@ impl SharedCache {
         let candidate_keys = candidate_commit_keys(repo_root, history_len);
 
         let snapshot_store = SnapshotStore::new(paths.clone());
+        #[cfg(unix)]
         let remote = match extras.remote {
             Some(config) => match RemoteSync::from_config(config) {
                 Ok(remote) => Some(remote),
@@ -250,6 +260,7 @@ impl SharedCache {
             write_commit_key,
             candidate_keys,
             snapshot_store,
+            #[cfg(unix)]
             remote,
             index: OnceLock::new(),
             size_cap_bytes,
@@ -282,6 +293,7 @@ impl SharedCache {
             write_commit_key,
             candidate_keys,
             snapshot_store,
+            #[cfg(unix)]
             remote: None,
             index: OnceLock::new(),
             size_cap_bytes,
@@ -303,6 +315,7 @@ impl SharedCache {
         input_key: &[u8; 32],
         package_dir: &Path,
     ) -> impl Iterator<Item = StagedCandidate> + '_ {
+        #[cfg(unix)]
         self.pull_remote_snapshots_for_restore();
         let index = self.get_or_build_index();
         let input_key_hex = input_key_hex(*input_key);
@@ -334,12 +347,20 @@ impl SharedCache {
         // Stage each candidate (returns None for missing/corrupt blobs)
         let paths = self.paths.clone();
         let package_dir = package_dir.to_path_buf();
+        #[cfg(unix)]
         let remote = self.remote.clone();
         candidates.into_iter().filter_map(move |entry| {
-            Self::stage_entry(&entry, &paths, &package_dir, remote.as_ref())
+            Self::stage_entry(
+                &entry,
+                &paths,
+                &package_dir,
+                #[cfg(unix)]
+                remote.as_ref(),
+            )
         })
     }
 
+    #[cfg(unix)]
     fn pull_remote_snapshots_for_restore(&self) {
         let Some(remote) = self.remote.as_ref() else {
             return;
@@ -352,9 +373,10 @@ impl SharedCache {
         entry: &SnapshotEntry,
         paths: &SharedCachePaths,
         package_dir: &Path,
-        remote: Option<&RemoteSync>,
+        #[cfg(unix)] remote: Option<&RemoteSync>,
     ) -> Option<StagedCandidate> {
         if !blob_path(paths, &entry.outputs_hash).is_file() {
+            #[cfg(unix)]
             if let Some(remote) = remote {
                 if let Err(err) = remote.pull_blob(paths, &entry.outputs_hash) {
                     eprintln!(
@@ -410,16 +432,25 @@ impl SharedCache {
 
     /// Builds the merged index on first access.
     fn get_or_build_index(&self) -> &MergedIndex {
-        self.index
-            .get_or_init(|| self.build_index(self.remote.as_ref()))
+        self.index.get_or_init(|| {
+            self.build_index(
+                #[cfg(unix)]
+                self.remote.as_ref(),
+            )
+        })
     }
 
-    fn build_index(&self, remote: Option<&RemoteSync>) -> MergedIndex {
+    fn build_index(&self, #[cfg(unix)] remote: Option<&RemoteSync>) -> MergedIndex {
         let mut merged = MergedIndex::new();
 
         // Iterate in reverse order (oldest first) so that newest overwrites.
         for commit_key in self.candidate_keys.iter().rev() {
-            self.load_commit_into_index(&mut merged, commit_key, remote);
+            self.load_commit_into_index(
+                &mut merged,
+                commit_key,
+                #[cfg(unix)]
+                remote,
+            );
         }
 
         // Reverse snapshots so newest is first.
@@ -433,8 +464,9 @@ impl SharedCache {
         &self,
         merged: &mut MergedIndex,
         commit_key: &str,
-        remote: Option<&RemoteSync>,
+        #[cfg(unix)] remote: Option<&RemoteSync>,
     ) {
+        #[cfg(unix)]
         if let Some(remote) = remote {
             remote.pull_snapshot_commit(&self.snapshot_store, commit_key);
         }
@@ -547,6 +579,7 @@ impl SharedCache {
     ) -> io::Result<StoreOutcome> {
         match blob_result {
             BlobWriteResult::Written | BlobWriteResult::AlreadyExists => {
+                #[cfg(unix)]
                 let outputs_hash = entry.outputs_hash;
                 let merge = self
                     .snapshot_store
@@ -554,6 +587,7 @@ impl SharedCache {
                 if matches!(merge.result, MergeResult::SkippedLockUnavailable) {
                     return Ok(StoreOutcome::SkippedLockUnavailable);
                 }
+                #[cfg(unix)]
                 if let Some(remote) = &self.remote {
                     remote.push_store_artifacts(remote::PushArtifacts {
                         paths: &self.paths,

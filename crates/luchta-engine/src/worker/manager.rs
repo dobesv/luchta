@@ -1,5 +1,6 @@
 use std::{collections::HashMap, io, time::Duration};
 
+#[cfg(unix)]
 const CRASH_DETAIL_WAIT_TIMEOUT: Duration = Duration::from_millis(250);
 
 #[cfg(unix)]
@@ -13,11 +14,11 @@ use luchta_worker::WorkerDonePayload;
 #[cfg(unix)]
 use tokio::sync::{mpsc, Mutex};
 
-use crate::worker::protocol::{LogStream, ResolveResult, ResolveTask, WorkerRequest};
+use crate::worker::protocol::{ResolveResult, ResolveTask, WorkerRequest};
 #[cfg(unix)]
 use crate::worker::{
     io_tasks::ReaperContext,
-    protocol::{WorkerMessage, WorkerResponse},
+    protocol::{LogStream, WorkerMessage, WorkerResponse},
 };
 use crate::{ExecutionLogSink, TaskResolver};
 
@@ -472,6 +473,7 @@ impl WorkerManager {
         request: WorkerRequest,
         sink: Option<&ExecutionLogSink>,
     ) -> Result<WorkerDonePayload, WorkerError> {
+        let _ = sink;
         self.unsupported(worker_name, request.id)
     }
 

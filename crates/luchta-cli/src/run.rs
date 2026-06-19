@@ -702,6 +702,7 @@ fn compute_execution_waves(
 #[derive(Debug, Clone, Copy)]
 enum ShutdownSignal {
     CtrlC,
+    #[cfg(unix)]
     SigTerm,
 }
 
@@ -709,6 +710,7 @@ impl ShutdownSignal {
     fn name(self) -> &'static str {
         match self {
             Self::CtrlC => "SIGINT (Ctrl-C)",
+            #[cfg(unix)]
             Self::SigTerm => "SIGTERM",
         }
     }

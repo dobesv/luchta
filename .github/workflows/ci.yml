@@ -1,7 +1,12 @@
 name: CI
 
 on:
+  # Run on pushes to main only (e.g. Mergify squash-merges land here as a normal
+  # commit with no pull_request event) so the trunk stays verified. Branch pushes
+  # that already have an open PR are covered by the pull_request trigger below —
+  # scoping push to main avoids running every PR-branch commit twice.
   push:
+    branches: [main]
   pull_request:
 
 env:
@@ -9,20 +14,44 @@ env:
 
 jobs:
   check:
-    name: Check
-    runs-on: ubuntu-latest
+    name: Check (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Build every OS even if one fails, so a single platform's compile error
+      # doesn't mask the others. This is the gate that catches platform-specific
+      # `#[cfg]` mistakes on PRs instead of at release time.
+      fail-fast: false
+      matrix:
+        include:
+          # Unix platforms build the whole workspace including test/bench
+          # targets (`--all-targets`) — the test suite must compile and lint
+          # cleanly there. The shared-cache test helpers use Unix-only APIs
+          # (e.g. PermissionsExt::set_mode), so on Windows we lint production
+          # targets only (lib + bins) — the same surface the release build
+          # compiles. Windows test execution is intentionally out of scope.
+          - os: ubuntu-latest
+            targets_flag: "--all-targets"
+          - os: macos-latest
+            targets_flag: "--all-targets"
+          - os: windows-latest
+            targets_flag: ""
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
+      - name: Install Rust toolchain with clippy
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
 
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
 
       - name: Check workspace
-        run: cargo check --workspace
+        run: cargo check --workspace ${{ matrix.targets_flag }}
+
+      - name: Clippy workspace
+        run: cargo clippy --workspace ${{ matrix.targets_flag }} -- -D warnings
 
   test:
     name: Test
@@ -44,24 +73,6 @@ jobs:
 
       - name: Test workspace
         run: cargo nextest run --workspace
-
-  clippy:
-    name: Clippy
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Install Rust toolchain with clippy
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-
-      - name: Cache cargo artifacts
-        uses: Swatinem/rust-cache@v2
-
-      - name: Run clippy
-        run: cargo clippy --workspace -- -D warnings
 
   fmt:
     name: Format

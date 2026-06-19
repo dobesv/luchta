@@ -9,10 +9,13 @@ queue_rules:
     batch_max_failure_resolution_attempts: 10
     # The batch is only merged once every required CI check is green.
     # These names match the `name:` of each job in .github/workflows/ci.yml.
+    # The `Check` job runs as a per-OS matrix (it also runs clippy), so each
+    # platform produces its own check-run named `Check (<os>)`.
     merge_conditions:
-      - check-success=Check
+      - check-success=Check (ubuntu-latest)
+      - check-success=Check (windows-latest)
+      - check-success=Check (macos-latest)
       - check-success=Test
-      - check-success=Clippy
       - check-success=Format
 
 pull_request_rules:
