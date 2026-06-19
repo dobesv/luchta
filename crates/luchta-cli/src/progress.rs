@@ -138,18 +138,20 @@ impl ProgressReporter {
             .count();
 
         let mut segments = vec![
-            format!("☑️ {done_or_skipped}/{total_tasks}"),
-            format!("⏭️ {skipped}"),
+            format!("☑️ {done_or_skipped}"),
         ];
+        if skipped > 0 {
+            segments.push(format!("⏭️ {skipped}"));
+        }
         if shared_hits > 0 {
-            segments.push(format!("📥 shared: {shared_hits}"));
+            segments.push(format!("📥 {shared_hits}"));
         }
         if pending > 0 {
             segments.push(format!("⌛ {pending}"));
         }
         if running_count > 0 {
             segments.push(format!(
-                "🏃{running_count} ({})",
+                "🏃 {running_count} ({})",
                 render_running_task_list(&running)
             ));
         }
@@ -170,13 +172,13 @@ impl ProgressReporter {
         let shared_hits = self.shared_hits.load(Ordering::SeqCst);
         let done_or_skipped = done + skipped;
         let shared_segment = if shared_hits > 0 {
-            format!(" 📥 shared: {shared_hits}")
+            format!(" 📥 {shared_hits}")
         } else {
             String::new()
         };
 
         format!(
-            "☑️ {done_or_skipped}/{total_tasks} ⏭️ {skipped}{shared_segment} ⏱️ {elapsed_total}s 🐏 {rss_formatted} 🌊 {} / {}",
+            "☑️ {done_or_skipped} ⏭️ {skipped}{shared_segment} ⏱️ {elapsed_total}s 🐏 {rss_formatted} 🌊 {} / {}",
             self.total_waves, self.total_waves
         )
     }
