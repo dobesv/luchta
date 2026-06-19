@@ -103,7 +103,7 @@ fn run_executes_worker_task() {
         // Successful task output is captured (not streamed) in default mode, so
         // the worker's "worker-ran" log line no longer appears on stdout. A
         // successful run is confirmed by the Done summary.
-        .stdout(predicate::str::contains("☑️ 1/1 ⏭️ 0"))
+        .stdout(predicate::str::contains("☑️ 1 ⏭️ 0"))
         .stdout(predicate::str::contains("worker-ran").not());
 
     temp.close().expect("cleanup temp dir");

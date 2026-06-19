@@ -10,16 +10,12 @@ use assert_fs::prelude::*;
 #[derive(Clone, Copy)]
 struct DoneLine {
     done: usize,
-    total: usize,
     skipped: usize,
     waves: usize,
 }
 
 fn assert_done_line(out: &str, label: &str, expected: DoneLine) {
-    let done_token = format!(
-        "☑️ {}/{} ⏭️ {}",
-        expected.done, expected.total, expected.skipped
-    );
+    let done_token = format!("☑️ {} ⏭️ {}", expected.done, expected.skipped);
     let wave_token = format!("🌊 {} / {}", expected.waves, expected.waves);
     assert!(
         out.contains(&done_token),
@@ -181,8 +177,8 @@ fn skip_count_is_cache_hit_only() {
     );
     // First run: 1 done, 0 skipped
     assert!(
-        stdout1.contains("☑️ 1/1 ⏭️ 0"),
-        "first run stdout should contain '☑️ 1/1 ⏭️ 0', got: {stdout1}"
+        stdout1.contains("☑️ 1 ⏭️ 0"),
+        "first run stdout should contain '☑️ 1 ⏭️ 0', got: {stdout1}"
     );
     assert!(
         stdout1.contains("🌊 1 / 1"),
@@ -213,8 +209,8 @@ fn skip_count_is_cache_hit_only() {
     );
     // Second run: 0 done, 1 skipped (cache-hit)
     assert!(
-        stdout2.contains("☑️ 1/1 ⏭️ 1"),
-        "second run stdout should contain '☑️ 1/1 ⏭️ 1', got: {stdout2}"
+        stdout2.contains("☑️ 1 ⏭️ 1"),
+        "second run stdout should contain '☑️ 1 ⏭️ 1', got: {stdout2}"
     );
     assert!(
         stdout2.contains("🌊 1 / 1"),
@@ -259,7 +255,7 @@ echo '{{"concurrency":{{"maxWeight":4}},"workers":{{"shell":{{"command":"{worker
 
     // `a#build` runs (cacheable) and the no-command `b#build` counts as done; no
     // skips on the first run. On rerun `a#build` is a cache hit (the only
-    // "skipped"), so the numerator stays 2/2 with one skip.
+    // "skipped"), so the done count stays 2 with one skip.
     let run = |label: &str, expected: DoneLine| {
         let output = Command::cargo_bin("luchta")
             .unwrap()
@@ -282,7 +278,6 @@ echo '{{"concurrency":{{"maxWeight":4}},"workers":{{"shell":{{"command":"{worker
         "first run",
         DoneLine {
             done: 2,
-            total: 2,
             skipped: 0,
             waves: 1,
         },
@@ -291,7 +286,6 @@ echo '{{"concurrency":{{"maxWeight":4}},"workers":{{"shell":{{"command":"{worker
         "second run",
         DoneLine {
             done: 2,
-            total: 2,
             skipped: 1,
             waves: 1,
         },

@@ -137,9 +137,7 @@ impl ProgressReporter {
             })
             .count();
 
-        let mut segments = vec![
-            format!("☑️ {done_or_skipped}"),
-        ];
+        let mut segments = vec![format!("☑️ {done_or_skipped}")];
         if skipped > 0 {
             segments.push(format!("⏭️ {skipped}"));
         }
@@ -166,7 +164,6 @@ impl ProgressReporter {
 
     pub fn render_summary(&self, rss_formatted: &str) -> String {
         let elapsed_total = self.start.elapsed().as_secs();
-        let total_tasks: usize = self.wave_total.iter().sum();
         let done = self.done.load(Ordering::SeqCst);
         let skipped = self.skipped.load(Ordering::SeqCst);
         let shared_hits = self.shared_hits.load(Ordering::SeqCst);
@@ -400,7 +397,6 @@ mod tests {
 
     struct DoneSummaryExpectation {
         done: usize,
-        total: usize,
         skipped: usize,
         waves: usize,
     }
@@ -408,13 +404,9 @@ mod tests {
     impl DoneSummaryExpectation {
         fn assert_in(&self, out: &str) {
             assert!(
-                out.contains(&format!(
-                    "☑️ {}/{} ⏭️ {}",
-                    self.done, self.total, self.skipped
-                )),
-                "expected done summary '☑️ {}/{} ⏭️ {}', got: {out}",
+                out.contains(&format!("☑️ {} ⏭️ {}", self.done, self.skipped)),
+                "expected done summary '☑️ {} ⏭️ {}', got: {out}",
                 self.done,
-                self.total,
                 self.skipped
             );
             assert!(
@@ -468,12 +460,13 @@ mod tests {
     }
 
     #[test]
-    fn render_progress_shows_zero_skipped_and_pending_when_work_remains() {
+    fn render_progress_omits_zero_skipped_and_shows_pending_when_work_remains() {
         let wave_of = HashMap::from([(task_id("pkg-a", "build"), 0)]);
         let reporter = ProgressReporter::new(OutputMode::Default, wave_of, 1);
 
         let out = reporter.render_progress("10 MB", &[], &pressure_snapshot(None, 0, 0));
-        assert_progress_line_shape(&out, "☑️ 0/1 ⏭️ 0 ⌛ 1 ⏱️ ", "10 MB", "0 / 1");
+        assert_progress_line_shape(&out, "☑️ 0 ⌛ 1 ⏱️ ", "10 MB", "0 / 1");
+        assert!(!out.contains("⏭️"));
         assert!(!out.contains("🏃"));
     }
 
@@ -497,7 +490,7 @@ mod tests {
         reporter.task_started(&task_c);
 
         let out = reporter.render_progress("10 MB", &[], &pressure_snapshot(None, 0, 0));
-        assert_progress_line_shape(&out, "☑️ 2/3 ⏭️ 1 🏃1 (pkg-c#build) ⏱️ ", "10 MB", "0 / 1");
+        assert_progress_line_shape(&out, "☑️ 2 ⏭️ 1 🏃 1 (pkg-c#build) ⏱️ ", "10 MB", "0 / 1");
         assert!(!out.contains("⌛"));
     }
 
@@ -547,7 +540,7 @@ mod tests {
         );
         assert_progress_line_shape(
             &out,
-            "☑️ 0/6 ⏭️ 0 🏃6 ({a,b,c}:lint, d:{test,tsc} +1) ⏱️ ",
+            "☑️ 0 🏃 6 ({a,b,c}:lint, d:{test,tsc} +1) ⏱️ ",
             "42 MB",
             "0 / 1",
         );
@@ -718,7 +711,6 @@ mod tests {
 
         DoneSummaryExpectation {
             done: 1,
-            total: 1,
             skipped: 0,
             waves: 1,
         }
@@ -743,7 +735,6 @@ mod tests {
 
         DoneSummaryExpectation {
             done: 2,
-            total: 2,
             skipped: 1,
             waves: 2,
         }
@@ -766,10 +757,7 @@ mod tests {
 
         let summary = reporter.render_summary("10 MB");
 
-        assert!(
-            summary.contains("☑️ 2/2 ⏭️ 1 📥 1"),
-            "summary was: {summary}"
-        );
+        assert!(summary.contains("☑️ 2 ⏭️ 1 📥 1"), "summary was: {summary}");
     }
 
     #[test]
