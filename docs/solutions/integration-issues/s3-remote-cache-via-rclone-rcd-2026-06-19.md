@@ -75,6 +75,20 @@ timeout`) so no remote op can hang a build wave.
   silently to local-only. Opt-in is strict: `LUCHTA_SHARED_CACHE=rclone:<spec>`
   enables remote; `local`/`1`/`true` = local-only (unchanged); unset = off.
   `LUCHTA_SHARED_CACHE_SYNC_TIMEOUT` (default 30s) bounds the initial sync.
+- **Never drop the rclone runtime from inside an async context.** `RcloneRcd`
+  owns a `tokio::runtime::Runtime`. The `SharedCache` Arc is released *inside*
+  the build's tokio runtime (the `run_tasks` async task), so its `Drop` chain
+  reaches `RcloneRcd::Drop` while still in an async context. Calling
+  `runtime.block_on(...)` there — or simply letting the owned `Runtime` drop
+  there — panics: *"Cannot drop a runtime in a context where blocking is not
+  allowed."* This only surfaces at runtime (the unit tests dropped the cache
+  outside async, so they missed it). Fix: in `Drop`, **move** the runtime out
+  (`Option<Runtime>` + `take()`) onto a fresh `std::thread`, run the
+  quit/wait/kill there, and let the runtime drop on that thread. `shutdown()`
+  (called from `SharedCache::Drop`) does the same via `std::thread::scope` so
+  `block_on` never runs on the async thread. Add a regression test that drops a
+  remote-configured `SharedCache` inside a `block_on` — it reproduces the panic
+  on the unfixed code and passes after.
 - **Remote GC is out of scope** — use S3 bucket lifecycle rules. Local GC was
   extended to the shard-dir layout (age out shards, remove `.merged` sidecars
   with their shard, prune empty commit dirs, still age out legacy files) and
