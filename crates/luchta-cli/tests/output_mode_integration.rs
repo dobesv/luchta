@@ -5,12 +5,11 @@ use std::fs;
 use assert_cmd::Command;
 use assert_fs::prelude::*;
 
-/// Expected tokens for the emoji done line: `☑️ done/total ⏭️ skipped` plus
+/// Expected tokens for the emoji done line: `✔ done ⏩ skipped` plus
 /// `🌊 waves / waves`.
 #[derive(Clone, Copy)]
 struct DoneLine {
     done: usize,
-    total: usize,
     skipped: usize,
     waves: usize,
 }
@@ -52,14 +51,11 @@ impl ProgressOutput {
         self
     }
 
-    /// Asserts the emoji done line (`☑️ … 🌊 …`) is present and the old
+    /// Asserts the emoji done line (`✔ … 🌊 …`) is present and the old
     /// `Done:` text is gone.
     fn assert_done_line(&self, expected: DoneLine) -> &Self {
         let label = &self.label;
-        let done_token = format!(
-            "☑️ {}/{} ⏭️ {}",
-            expected.done, expected.total, expected.skipped
-        );
+        let done_token = format!("✔ {} ⏩ {}", expected.done, expected.skipped);
         let wave_token = format!("🌊 {} / {}", expected.waves, expected.waves);
         assert!(
             self.stdout.contains(&done_token),
@@ -241,7 +237,6 @@ fn summary_mode_prints_only_done_line() {
 
     out.assert_done_line(DoneLine {
         done: 2,
-        total: 2,
         skipped: 0,
         waves: 2,
     })
@@ -286,13 +281,12 @@ fn long_run_default_mode_emits_periodic_progress() {
     );
 
     assert!(
-        out.stderr().contains("🏃") && out.stderr().contains("☑️"),
+        out.stderr().contains("🏃") && out.stderr().contains("✔"),
         "default run should emit periodic progress status line markers on stderr, got: {}",
         out.stderr()
     );
     out.assert_done_line(DoneLine {
         done: 1,
-        total: 1,
         skipped: 0,
         waves: 1,
     });
@@ -337,7 +331,6 @@ fn long_run_summary_mode_still_prints_done_line() {
 
     out.assert_done_line(DoneLine {
         done: 1,
-        total: 1,
         skipped: 0,
         waves: 1,
     });
@@ -375,7 +368,6 @@ fn default_mode_fast_run_prints_summary_no_progress() {
 
     out.assert_done_line(DoneLine {
         done: 2,
-        total: 2,
         skipped: 0,
         waves: 2,
     })

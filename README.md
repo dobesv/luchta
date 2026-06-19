@@ -515,7 +515,7 @@ A task is eligible for the shared cache if all the following are true:
 Luchta automatically performs throttled garbage collection of old local cache entries and blobs (those older than `LUCHTA_SHARED_CACHE_GC_DAYS`). The cache is read-tolerant; if a blob is missing due to GC or other reasons, it is treated as a cache miss.
 
 #### Stats
-Shared cache hits are shown in the build summary: `📥 shared: <n>`.
+Shared cache hits are shown in the build summary: `📥 <n>`.
 
 ## Roadmap
 

@@ -175,8 +175,8 @@ let waves_done = self.wave_total.iter().enumerate()
     .count();
 
 let mut parts = vec![
-    format!("☑️ {}/{}", done_or_skipped, total_tasks),
-    format!("⏭️ {}", skipped),
+    format!("✔ {}/{}", done_or_skipped, total_tasks),
+    format!("⏩ {}", skipped),
 ];
 if pending > 0 { parts.push(format!("⌛ {}", pending)); }
 if running_count > 0 {
@@ -184,7 +184,7 @@ if running_count > 0 {
     parts.push(format!("({})", render_running_task_list(running)));
 }
 parts.extend([
-    format!("⏱️ {}s", elapsed),
+    format!("⌚ {}s", elapsed),
     format!("🐏 {}", rss_formatted),
     format!("🌊 {} / {}", waves_done, self.total_waves),
 ]);
@@ -229,7 +229,7 @@ impl ProgressOutput {
     }
 
     fn assert_done_line(&self, expected: DoneLine) -> &Self {
-        let token = format!("☑️ {}/{} ⏭️ {}", expected.done, expected.total, expected.skipped);
+        let token = format!("✔ {}/{} ⏩ {}", expected.done, expected.total, expected.skipped);
         assert!(self.stdout.contains(&token), "{} missing '{}', got: {}", self.label, token, self.stdout);
         self
     }
@@ -290,8 +290,8 @@ fn pressure_suffix(warnings: &[PressureReason]) -> String {
     let has_free = warnings.iter().any(|w| matches!(w, PressureReason::FreeLow));
 
     let mut suffix = String::new();
-    if has_usage { suffix.push_str(" ⚠️ mem usage high"); }
-    if has_free { suffix.push_str(" ⚠️ system free memory low"); }
+    if has_usage { suffix.push_str(" ❗ mem usage high"); }
+    if has_free { suffix.push_str(" ❗ system free memory low"); }
     suffix
 }
 ```

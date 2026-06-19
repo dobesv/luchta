@@ -137,23 +137,23 @@ impl ProgressReporter {
             })
             .count();
 
-        let mut segments = vec![
-            format!("☑️ {done_or_skipped}/{total_tasks}"),
-            format!("⏭️ {skipped}"),
-        ];
+        let mut segments = vec![format!("✔ {done_or_skipped}")];
+        if skipped > 0 {
+            segments.push(format!("⏩ {skipped}"));
+        }
         if shared_hits > 0 {
-            segments.push(format!("📥 shared: {shared_hits}"));
+            segments.push(format!("📥 {shared_hits}"));
         }
         if pending > 0 {
             segments.push(format!("⌛ {pending}"));
         }
         if running_count > 0 {
             segments.push(format!(
-                "🏃{running_count} ({})",
+                "🏃 {running_count} ({})",
                 render_running_task_list(&running)
             ));
         }
-        segments.push(format!("⏱️ {elapsed_total}s"));
+        segments.push(format!("⌚ {elapsed_total}s"));
         segments.push(format!("🐏 {rss_formatted}"));
         segments.push(format!("🌊 {waves_done} / {}", self.total_waves));
 
@@ -164,19 +164,18 @@ impl ProgressReporter {
 
     pub fn render_summary(&self, rss_formatted: &str) -> String {
         let elapsed_total = self.start.elapsed().as_secs();
-        let total_tasks: usize = self.wave_total.iter().sum();
         let done = self.done.load(Ordering::SeqCst);
         let skipped = self.skipped.load(Ordering::SeqCst);
         let shared_hits = self.shared_hits.load(Ordering::SeqCst);
         let done_or_skipped = done + skipped;
         let shared_segment = if shared_hits > 0 {
-            format!(" 📥 shared: {shared_hits}")
+            format!(" 📥 {shared_hits}")
         } else {
             String::new()
         };
 
         format!(
-            "☑️ {done_or_skipped}/{total_tasks} ⏭️ {skipped}{shared_segment} ⏱️ {elapsed_total}s 🐏 {rss_formatted} 🌊 {} / {}",
+            "✔ {done_or_skipped} ⏩ {skipped}{shared_segment} ⌚ {elapsed_total}s 🐏 {rss_formatted} 🌊 {} / {}",
             self.total_waves, self.total_waves
         )
     }
@@ -369,13 +368,13 @@ fn pressure_suffix(warnings: &[PressureReason], pressure: &PressureSnapshot) -> 
             PressureReason::UsageHigh => {
                 let measured = crate::rss::format_rss(sample.map(|sample| sample.tree_rss));
                 let threshold = crate::rss::format_rss(Some(pressure.usage_threshold));
-                suffix.push_str(&format!(" ⚠️ mem usage high ({measured} / {threshold})"));
+                suffix.push_str(&format!(" ❗ mem usage high ({measured} / {threshold})"));
             }
             PressureReason::FreeLow => {
                 let measured = crate::rss::format_rss(sample.map(|sample| sample.system_available));
                 let threshold = crate::rss::format_rss(Some(pressure.free_threshold));
                 suffix.push_str(&format!(
-                    " ⚠️ system free memory low ({measured} / {threshold})"
+                    " ❗ system free memory low ({measured} / {threshold})"
                 ));
             }
         }
@@ -398,7 +397,6 @@ mod tests {
 
     struct DoneSummaryExpectation {
         done: usize,
-        total: usize,
         skipped: usize,
         waves: usize,
     }
@@ -406,13 +404,9 @@ mod tests {
     impl DoneSummaryExpectation {
         fn assert_in(&self, out: &str) {
             assert!(
-                out.contains(&format!(
-                    "☑️ {}/{} ⏭️ {}",
-                    self.done, self.total, self.skipped
-                )),
-                "expected done summary '☑️ {}/{} ⏭️ {}', got: {out}",
+                out.contains(&format!("✔ {} ⏩ {}", self.done, self.skipped)),
+                "expected done summary '✔ {} ⏩ {}', got: {out}",
                 self.done,
-                self.total,
                 self.skipped
             );
             assert!(
@@ -466,12 +460,13 @@ mod tests {
     }
 
     #[test]
-    fn render_progress_shows_zero_skipped_and_pending_when_work_remains() {
+    fn render_progress_omits_zero_skipped_and_shows_pending_when_work_remains() {
         let wave_of = HashMap::from([(task_id("pkg-a", "build"), 0)]);
         let reporter = ProgressReporter::new(OutputMode::Default, wave_of, 1);
 
         let out = reporter.render_progress("10 MB", &[], &pressure_snapshot(None, 0, 0));
-        assert_progress_line_shape(&out, "☑️ 0/1 ⏭️ 0 ⌛ 1 ⏱️ ", "10 MB", "0 / 1");
+        assert_progress_line_shape(&out, "✔ 0 ⌛ 1 ⌚ ", "10 MB", "0 / 1");
+        assert!(!out.contains("⏩"));
         assert!(!out.contains("🏃"));
     }
 
@@ -495,7 +490,7 @@ mod tests {
         reporter.task_started(&task_c);
 
         let out = reporter.render_progress("10 MB", &[], &pressure_snapshot(None, 0, 0));
-        assert_progress_line_shape(&out, "☑️ 2/3 ⏭️ 1 🏃1 (pkg-c#build) ⏱️ ", "10 MB", "0 / 1");
+        assert_progress_line_shape(&out, "✔ 2 ⏩ 1 🏃 1 (pkg-c#build) ⌚ ", "10 MB", "0 / 1");
         assert!(!out.contains("⌛"));
     }
 
@@ -514,8 +509,8 @@ mod tests {
 
         let out = reporter.render_progress("10 MB", &[], &pressure_snapshot(None, 0, 0));
 
-        assert!(out.contains("📥 shared: 1"), "output was: {out}");
-        assert!(out.contains("⏭️ 1"), "output was: {out}");
+        assert!(out.contains("📥 1"), "output was: {out}");
+        assert!(out.contains("⏩ 1"), "output was: {out}");
     }
 
     #[test]
@@ -545,7 +540,7 @@ mod tests {
         );
         assert_progress_line_shape(
             &out,
-            "☑️ 0/6 ⏭️ 0 🏃6 ({a,b,c}:lint, d:{test,tsc} +1) ⏱️ ",
+            "✔ 0 🏃 6 ({a,b,c}:lint, d:{test,tsc} +1) ⌚ ",
             "42 MB",
             "0 / 1",
         );
@@ -716,7 +711,6 @@ mod tests {
 
         DoneSummaryExpectation {
             done: 1,
-            total: 1,
             skipped: 0,
             waves: 1,
         }
@@ -741,7 +735,6 @@ mod tests {
 
         DoneSummaryExpectation {
             done: 2,
-            total: 2,
             skipped: 1,
             waves: 2,
         }
@@ -764,10 +757,7 @@ mod tests {
 
         let summary = reporter.render_summary("10 MB");
 
-        assert!(
-            summary.contains("☑️ 2/2 ⏭️ 1 📥 shared: 1"),
-            "summary was: {summary}"
-        );
+        assert!(summary.contains("✔ 2 ⏩ 1 📥 1"), "summary was: {summary}");
     }
 
     #[test]
@@ -824,10 +814,10 @@ mod tests {
             &warnings,
             &pressure_snapshot(Some(sample), 30 * 1024 * 1024, 16 * 1024 * 1024),
         );
-        assert!(out.contains("⚠️ mem usage high ("));
-        assert!(out.contains("⚠️ system free memory low ("));
+        assert!(out.contains("❗ mem usage high ("));
+        assert!(out.contains("❗ system free memory low ("));
         assert!(out.ends_with(&format!(
-            "⚠️ system free memory low ({} / {})",
+            "❗ system free memory low ({} / {})",
             rss::format_rss(Some(sample.system_available)),
             rss::format_rss(Some(16 * 1024 * 1024))
         )));
@@ -837,7 +827,7 @@ mod tests {
     fn render_progress_warnings_none() {
         let reporter = ProgressReporter::new(OutputMode::Default, HashMap::new(), 0);
         let out = reporter.render_progress("10 MB", &[], &pressure_snapshot(None, 0, 0));
-        assert!(!out.contains("⚠️"));
+        assert!(!out.contains("❗"));
     }
     fn running_tasks(tasks: &[(&str, &str)]) -> Vec<&'static TaskId> {
         let leaked = Box::leak(
