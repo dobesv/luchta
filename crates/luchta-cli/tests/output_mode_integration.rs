@@ -5,7 +5,7 @@ use std::fs;
 use assert_cmd::Command;
 use assert_fs::prelude::*;
 
-/// Expected tokens for the emoji done line: `✔ done ⏭️ skipped` plus
+/// Expected tokens for the emoji done line: `✔ done ⏩ skipped` plus
 /// `🌊 waves / waves`.
 #[derive(Clone, Copy)]
 struct DoneLine {
@@ -55,7 +55,7 @@ impl ProgressOutput {
     /// `Done:` text is gone.
     fn assert_done_line(&self, expected: DoneLine) -> &Self {
         let label = &self.label;
-        let done_token = format!("✔ {} ⏭️ {}", expected.done, expected.skipped);
+        let done_token = format!("✔ {} ⏩ {}", expected.done, expected.skipped);
         let wave_token = format!("🌊 {} / {}", expected.waves, expected.waves);
         assert!(
             self.stdout.contains(&done_token),

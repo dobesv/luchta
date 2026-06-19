@@ -190,7 +190,7 @@ done
         .arg(temp.path())
         .assert()
         .success()
-        .stdout(predicate::str::contains("✔ 1 ⏭️ 0"));
+        .stdout(predicate::str::contains("✔ 1 ⏩ 0"));
 
     // Assertions:
     // - lazy-worker deferred spawn until Run, so delegate was spawned (spawned marker exists)
@@ -369,7 +369,7 @@ done
         .arg(temp.path())
         .assert()
         .success()
-        .stdout(predicate::str::contains("✔ 2 ⏭️ 0"));
+        .stdout(predicate::str::contains("✔ 2 ⏩ 0"));
 
     // Verify ordering: prep ran before consumer
     wait_for_file(prep_ran.path(), Duration::from_secs(5));

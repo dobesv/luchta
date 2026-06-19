@@ -26,7 +26,7 @@ Memory-pressure warnings showed an RSS value that didn't match the value trigger
 
 ## Symptoms
 
-- `luchta run build` showed "⚠️ mem usage high" with displayed 🐏 RSS far below the 50%-of-RAM threshold (4.1 GB displayed on a 64 GB host)
+- `luchta run build` showed "❗ mem usage high" with displayed 🐏 RSS far below the 50%-of-RAM threshold (4.1 GB displayed on a 64 GB host)
 - Status lines stopped printing during memory-pressure pause; build appeared to hang indefinitely
 - User couldn't tell whether memory usage was actually high or what threshold triggered pause
 
@@ -58,8 +58,8 @@ Lesson: A value used for a control decision and the value shown to the user must
 All from one `RwLock` read.
 
 **Transparency in warning suffix**: Status line renders 🐏 from `snapshot.sample.tree_rss` (same value compared to threshold). Warning shows measured vs threshold:
-- `⚠️ mem usage high (<rss> / <usage_threshold>)` e.g., `(32.1 / 30.97 GB)`
-- `⚠️ system free memory low (<available> / <free_threshold>)`
+- `❗ mem usage high (<rss> / <usage_threshold>)` e.g., `(32.1 / 30.97 GB)`
+- `❗ system free memory low (<available> / <free_threshold>)`
 
 **Paused progress rendering**: `render_status_line` prints while paused even with zero running tasks. Gated via pure helper:
 ```rust

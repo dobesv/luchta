@@ -418,7 +418,7 @@ fn resident_worker_reuse_and_output_streaming() {
         "expected one worker process to service both tasks: {worker_invocations}"
     );
     assert!(
-        String::from_utf8_lossy(&output.stdout).contains("✔ 2 ⏭️ 0"),
+        String::from_utf8_lossy(&output.stdout).contains("✔ 2 ⏩ 0"),
         "expected done summary, got: {}",
         String::from_utf8_lossy(&output.stdout)
     );
@@ -520,7 +520,7 @@ fn worker_is_reaped_after_run() {
     // the Done summary; that the worker actually ran is asserted below via the
     // recorded PID/PGID markers.
     assert!(
-        stdout.contains("✔ 2 ⏭️ 0") && stdout.contains("🌊 1 / 1"),
+        stdout.contains("✔ 2 ⏩ 0") && stdout.contains("🌊 1 / 1"),
         "stdout should include the Done summary: {stdout}"
     );
     assert!(
@@ -799,7 +799,7 @@ fn real_yarn_worker_e2e() {
         .arg(temp.path())
         .assert()
         .success()
-        .stdout(predicate::str::contains("✔ 1 ⏭️ 0"))
+        .stdout(predicate::str::contains("✔ 1 ⏩ 0"))
         .stdout(predicate::str::contains("yarn-ran workspace=myapp script=build").not());
 
     temp.close().expect("cleanup temp dir");
@@ -870,7 +870,7 @@ fn global_task_prunes_packages_missing_the_script() {
         .arg(temp.path())
         .assert()
         .success()
-        .stdout(predicate::str::contains("✔ 1 ⏭️ 0"))
+        .stdout(predicate::str::contains("✔ 1 ⏩ 0"))
         .stdout(predicate::str::contains("yarn-ran workspace=has-build").not())
         // no-build#build is pruned (no prune output on run path).
         .stdout(predicate::str::contains("yarn-ran workspace=no-build").not());
@@ -904,7 +904,7 @@ fn explicit_command_resolves_against_scripts_for_pruning() {
         .arg(temp.path())
         .assert()
         .success()
-        .stdout(predicate::str::contains("✔ 1 ⏭️ 0"))
+        .stdout(predicate::str::contains("✔ 1 ⏩ 0"))
         .stdout(predicate::str::contains("yarn-ran workspace=has-build").not())
         .stdout(predicate::str::contains("yarn-ran workspace=no-build").not());
 
@@ -984,7 +984,7 @@ fn root_worker_task_resolves_against_root_package_scripts() {
         .assert()
         .success()
         // The root task ran and was NOT pruned; successful worker output stays hidden.
-        .stdout(predicate::str::contains("✔ 1 ⏭️ 0"))
+        .stdout(predicate::str::contains("✔ 1 ⏩ 0"))
         .stdout(predicate::str::contains("yarn-ran root script=release").not())
         .stdout(predicate::str::contains("pruned during resolution").not());
 
@@ -1060,7 +1060,7 @@ fn real_bash_worker_clears_ambient_env_end_to_end() {
         .arg(temp.path())
         .assert()
         .success()
-        .stdout(predicate::str::contains("✔ 1 ⏭️ 0"))
+        .stdout(predicate::str::contains("✔ 1 ⏩ 0"))
         .stdout(predicate::str::contains("package-build-script-unused").not())
         .stdout(predicate::str::contains("pruned during resolution").not());
 
