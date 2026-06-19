@@ -248,12 +248,8 @@ impl RcloneRcd {
         T: DeserializeOwned,
     {
         let mut state = self.lock_state()?;
-        if state.daemon.is_none() {
-            state.daemon = Some(self.runtime().block_on(Self::spawn_daemon(timeout))?);
-        }
-        let daemon = state.daemon.as_mut().expect("daemon initialized");
-        self.runtime()
-            .block_on(daemon.post_json(endpoint, payload, timeout))
+        let runtime = self.runtime();
+        call_on_runtime_thread(&mut state, runtime, endpoint, payload, timeout)
     }
 
     fn lock_state(&self) -> Result<std::sync::MutexGuard<'_, State>, RcloneError> {
@@ -309,6 +305,35 @@ impl RcloneRcd {
             .await?;
         Ok(daemon)
     }
+}
+
+fn call_on_runtime_thread<P, T>(
+    state: &mut State,
+    runtime: &Runtime,
+    endpoint: &str,
+    payload: P,
+    timeout: Duration,
+) -> Result<T, RcloneError>
+where
+    P: Serialize,
+    T: DeserializeOwned,
+{
+    let payload = serde_json::to_value(payload)?;
+    let response = std::thread::scope(|scope| {
+        scope
+            .spawn(move || -> Result<Value, RcloneError> {
+                if state.daemon.is_none() {
+                    state.daemon = Some(runtime.block_on(RcloneRcd::spawn_daemon(timeout))?);
+                }
+                let daemon = state.daemon.as_mut().expect("daemon initialized");
+                runtime.block_on(daemon.post_json::<_, Value>(endpoint, payload, timeout))
+            })
+            .join()
+            .map_err(|_| RcloneError::Process {
+                reason: "rclone call thread panicked".to_string(),
+            })?
+    })?;
+    serde_json::from_value(response).map_err(RcloneError::from)
 }
 
 /// Sends `core/quit` and waits for the daemon to exit, on the given runtime.
@@ -552,6 +577,20 @@ mod tests {
                 .status()
                 .map(|status| status.success())
                 .unwrap_or(false),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn noop_from_runtime_context_returns_result_instead_of_panicking() {
+        let timeout = Duration::from_millis(50);
+        let rclone = RcloneRcd::new(timeout).unwrap();
+
+        let result = std::panic::catch_unwind(|| rclone.noop(timeout));
+
+        assert!(result.is_ok(), "noop panicked inside runtime context");
+        let call_result = result.unwrap();
+        if !should_run_rclone_test() {
+            assert!(call_result.is_err(), "missing rclone should return Err");
         }
     }
 

@@ -9,3 +9,4 @@
 
 # Isolated build dir used by agents
 /.harnx-target/
+test_scope
