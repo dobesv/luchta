@@ -103,6 +103,8 @@ them as workflow artifacts instead of publishing a release.
   are flagged for automerge; major updates require manual review.
 - **Mergify** (`.mergify.yml`) runs a squash merge queue named `main`. It
   auto-queues passing Renovate PRs and any PR labeled `automerge`. A batch only
-  merges once every CI check is green: `Check`, `Test`, `Clippy`, `Format`
-  (the job names in `.github/workflows/ci.yml`). If you rename or add a CI job,
-  update the `merge_conditions` in `.mergify.yml` to match.
+  merges once every CI check is green. The `Check` job runs as a per-OS matrix
+  (ubuntu/windows/macos, and also runs clippy), producing `Check (<os>)`
+  check-runs; alongside `Test` and `Format` (the job names in
+  `.github/workflows/ci.yml`). If you rename or add a CI job, update the
+  `merge_conditions` in `.mergify.yml` to match.

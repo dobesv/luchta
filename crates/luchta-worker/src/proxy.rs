@@ -390,6 +390,22 @@ fn nix_killpg(pgid: i32, signal: i32) -> Result<(), ProxyError> {
     }
 }
 
+// Windows has no process-group signalling equivalent to SIGTERM/SIGKILL, so both
+// the graceful and forceful paths fall back to `Child::start_kill`, which issues
+// a `TerminateProcess`. The caller already awaits `child.wait()` afterwards to
+// reap the process.
+#[cfg(windows)]
+async fn terminate_child(child: &mut Child) -> Result<(), ProxyError> {
+    child.start_kill()?;
+    Ok(())
+}
+
+#[cfg(windows)]
+async fn kill_child(child: &mut Child) -> Result<(), ProxyError> {
+    child.start_kill()?;
+    Ok(())
+}
+
 async fn fail_all_waiters(waiters: &ResponseWaiters, message: String) {
     let waiters = {
         let mut guard = waiters.lock().await;
@@ -437,6 +453,7 @@ pub enum ProxyError {
     DelegateClosed(String),
     #[error("delegate did not respond before timeout for id: {0}")]
     ResponseTimeout(String),
+    #[cfg(unix)]
     #[error("delegate child missing pid")]
     MissingChildId,
 }
