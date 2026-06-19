@@ -8,7 +8,7 @@
 //!
 //! Path-escape at write time is covered by unit tests in shared/mod.rs.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use assert_cmd::Command;
 use assert_fs::prelude::*;
@@ -196,20 +196,7 @@ fn slow_task_stores_in_shared_cache() {
         "at least one blob should exist after >100ms task"
     );
 
-    // Count .bincode files, excluding .lock sidecar files
-    let snapshot_count = std::fs::read_dir(&snapshots_dir)
-        .unwrap()
-        .filter(|e| {
-            e.as_ref()
-                .ok()
-                .map(|e| {
-                    let file_name = e.file_name();
-                    let name = file_name.to_string_lossy();
-                    name.ends_with(".bincode") && !name.ends_with(".lock")
-                })
-                .unwrap_or(false)
-        })
-        .count();
+    let snapshot_count = snapshot_shard_paths(&snapshots_dir).len();
     assert!(
         snapshot_count > 0,
         "at least one snapshot should exist after >100ms task"
@@ -439,20 +426,7 @@ fn e2e_cross_build_shared_cache_hit() {
     let blobs_dir = shared_cache_dir.path().join("blobs");
     let snapshots_dir = shared_cache_dir.path().join("snapshots");
 
-    // Count .bincode files, excluding .lock sidecar files
-    let snapshot_count = std::fs::read_dir(&snapshots_dir)
-        .unwrap()
-        .filter(|e| {
-            e.as_ref()
-                .ok()
-                .map(|e| {
-                    let file_name = e.file_name();
-                    let name = file_name.to_string_lossy();
-                    name.ends_with(".bincode") && !name.ends_with(".lock")
-                })
-                .unwrap_or(false)
-        })
-        .count();
+    let snapshot_count = snapshot_shard_paths(&snapshots_dir).len();
     assert!(snapshot_count > 0, "first build should store snapshot");
 
     let blob_count = std::fs::read_dir(&blobs_dir)
@@ -491,11 +465,11 @@ fn e2e_cross_build_shared_cache_hit() {
     temp.child("packages/app/counter.txt").assert("1\n");
 
     assert!(
-        second_stdout.contains("📦 shared: 1"),
+        second_stdout.contains("📥 shared: 1"),
         "second build should report shared hit stats, stdout was:\n{second_stdout}"
     );
     assert!(
-        second_stdout.contains("⏭️ 1 📦 shared: 1"),
+        second_stdout.contains("⏭️ 1 📥 shared: 1"),
         "second build summary should report shared hit stats, stdout was:\n{second_stdout}"
     );
 
@@ -522,7 +496,7 @@ fn e2e_cross_build_shared_cache_hit() {
         "third build should still report skip total, stdout was:\n{third_stdout}"
     );
     assert!(
-        !third_stdout.contains("📦 shared:"),
+        !third_stdout.contains("📥 shared:"),
         "third build should be local skip, not shared, stdout was:\n{third_stdout}"
     );
 }
@@ -620,7 +594,7 @@ fn cross_worktree_shared_cache_hit() {
     worktree_b.child("packages/app/counter.txt").assert("1\n");
 
     assert!(
-        stdout_b.contains("📦 shared: 1"),
+        stdout_b.contains("📥 shared: 1"),
         "worktree B should report shared hit, stdout was:\n{stdout_b}"
     );
 
@@ -774,13 +748,20 @@ fn dirty_key_isolation() {
 
     temp.child("packages/app/counter.txt").assert("1\n");
 
-    // Verify dirty snapshot exists, clean does NOT
+    // Verify dirty snapshot shard dir exists, clean commit dir does NOT
     let snapshots_dir = shared_cache_dir.path().join("snapshots");
-    let dirty_snapshot = snapshots_dir.join(format!("{}-dirty.bincode", commit));
-    let clean_snapshot = snapshots_dir.join(format!("{}.bincode", commit));
+    let dirty_snapshot_dir = snapshots_dir.join(format!("{}-dirty", commit));
+    let clean_snapshot_dir = snapshots_dir.join(&commit);
 
-    assert!(dirty_snapshot.exists(), "dirty snapshot should exist");
-    assert!(!clean_snapshot.exists(), "clean snapshot should NOT exist");
+    let dirty_snapshot_shards = snapshot_shard_paths(&dirty_snapshot_dir);
+    assert!(
+        !dirty_snapshot_shards.is_empty(),
+        "dirty snapshot shard(s) should exist"
+    );
+    assert!(
+        !clean_snapshot_dir.exists(),
+        "clean snapshot dir should NOT exist"
+    );
 
     // NEW TEST START — verify written entry structure directly
     // Load the snapshot and verify entry structure
@@ -1039,16 +1020,17 @@ fn accumulation_single_snapshot_multiple_entries() {
         .assert()
         .success();
 
-    // Verify ONE snapshot file with 2 entries
+    // Verify commit snapshot shard(s) preserve both entries
     let commit = get_head_commit(temp.path());
-    let snapshot_path = shared_cache_dir
-        .path()
-        .join("snapshots")
-        .join(format!("{}.bincode", commit));
+    let commit_snapshot_dir = shared_cache_dir.path().join("snapshots").join(&commit);
+    let shard_paths = snapshot_shard_paths(&commit_snapshot_dir);
 
-    assert!(snapshot_path.exists(), "snapshot file should exist");
+    assert!(
+        !shard_paths.is_empty(),
+        "snapshot shard(s) should exist for commit"
+    );
 
-    // Load snapshot and verify entry count
+    // Load merged snapshot and verify entry count
     let paths = luchta_cache::shared::open_shared_paths(shared_cache_dir.path()).unwrap();
     let store = luchta_cache::shared::snapshot::SnapshotStore::new(paths);
     let snapshot = store.load(&commit).expect("snapshot should load");
@@ -1136,6 +1118,37 @@ fn over_size_cap_task_not_cached() {
 
     // Snapshot may or may not exist with entry, but if it does, entry should record skip
     // The key invariant: no blob was written for over-size output
+}
+
+/// Recursively list snapshot shard files under snapshots/<commit>/*.bincode.
+fn snapshot_shard_paths(root: &Path) -> Vec<PathBuf> {
+    let mut shards = Vec::new();
+    collect_snapshot_shards(root, &mut shards);
+    shards.sort();
+    shards
+}
+
+fn collect_snapshot_shards(path: &Path, shards: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let entry_path = entry.path();
+        if entry_path.is_dir() {
+            collect_snapshot_shards(&entry_path, shards);
+            continue;
+        }
+
+        let Some(ext) = entry_path.extension().and_then(|ext| ext.to_str()) else {
+            continue;
+        };
+        if ext != "bincode" {
+            continue;
+        }
+
+        shards.push(entry_path);
+    }
 }
 
 // === Helper functions ===

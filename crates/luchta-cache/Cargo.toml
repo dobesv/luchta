@@ -12,6 +12,7 @@ description.workspace = true
 [dependencies]
 luchta-types = { path = "../luchta-types" }
 serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
 bincode = { workspace = true }
 blake3 = { workspace = true }
 gix = { workspace = true }
@@ -21,8 +22,13 @@ walkdir = { workspace = true }
 zstd = { workspace = true }
 tar = { workspace = true }
 dirs = { workspace = true }
-fs2 = { workspace = true }
 tempfile = { workspace = true }
+tokio = { workspace = true }
+bytes = "1.11.1"
+http-body-util = "0.1.3"
+hyper = { version = "1.10.1", features = ["client", "http1"] }
+hyper-util = { version = "0.1.18", features = ["client-legacy", "http1", "tokio"] }
+hyperlocal = { version = "0.9.1", default-features = false, features = ["client"] }
 
 [dev-dependencies]
 filetime = "0.2"

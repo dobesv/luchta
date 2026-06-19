@@ -9,7 +9,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use luchta_cache::shared::{maybe_run_gc, SharedCache, DEFAULT_GC_RETENTION, DEFAULT_GC_THROTTLE};
+use luchta_cache::shared::{
+    maybe_run_gc, OpenExtras, RemoteConfig, SharedCache, DEFAULT_GC_RETENTION, DEFAULT_GC_THROTTLE,
+};
 use luchta_cache::Cache;
 use luchta_engine::{ExecutionRequest, TaskGraph, WeightedExecutor, WorkerManager};
 use luchta_types::{EnvSpec, TaskId, WorkerDefinition};
@@ -112,6 +114,8 @@ const SHARED_CACHE_GC_DAYS_ENV: &str = "LUCHTA_SHARED_CACHE_GC_DAYS";
 const SHARED_CACHE_MAX_OUTPUT_MB_ENV: &str = "LUCHTA_SHARED_CACHE_MAX_OUTPUT_MB";
 /// Environment variable overriding shared cache recent-commit history length.
 const SHARED_CACHE_HISTORY_ENV: &str = "LUCHTA_SHARED_CACHE_HISTORY";
+/// Environment variable overriding shared cache remote sync timeout, in seconds.
+const SHARED_CACHE_SYNC_TIMEOUT_ENV: &str = "LUCHTA_SHARED_CACHE_SYNC_TIMEOUT";
 
 /// Default shared cache size cap in megabytes.
 const DEFAULT_SHARED_CACHE_SIZE_CAP_MB: u64 = 250;
@@ -122,8 +126,53 @@ fn parse_truthy_env_value(value: Option<&str>) -> bool {
     matches!(value.map(str::trim), Some(raw) if raw.eq_ignore_ascii_case("1") || raw.eq_ignore_ascii_case("true") || raw.eq_ignore_ascii_case("on"))
 }
 
-fn shared_cache_enabled() -> bool {
-    parse_truthy_env_value(std::env::var(SHARED_CACHE_ENABLED_ENV).ok().as_deref())
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SharedCacheMode {
+    Off,
+    LocalOnly,
+    Remote { fs_base: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SharedCacheSettings {
+    mode: SharedCacheMode,
+    sync_timeout: Duration,
+}
+
+fn parse_shared_cache_mode(value: Option<&str>) -> SharedCacheMode {
+    match value.map(str::trim) {
+        None | Some("") => SharedCacheMode::Off,
+        Some(raw) if raw.len() >= 7 && raw[..7].eq_ignore_ascii_case("rclone:") => {
+            let fs_spec = raw[7..].trim();
+            if fs_spec.is_empty() {
+                SharedCacheMode::Off
+            } else {
+                let fs_base = if fs_spec.contains(':') {
+                    fs_spec.to_owned()
+                } else {
+                    format!("{fs_spec}:")
+                };
+                SharedCacheMode::Remote { fs_base }
+            }
+        }
+        Some(raw) if raw.eq_ignore_ascii_case("local") || parse_truthy_env_value(Some(raw)) => {
+            SharedCacheMode::LocalOnly
+        }
+        Some(_) => SharedCacheMode::Off,
+    }
+}
+
+fn shared_cache_settings() -> SharedCacheSettings {
+    let mode = parse_shared_cache_mode(std::env::var(SHARED_CACHE_ENABLED_ENV).ok().as_deref());
+    let sync_timeout_secs = parse_env_u64_or(
+        SHARED_CACHE_SYNC_TIMEOUT_ENV,
+        std::env::var(SHARED_CACHE_SYNC_TIMEOUT_ENV).ok().as_deref(),
+        30,
+    );
+    SharedCacheSettings {
+        mode,
+        sync_timeout: Duration::from_secs(sync_timeout_secs),
+    }
 }
 
 fn parse_env_u64_or(var: &str, value: Option<&str>, default: u64) -> u64 {
@@ -187,26 +236,37 @@ pub(super) fn build_execution_resources(
     );
     let output_hashes: Arc<Mutex<HashMap<TaskId, [u8; 32]>>> = Arc::new(Mutex::new(HashMap::new()));
 
-    let shared_cache = if shared_cache_enabled() {
-        let shared_cache = SharedCache::open(
+    let shared_cache_settings = shared_cache_settings();
+    let shared_cache = match &shared_cache_settings.mode {
+        SharedCacheMode::Off => None,
+        SharedCacheMode::LocalOnly => SharedCache::open(
             inputs.workspace_root,
             shared_cache_size_cap_bytes(),
             shared_cache_history_len(),
         )
-        .map(Arc::new);
-
-        if let Some(shared_cache) = shared_cache.as_ref() {
-            let _ = maybe_run_gc(
-                shared_cache.paths(),
-                shared_cache_gc_retention(),
-                DEFAULT_GC_THROTTLE,
-            );
-        }
-
-        shared_cache
-    } else {
-        None
+        .map(Arc::new),
+        SharedCacheMode::Remote { fs_base } => SharedCache::open_with_remote(
+            inputs.workspace_root,
+            shared_cache_size_cap_bytes(),
+            shared_cache_history_len(),
+            OpenExtras {
+                cache_dir: None,
+                remote: Some(RemoteConfig {
+                    fs_base: fs_base.clone(),
+                    sync_timeout: shared_cache_settings.sync_timeout,
+                }),
+            },
+        )
+        .map(Arc::new),
     };
+
+    if let Some(shared_cache) = shared_cache.as_ref() {
+        let _ = maybe_run_gc(
+            shared_cache.paths(),
+            shared_cache_gc_retention(),
+            DEFAULT_GC_THROTTLE,
+        );
+    }
 
     let CommandMap {
         commands,
@@ -266,6 +326,68 @@ mod tests {
                 "expected {value:?} to disable"
             );
         }
+    }
+
+    #[test]
+    fn parse_shared_cache_mode_matrix() {
+        assert_eq!(parse_shared_cache_mode(None), SharedCacheMode::Off);
+        assert_eq!(parse_shared_cache_mode(Some("")), SharedCacheMode::Off);
+        assert_eq!(
+            parse_shared_cache_mode(Some("local")),
+            SharedCacheMode::LocalOnly
+        );
+        assert_eq!(
+            parse_shared_cache_mode(Some("1")),
+            SharedCacheMode::LocalOnly
+        );
+        assert_eq!(
+            parse_shared_cache_mode(Some("true")),
+            SharedCacheMode::LocalOnly
+        );
+        assert_eq!(
+            parse_shared_cache_mode(Some("rclone:luchta")),
+            SharedCacheMode::Remote {
+                fs_base: "luchta:".to_owned()
+            }
+        );
+        assert_eq!(
+            parse_shared_cache_mode(Some("rclone:luchta:bucket/prefix")),
+            SharedCacheMode::Remote {
+                fs_base: "luchta:bucket/prefix".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn shared_cache_settings_default_timeout() {
+        let settings = SharedCacheSettings {
+            mode: parse_shared_cache_mode(Some("local")),
+            sync_timeout: Duration::from_secs(parse_env_u64_or(
+                SHARED_CACHE_SYNC_TIMEOUT_ENV,
+                None,
+                30,
+            )),
+        };
+        assert_eq!(settings.sync_timeout, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn shared_cache_settings_override_timeout() {
+        let settings = SharedCacheSettings {
+            mode: parse_shared_cache_mode(Some("rclone:luchta")),
+            sync_timeout: Duration::from_secs(parse_env_u64_or(
+                SHARED_CACHE_SYNC_TIMEOUT_ENV,
+                Some("5"),
+                30,
+            )),
+        };
+        assert_eq!(settings.sync_timeout, Duration::from_secs(5));
+        assert_eq!(
+            settings.mode,
+            SharedCacheMode::Remote {
+                fs_base: "luchta:".to_owned()
+            }
+        );
     }
 
     #[test]

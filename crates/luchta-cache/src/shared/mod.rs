@@ -3,6 +3,8 @@ pub mod blob;
 pub mod gc;
 pub mod git;
 pub mod paths;
+pub mod rclone;
+mod remote;
 pub mod scope;
 pub mod snapshot;
 
@@ -17,15 +19,17 @@ pub use paths::{
     open_shared_paths, resolve_shared_cache_dir, SharedCachePaths, BLOBS_DIR_NAME,
     SHARED_CACHE_DIR_ENV, SNAPSHOTS_DIR_NAME,
 };
+pub use rclone::RcloneRcd;
+pub use remote::RemoteConfig;
+pub(crate) use remote::RemoteSync;
 pub use scope::{classify_outputs, OutputScope, ScopeError};
 pub use snapshot::{
-    combined_dep_outputs_hash, derive_input_key, input_key_hex, MergeResult, Snapshot,
-    SnapshotEntry, SnapshotStore, SNAPSHOT_SCHEMA_VERSION,
+    combined_dep_outputs_hash, derive_input_key, input_key_hex, MergeEntryOutcome, MergeResult,
+    Snapshot, SnapshotEntry, SnapshotStore, SNAPSHOT_SCHEMA_VERSION,
 };
-
 use std::collections::HashMap;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use crate::record::TaskRunRecord;
@@ -130,10 +134,46 @@ pub struct SharedCache {
     candidate_keys: Vec<String>,
     /// Snapshot store for merge_entry.
     snapshot_store: SnapshotStore,
+    /// Optional remote sync for on-demand restore pull.
+    remote: Option<RemoteSync>,
     /// Lazily-built merged index.
     index: OnceLock<MergedIndex>,
     /// Size cap for individual blobs.
     size_cap_bytes: u64,
+}
+
+pub(crate) fn blob_path(paths: &SharedCachePaths, outputs_hash: &[u8; 32]) -> PathBuf {
+    paths
+        .blobs_dir
+        .join(format!("{}.tar.zst", hex_hash(*outputs_hash)))
+}
+
+pub(crate) fn hex_hash(hash: [u8; 32]) -> String {
+    blake3::Hash::from(hash).to_hex().to_string()
+}
+
+impl Drop for SharedCache {
+    fn drop(&mut self) {
+        // Own the rclone rcd daemon lifecycle: shut it down at run end so no
+        // process is orphaned. SIGKILL skips Drop, but that is mitigated by the
+        // per-run unique temp socket — any orphaned daemon is bound to a stale
+        // socket path that is never reused by a later run.
+        if let Some(remote) = &self.remote {
+            remote.shutdown();
+        }
+    }
+}
+
+/// Optional inputs for [`SharedCache::open_with_remote`].
+///
+/// Bundles the rarely-set knobs (explicit cache directory, remote sync config)
+/// so the opener keeps a small, fixed argument list.
+#[derive(Debug, Default)]
+pub struct OpenExtras<'a> {
+    /// Explicit cache directory; `None` resolves from env/platform defaults.
+    pub cache_dir: Option<&'a Path>,
+    /// Remote sync config; `None` keeps the cache local-only.
+    pub remote: Option<RemoteConfig>,
 }
 
 impl SharedCache {
@@ -143,7 +183,12 @@ impl SharedCache {
     /// - The shared cache directory cannot be created
     /// - No commit key is available (not in a git repo)
     pub fn open(repo_root: &Path, size_cap_bytes: u64, history_len: usize) -> Option<Self> {
-        Self::open_with_cache_dir(repo_root, size_cap_bytes, history_len, None)
+        Self::open_with_remote(
+            repo_root,
+            size_cap_bytes,
+            history_len,
+            OpenExtras::default(),
+        )
     }
 
     /// Opens the shared cache with an optional explicit cache directory.
@@ -156,7 +201,26 @@ impl SharedCache {
         history_len: usize,
         cache_dir: Option<&Path>,
     ) -> Option<Self> {
-        let cache_path = cache_dir
+        Self::open_with_remote(
+            repo_root,
+            size_cap_bytes,
+            history_len,
+            OpenExtras {
+                cache_dir,
+                remote: None,
+            },
+        )
+    }
+
+    /// Opens shared cache with optional cache directory and optional remote sync.
+    pub fn open_with_remote(
+        repo_root: &Path,
+        size_cap_bytes: u64,
+        history_len: usize,
+        extras: OpenExtras<'_>,
+    ) -> Option<Self> {
+        let cache_path = extras
+            .cache_dir
             .map(|p| p.to_path_buf())
             .unwrap_or_else(resolve_shared_cache_dir);
         let paths = open_shared_paths(&cache_path).ok()?;
@@ -170,12 +234,23 @@ impl SharedCache {
         let candidate_keys = candidate_commit_keys(repo_root, history_len);
 
         let snapshot_store = SnapshotStore::new(paths.clone());
+        let remote = match extras.remote {
+            Some(config) => match RemoteSync::from_config(config) {
+                Ok(remote) => Some(remote),
+                Err(err) => {
+                    eprintln!("warn: shared cache remote disabled: {err}");
+                    None
+                }
+            },
+            None => None,
+        };
 
         Some(Self {
             paths,
             write_commit_key,
             candidate_keys,
             snapshot_store,
+            remote,
             index: OnceLock::new(),
             size_cap_bytes,
         })
@@ -185,8 +260,6 @@ impl SharedCache {
     pub fn paths(&self) -> &SharedCachePaths {
         &self.paths
     }
-
-    /// Test-only constructor that accepts a pre-configured SnapshotStore with a load counter.
     #[cfg(test)]
     pub fn from_parts_for_test(
         repo_root: &Path,
@@ -209,6 +282,7 @@ impl SharedCache {
             write_commit_key,
             candidate_keys,
             snapshot_store,
+            remote: None,
             index: OnceLock::new(),
             size_cap_bytes,
         })
@@ -229,6 +303,7 @@ impl SharedCache {
         input_key: &[u8; 32],
         package_dir: &Path,
     ) -> impl Iterator<Item = StagedCandidate> + '_ {
+        self.pull_remote_snapshots_for_restore();
         let index = self.get_or_build_index();
         let input_key_hex = input_key_hex(*input_key);
 
@@ -259,9 +334,17 @@ impl SharedCache {
         // Stage each candidate (returns None for missing/corrupt blobs)
         let paths = self.paths.clone();
         let package_dir = package_dir.to_path_buf();
-        candidates
-            .into_iter()
-            .filter_map(move |entry| Self::stage_entry(&entry, &paths, &package_dir))
+        let remote = self.remote.clone();
+        candidates.into_iter().filter_map(move |entry| {
+            Self::stage_entry(&entry, &paths, &package_dir, remote.as_ref())
+        })
+    }
+
+    fn pull_remote_snapshots_for_restore(&self) {
+        let Some(remote) = self.remote.as_ref() else {
+            return;
+        };
+        self.index.get_or_init(|| self.build_index(Some(remote)));
     }
 
     /// Stage a single entry, returning a StagedCandidate for validation.
@@ -269,7 +352,18 @@ impl SharedCache {
         entry: &SnapshotEntry,
         paths: &SharedCachePaths,
         package_dir: &Path,
+        remote: Option<&RemoteSync>,
     ) -> Option<StagedCandidate> {
+        if !blob_path(paths, &entry.outputs_hash).is_file() {
+            if let Some(remote) = remote {
+                if let Err(err) = remote.pull_blob(paths, &entry.outputs_hash) {
+                    eprintln!(
+                        "debug: remote blob pull failed for outputs_hash={}: {err}",
+                        hex_hash(entry.outputs_hash)
+                    );
+                }
+            }
+        }
         let staged = match restore_blob_with_meta(paths, &entry.outputs_hash, package_dir) {
             Ok(BlobReadResultWithMeta::Restored(staged)) => staged,
             Ok(BlobReadResultWithMeta::Missing) | Ok(BlobReadResultWithMeta::Corrupt) => {
@@ -316,28 +410,41 @@ impl SharedCache {
 
     /// Builds the merged index on first access.
     fn get_or_build_index(&self) -> &MergedIndex {
-        self.index.get_or_init(|| {
-            let mut merged = MergedIndex::new();
+        self.index
+            .get_or_init(|| self.build_index(self.remote.as_ref()))
+    }
 
-            // Iterate in reverse order (oldest first) so that newest overwrites
-            for commit_key in self.candidate_keys.iter().rev() {
-                if let Some(snapshot) = self.snapshot_store.load(commit_key) {
-                    for (input_key_hex, entry) in &snapshot.entries {
-                        merged.insert_entry(
-                            input_key_hex.clone(),
-                            entry.clone(),
-                            commit_key.clone(),
-                        );
-                    }
-                    merged.snapshots.push((commit_key.clone(), snapshot));
-                }
-            }
+    fn build_index(&self, remote: Option<&RemoteSync>) -> MergedIndex {
+        let mut merged = MergedIndex::new();
 
-            // Reverse snapshots so newest is first
-            merged.snapshots.reverse();
+        // Iterate in reverse order (oldest first) so that newest overwrites.
+        for commit_key in self.candidate_keys.iter().rev() {
+            self.load_commit_into_index(&mut merged, commit_key, remote);
+        }
 
-            merged
-        })
+        // Reverse snapshots so newest is first.
+        merged.snapshots.reverse();
+
+        merged
+    }
+
+    /// Pull (if remote-enabled) and merge a single commit's snapshot into the index.
+    fn load_commit_into_index(
+        &self,
+        merged: &mut MergedIndex,
+        commit_key: &str,
+        remote: Option<&RemoteSync>,
+    ) {
+        if let Some(remote) = remote {
+            remote.pull_snapshot_commit(&self.snapshot_store, commit_key);
+        }
+        let Some(snapshot) = self.snapshot_store.load(commit_key) else {
+            return;
+        };
+        for (input_key_hex, entry) in &snapshot.entries {
+            merged.insert_entry(input_key_hex.clone(), entry.clone(), commit_key.to_string());
+        }
+        merged.snapshots.push((commit_key.to_string(), snapshot));
     }
 
     /// Store task outputs in the shared cache.
@@ -416,27 +523,45 @@ impl SharedCache {
             &meta,
         )?;
 
+        let entry = SnapshotEntry {
+            task_id: task_id.to_string(),
+            input_key: *input_key,
+            outputs_hash: *outputs_hash,
+            task_spec_hash: record.task_spec_hash,
+            env_hash: record.env_hash,
+            pkg_dep_hash: record.pkg_dep_hash,
+            duration_ms,
+            output_bytes: record.outputs.iter().map(|f| f.size).sum(),
+            cached_at_unix_ms: record.end_unix_ms,
+            tool_version: None,
+        };
+        self.finish_store(blob_result, &write_key, entry)
+    }
+
+    /// Records the snapshot entry and pushes to the remote after a blob write.
+    fn finish_store(
+        &self,
+        blob_result: BlobWriteResult,
+        write_key: &str,
+        entry: SnapshotEntry,
+    ) -> io::Result<StoreOutcome> {
         match blob_result {
             BlobWriteResult::Written | BlobWriteResult::AlreadyExists => {
-                // Merge entry into snapshot.
-                let entry = SnapshotEntry {
-                    task_id: task_id.to_string(),
-                    input_key: *input_key,
-                    outputs_hash: *outputs_hash,
-                    task_spec_hash: record.task_spec_hash,
-                    env_hash: record.env_hash,
-                    pkg_dep_hash: record.pkg_dep_hash,
-                    duration_ms,
-                    output_bytes: record.outputs.iter().map(|f| f.size).sum(),
-                    cached_at_unix_ms: record.end_unix_ms,
-                    tool_version: None,
-                };
-
-                let merge_result = self.snapshot_store.merge_entry(&write_key, entry);
-                if matches!(merge_result, MergeResult::SkippedLockUnavailable) {
+                let outputs_hash = entry.outputs_hash;
+                let merge = self
+                    .snapshot_store
+                    .merge_entry_with_outcome(write_key, entry);
+                if matches!(merge.result, MergeResult::SkippedLockUnavailable) {
                     return Ok(StoreOutcome::SkippedLockUnavailable);
                 }
-
+                if let Some(remote) = &self.remote {
+                    remote.push_store_artifacts(remote::PushArtifacts {
+                        paths: &self.paths,
+                        commit_key: write_key,
+                        outputs_hash: &outputs_hash,
+                        merge,
+                    });
+                }
                 Ok(StoreOutcome::Stored)
             }
             BlobWriteResult::SkippedTooLarge { bytes } => {
@@ -470,11 +595,11 @@ mod tests {
     use std::thread;
     use tempfile::TempDir;
 
-    fn bincode_config() -> impl bincode::config::Config {
+    pub(crate) fn bincode_config() -> impl bincode::config::Config {
         bincode::config::standard().with_fixed_int_encoding()
     }
 
-    fn setup_git_repo(repo_root: &Path) {
+    pub(crate) fn setup_git_repo(repo_root: &Path) {
         use std::process::Command;
         Command::new("git")
             .args(["init"])
@@ -493,7 +618,7 @@ mod tests {
             .unwrap();
     }
 
-    fn create_commit(repo_root: &Path) -> String {
+    pub(crate) fn create_commit(repo_root: &Path) -> String {
         use std::process::Command;
         static COUNTER: AtomicU64 = AtomicU64::new(1);
         let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -516,7 +641,7 @@ mod tests {
         String::from_utf8_lossy(&output.stdout).trim().to_string()
     }
 
-    fn sample_record(succeeded: bool, duration_ms: u64) -> TaskRunRecord {
+    pub(crate) fn sample_record(succeeded: bool, duration_ms: u64) -> TaskRunRecord {
         let start = 1_000_000_000_000_u64;
         TaskRunRecord {
             schema_version: crate::record::SCHEMA_VERSION_V1,
@@ -1082,6 +1207,16 @@ mod tests {
         assert_eq!(found.outputs_hash, [2; 32]);
     }
 
+    fn write_snapshot_fixture(snapshot_dir: &Path, commit: &str, entry: SnapshotEntry) {
+        let mut snapshot = Snapshot::new();
+        snapshot
+            .entries
+            .insert(input_key_hex(entry.input_key), entry);
+        let encoded = bincode::serde::encode_to_vec(&snapshot, bincode_config()).unwrap();
+        fs::create_dir_all(snapshot_dir.join(commit)).unwrap();
+        fs::write(snapshot_dir.join(commit).join("a.bincode"), encoded).unwrap();
+    }
+
     #[test]
     fn load_once_proven_via_counter() {
         use std::sync::atomic::Ordering;
@@ -1090,21 +1225,14 @@ mod tests {
         setup_git_repo(temp_repo.path());
         let commit1 = create_commit(temp_repo.path());
         let commit2 = create_commit(temp_repo.path());
-
         let temp_cache = TempDir::new().unwrap();
-
-        // Manually create snapshot files BEFORE opening cache
-        // This way merge_entry doesn't trigger load during test setup
+        let snapshot_dir = temp_cache.path().join("snapshots");
         let input_key1 = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32]);
         let input_key2 = derive_input_key([5; 32], [6; 32], [7; 32], [8; 32]);
 
-        // Create minimal snapshot files for both commits
-        let snapshot_dir = temp_cache.path().join("snapshots");
-        fs::create_dir_all(&snapshot_dir).unwrap();
-
-        let mut snapshot1 = Snapshot::new();
-        snapshot1.entries.insert(
-            input_key_hex(input_key1),
+        write_snapshot_fixture(
+            &snapshot_dir,
+            &commit1,
             SnapshotEntry {
                 task_id: "pkg#build".to_string(),
                 input_key: input_key1,
@@ -1118,10 +1246,9 @@ mod tests {
                 tool_version: None,
             },
         );
-
-        let mut snapshot2 = Snapshot::new();
-        snapshot2.entries.insert(
-            input_key_hex(input_key2),
+        write_snapshot_fixture(
+            &snapshot_dir,
+            &commit2,
             SnapshotEntry {
                 task_id: "pkg#build".to_string(),
                 input_key: input_key2,
@@ -1136,43 +1263,26 @@ mod tests {
             },
         );
 
-        // Write snapshot files directly (no load during merge_entry)
-        let encoded1 = bincode::serde::encode_to_vec(&snapshot1, bincode_config()).unwrap();
-        let encoded2 = bincode::serde::encode_to_vec(&snapshot2, bincode_config()).unwrap();
-        fs::write(snapshot_dir.join(format!("{commit1}.bincode")), &encoded1).unwrap();
-        fs::write(snapshot_dir.join(format!("{commit2}.bincode")), &encoded2).unwrap();
-
-        // Open cache with per-instance load counter
         let paths = open_shared_paths(temp_cache.path()).unwrap();
         let (snapshot_store, load_counter) = SnapshotStore::new_with_counter(paths);
-
         let cache =
             SharedCache::from_parts_for_test(temp_repo.path(), 1_000_000, 10, snapshot_store)
                 .unwrap();
-
-        // Call try_restore 50 times across different input_keys
         let restore_dir = temp_repo.path().join("restore");
+
         for i in 0..50 {
             fs::create_dir_all(&restore_dir).unwrap();
-            // Alternate between input keys
             let input_key = if i % 2 == 0 { &input_key1 } else { &input_key2 };
-            // Commit first candidate (if any) - just testing load-once behavior
             if let Some(candidate) = cache
                 .try_restore_candidates("pkg#build", input_key, &restore_dir)
                 .next()
             {
                 let _ = candidate.commit();
             }
-            // Clean restore dir for next iteration
             fs::remove_dir_all(&restore_dir).ok();
         }
 
-        // Count snapshot files that exist in cache
-        let snapshot_file_count = 2; // We know we wrote exactly 2
-
-        // CRITICAL ASSERTION: Each snapshot file is loaded EXACTLY ONCE during index build.
-        // If try_restore re-reads from disk, count would be 50 * snapshot_file_count.
-        // With proper O(1) in-memory lookup, count must equal snapshot_file_count.
+        let snapshot_file_count = 2;
         assert_eq!(
             load_counter.load(Ordering::SeqCst),
             snapshot_file_count,
@@ -1181,8 +1291,6 @@ mod tests {
             snapshot_file_count,
             load_counter.load(Ordering::SeqCst)
         );
-
-        // Index was initialized exactly once.
         assert!(cache.index.get().is_some());
     }
 

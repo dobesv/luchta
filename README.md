@@ -462,24 +462,46 @@ The shared build cache is a cross-worktree, cross-clone cache that restores task
 #### Concept
 - **Commit-Keyed:** Results are indexed by git commit hash.
 - **Content-Addressed Blobs:** Build outputs are compressed and stored in a deduped blob store.
-- **Read Window:** On cache lookup, Luchta consults the last 20 commits (configurable) to find a match, allowing for hits even if the current commit hasn't been cached yet.
-- **Remote-Ready:** The on-disk format is designed for easy synchronization. Remote/S3/rclone sync is planned for future work.
+- **Read Window:** On cache lookup, Luchta consults the last 20 commits (configurable) to find a match.
+- **Remote Synchronization:** Opt-in synchronization with S3 or other object stores via `rclone`.
 
 #### Layout
 By default, the cache is stored at `~/.cache/luchta` (on Linux/macOS):
 - `blobs/<outputs_hash>.tar.zst` — Content-addressed compressed output archives.
-- `snapshots/<commit>.bincode` — Metadata snapshots for all cached tasks at a specific commit.
+- `snapshots/<commit>/<shard_id>.bincode` — Metadata snapshots, stored as append-only content-addressed shards.
 
 #### Configuration (Environment Variables)
-The shared cache is **OPT-IN** and is only active when `LUCHTA_SHARED_CACHE` is enabled. It is configured exclusively via environment variables (there are no CLI flags or project config settings for this feature):
+The shared cache is **OPT-IN** and is configured exclusively via environment variables:
 
-- `LUCHTA_SHARED_CACHE` — Set to `1`, `true`, or `on` (case-insensitive) to enable. Default: `off`.
+- `LUCHTA_SHARED_CACHE` — Configuration mode:
+    - `off` (default) — Disabled.
+    - `local`, `1`, `true`, `on` — Local-only shared cache.
+    - `rclone:<spec>` — Enable remote-sync via rclone, where `<spec>` is an rclone Fs base that points at a bucket and (recommended) a prefix, e.g. `rclone:my-s3:my-bucket/luchta-cache`.
 - `LUCHTA_SHARED_CACHE_DIR` — Override the cache root directory.
-- `LUCHTA_SHARED_CACHE_GC_DAYS` — Retention period for cache entries. Default: `14`.
+- `LUCHTA_SHARED_CACHE_SYNC_TIMEOUT` — Maximum seconds for the initial remote sync. Default: `30`.
+- `LUCHTA_SHARED_CACHE_GC_DAYS` — Retention period for local cache entries. Default: `14`.
 - `LUCHTA_SHARED_CACHE_MAX_OUTPUT_MB` — Maximum size for a single task's output to be cached. Default: `250`.
 - `LUCHTA_SHARED_CACHE_HISTORY` — Number of recent commits to check for snapshots. Default: `20`.
 
-Invalid numeric values for these variables will trigger a warning and fall back to their defaults.
+Invalid numeric values will trigger a warning and fall back to their defaults.
+
+#### Remote Synchronization (S3/rclone)
+Luchta can synchronize the shared cache with a remote object store (like S3, GCS, or Azure) using [rclone](https://rclone.org/).
+
+1. **Setup:** Run `rclone config` to create and name a remote (e.g., `my-s3`).
+2. **Enable:** Set `LUCHTA_SHARED_CACHE=rclone:<remote-name>:<bucket>/<prefix>`.
+   - Example: `rclone:my-s3:my-bucket/luchta-cache`.
+   - Luchta appends `blobs/` and `snapshots/` beneath this base, so a dedicated
+     bucket or prefix is recommended.
+   - For S3 (and other bucket-based backends) you **must** include the bucket
+     name — pointing at the bare remote root (`rclone:my-s3`) is not a valid
+     write target.
+3. **Credentials:** Luchta does not handle credentials directly. It uses the `rclone` binary on your `PATH` and relies on your `rclone.conf` or `RCLONE_*` environment variables.
+
+**Resilience & Performance:**
+- **Build Safety:** Remote cache problems (timeouts or rclone errors) never fail a build. If an error occurs, Luchta issues a warning, disables the remote cache for the rest of the run, and continues using only the local cache.
+- **No CAS Required:** Snapshots are stored as append-only content-addressed shards, eliminating the need for complex "Compare-and-Swap" operations on the remote store.
+- **Garbage Collection:** Remote GC is not managed by Luchta. Use S3 bucket lifecycle rules or similar object store features to expire old objects.
 
 #### Cacheability
 A task is eligible for the shared cache if all the following are true:
@@ -490,14 +512,14 @@ A task is eligible for the shared cache if all the following are true:
 - The working tree is "clean" (bare `<commit>` key) or "dirty" (staged or unstaged changes to tracked files; ignored files don't count). Both clean and dirty entries are reusable (content-validated on restore), though dirty entries are kept out of any future remote sync.
 
 #### Maintenance
-Luchta automatically performs throttled garbage collection of old cache entries and blobs (those older than `LUCHTA_SHARED_CACHE_GC_DAYS`). The cache is read-tolerant; if a blob is missing due to GC or other reasons, it is treated as a cache miss.
+Luchta automatically performs throttled garbage collection of old local cache entries and blobs (those older than `LUCHTA_SHARED_CACHE_GC_DAYS`). The cache is read-tolerant; if a blob is missing due to GC or other reasons, it is treated as a cache miss.
 
 #### Stats
-Shared cache hits are shown in the build summary: `📦 shared: <n>`.
+Shared cache hits are shown in the build summary: `📥 shared: <n>`.
 
 ## Roadmap
 
 - **Phase 1 (Current):** Multi-crate workspace skeleton, CI, and release tooling (nextest, knope changesets, GitHub release workflows).
 - **Phase 2:** Foundation libraries (workspace discovery, lockfile parsing, graph construction, weighted parallel execution).
 - **Phase 3 (Current):** Opt-in build change-detection cache (blake3 hashing, local and shared) — see "Build cache" and "Shared Build Cache" above.
-- **Future:** Cross-process build locking and remote (S3/rclone) sync.
+- **Future:** Cross-process build locking.
