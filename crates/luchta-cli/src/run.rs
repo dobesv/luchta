@@ -53,7 +53,7 @@ use dispatch::dispatch_ready_task;
 /// Encapsulates the requested tasks, package filters, and top-level flag into a
 /// single struct to reduce function argument counts and improve API ergonomics.
 #[derive(Debug)]
-pub struct TaskSelection<'a> {
+pub(crate) struct TaskSelection<'a> {
     pub requested_tasks: &'a [String],
     pub packages: &'a [String],
     pub top_level: bool,
@@ -64,7 +64,7 @@ pub struct TaskSelection<'a> {
 ///
 /// Pre-built from `TaskSelection` to avoid repeatedly passing the same arguments
 /// to `collect_matching_task_ids` and `package_matches`.
-struct SelectionCriteria<'a> {
+pub(crate) struct SelectionCriteria<'a> {
     task_globs: &'a GlobSet,
     package_globs: &'a GlobSet,
     match_all_non_root_packages: bool,
@@ -190,12 +190,13 @@ pub async fn run_tasks(
     else {
         return Ok(());
     };
-    let tasks_to_run = collect_requested_subgraph(
-        &run.task_graph,
+    let tasks_to_run = collect_requested_subgraph(CollectSubgraphRequest {
+        task_graph: &run.task_graph,
         selection,
-        &run.pruned,
-        run_since_affected(&run),
-    )?;
+        pruned: &run.pruned,
+        since_affected: run_since_affected(&run),
+        expand_dependencies: true,
+    })?;
     let (wave_of, total_waves) = compute_wave_indices(&run.task_graph, &tasks_to_run);
     let reporter = Arc::new(ProgressReporter::new(output, wave_of, total_waves));
 
@@ -536,8 +537,13 @@ pub async fn dry_run_tasks(workspace_root: &Path, selection: &TaskSelection<'_>)
         SinceSelection::Proceed(set) => set,
     };
 
-    let tasks_to_run =
-        collect_requested_subgraph(&task_graph, selection, &pruned, since_affected.as_ref())?;
+    let tasks_to_run = collect_requested_subgraph(CollectSubgraphRequest {
+        task_graph: &task_graph,
+        selection,
+        pruned: &pruned,
+        since_affected: since_affected.as_ref(),
+        expand_dependencies: true,
+    })?;
     let CommandMap {
         commands,
         invalid,
@@ -747,7 +753,7 @@ fn shutdown_signal() -> Pin<Box<dyn Future<Output = Result<ShutdownSignal>> + Se
     })
 }
 
-fn build_globset(patterns: &[String]) -> Result<GlobSet> {
+pub(crate) fn build_globset(patterns: &[String]) -> Result<GlobSet> {
     let mut builder = GlobSetBuilder::new();
     for pattern in patterns {
         builder.add(
@@ -762,12 +768,24 @@ fn build_globset(patterns: &[String]) -> Result<GlobSet> {
         .wrap_err("failed to build glob set")
 }
 
-fn collect_requested_subgraph(
-    task_graph: &TaskGraph,
-    selection: &TaskSelection<'_>,
-    pruned: &[PrunedTask],
-    since_affected: Option<&HashSet<PackageName>>,
+pub(crate) struct CollectSubgraphRequest<'a> {
+    pub task_graph: &'a TaskGraph,
+    pub selection: &'a TaskSelection<'a>,
+    pub pruned: &'a [PrunedTask],
+    pub since_affected: Option<&'a HashSet<PackageName>>,
+    pub expand_dependencies: bool,
+}
+
+pub(crate) fn collect_requested_subgraph(
+    request: CollectSubgraphRequest<'_>,
 ) -> Result<HashSet<TaskId>> {
+    let CollectSubgraphRequest {
+        task_graph,
+        selection,
+        pruned,
+        since_affected,
+        expand_dependencies,
+    } = request;
     let package_globs = build_globset(selection.packages)?;
     let task_globs = build_globset(selection.requested_tasks)?;
     let available_nodes: Vec<&TaskNode> = task_graph.nodes().collect();
@@ -802,12 +820,16 @@ fn collect_requested_subgraph(
         );
     }
 
-    Ok(expand_with_dependencies(task_graph, requested_ids))
+    if expand_dependencies {
+        Ok(expand_with_dependencies(task_graph, requested_ids))
+    } else {
+        Ok(requested_ids)
+    }
 }
 
 /// Adds every node whose task name matches `task_globs` and whose package scope
 /// matches selection matrix, returning matched goal ids.
-fn collect_matching_task_ids(
+pub(crate) fn collect_matching_task_ids(
     available_nodes: &[&TaskNode],
     criteria: &SelectionCriteria<'_>,
 ) -> HashSet<TaskId> {
@@ -819,7 +841,7 @@ fn collect_matching_task_ids(
         .collect()
 }
 
-fn collect_matched_package_names(
+pub(crate) fn collect_matched_package_names(
     available_nodes: &[&TaskNode],
     packages: &[String],
     package_globs: &GlobSet,
@@ -837,7 +859,7 @@ fn collect_matched_package_names(
         .collect()
 }
 
-fn package_matches(task_id: &TaskId, criteria: &SelectionCriteria<'_>) -> bool {
+pub(crate) fn package_matches(task_id: &TaskId, criteria: &SelectionCriteria<'_>) -> bool {
     let is_root = task_id.is_root();
 
     let matches_non_root_package = if criteria.match_all_non_root_packages {
@@ -866,7 +888,7 @@ fn package_matches(task_id: &TaskId, criteria: &SelectionCriteria<'_>) -> bool {
     base_match && passes_since
 }
 
-fn is_literal_pattern(s: &str) -> bool {
+pub(crate) fn is_literal_pattern(s: &str) -> bool {
     !s.contains(['*', '?', '[', ']', '{', '}', '!', '\\'])
 }
 
@@ -1302,35 +1324,101 @@ mod tests {
         assert!(message.contains("["));
     }
 
+    fn collect_requested_for_test(
+        task_graph: &TaskGraph,
+        selection: TaskSelection<'_>,
+        expand_dependencies: bool,
+    ) -> miette::Result<HashSet<TaskId>> {
+        collect_requested_subgraph(CollectSubgraphRequest {
+            task_graph,
+            selection: &selection,
+            pruned: &[],
+            since_affected: None,
+            expand_dependencies,
+        })
+    }
+
     #[test]
     fn collect_requested_subgraph_expands_prereqs_in_unmatched_package() {
         let task_graph = goal_model_prereq_task_graph();
 
-        let selection = TaskSelection {
-            requested_tasks: &["build".to_string()],
-            packages: &["@repo/app".to_string()],
-            top_level: false,
-            since: None,
-        };
-        let requested = collect_requested_subgraph(&task_graph, &selection, &[], None)
-            .expect("collect requested");
+        let requested = collect_requested_for_test(
+            &task_graph,
+            TaskSelection {
+                requested_tasks: &["build".to_string()],
+                packages: &["@repo/app".to_string()],
+                top_level: false,
+                since: None,
+            },
+            true,
+        )
+        .expect("collect requested");
 
         assert!(requested.contains(&TaskId::new("@repo/app", "build")));
         assert!(requested.contains(&TaskId::new("@repo/api", "codegen")));
     }
 
     #[test]
+    fn collect_requested_subgraph_without_dependency_expansion_returns_only_direct_matches() {
+        let task_graph = package_task_graph(
+            vec![
+                ("@repo/a", "packages/a", vec!["@repo/b"]),
+                ("@repo/b", "packages/b", Vec::new()),
+            ],
+            vec![
+                task_entry(
+                    "build",
+                    vec![luchta_types::DependsOn::DirectUpstream(TaskName::from(
+                        "codegen",
+                    ))],
+                ),
+                task_entry("bundle", Vec::new()),
+                task_entry("codegen", Vec::new()),
+            ],
+        );
+
+        let requested = collect_requested_for_test(
+            &task_graph,
+            TaskSelection {
+                requested_tasks: &["b*".to_string()],
+                packages: &[],
+                top_level: false,
+                since: None,
+            },
+            false,
+        )
+        .expect("collect requested without deps");
+
+        assert_eq!(
+            requested,
+            HashSet::from([
+                TaskId::new("@repo/a", "build"),
+                TaskId::new("@repo/a", "bundle"),
+                TaskId::new("@repo/b", "build"),
+                TaskId::new("@repo/b", "bundle"),
+            ])
+        );
+        assert!(
+            !requested.contains(&TaskId::new("@repo/b", "codegen")),
+            "no-expansion selection must not include transitive deps"
+        );
+    }
+
+    #[test]
     fn collect_requested_subgraph_package_glob_does_not_select_root_without_top_level() {
         let task_graph = package_selection_task_graph();
 
-        let selection = TaskSelection {
-            requested_tasks: &["build".to_string()],
-            packages: &["*root*".to_string()],
-            top_level: false,
-            since: None,
-        };
-        let error = collect_requested_subgraph(&task_graph, &selection, &[], None)
-            .expect_err("root sentinel must not satisfy package filter");
+        let error = collect_requested_for_test(
+            &task_graph,
+            TaskSelection {
+                requested_tasks: &["build".to_string()],
+                packages: &["*root*".to_string()],
+                top_level: false,
+                since: None,
+            },
+            true,
+        )
+        .expect_err("root sentinel must not satisfy package filter");
 
         assert!(error.to_string().contains("No packages matched"));
     }

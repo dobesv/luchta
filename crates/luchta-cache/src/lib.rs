@@ -14,8 +14,8 @@ pub use resolve::{
     ResolveRequest,
 };
 pub use store::{
-    resolve_cache_dir, Cache, RunArtifacts, CACHE_DIR_ENV, CACHE_DIR_NAME, GITIGNORE_CONTENTS,
-    GITIGNORE_FILE_NAME, LUCHTA_DIR_NAME,
+    resolve_cache_dir, task_cache_key, Cache, RunArtifacts, CACHE_DIR_ENV, CACHE_DIR_NAME,
+    GITIGNORE_CONTENTS, GITIGNORE_FILE_NAME, LUCHTA_DIR_NAME,
 };
 
 #[derive(Debug, thiserror::Error)]

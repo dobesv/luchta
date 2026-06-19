@@ -3,6 +3,8 @@ mod cli;
 mod config;
 mod env_conflict;
 mod env_merge;
+mod format;
+mod logs;
 mod memory_pressure;
 mod progress;
 mod rss;
@@ -11,6 +13,7 @@ mod since;
 
 use clap::Parser;
 use cli::{Cli, Commands, OutputMode};
+use logs::LogsOptions;
 use luchta_engine::{
     DependencyValidationError, ResolveMode, TaskGraph, TaskValidationDiagnostic,
     TaskValidationReason,
@@ -56,6 +59,26 @@ async fn run(cli: Cli) -> Result<()> {
 
     match cli.command {
         command @ Commands::Run { .. } => run_command(&workspace_root, command).await,
+        Commands::Logs {
+            tasks,
+            packages,
+            top_level,
+            time_taken,
+            failed,
+            show_inputs,
+            show_outputs,
+        } => {
+            let options = LogsOptions {
+                tasks: &tasks,
+                packages: &packages,
+                top_level,
+                time_taken,
+                failed,
+                show_inputs,
+                show_outputs,
+            };
+            logs::execute_logs(&workspace_root, &options).await
+        }
         Commands::Check => {
             // Check mode: a worker `Reject` during resolution is a hard error
             // (surfaced from prepare_workspace); a `Prune` is informational.
@@ -175,7 +198,7 @@ fn command_run_args(command: Commands) -> RunArgs {
             max_weight_cli: max_weight,
             since,
         },
-        Commands::Check => unreachable!("checked by caller"),
+        Commands::Logs { .. } | Commands::Check => unreachable!("checked by caller"),
     }
 }
 

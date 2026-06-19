@@ -21,6 +21,7 @@ serde_json.workspace = true
 serde_path_to_error = "0.1"
 tokio = { workspace = true }
 owo-colors = "4.0"
+jiff = "0.2.28"
 petgraph.workspace = true
 globset = { workspace = true }
 thiserror = { workspace = true }

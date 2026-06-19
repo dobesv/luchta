@@ -266,6 +266,24 @@ Additional targeting rules:
 - **Mandatory Tasks**: At least one task argument is required; `luchta run -p pkg` is an error.
 - **Error Reporting**: If no matches are found, Luchta provides a clear error distinguishing between "no packages matched the pattern" and "no tasks matched within the selected packages".
 
+
+#### Failed Task Output
+
+When a task fails during `luchta run`, its output is replayed to the console wrapped in a clear header and footer block.
+
+To prevent extremely large logs from flooding the terminal, `luchta run` truncates output that exceeds 100 lines. It preserves the first 30 lines and the last 70 lines, inserting a placeholder that points to the exact `luchta logs` command needed to view the full output.
+
+```text
+──▶ app#build
+...
+(first 30 lines)
+...
+… 150 lines hidden — run `luchta logs -p app build` for full output
+...
+(last 70 lines)
+...
+──◀ app#build (1200ms)
+```
 #### Memory-pressure backpressure
 
 `luchta run` can pause dispatching **new** tasks when memory pressure is high. In-flight tasks keep running to completion.
@@ -294,6 +312,34 @@ Status line: while paused, periodic progress output appends `⚠️ mem usage hi
 
 Precedence: flag > env var > config `concurrency.maxWeight` > default.
 
+
+### Viewing Logs
+
+By default, `luchta run` suppresses the output of successful tasks to keep the console clean. You can view the full stdout, stderr, and execution metadata for any previously run task using the `luchta logs` command.
+
+All executed tasks—even those that are not opt-in for caching—persist their run records and logs locally.
+
+#### Examples
+
+- `luchta logs`: View logs for all tasks from the most recent runs.
+- `luchta logs build`: View logs for all tasks named `build`.
+- `luchta logs -p '@scope/*' build`: View logs for `build` tasks in packages matching `@scope/*`.
+- `luchta logs --failed`: View logs only for tasks that failed in their last run.
+- `luchta logs --show-outputs`: Include metadata for all task outputs.
+
+#### Logs CLI Options
+
+| Flag | Description |
+|---|---|
+| `tasks` (positional) | Task names to match; supports glob wildcards (e.g. `b*`). |
+| `-p, --package <PKG>` | Match package name globs (not paths). Repeatable. |
+| `-T, --top-level` | Match tasks defined at the workspace root instead of package tasks. |
+| `--time-taken <MS>` | Filter to tasks that took at least this many milliseconds. |
+| `--failed` | Filter to tasks that failed (`succeeded == false`). |
+| `--show-inputs` | Show input file metadata (path, size, mtime, hash) for each task. |
+| `--show-outputs` | Show output file metadata for each task. |
+
+`luchta logs` always displays the full, non-truncated output for every matching task.
 ### `dependsOn` Syntax
 
 Luchta supports flexible dependency definitions:

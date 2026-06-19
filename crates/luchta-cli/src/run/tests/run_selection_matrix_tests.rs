@@ -204,7 +204,13 @@ fn run_selection_case(
         top_level: *top_level,
         since: None,
     };
-    collect_requested_subgraph(&task_graph, &selection, &[], None)
+    collect_requested_subgraph(CollectSubgraphRequest {
+        task_graph: &task_graph,
+        selection: &selection,
+        pruned: &[],
+        since_affected: None,
+        expand_dependencies: true,
+    })
 }
 
 /// Verifies table-driven success cases for collect_requested_subgraph.

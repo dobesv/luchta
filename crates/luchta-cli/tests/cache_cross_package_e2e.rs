@@ -12,7 +12,7 @@ mod common;
 
 use common::{
     git_commit_paths, init_git, shell_worker_with_done_fields, write_counter_task_config,
-    write_root_workspace, write_root_workspace_manifest, write_task_config_with_worker,
+    write_root_workspace, write_root_workspace_manifest, write_task_config_with_shell_worker,
 };
 
 fn run_luchta(temp: &assert_fs::TempDir, task: &str) -> assert_cmd::assert::Assert {
@@ -236,9 +236,13 @@ fn setup_transitive_upstream_glob_workspace(temp: &assert_fs::TempDir) {
 fn setup_detected_prefixed_input_workspace(temp: &assert_fs::TempDir) {
     write_root_workspace(temp);
     temp.child("yarn.lock").write_str("").unwrap();
-    let worker =
-        shell_worker_with_done_fields(temp, Some(",\"inputs\":[\"#shared.txt\",\"^*.ts\"]"));
-    write_task_config_with_worker(
+    let worker = shell_worker_with_done_fields(
+        temp,
+        common::WorkerDoneFields {
+            json_fragment: Some(",\"inputs\":[\"#shared.txt\",\"^*.ts\"]"),
+        },
+    );
+    write_task_config_with_shell_worker(
         temp,
         worker.path(),
         r##""build":{"dependsOn":["^build"]},"lib#build":{"worker":"shell","command":"cat lib.ts > out.txt"},"app#build":{"cache":{},"dependsOn":["^build"],"worker":"shell","outputs":["counter.txt","out.txt"],"command":"count=$(cat counter.txt 2>/dev/null || echo 0); count=$((count+1)); echo $count > counter.txt; cat ../../shared.txt ../lib/lib.ts > out.txt"}}"##,
@@ -495,8 +499,13 @@ fn detected_input_path_escape_fails_task() {
     write_root_workspace(&temp);
     temp.child("yarn.lock").write_str("").unwrap();
     // Worker reports an escaping prefixed detected input — untrusted; must fail.
-    let worker = shell_worker_with_done_fields(&temp, Some(",\"inputs\":[\"#../escape.txt\"]"));
-    write_task_config_with_worker(
+    let worker = shell_worker_with_done_fields(
+        &temp,
+        common::WorkerDoneFields {
+            json_fragment: Some(",\"inputs\":[\"#../escape.txt\"]"),
+        },
+    );
+    write_task_config_with_shell_worker(
         &temp,
         worker.path(),
         r##""app#build":{"cache":{},"worker":"shell","outputs":["counter.txt"],"command":"count=$(cat counter.txt 2>/dev/null || echo 0); count=$((count+1)); echo $count > counter.txt"}"##,

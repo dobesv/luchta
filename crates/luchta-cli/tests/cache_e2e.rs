@@ -11,7 +11,7 @@ use common::{
     setup_lockfile_workspace, setup_skip_edit_workspace, shell_worker,
     shell_worker_with_done_fields, write_basic_package, write_counter_task_config,
     write_executable, write_root_workspace, write_root_workspace_manifest,
-    write_task_config_with_worker, YARN1_LOCK_LEFT_PAD_1_0_0, YARN1_LOCK_LEFT_PAD_1_1_0,
+    write_task_config_with_shell_worker, YARN1_LOCK_LEFT_PAD_1_0_0, YARN1_LOCK_LEFT_PAD_1_1_0,
 };
 
 /// Process-wide lock to serialize env-mutating tests.
@@ -231,9 +231,13 @@ fn setup_dependency_workspace(temp: &assert_fs::TempDir) {
 fn setup_detected_dependency_workspace(temp: &assert_fs::TempDir) {
     write_root_workspace(temp);
     temp.child("yarn.lock").write_str("").unwrap();
-    let worker =
-        shell_worker_with_done_fields(temp, Some(",\"outputs\":[\"detected-output.txt\"]"));
-    write_task_config_with_worker(
+    let worker = shell_worker_with_done_fields(
+        temp,
+        common::WorkerDoneFields {
+            json_fragment: Some(",\"outputs\":[\"detected-output.txt\"]"),
+        },
+    );
+    write_task_config_with_shell_worker(
         temp,
         worker.path(),
         r#""build":{"dependsOn":["^build"]},"lib#build":{"worker":"shell","command":"count=$(cat counter.txt 2>/dev/null || echo 0); count=$((count+1)); echo $count > counter.txt; cp value.txt detected-output.txt; echo declared-stable > declared-output.txt"},"app#build":{"cache":{},"dependsOn":["^build"],"worker":"shell","outputs":["counter.txt","app-output.txt"],"command":"count=$(cat counter.txt 2>/dev/null || echo 0); count=$((count+1)); echo $count > counter.txt; cat ../lib/detected-output.txt > app-output.txt"}}"#,
@@ -276,7 +280,7 @@ fn setup_root_cache_workspace(temp: &assert_fs::TempDir, root_manifest: &str) {
     write_root_workspace_manifest(temp, root_manifest);
     temp.child("yarn.lock").write_str("").unwrap();
     let worker = shell_worker(temp);
-    write_task_config_with_worker(
+    write_task_config_with_shell_worker(
         temp,
         worker.path(),
         r##""#build":{"cache":{},"worker":"shell","inputs":["root-input.txt"],"outputs":["root-counter.txt","root-output.txt"],"command":"count=$(cat root-counter.txt 2>/dev/null || echo 0); count=$((count+1)); echo $count > root-counter.txt; cat root-input.txt > root-output.txt"}"##,
@@ -291,7 +295,7 @@ fn setup_root_dependency_workspace(temp: &assert_fs::TempDir) {
     write_root_workspace(temp);
     temp.child("yarn.lock").write_str("").unwrap();
     let worker = shell_worker(temp);
-    write_task_config_with_worker(
+    write_task_config_with_shell_worker(
         temp,
         worker.path(),
         r##""#build":{"cache":{},"worker":"shell","inputs":["root-input.txt"],"outputs":["root-counter.txt","root-output.txt"],"command":"count=$(cat root-counter.txt 2>/dev/null || echo 0); count=$((count+1)); echo $count > root-counter.txt; cat root-input.txt > root-output.txt"},"app#build":{"cache":{},"dependsOn":["#build"],"worker":"shell","inputs":["src.txt"],"outputs":["counter.txt","app-output.txt"],"command":"count=$(cat counter.txt 2>/dev/null || echo 0); count=$((count+1)); echo $count > counter.txt; cat src.txt ../../root-output.txt > app-output.txt"}}"##,
@@ -478,7 +482,7 @@ fn cache_corrupt_lockfile_forces_run_and_skips_cache_write() {
 }
 
 #[test]
-fn cache_resolve_error_skips_write_and_warns() {
+fn cache_resolve_error_writes_empty_outputs_record_and_warns() {
     let temp = assert_fs::TempDir::new().unwrap();
     WorkspaceBuilder {
         yarn_lock: Some(""),
@@ -490,18 +494,24 @@ fn cache_resolve_error_skips_write_and_warns() {
     }
     .build(&temp);
 
-    run_luchta(&temp, "pkgbuild")
-        .success()
-        .stderr(predicate::str::contains(
-        "warning: skipping cache write for task 'app#pkgbuild': failed to resolve cache outputs",
-    ));
+    run_luchta(&temp, "pkgbuild").success().stderr(
+        predicate::str::contains(
+            "warning: failed to resolve cache outputs for task 'app#pkgbuild':",
+        )
+        .and(predicate::str::contains(
+            "— recording run with empty outputs",
+        )),
+    );
     temp.child("packages/app/counter.txt").assert("1\n");
 
-    run_luchta(&temp, "pkgbuild")
-        .success()
-        .stderr(predicate::str::contains(
-        "warning: skipping cache write for task 'app#pkgbuild': failed to resolve cache outputs",
-    ));
+    run_luchta(&temp, "pkgbuild").success().stderr(
+        predicate::str::contains(
+            "warning: failed to resolve cache outputs for task 'app#pkgbuild':",
+        )
+        .and(predicate::str::contains(
+            "— recording run with empty outputs",
+        )),
+    );
     temp.child("packages/app/counter.txt").assert("2\n");
 }
 

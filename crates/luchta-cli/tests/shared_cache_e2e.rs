@@ -134,6 +134,65 @@ fn shared_cache_falsey_gate_disables_shared_cache() {
 }
 
 /// Test: a >100ms task stores blob and snapshot entry in shared cache.
+
+#[test]
+fn non_cacheable_task_stays_out_of_shared_cache_but_writes_local_record() {
+    let shared_cache_dir = tempfile::tempdir().unwrap();
+    let temp = assert_fs::TempDir::new().unwrap();
+
+    write_root_workspace(&temp);
+    write_counter_task_config(
+        &temp,
+        r#""app#pkgbuild":{"worker":"shell","inputs":["src.txt"],"outputs":["counter.txt"],"command":"sleep 0.15 && count=$(cat counter.txt 2>/dev/null || echo 0); count=$((count+1)); echo $count > counter.txt"}"#,
+    );
+    temp.child("packages/app/src.txt")
+        .write_str("one\n")
+        .unwrap();
+    temp.child("packages/app/package.json")
+        .write_str(
+            r#"{
+  "name": "app",
+  "scripts": {
+    "pkgbuild": "echo ignored"
+  }
+}"#,
+        )
+        .unwrap();
+    init_git(&temp);
+
+    let mut cmd = Command::cargo_bin("luchta").unwrap();
+    cmd.arg("run")
+        .arg("pkgbuild")
+        .arg("--workspace-root")
+        .arg(temp.path())
+        .env("LUCHTA_SHARED_CACHE", "1")
+        .env(
+            "LUCHTA_SHARED_CACHE_DIR",
+            shared_cache_dir.path().to_str().unwrap(),
+        )
+        .assert()
+        .success();
+
+    let cache_dir = temp
+        .path()
+        .join(".luchta")
+        .join("cache")
+        .join(blake3::hash("app#pkgbuild".as_bytes()).to_hex().to_string());
+    assert!(cache_dir.join("meta.bincode").exists());
+    assert!(cache_dir.join("stdout.log").exists());
+    assert!(cache_dir.join("stderr.log").exists());
+
+    let blobs_dir = shared_cache_dir.path().join("blobs");
+    let snapshots_dir = shared_cache_dir.path().join("snapshots");
+    assert!(
+        !blobs_dir.exists() || std::fs::read_dir(&blobs_dir).unwrap().next().is_none(),
+        "non-cacheable task must not store blobs in shared cache"
+    );
+    assert!(
+        !snapshots_dir.exists() || snapshot_shard_paths(&snapshots_dir).is_empty(),
+        "non-cacheable task must not store snapshots in shared cache"
+    );
+}
 #[test]
 fn slow_task_stores_in_shared_cache() {
     let shared_cache_dir = tempfile::tempdir().unwrap();
