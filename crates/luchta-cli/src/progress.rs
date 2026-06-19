@@ -516,7 +516,7 @@ mod tests {
 
         let out = reporter.render_progress("10 MB", &[], &pressure_snapshot(None, 0, 0));
 
-        assert!(out.contains("📥 shared: 1"), "output was: {out}");
+        assert!(out.contains("📥 1"), "output was: {out}");
         assert!(out.contains("⏭️ 1"), "output was: {out}");
     }
 
@@ -767,7 +767,7 @@ mod tests {
         let summary = reporter.render_summary("10 MB");
 
         assert!(
-            summary.contains("☑️ 2/2 ⏭️ 1 📥 shared: 1"),
+            summary.contains("☑️ 2/2 ⏭️ 1 📥 1"),
             "summary was: {summary}"
         );
     }
