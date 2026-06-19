@@ -492,7 +492,7 @@ fn e2e_cross_build_shared_cache_hit() {
     let third_stdout = String::from_utf8(third).unwrap();
 
     assert!(
-        third_stdout.contains("☑️ 1 ⏭️ 1"),
+        third_stdout.contains("✔ 1 ⏭️ 1"),
         "third build should still report skip total, stdout was:\n{third_stdout}"
     );
     assert!(

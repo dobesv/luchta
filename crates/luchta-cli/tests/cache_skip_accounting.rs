@@ -15,7 +15,7 @@ struct DoneLine {
 }
 
 fn assert_done_line(out: &str, label: &str, expected: DoneLine) {
-    let done_token = format!("☑️ {} ⏭️ {}", expected.done, expected.skipped);
+    let done_token = format!("✔ {} ⏭️ {}", expected.done, expected.skipped);
     let wave_token = format!("🌊 {} / {}", expected.waves, expected.waves);
     assert!(
         out.contains(&done_token),
@@ -177,8 +177,8 @@ fn skip_count_is_cache_hit_only() {
     );
     // First run: 1 done, 0 skipped
     assert!(
-        stdout1.contains("☑️ 1 ⏭️ 0"),
-        "first run stdout should contain '☑️ 1 ⏭️ 0', got: {stdout1}"
+        stdout1.contains("✔ 1 ⏭️ 0"),
+        "first run stdout should contain '✔ 1 ⏭️ 0', got: {stdout1}"
     );
     assert!(
         stdout1.contains("🌊 1 / 1"),
@@ -209,8 +209,8 @@ fn skip_count_is_cache_hit_only() {
     );
     // Second run: 0 done, 1 skipped (cache-hit)
     assert!(
-        stdout2.contains("☑️ 1 ⏭️ 1"),
-        "second run stdout should contain '☑️ 1 ⏭️ 1', got: {stdout2}"
+        stdout2.contains("✔ 1 ⏭️ 1"),
+        "second run stdout should contain '✔ 1 ⏭️ 1', got: {stdout2}"
     );
     assert!(
         stdout2.contains("🌊 1 / 1"),

@@ -175,7 +175,7 @@ let waves_done = self.wave_total.iter().enumerate()
     .count();
 
 let mut parts = vec![
-    format!("☑️ {}/{}", done_or_skipped, total_tasks),
+    format!("✔ {}/{}", done_or_skipped, total_tasks),
     format!("⏭️ {}", skipped),
 ];
 if pending > 0 { parts.push(format!("⌛ {}", pending)); }
@@ -229,7 +229,7 @@ impl ProgressOutput {
     }
 
     fn assert_done_line(&self, expected: DoneLine) -> &Self {
-        let token = format!("☑️ {}/{} ⏭️ {}", expected.done, expected.total, expected.skipped);
+        let token = format!("✔ {}/{} ⏭️ {}", expected.done, expected.total, expected.skipped);
         assert!(self.stdout.contains(&token), "{} missing '{}', got: {}", self.label, token, self.stdout);
         self
     }

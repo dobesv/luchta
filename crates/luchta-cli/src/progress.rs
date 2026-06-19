@@ -137,7 +137,7 @@ impl ProgressReporter {
             })
             .count();
 
-        let mut segments = vec![format!("☑️ {done_or_skipped}")];
+        let mut segments = vec![format!("✔ {done_or_skipped}")];
         if skipped > 0 {
             segments.push(format!("⏭️ {skipped}"));
         }
@@ -175,7 +175,7 @@ impl ProgressReporter {
         };
 
         format!(
-            "☑️ {done_or_skipped} ⏭️ {skipped}{shared_segment} ⏱️ {elapsed_total}s 🐏 {rss_formatted} 🌊 {} / {}",
+            "✔ {done_or_skipped} ⏭️ {skipped}{shared_segment} ⏱️ {elapsed_total}s 🐏 {rss_formatted} 🌊 {} / {}",
             self.total_waves, self.total_waves
         )
     }
@@ -404,8 +404,8 @@ mod tests {
     impl DoneSummaryExpectation {
         fn assert_in(&self, out: &str) {
             assert!(
-                out.contains(&format!("☑️ {} ⏭️ {}", self.done, self.skipped)),
-                "expected done summary '☑️ {} ⏭️ {}', got: {out}",
+                out.contains(&format!("✔ {} ⏭️ {}", self.done, self.skipped)),
+                "expected done summary '✔ {} ⏭️ {}', got: {out}",
                 self.done,
                 self.skipped
             );
@@ -465,7 +465,7 @@ mod tests {
         let reporter = ProgressReporter::new(OutputMode::Default, wave_of, 1);
 
         let out = reporter.render_progress("10 MB", &[], &pressure_snapshot(None, 0, 0));
-        assert_progress_line_shape(&out, "☑️ 0 ⌛ 1 ⏱️ ", "10 MB", "0 / 1");
+        assert_progress_line_shape(&out, "✔ 0 ⌛ 1 ⏱️ ", "10 MB", "0 / 1");
         assert!(!out.contains("⏭️"));
         assert!(!out.contains("🏃"));
     }
@@ -490,7 +490,7 @@ mod tests {
         reporter.task_started(&task_c);
 
         let out = reporter.render_progress("10 MB", &[], &pressure_snapshot(None, 0, 0));
-        assert_progress_line_shape(&out, "☑️ 2 ⏭️ 1 🏃 1 (pkg-c#build) ⏱️ ", "10 MB", "0 / 1");
+        assert_progress_line_shape(&out, "✔ 2 ⏭️ 1 🏃 1 (pkg-c#build) ⏱️ ", "10 MB", "0 / 1");
         assert!(!out.contains("⌛"));
     }
 
@@ -540,7 +540,7 @@ mod tests {
         );
         assert_progress_line_shape(
             &out,
-            "☑️ 0 🏃 6 ({a,b,c}:lint, d:{test,tsc} +1) ⏱️ ",
+            "✔ 0 🏃 6 ({a,b,c}:lint, d:{test,tsc} +1) ⏱️ ",
             "42 MB",
             "0 / 1",
         );
@@ -757,7 +757,7 @@ mod tests {
 
         let summary = reporter.render_summary("10 MB");
 
-        assert!(summary.contains("☑️ 2 ⏭️ 1 📥 1"), "summary was: {summary}");
+        assert!(summary.contains("✔ 2 ⏭️ 1 📥 1"), "summary was: {summary}");
     }
 
     #[test]
