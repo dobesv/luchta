@@ -436,6 +436,48 @@ mod tests {
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 
+    // Regression: a remote-configured `SharedCache` (which owns an `RcloneRcd`
+    // with its own tokio runtime) used to PANIC when its `Arc` was dropped from
+    // inside the build's tokio runtime ("Cannot drop a runtime in a context
+    // where blocking is not allowed"). The real `luchta run` drops the cache
+    // inside an async task, so this must not panic. Not rclone-gated: the bug is
+    // dropping the owned runtime in an async context, independent of whether the
+    // daemon ever spawned.
+    #[test]
+    fn remote_cache_drops_cleanly_inside_async_context() {
+        use std::sync::Arc;
+
+        let temp_repo = TempDir::new().unwrap();
+        setup_git_repo(temp_repo.path());
+        create_commit(temp_repo.path());
+        let cache_dir = TempDir::new().unwrap();
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async move {
+            let cache = SharedCache::open_with_remote(
+                temp_repo.path(),
+                1_000_000,
+                10,
+                OpenExtras {
+                    cache_dir: Some(cache_dir.path()),
+                    remote: Some(RemoteConfig {
+                        fs_base: ":local:/tmp/luchta-async-drop-test".to_string(),
+                        sync_timeout: std::time::Duration::from_secs(1),
+                    }),
+                },
+            )
+            .unwrap();
+            let cache = Arc::new(cache);
+            // Drop the last Arc reference inside the async context — must not panic.
+            drop(cache);
+        });
+    }
+
     fn should_run_rclone_test() -> bool {
         match std::env::var("LUCHTA_TEST_RCLONE") {
             Ok(value) if value == "1" => std::process::Command::new("rclone")

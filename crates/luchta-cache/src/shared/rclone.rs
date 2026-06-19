@@ -87,7 +87,9 @@ impl RcloneError {
 
 #[derive(Debug)]
 pub struct RcloneRcd {
-    runtime: Runtime,
+    /// Owned so it can be torn down off the async context on Drop (see below).
+    /// Always `Some` until `Drop`/`shutdown` takes it.
+    runtime: Option<Runtime>,
     state: Mutex<State>,
     default_timeout: Duration,
 }
@@ -110,10 +112,18 @@ impl RcloneRcd {
     pub fn new(default_timeout: Duration) -> Result<Self, RcloneError> {
         let runtime = Builder::new_current_thread().enable_all().build()?;
         Ok(Self {
-            runtime,
+            runtime: Some(runtime),
             state: Mutex::new(State { daemon: None }),
             default_timeout,
         })
+    }
+
+    /// The owned tokio runtime. Present for the whole lifetime except during the
+    /// final teardown in `shutdown`/`drop`.
+    fn runtime(&self) -> &Runtime {
+        self.runtime
+            .as_ref()
+            .expect("rclone runtime used after teardown")
     }
 
     pub fn with_default_timeout() -> Result<Self, RcloneError> {
@@ -214,19 +224,21 @@ impl RcloneRcd {
 
     pub fn shutdown(&self, timeout: Duration) -> Result<(), RcloneError> {
         let mut state = self.lock_state()?;
-        let Some(mut daemon) = state.daemon.take() else {
+        let Some(daemon) = state.daemon.take() else {
             return Ok(());
         };
-        self.runtime.block_on(async move {
-            let quit_result = daemon
-                .post_json::<_, EmptyResponse>("core/quit", json!({}), timeout)
-                .await;
-            let wait_result = daemon.wait_for_exit(timeout).await;
-            match (quit_result, wait_result) {
-                (Err(err), _) => Err(err),
-                (_, Err(err)) => Err(err),
-                _ => Ok(()),
-            }
+        // Run the blocking teardown on a dedicated OS thread. `block_on` must
+        // never be called from within an async context (e.g. when the owning
+        // `SharedCache` Arc is dropped inside the build's tokio runtime), so we
+        // borrow the runtime into a scoped thread instead of blocking here.
+        let runtime = self.runtime();
+        std::thread::scope(|scope| {
+            scope
+                .spawn(move || quit_and_wait(runtime, daemon, timeout))
+                .join()
+                .map_err(|_| RcloneError::Process {
+                    reason: "rclone shutdown thread panicked".to_string(),
+                })?
         })
     }
 
@@ -237,10 +249,10 @@ impl RcloneRcd {
     {
         let mut state = self.lock_state()?;
         if state.daemon.is_none() {
-            state.daemon = Some(self.runtime.block_on(Self::spawn_daemon(timeout))?);
+            state.daemon = Some(self.runtime().block_on(Self::spawn_daemon(timeout))?);
         }
         let daemon = state.daemon.as_mut().expect("daemon initialized");
-        self.runtime
+        self.runtime()
             .block_on(daemon.post_json(endpoint, payload, timeout))
     }
 
@@ -299,6 +311,26 @@ impl RcloneRcd {
     }
 }
 
+/// Sends `core/quit` and waits for the daemon to exit, on the given runtime.
+/// Intended to run on a dedicated OS thread, never inside an async context.
+fn quit_and_wait(
+    runtime: &Runtime,
+    mut daemon: DaemonState,
+    timeout: Duration,
+) -> Result<(), RcloneError> {
+    runtime.block_on(async move {
+        let quit_result = daemon
+            .post_json::<_, EmptyResponse>("core/quit", json!({}), timeout)
+            .await;
+        let wait_result = daemon.wait_for_exit(timeout).await;
+        match (quit_result, wait_result) {
+            (Err(err), _) => Err(err),
+            (_, Err(err)) => Err(err),
+            _ => Ok(()),
+        }
+    })
+}
+
 impl Drop for RcloneRcd {
     fn drop(&mut self) {
         let daemon = self
@@ -306,15 +338,36 @@ impl Drop for RcloneRcd {
             .get_mut()
             .ok()
             .and_then(|state| state.daemon.take());
-        if let Some(mut daemon) = daemon {
-            self.runtime.block_on(async move {
-                let _ = daemon
-                    .post_json::<_, EmptyResponse>("core/quit", json!({}), Duration::from_secs(1))
-                    .await;
-                let _ = daemon.wait_for_exit(Duration::from_secs(1)).await;
-                let _ = daemon.kill_force().await;
-            });
-        }
+        // Move the runtime OUT of `self` so it is dropped on the teardown thread
+        // below, NOT here. Dropping a tokio runtime from within an async context
+        // (e.g. when this Arc is released inside the build's runtime) panics
+        // with "Cannot drop a runtime in a context where blocking is not
+        // allowed". Running the teardown — and the runtime's own drop — on a
+        // dedicated OS thread sidesteps that entirely.
+        let Some(runtime) = self.runtime.take() else {
+            return;
+        };
+        let handle = std::thread::spawn(move || {
+            if let Some(mut daemon) = daemon {
+                runtime.block_on(async move {
+                    let _ = daemon
+                        .post_json::<_, EmptyResponse>(
+                            "core/quit",
+                            json!({}),
+                            Duration::from_secs(1),
+                        )
+                        .await;
+                    let _ = daemon.wait_for_exit(Duration::from_secs(1)).await;
+                    let _ = daemon.kill_force().await;
+                });
+            }
+            // `runtime` (and its background threads) is dropped here, on this
+            // dedicated thread, outside any async context.
+            drop(runtime);
+        });
+        // Join so the daemon is fully reaped before this drop returns; ignore a
+        // panic in the teardown thread (best-effort cleanup, never fatal).
+        let _ = handle.join();
     }
 }
 
