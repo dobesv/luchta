@@ -476,7 +476,7 @@ The shared cache is **OPT-IN** and is configured exclusively via environment var
 - `LUCHTA_SHARED_CACHE` — Configuration mode:
     - `off` (default) — Disabled.
     - `local`, `1`, `true`, `on` — Local-only shared cache.
-    - `rclone:<spec>` — Enable remote-sync via rclone (e.g., `rclone:my-remote`, `rclone:my-remote:bucket/prefix`).
+    - `rclone:<spec>` — Enable remote-sync via rclone, where `<spec>` is an rclone Fs base that points at a bucket and (recommended) a prefix, e.g. `rclone:my-s3:my-bucket/luchta-cache`.
 - `LUCHTA_SHARED_CACHE_DIR` — Override the cache root directory.
 - `LUCHTA_SHARED_CACHE_SYNC_TIMEOUT` — Maximum seconds for the initial remote sync. Default: `30`.
 - `LUCHTA_SHARED_CACHE_GC_DAYS` — Retention period for local cache entries. Default: `14`.
@@ -489,9 +489,13 @@ Invalid numeric values will trigger a warning and fall back to their defaults.
 Luchta can synchronize the shared cache with a remote object store (like S3, GCS, or Azure) using [rclone](https://rclone.org/).
 
 1. **Setup:** Run `rclone config` to create and name a remote (e.g., `my-s3`).
-2. **Enable:** Set `LUCHTA_SHARED_CACHE=rclone:<remote-name>[:<path>]`.
-   - `rclone:my-s3` uses the root of the `my-s3` remote.
-   - `rclone:my-s3:bucket/prefix` uses a specific bucket and path.
+2. **Enable:** Set `LUCHTA_SHARED_CACHE=rclone:<remote-name>:<bucket>/<prefix>`.
+   - Example: `rclone:my-s3:my-bucket/luchta-cache`.
+   - Luchta appends `blobs/` and `snapshots/` beneath this base, so a dedicated
+     bucket or prefix is recommended.
+   - For S3 (and other bucket-based backends) you **must** include the bucket
+     name — pointing at the bare remote root (`rclone:my-s3`) is not a valid
+     write target.
 3. **Credentials:** Luchta does not handle credentials directly. It uses the `rclone` binary on your `PATH` and relies on your `rclone.conf` or `RCLONE_*` environment variables.
 
 **Resilience & Performance:**
