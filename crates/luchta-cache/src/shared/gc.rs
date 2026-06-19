@@ -3,6 +3,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::shared::snapshot::{SNAPSHOT_FILE_EXTENSION, SNAPSHOT_MERGED_EXTENSION};
 use crate::shared::{atomic_write, SharedCachePaths};
 
 #[cfg(test)]
@@ -14,7 +15,6 @@ pub const DEFAULT_GC_RETENTION: Duration = Duration::from_secs(14 * 24 * 60 * 60
 pub const DEFAULT_GC_THROTTLE: Duration = Duration::from_secs(24 * 60 * 60);
 const LAST_GC_MARKER: &str = ".last-gc";
 const SNAPSHOT_SUFFIX: &str = ".bincode";
-const LOCK_SUFFIX: &str = ".bincode.lock";
 const BLOB_SUFFIX: &str = ".tar.zst";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -66,19 +66,68 @@ fn gc_snapshot_dir(
             Err(_) => continue,
         };
         let path = entry.path();
-        if !has_file_name_suffix(&path, SNAPSHOT_SUFFIX) || has_file_name_suffix(&path, LOCK_SUFFIX)
-        {
+
+        if path.is_dir() {
+            gc_snapshot_commit_dir(&path, retention, now, stats);
+            continue;
+        }
+
+        if !has_file_name_suffix(&path, SNAPSHOT_SUFFIX) {
             continue;
         }
         if !is_older_than(&path, retention, now) {
             continue;
         }
 
-        let snapshot_bytes = file_len(&path);
-        if remove_file_if_exists(&path) {
-            stats.snapshots_deleted += 1;
-            stats.bytes_freed = stats.bytes_freed.saturating_add(snapshot_bytes);
+        delete_snapshot_file(&path, stats);
+    }
+}
+
+fn gc_snapshot_commit_dir(path: &Path, retention: Duration, now: SystemTime, stats: &mut GcStats) {
+    let entries = match fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+        let shard_path = entry.path();
+
+        if !shard_path.is_file() {
+            continue;
         }
+        if shard_path.extension().and_then(|ext| ext.to_str()) != Some(SNAPSHOT_FILE_EXTENSION) {
+            continue;
+        }
+        if !is_older_than(&shard_path, retention, now) {
+            continue;
+        }
+
+        delete_snapshot_shard(&shard_path, stats);
+    }
+
+    prune_empty_dir(path);
+}
+
+fn delete_snapshot_shard(path: &Path, stats: &mut GcStats) {
+    let snapshot_bytes = file_len(path);
+    if remove_file_if_exists(path) {
+        stats.snapshots_deleted += 1;
+        stats.bytes_freed = stats.bytes_freed.saturating_add(snapshot_bytes);
+    }
+
+    let sidecar_path = path.with_extension(SNAPSHOT_MERGED_EXTENSION);
+    let _ = remove_file_if_exists(&sidecar_path);
+}
+
+fn delete_snapshot_file(path: &Path, stats: &mut GcStats) {
+    let snapshot_bytes = file_len(path);
+    if remove_file_if_exists(path) {
+        stats.snapshots_deleted += 1;
+        stats.bytes_freed = stats.bytes_freed.saturating_add(snapshot_bytes);
     }
 }
 
@@ -144,14 +193,6 @@ fn has_file_name_suffix(path: &Path, suffix: &str) -> bool {
         .is_some_and(|name| name.ends_with(suffix))
 }
 
-#[cfg(test)]
-fn snapshot_lock_path(snapshot_path: &Path) -> PathBuf {
-    let Some(file_name) = snapshot_path.file_name().and_then(|name| name.to_str()) else {
-        return snapshot_path.with_extension("lock");
-    };
-    snapshot_path.with_file_name(format!("{file_name}.lock"))
-}
-
 fn is_older_than(path: &Path, retention: Duration, now: SystemTime) -> bool {
     let modified = match fs::metadata(path).and_then(|metadata| metadata.modified()) {
         Ok(modified) => modified,
@@ -170,6 +211,20 @@ fn file_len(path: &Path) -> u64 {
     fs::metadata(path)
         .map(|metadata| metadata.len())
         .unwrap_or(0)
+}
+
+fn prune_empty_dir(path: &Path) {
+    if !dir_is_empty(path) {
+        return;
+    }
+    let _ = fs::remove_dir(path);
+}
+
+fn dir_is_empty(path: &Path) -> bool {
+    match fs::read_dir(path) {
+        Ok(mut entries) => entries.next().is_none(),
+        Err(_) => false,
+    }
 }
 
 fn remove_file_if_exists(path: &Path) -> bool {
@@ -215,7 +270,14 @@ mod tests {
         let store = SnapshotStore::new(paths.clone());
         let result = store.merge_entry(commit_key, entry_for("pkg#build", outputs_hash));
         assert!(matches!(result, crate::shared::MergeResult::Inserted));
-        paths.snapshots_dir.join(format!("{commit_key}.bincode"))
+        let shard_dir = paths.snapshots_dir.join(commit_key);
+        let mut entries = fs::read_dir(&shard_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("bincode"))
+            .collect::<Vec<_>>();
+        entries.sort();
+        entries.into_iter().next().unwrap()
     }
 
     fn write_blob_fixture(
@@ -243,27 +305,78 @@ mod tests {
     }
 
     #[test]
-    fn run_gc_deletes_old_snapshots_and_blobs_but_leaves_lock_files() {
+    fn run_gc_deletes_old_shard_and_merged_sidecar() {
+        let temp_dir = tempdir().unwrap();
+        let paths = open_shared_paths(temp_dir.path()).unwrap();
+        let old_snapshot = write_snapshot(&paths, "old-commit", [9; 32]);
+        let merged_sidecar = old_snapshot.with_extension(SNAPSHOT_MERGED_EXTENSION);
+        fs::write(&merged_sidecar, b"older-shard\n").unwrap();
+        let snapshot_bytes = file_len(&old_snapshot);
+
+        let stale = SystemTime::now() - Duration::from_secs(3 * 24 * 60 * 60);
+        set_mtime(&old_snapshot, stale);
+        set_mtime(&merged_sidecar, stale);
+
+        let stats = run_gc(&paths, Duration::from_secs(24 * 60 * 60));
+
+        assert_eq!(stats.snapshots_deleted, 1);
+        assert_eq!(stats.blobs_deleted, 0);
+        assert_eq!(stats.bytes_freed, snapshot_bytes);
+        assert!(!old_snapshot.exists());
+        assert!(!merged_sidecar.exists());
+        assert!(!old_snapshot.parent().unwrap().exists());
+    }
+
+    #[test]
+    fn run_gc_prunes_empty_commit_dir_after_shard_deletion() {
+        let temp_dir = tempdir().unwrap();
+        let paths = open_shared_paths(temp_dir.path()).unwrap();
+        let old_snapshot = write_snapshot(&paths, "old-commit", [9; 32]);
+        let commit_dir = old_snapshot.parent().unwrap().to_path_buf();
+        let stale = SystemTime::now() - Duration::from_secs(3 * 24 * 60 * 60);
+        set_mtime(&old_snapshot, stale);
+
+        let stats = run_gc(&paths, Duration::from_secs(24 * 60 * 60));
+
+        assert_eq!(stats.snapshots_deleted, 1);
+        assert!(!commit_dir.exists());
+    }
+
+    #[test]
+    fn run_gc_deletes_old_legacy_snapshot_file() {
+        let temp_dir = tempdir().unwrap();
+        let paths = open_shared_paths(temp_dir.path()).unwrap();
+        let legacy_snapshot = paths.snapshots_dir.join("legacy-commit.bincode");
+        fs::write(&legacy_snapshot, b"legacy snapshot").unwrap();
+        let expected_bytes = file_len(&legacy_snapshot);
+        let stale = SystemTime::now() - Duration::from_secs(3 * 24 * 60 * 60);
+        set_mtime(&legacy_snapshot, stale);
+
+        let stats = run_gc(&paths, Duration::from_secs(24 * 60 * 60));
+
+        assert_eq!(stats.snapshots_deleted, 1);
+        assert_eq!(stats.blobs_deleted, 0);
+        assert_eq!(stats.bytes_freed, expected_bytes);
+        assert!(!legacy_snapshot.exists());
+    }
+
+    #[test]
+    fn run_gc_deletes_old_snapshots_and_blobs() {
         let temp_dir = tempdir().unwrap();
         let paths = open_shared_paths(temp_dir.path()).unwrap();
         let package_dir = temp_dir.path().join("pkg");
         fs::create_dir_all(&package_dir).unwrap();
 
         let old_snapshot = write_snapshot(&paths, "old-commit", [9; 32]);
-        let old_lock = snapshot_lock_path(&old_snapshot);
-        fs::write(&old_lock, b"lock").unwrap();
         let old_blob = write_blob_fixture(&paths, &package_dir, [8; 32]);
 
         let recent_snapshot = paths.snapshots_dir.join("recent-commit.bincode");
         fs::write(&recent_snapshot, b"recent").unwrap();
-        let recent_lock = snapshot_lock_path(&recent_snapshot);
-        fs::write(&recent_lock, b"lock").unwrap();
         let recent_blob = paths.blobs_dir.join("recent.tar.zst");
         fs::write(&recent_blob, b"recent blob").unwrap();
 
         let stale = SystemTime::now() - Duration::from_secs(3 * 24 * 60 * 60);
         set_mtime(&old_snapshot, stale);
-        set_mtime(&old_lock, stale);
         set_mtime(&old_blob, stale);
 
         let stats = run_gc(&paths, Duration::from_secs(24 * 60 * 60));
@@ -272,29 +385,10 @@ mod tests {
         assert_eq!(stats.blobs_deleted, 1);
         assert!(stats.bytes_freed > 0);
         assert!(!old_snapshot.exists());
-        assert!(old_lock.exists());
+        assert!(!old_snapshot.parent().unwrap().exists());
         assert!(!old_blob.exists());
         assert!(recent_snapshot.exists());
-        assert!(recent_lock.exists());
         assert!(recent_blob.exists());
-    }
-
-    #[test]
-    fn run_gc_leaves_orphan_snapshot_lock_in_place() {
-        let temp_dir = tempdir().unwrap();
-        let paths = open_shared_paths(temp_dir.path()).unwrap();
-        let snapshot_path = paths.snapshots_dir.join("commit-orphan.bincode");
-        let lock_path = snapshot_lock_path(&snapshot_path);
-        fs::write(&lock_path, b"lock").unwrap();
-        let stale = SystemTime::now() - Duration::from_secs(3 * 24 * 60 * 60);
-        set_mtime(&lock_path, stale);
-
-        let stats = run_gc(&paths, Duration::from_secs(24 * 60 * 60));
-
-        assert_eq!(stats.snapshots_deleted, 0);
-        assert_eq!(stats.blobs_deleted, 0);
-        assert_eq!(stats.bytes_freed, 0);
-        assert!(lock_path.exists());
     }
 
     #[test]
@@ -321,6 +415,22 @@ mod tests {
         assert!(first.is_some());
         assert!(second.is_none());
         assert!(gc_marker_path(&paths).exists());
+    }
+
+    #[test]
+    fn reader_hitting_gcd_shard_degrades_to_miss_not_error() {
+        let temp_dir = tempdir().unwrap();
+        let paths = open_shared_paths(temp_dir.path()).unwrap();
+        let commit_key = "commit-race";
+        let outputs_hash = [6; 32];
+        let snapshot_path = write_snapshot(&paths, commit_key, outputs_hash);
+
+        assert!(SnapshotStore::new(paths.clone()).load(commit_key).is_some());
+        assert!(remove_file_if_exists(&snapshot_path));
+        prune_empty_dir(snapshot_path.parent().unwrap());
+
+        let loaded = SnapshotStore::new(paths.clone()).load(commit_key);
+        assert!(loaded.is_none());
     }
 
     #[test]

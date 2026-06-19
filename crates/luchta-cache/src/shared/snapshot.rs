@@ -1,8 +1,8 @@
-use std::collections::BTreeMap;
-use std::fs::{self, OpenOptions};
-use std::path::PathBuf;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
 
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
 use crate::shared::{atomic_write, SharedCachePaths};
@@ -10,6 +10,8 @@ use crate::shared::{atomic_write, SharedCachePaths};
 pub const SNAPSHOT_SCHEMA_VERSION: u32 = 2;
 const DEP_OUTPUTS_HASH_DOMAIN: &[u8] = b"luchta:dep-outputs:v1";
 const DEP_OUTPUTS_HASH_SEPARATOR: u8 = 0;
+pub(crate) const SNAPSHOT_FILE_EXTENSION: &str = "bincode";
+pub(crate) const SNAPSHOT_MERGED_EXTENSION: &str = "merged";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotEntry {
@@ -39,12 +41,41 @@ pub enum MergeResult {
     SkippedLockUnavailable,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeEntryOutcome {
+    pub result: MergeResult,
+    pub new_shard_id: Option<String>,
+    pub subsumed_shard_ids: Vec<String>,
+}
+
+impl MergeEntryOutcome {
+    fn from_result(result: MergeResult) -> Self {
+        Self {
+            result,
+            new_shard_id: None,
+            subsumed_shard_ids: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SnapshotStore {
     paths: SharedCachePaths,
     /// Optional per-instance load counter for testing. None in production.
     #[cfg(test)]
     load_count: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct SnapshotShard {
+    shard_id: String,
+    source: SnapshotShardSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum SnapshotShardSource {
+    LegacyFile(PathBuf),
+    ShardFile(PathBuf),
 }
 
 impl Snapshot {
@@ -60,6 +91,18 @@ impl Snapshot {
 impl Default for Snapshot {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl SnapshotEntry {
+    #[must_use]
+    pub fn dep_outputs_hash(&self) -> [u8; 32] {
+        derive_input_key(
+            self.task_spec_hash,
+            self.env_hash,
+            self.pkg_dep_hash,
+            [0; 32],
+        )
     }
 }
 
@@ -93,15 +136,17 @@ impl SnapshotStore {
         )
     }
 
-    /// Get the paths for this store (needed for test constructor).
-    #[cfg(test)]
+    /// Get paths for this store.
     pub fn paths(&self) -> &SharedCachePaths {
         &self.paths
     }
 
     pub fn load(&self, commit_key: &str) -> Option<Snapshot> {
-        let path = self.snapshot_path(commit_key);
-        let bytes = fs::read(path).ok()?;
+        let shards = self.list_snapshot_shards(commit_key);
+        if shards.is_empty() {
+            return None;
+        }
+
         #[cfg(test)]
         {
             use std::sync::atomic::Ordering;
@@ -109,79 +154,110 @@ impl SnapshotStore {
                 counter.fetch_add(1, Ordering::SeqCst);
             }
         }
-        decode_snapshot(&bytes, commit_key).ok()
+
+        self.load_merged_snapshot_from_shards(commit_key, shards)
     }
 
     pub fn merge_entry(&self, commit_key: &str, entry: SnapshotEntry) -> MergeResult {
-        let lock_path = self.lock_path(commit_key);
-        let _ = fs::create_dir_all(&self.paths.snapshots_dir);
+        self.merge_entry_with_outcome(commit_key, entry).result
+    }
 
-        // Lock sidecar file, not snapshot data file itself. atomic_write() does temp+rename,
-        // which swaps inode for `<commit>.bincode`; sidecar keeps stable flock handle across RMW.
-        let lock_file = match OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&lock_path)
-        {
-            Ok(lock_file) => lock_file,
-            Err(err) => {
-                eprintln!(
-                    "warning: failed to open snapshot lock file {}: {err}; skipping shared snapshot write",
-                    lock_path.display()
-                );
-                return MergeResult::SkippedLockUnavailable;
-            }
-        };
-        if let Err(err) = lock_file.lock_exclusive() {
+    pub fn merge_entry_with_outcome(
+        &self,
+        commit_key: &str,
+        entry: SnapshotEntry,
+    ) -> MergeEntryOutcome {
+        let shard_dir = self.shard_dir_path(commit_key);
+        if let Err(err) = fs::create_dir_all(&shard_dir) {
             eprintln!(
-                "warning: failed to lock snapshot lock file {}: {err}; skipping shared snapshot write",
-                lock_path.display()
+                "warning: failed to create snapshot shard dir {}: {err}; skipping shared snapshot write",
+                shard_dir.display()
             );
-            return MergeResult::SkippedLockUnavailable;
+            return MergeEntryOutcome::from_result(MergeResult::SkippedLockUnavailable);
         }
 
-        let snapshot_path = self.snapshot_path(commit_key);
-        let bytes = fs::read(&snapshot_path).ok();
-        let mut snapshot = match bytes {
-            Some(bytes) => decode_snapshot(&bytes, commit_key).unwrap_or_else(|_| Snapshot::new()),
-            None => Snapshot::new(),
-        };
+        let visible_shards = self.list_snapshot_shards(commit_key);
+        let merged_snapshot = self
+            .load_merged_snapshot_from_shards(commit_key, visible_shards.clone())
+            .unwrap_or_default();
 
+        if let Some(existing) = merged_snapshot.entries.get(&input_key_hex(entry.input_key)) {
+            if existing.outputs_hash == entry.outputs_hash {
+                return MergeEntryOutcome::from_result(MergeResult::IdempotentNoop);
+            }
+
+            eprintln!(
+                "warn: snapshot conflict kept existing for task_id={} existing_outputs_hash={} new_outputs_hash={}",
+                existing.task_id,
+                hex_hash(existing.outputs_hash),
+                hex_hash(entry.outputs_hash)
+            );
+            return MergeEntryOutcome::from_result(MergeResult::ConflictKeptExisting);
+        }
+
+        let mut consolidated = merged_snapshot;
         let entry_key = input_key_hex(entry.input_key);
-        let result = match snapshot.entries.get(&entry_key) {
-            None => {
-                snapshot.entries.insert(entry_key, entry);
-                MergeResult::Inserted
-            }
-            Some(existing) if existing.outputs_hash == entry.outputs_hash => {
-                MergeResult::IdempotentNoop
-            }
-            Some(existing) => {
-                eprintln!(
-                    "warn: snapshot conflict kept existing for task_id={} existing_outputs_hash={} new_outputs_hash={}",
-                    existing.task_id,
-                    hex_hash(existing.outputs_hash),
-                    hex_hash(entry.outputs_hash)
-                );
-                MergeResult::ConflictKeptExisting
-            }
-        };
+        consolidated.entries.insert(entry_key, entry);
 
-        if matches!(result, MergeResult::Inserted) {
-            let encoded = bincode::serde::encode_to_vec(&snapshot, bincode_config())
-                .expect("snapshot serialization should succeed");
-            if let Err(err) = atomic_write(&snapshot_path, &encoded) {
-                eprintln!(
-                    "warning: failed to write snapshot {}: {err}; skipping shared snapshot write",
-                    snapshot_path.display()
-                );
-                return MergeResult::SkippedLockUnavailable;
-            }
+        self.write_consolidated_shard(commit_key, &consolidated, &visible_shards)
+    }
+
+    /// Writes the consolidated shard + `.merged` sidecar and deletes the shards
+    /// it subsumes. Returns the merge outcome (new shard id + subsumed ids).
+    fn write_consolidated_shard(
+        &self,
+        commit_key: &str,
+        consolidated: &Snapshot,
+        visible_shards: &[SnapshotShard],
+    ) -> MergeEntryOutcome {
+        let shard_dir = self.shard_dir_path(commit_key);
+        let encoded = bincode::serde::encode_to_vec(consolidated, bincode_config())
+            .expect("snapshot serialization should succeed");
+        let shard_id = blake3::hash(&encoded).to_hex().to_string();
+        let shard_path = shard_dir.join(format!("{shard_id}.{SNAPSHOT_FILE_EXTENSION}"));
+        let merged_sidecar_path = shard_dir.join(format!("{shard_id}.{SNAPSHOT_MERGED_EXTENSION}"));
+
+        if shard_path.exists() {
+            return MergeEntryOutcome::from_result(MergeResult::IdempotentNoop);
         }
 
-        result
+        if let Err(err) = atomic_write(&shard_path, &encoded) {
+            eprintln!(
+                "warning: failed to write snapshot shard {}: {err}; skipping shared snapshot write",
+                shard_path.display()
+            );
+            return MergeEntryOutcome::from_result(MergeResult::SkippedLockUnavailable);
+        }
+
+        let subsumed_shard_ids = visible_shards
+            .iter()
+            .filter_map(SnapshotShard::deletable_shard_id)
+            .collect::<Vec<_>>();
+
+        if let Err(err) = atomic_write(
+            &merged_sidecar_path,
+            encode_merged_sidecar(&subsumed_shard_ids).as_bytes(),
+        ) {
+            eprintln!(
+                "warning: failed to write snapshot merged sidecar {}: {err}; skipping compaction cleanup",
+                merged_sidecar_path.display()
+            );
+            return MergeEntryOutcome {
+                result: MergeResult::Inserted,
+                new_shard_id: Some(shard_id),
+                subsumed_shard_ids: Vec::new(),
+            };
+        }
+
+        for subsumed_shard_id in &subsumed_shard_ids {
+            self.delete_shard_files_by_id(commit_key, subsumed_shard_id);
+        }
+
+        MergeEntryOutcome {
+            result: MergeResult::Inserted,
+            new_shard_id: Some(shard_id),
+            subsumed_shard_ids,
+        }
     }
 
     pub fn lookup(&self, commit_key: &str, input_key: &[u8; 32]) -> Option<SnapshotEntry> {
@@ -189,16 +265,191 @@ impl SnapshotStore {
         snapshot.entries.get(&input_key_hex(*input_key)).cloned()
     }
 
+    fn shard_dir_path(&self, commit_key: &str) -> PathBuf {
+        self.paths.snapshots_dir.join(commit_key)
+    }
+
+    #[cfg(test)]
+    fn legacy_snapshot_path(&self, commit_key: &str) -> PathBuf {
+        self.paths
+            .snapshots_dir
+            .join(format!("{commit_key}.{SNAPSHOT_FILE_EXTENSION}"))
+    }
+
+    #[cfg(test)]
+    fn merged_sidecar_path(&self, commit_key: &str, shard_id: &str) -> PathBuf {
+        self.shard_dir_path(commit_key)
+            .join(format!("{shard_id}.{SNAPSHOT_MERGED_EXTENSION}"))
+    }
+
+    fn load_merged_snapshot_from_shards(
+        &self,
+        commit_key: &str,
+        shards: Vec<SnapshotShard>,
+    ) -> Option<Snapshot> {
+        let mut merged = Snapshot::new();
+        let mut conflict_warned = BTreeSet::new();
+        let mut saw_any = false;
+
+        for shard in shards {
+            let bytes = match fs::read(shard.path()) {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    eprintln!(
+                        "warning: failed to read snapshot shard {}: {err}; skipping shard",
+                        shard.path().display()
+                    );
+                    continue;
+                }
+            };
+
+            let snapshot = match decode_snapshot(&bytes, commit_key) {
+                Ok(snapshot) => snapshot,
+                Err(err) => {
+                    eprintln!(
+                        "warning: failed to decode snapshot shard {} for commit {commit_key}: {err}; skipping shard",
+                        shard.path().display()
+                    );
+                    continue;
+                }
+            };
+
+            saw_any = true;
+            merge_shard_entries(
+                &mut merged,
+                snapshot,
+                ShardMergeContext {
+                    commit_key,
+                    shard_id: &shard.shard_id,
+                },
+                &mut conflict_warned,
+            );
+        }
+
+        saw_any.then_some(merged)
+    }
+
+    fn list_snapshot_shards(&self, commit_key: &str) -> Vec<SnapshotShard> {
+        let mut shards = Vec::new();
+        let legacy_path = self.snapshot_path(commit_key);
+        if legacy_path.is_file() {
+            shards.push(SnapshotShard {
+                shard_id: format!("legacy-{commit_key}"),
+                source: SnapshotShardSource::LegacyFile(legacy_path),
+            });
+        }
+
+        let shard_dir = self.shard_dir_path(commit_key);
+        if let Ok(entries) = fs::read_dir(&shard_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_file() {
+                    continue;
+                }
+                if path.extension().and_then(|ext| ext.to_str()) != Some(SNAPSHOT_FILE_EXTENSION) {
+                    continue;
+                }
+                let Some(file_stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                    continue;
+                };
+                shards.push(SnapshotShard {
+                    shard_id: file_stem.to_owned(),
+                    source: SnapshotShardSource::ShardFile(path),
+                });
+            }
+        }
+
+        shards.sort_unstable_by(|left, right| left.shard_id.cmp(&right.shard_id));
+        shards
+    }
+
     fn snapshot_path(&self, commit_key: &str) -> PathBuf {
         self.paths
             .snapshots_dir
-            .join(format!("{commit_key}.bincode"))
+            .join(format!("{commit_key}.{SNAPSHOT_FILE_EXTENSION}"))
     }
 
-    fn lock_path(&self, commit_key: &str) -> PathBuf {
-        self.paths
-            .snapshots_dir
-            .join(format!("{commit_key}.bincode.lock"))
+    fn delete_shard_files_by_id(&self, commit_key: &str, shard_id: &str) {
+        for path in [
+            self.shard_dir_path(commit_key)
+                .join(format!("{shard_id}.{SNAPSHOT_FILE_EXTENSION}")),
+            self.shard_dir_path(commit_key)
+                .join(format!("{shard_id}.{SNAPSHOT_MERGED_EXTENSION}")),
+        ] {
+            if let Err(err) = remove_file_if_exists(&path) {
+                eprintln!(
+                    "warning: failed to delete snapshot compaction file {}: {err}",
+                    path.display()
+                );
+            }
+        }
+    }
+}
+
+impl SnapshotShard {
+    fn path(&self) -> &Path {
+        match &self.source {
+            SnapshotShardSource::LegacyFile(path) | SnapshotShardSource::ShardFile(path) => path,
+        }
+    }
+
+    fn deletable_shard_id(&self) -> Option<String> {
+        match self.source {
+            SnapshotShardSource::LegacyFile(_) => None,
+            SnapshotShardSource::ShardFile(_) => Some(self.shard_id.clone()),
+        }
+    }
+}
+
+/// Identifies the source shard during a cross-shard merge (for conflict logs).
+struct ShardMergeContext<'a> {
+    commit_key: &'a str,
+    shard_id: &'a str,
+}
+
+fn merge_shard_entries(
+    merged: &mut Snapshot,
+    shard: Snapshot,
+    ctx: ShardMergeContext<'_>,
+    conflict_warned: &mut BTreeSet<String>,
+) {
+    let ShardMergeContext {
+        commit_key,
+        shard_id,
+    } = ctx;
+    for (entry_key, entry) in shard.entries {
+        match merged.entries.get(&entry_key) {
+            None => {
+                merged.entries.insert(entry_key, entry);
+            }
+            Some(existing) if existing.outputs_hash == entry.outputs_hash => {}
+            Some(existing) => {
+                if conflict_warned.insert(entry_key.clone()) {
+                    eprintln!(
+                        "warn: snapshot shard conflict kept first entry for commit={commit_key} input_key={entry_key} first_shard_id={shard_id} existing_task_id={} existing_outputs_hash={} conflicting_outputs_hash={}",
+                        existing.task_id,
+                        hex_hash(existing.outputs_hash),
+                        hex_hash(entry.outputs_hash)
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn encode_merged_sidecar(shard_ids: &[String]) -> String {
+    if shard_ids.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", shard_ids.join("\n"))
+    }
+}
+
+fn remove_file_if_exists(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
     }
 }
 
@@ -289,136 +540,82 @@ mod tests {
     }
 
     #[test]
-    fn combined_dep_outputs_hash_empty_is_stable() {
-        let first = combined_dep_outputs_hash(&BTreeMap::new());
-        let second = combined_dep_outputs_hash(&BTreeMap::new());
+    fn combined_dep_outputs_hash_is_order_stable() {
+        let mut map = BTreeMap::new();
+        map.insert("pkg-a#build".to_owned(), [1; 32]);
+        map.insert("pkg-b#build".to_owned(), [2; 32]);
+
+        let first = combined_dep_outputs_hash(&map);
+        let second = combined_dep_outputs_hash(&map);
         assert_eq!(first, second);
+
+        let mut reversed = BTreeMap::new();
+        reversed.insert("pkg-b#build".to_owned(), [2; 32]);
+        reversed.insert("pkg-a#build".to_owned(), [1; 32]);
+        assert_eq!(first, combined_dep_outputs_hash(&reversed));
     }
 
     #[test]
-    fn combined_dep_outputs_hash_changes_when_dependency_hash_changes() {
-        let first = combined_dep_outputs_hash(&sample_dep_outputs_one());
-        let second = combined_dep_outputs_hash(&sample_dep_outputs_two());
-        assert_ne!(first, second);
-    }
+    fn combined_dep_outputs_hash_changes_when_any_dependency_changes() {
+        let mut base = BTreeMap::new();
+        base.insert("pkg-a#build".to_owned(), [1; 32]);
 
-    #[test]
-    fn combined_dep_outputs_hash_order_independent_for_same_map() {
-        let mut ordered = BTreeMap::new();
-        ordered.insert("pkg-a#lint".to_owned(), [7; 32]);
-        ordered.insert("pkg-b#build".to_owned(), [8; 32]);
+        let mut changed_hash = base.clone();
+        changed_hash.insert("pkg-a#build".to_owned(), [9; 32]);
 
-        let mut same_entries = BTreeMap::new();
-        same_entries.insert("pkg-b#build".to_owned(), [8; 32]);
-        same_entries.insert("pkg-a#lint".to_owned(), [7; 32]);
+        let mut changed_task = BTreeMap::new();
+        changed_task.insert("pkg-b#build".to_owned(), [1; 32]);
 
-        assert_eq!(
-            combined_dep_outputs_hash(&ordered),
-            combined_dep_outputs_hash(&same_entries)
+        assert_ne!(
+            combined_dep_outputs_hash(&base),
+            combined_dep_outputs_hash(&changed_hash)
+        );
+        assert_ne!(
+            combined_dep_outputs_hash(&base),
+            combined_dep_outputs_hash(&changed_task)
         );
     }
 
     #[test]
-    fn snapshot_serialization_round_trip_preserves_entry_map() {
+    fn snapshot_round_trip_serialization() {
         let snapshot = sample_snapshot();
-        let bytes = bincode::serde::encode_to_vec(&snapshot, bincode_config())
-            .expect("snapshot serialization should succeed");
-        let (decoded, _): (Snapshot, usize) =
-            bincode::serde::decode_from_slice(&bytes, bincode_config())
-                .expect("snapshot deserialization should succeed");
-
+        let encoded = bincode::serde::encode_to_vec(&snapshot, bincode_config()).unwrap();
+        let decoded = decode_snapshot(&encoded, "commit").unwrap();
         assert_eq!(decoded, snapshot);
-        assert_eq!(decoded.schema_version, SNAPSHOT_SCHEMA_VERSION);
     }
 
     #[test]
-    fn snapshot_schema_version_initializes_to_current() {
-        let snapshot = Snapshot::new();
-        assert_eq!(snapshot.schema_version, SNAPSHOT_SCHEMA_VERSION);
-        assert!(snapshot.entries.is_empty());
+    fn snapshot_decode_rejects_schema_mismatch() {
+        let mut snapshot = sample_snapshot();
+        snapshot.schema_version = SNAPSHOT_SCHEMA_VERSION + 1;
+        let encoded = bincode::serde::encode_to_vec(&snapshot, bincode_config()).unwrap();
+        let err = decode_snapshot(&encoded, "commit").unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("unsupported snapshot schema version"));
     }
 
     #[test]
-    fn snapshot_supports_multiple_variants_for_same_task_id() {
-        let task_id = "pkg-a#build".to_owned();
-        let first_key = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32]);
-        let second_key = derive_input_key([1; 32], [9; 32], [3; 32], [4; 32]);
-
-        let first_entry = SnapshotEntry {
-            task_id: task_id.clone(),
-            input_key: first_key,
-            outputs_hash: [5; 32],
-            task_spec_hash: [1; 32],
-            env_hash: [2; 32],
-            pkg_dep_hash: [3; 32],
-            duration_ms: 10,
-            output_bytes: 20,
-            cached_at_unix_ms: 30,
-            tool_version: Some("1.0.0".to_owned()),
-        };
-        let second_entry = SnapshotEntry {
-            task_id: task_id.clone(),
-            input_key: second_key,
-            outputs_hash: [5; 32],
-            task_spec_hash: [1; 32],
-            env_hash: [9; 32],
-            pkg_dep_hash: [3; 32],
-            duration_ms: 11,
-            output_bytes: 21,
-            cached_at_unix_ms: 31,
-            tool_version: Some("1.0.1".to_owned()),
-        };
-
-        let mut snapshot = Snapshot::new();
-        snapshot
-            .entries
-            .insert(input_key_hex(first_key), first_entry.clone());
-        snapshot
-            .entries
-            .insert(input_key_hex(second_key), second_entry.clone());
-
-        let bytes = bincode::serde::encode_to_vec(&snapshot, bincode_config())
-            .expect("snapshot serialization should succeed");
-        let (decoded, _): (Snapshot, usize) =
-            bincode::serde::decode_from_slice(&bytes, bincode_config())
-                .expect("snapshot deserialization should succeed");
-
-        assert_eq!(decoded.schema_version, SNAPSHOT_SCHEMA_VERSION);
-        assert_eq!(decoded.entries.len(), 2);
-        assert_eq!(
-            decoded.entries.get(&input_key_hex(first_key)),
-            Some(&first_entry)
-        );
-        assert_eq!(
-            decoded.entries.get(&input_key_hex(second_key)),
-            Some(&second_entry)
-        );
-    }
-
-    #[test]
-    fn snapshot_store_insert_then_lookup_returns_entry() {
+    fn snapshot_store_writes_and_reads_entry() {
         let temp_dir = tempdir().unwrap();
         let paths = open_shared_paths(temp_dir.path()).unwrap();
         let store = SnapshotStore::new(paths);
-        let entry = sample_entry_with_seed(1, [41; 32]);
+        let entry = sample_entry_with_seed(1, [5; 32]);
 
         assert_eq!(
             store.merge_entry("commit-a", entry.clone()),
             MergeResult::Inserted
         );
-        assert_eq!(
-            store.lookup("commit-a", &entry.input_key),
-            Some(entry.clone())
-        );
+        assert_eq!(store.lookup("commit-a", &entry.input_key), Some(entry));
         assert_eq!(store.lookup("commit-a", &[99; 32]), None);
     }
 
     #[test]
-    fn snapshot_store_idempotent_merge_keeps_single_entry() {
+    fn snapshot_store_idempotent_when_outputs_match() {
         let temp_dir = tempdir().unwrap();
         let paths = open_shared_paths(temp_dir.path()).unwrap();
         let store = SnapshotStore::new(paths);
-        let entry = sample_entry_with_seed(2, [42; 32]);
+        let entry = sample_entry_with_seed(2, [6; 32]);
 
         assert_eq!(
             store.merge_entry("commit-b", entry.clone()),
@@ -428,23 +625,18 @@ mod tests {
             store.merge_entry("commit-b", entry.clone()),
             MergeResult::IdempotentNoop
         );
-
         let snapshot = store.load("commit-b").unwrap();
         assert_eq!(snapshot.entries.len(), 1);
-        assert_eq!(
-            snapshot.entries.get(&input_key_hex(entry.input_key)),
-            Some(&entry)
-        );
     }
 
     #[test]
-    fn snapshot_store_conflict_keeps_original_entry() {
+    fn snapshot_store_conflict_keeps_existing_entry() {
         let temp_dir = tempdir().unwrap();
         let paths = open_shared_paths(temp_dir.path()).unwrap();
         let store = SnapshotStore::new(paths);
-        let original = sample_entry_with_seed(3, [43; 32]);
+        let original = sample_entry_with_seed(3, [7; 32]);
         let mut conflicting = original.clone();
-        conflicting.outputs_hash = [99; 32];
+        conflicting.outputs_hash = [8; 32];
 
         assert_eq!(
             store.merge_entry("commit-c", original.clone()),
@@ -454,49 +646,40 @@ mod tests {
             store.merge_entry("commit-c", conflicting),
             MergeResult::ConflictKeptExisting
         );
+
+        let snapshot = store.load("commit-c").unwrap();
+        assert_eq!(snapshot.entries.len(), 1);
         assert_eq!(
-            store.lookup("commit-c", &original.input_key),
-            Some(original)
+            snapshot.entries.get(&input_key_hex(original.input_key)),
+            Some(&original)
         );
     }
 
     #[test]
-    fn snapshot_store_load_corrupt_file_returns_none() {
+    fn snapshot_store_handles_concurrent_appends_without_losing_entries() {
         let temp_dir = tempdir().unwrap();
-        let paths = open_shared_paths(temp_dir.path()).unwrap();
-        let store = SnapshotStore::new(paths.clone());
-        let snapshot_path = paths.snapshots_dir.join("commit-d.bincode");
-        fs::write(snapshot_path, b"not-bincode").unwrap();
+        let paths = open_shared_paths(temp_dir.path());
+        let store = Arc::new(SnapshotStore::new(paths.unwrap()));
+        let commit_key = "commit-concurrent";
 
-        assert_eq!(store.load("commit-d"), None);
-    }
-
-    #[test]
-    fn snapshot_store_concurrent_merges_preserve_all_entries() {
-        let temp_dir = tempdir().unwrap();
-        let paths = open_shared_paths(temp_dir.path()).unwrap();
-        let store = Arc::new(SnapshotStore::new(paths));
-        let commit_key = "commit-e";
-        let threads = 16usize;
-
-        let handles = (0..threads)
-            .map(|i| {
-                let store = Arc::clone(&store);
-                thread::spawn(move || {
-                    let entry = sample_entry_with_seed(i as u8 + 10, [i as u8 + 1; 32]);
-                    assert_eq!(store.merge_entry(commit_key, entry), MergeResult::Inserted);
-                })
-            })
-            .collect::<Vec<_>>();
+        let mut handles = Vec::new();
+        for seed in 4..12 {
+            let store = Arc::clone(&store);
+            let commit_key = commit_key.to_owned();
+            handles.push(thread::spawn(move || {
+                let entry = sample_entry_with_seed(seed, [seed; 32]);
+                assert_eq!(store.merge_entry(&commit_key, entry), MergeResult::Inserted);
+            }));
+        }
 
         for handle in handles {
             handle.join().unwrap();
         }
 
         let snapshot = store.load(commit_key).unwrap();
-        assert_eq!(snapshot.entries.len(), threads);
-        for i in 0..threads {
-            let entry = sample_entry_with_seed(i as u8 + 10, [i as u8 + 1; 32]);
+        assert_eq!(snapshot.entries.len(), 8);
+        for seed in 4..12 {
+            let entry = sample_entry_with_seed(seed, [seed; 32]);
             assert_eq!(
                 snapshot.entries.get(&input_key_hex(entry.input_key)),
                 Some(&entry)
@@ -504,20 +687,311 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[test]
-    fn snapshot_store_lock_failure_skips_instead_of_panicking() {
-        use std::os::unix::fs::PermissionsExt;
-
+    fn snapshot_store_shard_name_matches_content_hash() {
         let temp_dir = tempdir().unwrap();
         let paths = open_shared_paths(temp_dir.path()).unwrap();
-        fs::set_permissions(&paths.snapshots_dir, fs::Permissions::from_mode(0o500)).unwrap();
         let store = SnapshotStore::new(paths.clone());
+        let commit_key = "commit-hash";
+        let entry = sample_entry_with_seed(9, [9; 32]);
 
-        let result = store.merge_entry("commit-lock-fail", sample_entry_with_seed(42, [9; 32]));
+        assert_eq!(
+            store.merge_entry(commit_key, entry.clone()),
+            MergeResult::Inserted
+        );
 
-        assert_eq!(result, MergeResult::SkippedLockUnavailable);
-        assert_eq!(store.load("commit-lock-fail"), None);
+        let shard_dir = store.shard_dir_path(commit_key);
+        let shard_paths = collect_bincode_files(&shard_dir);
+        assert_eq!(shard_paths.len(), 1);
+
+        let bytes = fs::read(&shard_paths[0]).unwrap();
+        let expected_name = format!(
+            "{}.{}",
+            blake3::hash(&bytes).to_hex(),
+            SNAPSHOT_FILE_EXTENSION
+        );
+        assert_eq!(
+            shard_paths[0].file_name().unwrap().to_string_lossy(),
+            expected_name
+        );
+
+        let snapshot = decode_snapshot(&bytes, commit_key).unwrap();
+        assert_eq!(snapshot.entries.len(), 1);
+        assert_eq!(
+            snapshot.entries.get(&input_key_hex(entry.input_key)),
+            Some(&entry)
+        );
+    }
+
+    #[test]
+    fn snapshot_store_compacts_seeded_shards_and_records_subsumed_ids() {
+        let temp_dir = tempdir().unwrap();
+        let paths = open_shared_paths(temp_dir.path()).unwrap();
+        let store = SnapshotStore::new(paths.clone());
+        let commit_key = "commit-compact";
+        let seeded = [
+            sample_entry_with_seed(12, [1; 32]),
+            sample_entry_with_seed(13, [2; 32]),
+            sample_entry_with_seed(14, [3; 32]),
+        ];
+
+        for entry in &seeded {
+            let snapshot = snapshot_with_entries([entry.clone()]);
+            let bytes = bincode::serde::encode_to_vec(&snapshot, bincode_config()).unwrap();
+            let shard_id = blake3::hash(&bytes).to_hex().to_string();
+            write_snapshot_file(
+                &store
+                    .shard_dir_path(commit_key)
+                    .join(format!("{shard_id}.{SNAPSHOT_FILE_EXTENSION}")),
+                snapshot,
+            );
+        }
+
+        let shard_ids_before = collect_shard_ids(&store.shard_dir_path(commit_key));
+        assert_eq!(shard_ids_before.len(), 3);
+
+        let new_entry = sample_entry_with_seed(15, [4; 32]);
+        assert_eq!(
+            store.merge_entry(commit_key, new_entry.clone()),
+            MergeResult::Inserted
+        );
+
+        let shard_ids_after = collect_shard_ids(&store.shard_dir_path(commit_key));
+        assert_eq!(shard_ids_after.len(), 1);
+        let merged_sidecar =
+            fs::read_to_string(store.merged_sidecar_path(commit_key, &shard_ids_after[0])).unwrap();
+        assert_eq!(
+            merged_sidecar.lines().collect::<Vec<_>>(),
+            shard_ids_before
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+        );
+
+        let snapshot = store.load(commit_key).unwrap();
+        assert_eq!(snapshot.entries.len(), 4);
+        for entry in seeded.into_iter().chain(std::iter::once(new_entry)) {
+            assert_eq!(
+                snapshot.entries.get(&input_key_hex(entry.input_key)),
+                Some(&entry)
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_store_keeps_unseen_shard_added_after_capture() {
+        let temp_dir = tempdir().unwrap();
+        let paths = open_shared_paths(temp_dir.path()).unwrap();
+        let store = SnapshotStore::new(paths.clone());
+        let commit_key = "commit-unseen";
+        let seen_entry = sample_entry_with_seed(16, [5; 32]);
+        let unseen_entry = sample_entry_with_seed(17, [6; 32]);
+        let new_entry = sample_entry_with_seed(18, [7; 32]);
+
+        let seen_snapshot = snapshot_with_entries([seen_entry.clone()]);
+        let seen_bytes = bincode::serde::encode_to_vec(&seen_snapshot, bincode_config()).unwrap();
+        let seen_shard_id = blake3::hash(&seen_bytes).to_hex().to_string();
+        write_snapshot_file(
+            &store
+                .shard_dir_path(commit_key)
+                .join(format!("{seen_shard_id}.{SNAPSHOT_FILE_EXTENSION}")),
+            seen_snapshot,
+        );
+
+        let visible_shards = store.list_snapshot_shards(commit_key);
+        let mut consolidated = store
+            .load_merged_snapshot_from_shards(commit_key, visible_shards.clone())
+            .unwrap();
+        consolidated
+            .entries
+            .insert(input_key_hex(new_entry.input_key), new_entry.clone());
+        let consolidated_bytes =
+            bincode::serde::encode_to_vec(&consolidated, bincode_config()).unwrap();
+        let consolidated_id = blake3::hash(&consolidated_bytes).to_hex().to_string();
+        let consolidated_path = store
+            .shard_dir_path(commit_key)
+            .join(format!("{consolidated_id}.{SNAPSHOT_FILE_EXTENSION}"));
+        let consolidated_sidecar = store.merged_sidecar_path(commit_key, &consolidated_id);
+
+        atomic_write(&consolidated_path, &consolidated_bytes).unwrap();
+
+        let unseen_snapshot = snapshot_with_entries([unseen_entry.clone()]);
+        let unseen_bytes =
+            bincode::serde::encode_to_vec(&unseen_snapshot, bincode_config()).unwrap();
+        let unseen_shard_id = blake3::hash(&unseen_bytes).to_hex().to_string();
+        write_snapshot_file(
+            &store
+                .shard_dir_path(commit_key)
+                .join(format!("{unseen_shard_id}.{SNAPSHOT_FILE_EXTENSION}")),
+            unseen_snapshot,
+        );
+
+        let subsumed_shard_ids = visible_shards
+            .iter()
+            .filter_map(SnapshotShard::deletable_shard_id)
+            .collect::<Vec<_>>();
+        atomic_write(
+            &consolidated_sidecar,
+            encode_merged_sidecar(&subsumed_shard_ids).as_bytes(),
+        )
+        .unwrap();
+        for shard_id in subsumed_shard_ids {
+            store.delete_shard_files_by_id(commit_key, &shard_id);
+        }
+
+        let shard_ids_after = collect_shard_ids(&store.shard_dir_path(commit_key));
+        let mut expected_shard_ids = vec![consolidated_id.clone(), unseen_shard_id.clone()];
+        expected_shard_ids.sort();
+        assert_eq!(shard_ids_after, expected_shard_ids);
+
+        let restored = store.load(commit_key).unwrap();
+        assert_eq!(restored.entries.len(), 3);
+        for entry in [seen_entry, unseen_entry, new_entry] {
+            assert_eq!(
+                restored.entries.get(&input_key_hex(entry.input_key)),
+                Some(&entry)
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_store_delete_missing_subsumed_shard_is_noop() {
+        let temp_dir = tempdir().unwrap();
+        let paths = open_shared_paths(temp_dir.path()).unwrap();
+        let store = SnapshotStore::new(paths.clone());
+        let commit_key = "commit-delete-noop";
+        let entry = sample_entry_with_seed(19, [8; 32]);
+        let snapshot = snapshot_with_entries([entry.clone()]);
+        let bytes = bincode::serde::encode_to_vec(&snapshot, bincode_config()).unwrap();
+        let shard_id = blake3::hash(&bytes).to_hex().to_string();
+        let shard_path = store
+            .shard_dir_path(commit_key)
+            .join(format!("{shard_id}.{SNAPSHOT_FILE_EXTENSION}"));
+        write_snapshot_file(&shard_path, snapshot);
+        atomic_write(
+            &store.merged_sidecar_path(commit_key, &shard_id),
+            b"some-old-sidecar\n",
+        )
+        .unwrap();
+
+        fs::remove_file(&shard_path).unwrap();
+        store.delete_shard_files_by_id(commit_key, &shard_id);
+        store.delete_shard_files_by_id(commit_key, &shard_id);
+
+        assert!(!store.merged_sidecar_path(commit_key, &shard_id).exists());
+    }
+
+    #[test]
+    fn snapshot_store_load_merges_legacy_file_alongside_shards() {
+        let temp_dir = tempdir().unwrap();
+        let paths = open_shared_paths(temp_dir.path()).unwrap();
+        let store = SnapshotStore::new(paths.clone());
+        let commit_key = "commit-legacy";
+        let legacy_entry = sample_entry_with_seed(14, [3; 32]);
+        let shard_entry = sample_entry_with_seed(15, [4; 32]);
+
+        write_snapshot_file(
+            &store.legacy_snapshot_path(commit_key),
+            snapshot_with_entries([legacy_entry.clone()]),
+        );
+        assert_eq!(
+            store.merge_entry(commit_key, shard_entry.clone()),
+            MergeResult::Inserted
+        );
+
+        let snapshot = store.load(commit_key).unwrap();
+        assert_eq!(snapshot.entries.len(), 2);
+        assert_eq!(
+            snapshot.entries.get(&input_key_hex(legacy_entry.input_key)),
+            Some(&legacy_entry)
+        );
+        assert_eq!(
+            snapshot.entries.get(&input_key_hex(shard_entry.input_key)),
+            Some(&shard_entry)
+        );
+        assert!(store.legacy_snapshot_path(commit_key).exists());
+    }
+
+    #[test]
+    fn snapshot_store_load_skips_corrupt_shards() {
+        let temp_dir = tempdir().unwrap();
+        let paths = open_shared_paths(temp_dir.path()).unwrap();
+        let store = SnapshotStore::new(paths.clone());
+        let commit_key = "commit-corrupt";
+        let valid_entry = sample_entry_with_seed(20, [5; 32]);
+
+        assert_eq!(
+            store.merge_entry(commit_key, valid_entry.clone()),
+            MergeResult::Inserted
+        );
+
+        let corrupt_path = store
+            .shard_dir_path(commit_key)
+            .join(format!("{}.{}", "0000badshard", SNAPSHOT_FILE_EXTENSION));
+        fs::write(&corrupt_path, b"not-bincode").unwrap();
+
+        let snapshot = store.load(commit_key).unwrap();
+        assert_eq!(snapshot.entries.len(), 1);
+        assert_eq!(
+            snapshot.entries.get(&input_key_hex(valid_entry.input_key)),
+            Some(&valid_entry)
+        );
+    }
+
+    #[test]
+    fn snapshot_store_load_conflicting_legacy_file_and_shard_dir_prefers_first_shard_id() {
+        let temp_dir = tempdir().unwrap();
+        let paths = open_shared_paths(temp_dir.path()).unwrap();
+        let store = SnapshotStore::new(paths.clone());
+        let commit_key = "commit-legacy-conflict";
+        let original = sample_entry_with_seed(22, [9; 32]);
+        let mut conflicting = original.clone();
+        conflicting.outputs_hash = [10; 32];
+        conflicting.cached_at_unix_ms += 1;
+
+        write_snapshot_file(
+            &store.legacy_snapshot_path(commit_key),
+            snapshot_with_entries([conflicting]),
+        );
+        let shard_path = store
+            .shard_dir_path(commit_key)
+            .join(format!("{}.{}", "000-first", SNAPSHOT_FILE_EXTENSION));
+        write_snapshot_file(&shard_path, snapshot_with_entries([original.clone()]));
+
+        let snapshot = store.load(commit_key).unwrap();
+        assert_eq!(snapshot.entries.len(), 1);
+        assert_eq!(
+            snapshot.entries.get(&input_key_hex(original.input_key)),
+            Some(&original)
+        );
+    }
+
+    #[test]
+    fn snapshot_store_load_conflict_resolution_first_shard_id_wins() {
+        let temp_dir = tempdir().unwrap();
+        let paths = open_shared_paths(temp_dir.path()).unwrap();
+        let store = SnapshotStore::new(paths.clone());
+        let commit_key = "commit-conflict";
+        let original = sample_entry_with_seed(21, [6; 32]);
+        let mut conflicting = original.clone();
+        conflicting.outputs_hash = [7; 32];
+        conflicting.cached_at_unix_ms += 10;
+
+        let low_id_path = store
+            .shard_dir_path(commit_key)
+            .join(format!("{}.{}", "000-first", SNAPSHOT_FILE_EXTENSION));
+        let high_id_path = store
+            .shard_dir_path(commit_key)
+            .join(format!("{}.{}", "zzz-last", SNAPSHOT_FILE_EXTENSION));
+        write_snapshot_file(&high_id_path, snapshot_with_entries([conflicting]));
+        write_snapshot_file(&low_id_path, snapshot_with_entries([original.clone()]));
+
+        let snapshot = store.load(commit_key).unwrap();
+        assert_eq!(snapshot.entries.len(), 1);
+        assert_eq!(
+            snapshot.entries.get(&input_key_hex(original.input_key)),
+            Some(&original)
+        );
     }
 
     fn sample_snapshot() -> Snapshot {
@@ -559,17 +1033,44 @@ mod tests {
         }
     }
 
-    fn sample_dep_outputs_one() -> BTreeMap<String, [u8; 32]> {
-        BTreeMap::from([
-            ("pkg-a#lint".to_owned(), [7; 32]),
-            ("pkg-b#build".to_owned(), [8; 32]),
-        ])
+    fn snapshot_with_entries(entries: impl IntoIterator<Item = SnapshotEntry>) -> Snapshot {
+        let mut snapshot = Snapshot::new();
+        for entry in entries {
+            snapshot
+                .entries
+                .insert(input_key_hex(entry.input_key), entry);
+        }
+        snapshot
     }
 
-    fn sample_dep_outputs_two() -> BTreeMap<String, [u8; 32]> {
-        BTreeMap::from([
-            ("pkg-a#lint".to_owned(), [7; 32]),
-            ("pkg-b#build".to_owned(), [9; 32]),
-        ])
+    fn write_snapshot_file(path: &Path, snapshot: Snapshot) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let bytes = bincode::serde::encode_to_vec(&snapshot, bincode_config()).unwrap();
+        fs::write(path, bytes).unwrap();
+    }
+
+    fn collect_bincode_files(dir: &Path) -> Vec<PathBuf> {
+        let mut files = fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.extension().and_then(|ext| ext.to_str()) == Some(SNAPSHOT_FILE_EXTENSION)
+            })
+            .collect::<Vec<_>>();
+        files.sort();
+        files
+    }
+
+    fn collect_shard_ids(dir: &Path) -> Vec<String> {
+        let mut shard_ids = collect_bincode_files(dir)
+            .into_iter()
+            .filter_map(|path| {
+                path.file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .map(ToOwned::to_owned)
+            })
+            .collect::<Vec<_>>();
+        shard_ids.sort();
+        shard_ids
     }
 }
