@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -42,9 +42,16 @@ pub enum MergeResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotUpload {
+    pub shard_id: String,
+    pub shard_bytes: Vec<u8>,
+    pub merged_bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MergeEntryOutcome {
     pub result: MergeResult,
-    pub new_shard_id: Option<String>,
+    pub new_snapshot_upload: Option<SnapshotUpload>,
     pub subsumed_shard_ids: Vec<String>,
 }
 
@@ -52,7 +59,7 @@ impl MergeEntryOutcome {
     fn from_result(result: MergeResult) -> Self {
         Self {
             result,
-            new_shard_id: None,
+            new_snapshot_upload: None,
             subsumed_shard_ids: Vec::new(),
         }
     }
@@ -186,12 +193,6 @@ impl SnapshotStore {
                 return MergeEntryOutcome::from_result(MergeResult::IdempotentNoop);
             }
 
-            eprintln!(
-                "warn: snapshot conflict kept existing for task_id={} existing_outputs_hash={} new_outputs_hash={}",
-                existing.task_id,
-                hex_hash(existing.outputs_hash),
-                hex_hash(entry.outputs_hash)
-            );
             return MergeEntryOutcome::from_result(MergeResult::ConflictKeptExisting);
         }
 
@@ -234,17 +235,19 @@ impl SnapshotStore {
             .filter_map(SnapshotShard::deletable_shard_id)
             .collect::<Vec<_>>();
 
-        if let Err(err) = atomic_write(
-            &merged_sidecar_path,
-            encode_merged_sidecar(&subsumed_shard_ids).as_bytes(),
-        ) {
+        let merged_bytes = encode_merged_sidecar(&subsumed_shard_ids).into_bytes();
+        if let Err(err) = atomic_write(&merged_sidecar_path, &merged_bytes) {
             eprintln!(
                 "warning: failed to write snapshot merged sidecar {}: {err}; skipping compaction cleanup",
                 merged_sidecar_path.display()
             );
             return MergeEntryOutcome {
                 result: MergeResult::Inserted,
-                new_shard_id: Some(shard_id),
+                new_snapshot_upload: Some(SnapshotUpload {
+                    shard_id,
+                    shard_bytes: encoded,
+                    merged_bytes: Vec::new(),
+                }),
                 subsumed_shard_ids: Vec::new(),
             };
         }
@@ -255,7 +258,11 @@ impl SnapshotStore {
 
         MergeEntryOutcome {
             result: MergeResult::Inserted,
-            new_shard_id: Some(shard_id),
+            new_snapshot_upload: Some(SnapshotUpload {
+                shard_id,
+                shard_bytes: encoded,
+                merged_bytes,
+            }),
             subsumed_shard_ids,
         }
     }
@@ -288,7 +295,6 @@ impl SnapshotStore {
         shards: Vec<SnapshotShard>,
     ) -> Option<Snapshot> {
         let mut merged = Snapshot::new();
-        let mut conflict_warned = BTreeSet::new();
         let mut saw_any = false;
 
         for shard in shards {
@@ -315,15 +321,7 @@ impl SnapshotStore {
             };
 
             saw_any = true;
-            merge_shard_entries(
-                &mut merged,
-                snapshot,
-                ShardMergeContext {
-                    commit_key,
-                    shard_id: &shard.shard_id,
-                },
-                &mut conflict_warned,
-            );
+            merge_shard_entries(&mut merged, snapshot);
         }
 
         saw_any.then_some(merged)
@@ -401,38 +399,14 @@ impl SnapshotShard {
     }
 }
 
-/// Identifies the source shard during a cross-shard merge (for conflict logs).
-struct ShardMergeContext<'a> {
-    commit_key: &'a str,
-    shard_id: &'a str,
-}
-
-fn merge_shard_entries(
-    merged: &mut Snapshot,
-    shard: Snapshot,
-    ctx: ShardMergeContext<'_>,
-    conflict_warned: &mut BTreeSet<String>,
-) {
-    let ShardMergeContext {
-        commit_key,
-        shard_id,
-    } = ctx;
+fn merge_shard_entries(merged: &mut Snapshot, shard: Snapshot) {
     for (entry_key, entry) in shard.entries {
         match merged.entries.get(&entry_key) {
             None => {
                 merged.entries.insert(entry_key, entry);
             }
             Some(existing) if existing.outputs_hash == entry.outputs_hash => {}
-            Some(existing) => {
-                if conflict_warned.insert(entry_key.clone()) {
-                    eprintln!(
-                        "warn: snapshot shard conflict kept first entry for commit={commit_key} input_key={entry_key} first_shard_id={shard_id} existing_task_id={} existing_outputs_hash={} conflicting_outputs_hash={}",
-                        existing.task_id,
-                        hex_hash(existing.outputs_hash),
-                        hex_hash(entry.outputs_hash)
-                    );
-                }
-            }
+            Some(_) => {}
         }
     }
 }
@@ -503,10 +477,6 @@ fn decode_snapshot(
         ));
     }
     Ok(snapshot)
-}
-
-fn hex_hash(hash: [u8; 32]) -> String {
-    blake3::Hash::from(hash).to_hex().to_string()
 }
 
 #[cfg(test)]

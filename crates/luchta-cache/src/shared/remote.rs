@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::snapshot::{SNAPSHOT_FILE_EXTENSION, SNAPSHOT_MERGED_EXTENSION};
+use super::snapshot::{SnapshotUpload, SNAPSHOT_FILE_EXTENSION, SNAPSHOT_MERGED_EXTENSION};
 use super::{
     blob_path, hex_hash, rclone, MergeEntryOutcome, RcloneRcd, SharedCachePaths, SnapshotStore,
     BLOBS_DIR_NAME, SNAPSHOTS_DIR_NAME,
@@ -57,6 +57,20 @@ impl RemoteState {
     }
 }
 
+fn is_missing_local_source_copy_error(err: &rclone::RcloneError) -> bool {
+    let rclone::RcloneError::HttpStatus { status, body } = err else {
+        return false;
+    };
+    if *status != 500 {
+        return false;
+    }
+
+    let body = body.to_ascii_lowercase();
+    (body.contains("failed to open source object") || body.contains("object not found"))
+        && (body.contains("lstat") || body.contains("srcremote"))
+        && body.contains("no such file")
+}
+
 #[derive(Debug, Clone)]
 pub struct RemoteSync {
     pub(crate) rclone: Arc<RcloneRcd>,
@@ -69,7 +83,7 @@ pub(crate) struct PushArtifacts<'a> {
     pub(crate) paths: &'a SharedCachePaths,
     pub(crate) commit_key: &'a str,
     pub(crate) outputs_hash: &'a [u8; 32],
-    pub(crate) merge: &'a MergeEntryOutcome,
+    pub(crate) merge: MergeEntryOutcome,
 }
 
 /// Per-commit context shared across the shard pulls of one snapshot directory.
@@ -106,7 +120,9 @@ impl RemoteSync {
     /// Only genuine health failures (timeout, unavailable, process/request
     /// errors, other HTTP statuses) trip the run-wide disable flag.
     fn record_remote_error(&self, err: &rclone::RcloneError) {
-        if matches!(err, rclone::RcloneError::HttpStatus { status: 404, .. }) {
+        if matches!(err, rclone::RcloneError::HttpStatus { status: 404, .. })
+            || is_missing_local_source_copy_error(err)
+        {
             return;
         }
         self.state.disable_with_warning(&remote_disable_reason(err));
@@ -321,17 +337,13 @@ impl RemoteSync {
 
         self.push_blob_if_missing(paths, outputs_hash);
 
-        if let Some(new_shard_id) = &merge.new_shard_id {
-            self.push_snapshot_file(
-                paths,
-                commit_key,
-                &format!("{new_shard_id}.{SNAPSHOT_FILE_EXTENSION}"),
-            );
-            self.push_snapshot_file(
-                paths,
-                commit_key,
-                &format!("{new_shard_id}.{SNAPSHOT_MERGED_EXTENSION}"),
-            );
+        let uploaded_new_shard = match merge.new_snapshot_upload.as_ref() {
+            Some(upload) => self.push_snapshot_upload(commit_key, upload),
+            None => false,
+        };
+
+        if !uploaded_new_shard {
+            return;
         }
 
         for shard_id in &merge.subsumed_shard_ids {
@@ -363,19 +375,27 @@ impl RemoteSync {
         }
     }
 
-    fn push_snapshot_file(&self, paths: &SharedCachePaths, commit_key: &str, file_name: &str) {
-        let local_path = paths.snapshots_dir.join(commit_key).join(file_name);
-        if !local_path.exists() {
-            return;
-        }
-
+    fn push_snapshot_upload(&self, commit_key: &str, upload: &SnapshotUpload) -> bool {
         let remote_fs = self.snapshots_fs(commit_key);
-        if let Err(err) = self.copy_local_file_up(&local_path, &remote_fs, file_name) {
+        let shard_name = format!("{}.{SNAPSHOT_FILE_EXTENSION}", upload.shard_id);
+        if let Err(err) = self.copy_bytes_up(&upload.shard_bytes, &remote_fs, &shard_name) {
             self.record_remote_error(&err);
             eprintln!(
-                "warn: shared cache remote snapshot upload failed for commit={commit_key} file={file_name}: {err}"
+                "warn: shared cache remote snapshot upload failed for commit={commit_key} file={shard_name}: {err}"
             );
+            return false;
         }
+
+        let merged_name = format!("{}.{SNAPSHOT_MERGED_EXTENSION}", upload.shard_id);
+        if let Err(err) = self.copy_bytes_up(&upload.merged_bytes, &remote_fs, &merged_name) {
+            self.record_remote_error(&err);
+            eprintln!(
+                "warn: shared cache remote snapshot upload failed for commit={commit_key} file={merged_name}: {err}"
+            );
+            return false;
+        }
+
+        true
     }
 
     fn delete_remote_snapshot_file(&self, commit_key: &str, shard_id: &str, extension: &str) {
@@ -393,6 +413,18 @@ impl RemoteSync {
                 "warn: shared cache remote snapshot delete failed for commit={commit_key} file={remote_name}: {err}"
             );
         }
+    }
+
+    fn copy_bytes_up(
+        &self,
+        bytes: &[u8],
+        dst_fs: &str,
+        dst_remote: &str,
+    ) -> Result<(), rclone::RcloneError> {
+        let temp_dir = tempfile::Builder::new().prefix("remote-push-").tempdir()?;
+        let local_path = temp_dir.path().join(dst_remote);
+        fs::write(&local_path, bytes)?;
+        self.copy_local_file_up(&local_path, dst_fs, dst_remote)
     }
 
     fn copy_local_file_up(
@@ -653,6 +685,26 @@ mod tests {
         );
     }
 
+    fn seed_snapshot_entry(
+        seed_cache: &SharedCache,
+        remote_seed: &RemoteSync,
+        commit: &str,
+        entry: SnapshotEntry,
+    ) -> String {
+        let outputs_hash = entry.outputs_hash;
+        let merge = seed_cache
+            .snapshot_store
+            .merge_entry_with_outcome(commit, entry);
+        let shard_id = merge.new_snapshot_upload.as_ref().unwrap().shard_id.clone();
+        remote_seed.push_store_artifacts(PushArtifacts {
+            paths: seed_cache.paths(),
+            commit_key: commit,
+            outputs_hash: &outputs_hash,
+            merge,
+        });
+        shard_id
+    }
+
     fn seed_remote_snapshot_entries(
         repo_root: &Path,
         commit: &str,
@@ -670,8 +722,9 @@ mod tests {
             Arc::new(RcloneRcd::new(Duration::from_secs(10)).unwrap()),
             format!(":local:{}", remote_root.display()),
         );
-
-        let merge1 = seed_cache.snapshot_store.merge_entry_with_outcome(
+        let merge1_id = seed_snapshot_entry(
+            &seed_cache,
+            &remote_seed,
             commit,
             SnapshotEntry {
                 task_id: "pkg#a".to_string(),
@@ -686,15 +739,9 @@ mod tests {
                 tool_version: None,
             },
         );
-        remote_seed.push_store_artifacts(PushArtifacts {
-            paths: seed_cache.paths(),
-            commit_key: commit,
-            outputs_hash: &[21; 32],
-            merge: &merge1,
-        });
-        let merge1_id = merge1.new_shard_id.unwrap();
-
-        let merge2 = seed_cache.snapshot_store.merge_entry_with_outcome(
+        let merge2_id = seed_snapshot_entry(
+            &seed_cache,
+            &remote_seed,
             commit,
             SnapshotEntry {
                 task_id: "pkg#b".to_string(),
@@ -709,13 +756,118 @@ mod tests {
                 tool_version: None,
             },
         );
-        remote_seed.push_store_artifacts(PushArtifacts {
-            paths: seed_cache.paths(),
-            commit_key: commit,
-            outputs_hash: &[22; 32],
-            merge: &merge2,
+        (seed_cache, merge1_id, merge2_id)
+    }
+
+    #[test]
+    fn missing_local_source_copy_error_does_not_disable_remote() {
+        let remote = RemoteSync::new(
+            Arc::new(RcloneRcd::new(Duration::from_secs(1)).unwrap()),
+            ":local:/tmp/nonexistent-remote".to_string(),
+        );
+        let err = rclone::RcloneError::HttpStatus {
+            status: 500,
+            body: "failed to open source object: lstat /tmp/cache/snapshots/abc/123.merged: no such file or directory".to_string(),
+        };
+
+        remote.record_remote_error(&err);
+
+        assert!(!remote.is_disabled_for_test());
+    }
+
+    fn seed_guard_blob(local_cache: &TempDir, outputs_hash: [u8; 32], body: &[u8]) {
+        let local_blob_dir = local_cache.path().join("blobs");
+        fs::create_dir_all(&local_blob_dir).unwrap();
+        fs::write(
+            local_blob_dir.join(format!("{}.tar.zst", hex_hash(outputs_hash))),
+            body,
+        )
+        .unwrap();
+    }
+
+    fn assert_snapshot_upload_failure_preserves_remote(
+        remote_root: &Path,
+        commit: &str,
+        before: &[String],
+        expected_present_ids: &[&str],
+    ) {
+        let remote_after = remote_snapshot_files(remote_root, commit);
+        assert_eq!(remote_after, before);
+        for shard_id in expected_present_ids {
+            assert!(remote_after.iter().any(|name| name.starts_with(shard_id)));
+        }
+        assert!(!remote_after
+            .iter()
+            .any(|name| name.starts_with("subsuming-shard")));
+    }
+
+    #[test]
+    fn remote_store_skips_remote_delete_when_snapshot_upload_fails() {
+        if !should_run_rclone_test() {
+            eprintln!("skipping rclone-gated shared-cache upload-failure guard test; rclone not on PATH or LUCHTA_TEST_RCLONE disabled");
+            return;
+        }
+
+        let harness = RemoteHarness::new("console.log('guard');\n");
+        let (seed_cache, _merge1_id, merge2_id) = seed_remote_snapshot_entries(
+            harness.temp_repo.path(),
+            &harness.commit,
+            harness.remote_root.path(),
+        );
+        let remote_before = remote_snapshot_files(harness.remote_root.path(), &harness.commit);
+        assert_eq!(remote_before.len(), 2);
+        seed_guard_blob(&harness.local_cache, [23; 32], b"blob-23");
+        let cache = harness.cache();
+        let mut merge3 = cache.snapshot_store.merge_entry_with_outcome(
+            &harness.commit,
+            SnapshotEntry {
+                task_id: "pkg#c".to_string(),
+                input_key: derive_input_key([19; 32], [20; 32], [21; 32], [22; 32]),
+                outputs_hash: [23; 32],
+                task_spec_hash: [33; 32],
+                env_hash: [43; 32],
+                pkg_dep_hash: [53; 32],
+                duration_ms: 120,
+                output_bytes: 12,
+                cached_at_unix_ms: 3,
+                tool_version: None,
+            },
+        );
+        let upload = merge3.new_snapshot_upload.as_mut().unwrap();
+        let expected_subsumed = merge3.subsumed_shard_ids.clone();
+        let missing_source_err = rclone::RcloneError::HttpStatus {
+            status: 500,
+            body: format!(
+                "failed to open source object: lstat {}: no such file or directory",
+                cache
+                    .paths()
+                    .snapshots_dir
+                    .join(&harness.commit)
+                    .join("vanished-shard.bincode")
+                    .display()
+            ),
+        };
+        assert!(remote_disable_reason(&missing_source_err).contains("HTTP 500"));
+        assert!(is_missing_local_source_copy_error(&missing_source_err));
+        harness.remote.record_remote_error(&missing_source_err);
+        assert!(!harness.remote.is_disabled_for_test());
+        upload.shard_id = "missing-parent/subsuming-shard".to_string();
+        harness.remote.push_store_artifacts(PushArtifacts {
+            paths: cache.paths(),
+            commit_key: &harness.commit,
+            outputs_hash: &[23; 32],
+            merge: merge3,
         });
-        (seed_cache, merge1_id, merge2.new_shard_id.unwrap())
+        drop(seed_cache);
+        let expected_present_ids: Vec<&str> = std::iter::once(merge2_id.as_str())
+            .chain(expected_subsumed.iter().map(String::as_str))
+            .collect();
+        assert_snapshot_upload_failure_preserves_remote(
+            harness.remote_root.path(),
+            &harness.commit,
+            &remote_before,
+            &expected_present_ids,
+        );
     }
 
     #[test]

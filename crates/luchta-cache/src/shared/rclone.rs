@@ -108,6 +108,14 @@ struct DaemonState {
     pid: u32,
 }
 
+struct RuntimeCall<'a, P> {
+    state: &'a mut State,
+    runtime: &'a Runtime,
+    endpoint: &'a str,
+    payload: P,
+    timeout: Duration,
+}
+
 impl RcloneRcd {
     pub fn new(default_timeout: Duration) -> Result<Self, RcloneError> {
         let runtime = Builder::new_current_thread().enable_all().build()?;
@@ -249,7 +257,13 @@ impl RcloneRcd {
     {
         let mut state = self.lock_state()?;
         let runtime = self.runtime();
-        call_on_runtime_thread(&mut state, runtime, endpoint, payload, timeout)
+        call_on_runtime_thread(RuntimeCall {
+            state: &mut state,
+            runtime,
+            endpoint,
+            payload,
+            timeout,
+        })
     }
 
     fn lock_state(&self) -> Result<std::sync::MutexGuard<'_, State>, RcloneError> {
@@ -307,17 +321,18 @@ impl RcloneRcd {
     }
 }
 
-fn call_on_runtime_thread<P, T>(
-    state: &mut State,
-    runtime: &Runtime,
-    endpoint: &str,
-    payload: P,
-    timeout: Duration,
-) -> Result<T, RcloneError>
+fn call_on_runtime_thread<P, T>(call: RuntimeCall<'_, P>) -> Result<T, RcloneError>
 where
     P: Serialize,
     T: DeserializeOwned,
 {
+    let RuntimeCall {
+        state,
+        runtime,
+        endpoint,
+        payload,
+        timeout,
+    } = call;
     let payload = serde_json::to_value(payload)?;
     let response = std::thread::scope(|scope| {
         scope

@@ -559,7 +559,7 @@ impl SharedCache {
                         paths: &self.paths,
                         commit_key: write_key,
                         outputs_hash: &outputs_hash,
-                        merge: &merge,
+                        merge,
                     });
                 }
                 Ok(StoreOutcome::Stored)
