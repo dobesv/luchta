@@ -11,7 +11,8 @@ use crate::format::{
     format_task_log_block, format_unix_ms_local, package_and_task_display, LogBlockMeta,
 };
 use crate::run::{
-    collect_requested_subgraph, prepare_workspace, CollectSubgraphRequest, TaskSelection,
+    build_globset, collect_matched_package_names, collect_requested_subgraph, prepare_workspace,
+    CollectSubgraphRequest, TaskSelection,
 };
 use luchta_engine::ResolveMode;
 
@@ -71,6 +72,27 @@ fn select_task_ids(
             .collect());
     }
 
+    if selection_requests_packages_without_tasks(selection) {
+        let package_globs = build_globset(selection.packages)?;
+        let available_nodes: Vec<_> = task_graph.nodes().collect();
+        let matched_package_names =
+            collect_matched_package_names(&available_nodes, selection.packages, &package_globs);
+
+        if matched_package_names.is_empty() {
+            return Err(miette::miette!(
+                "No packages matched: [{}]. -p matches package names, not paths.",
+                selection.packages.join(", ")
+            ));
+        }
+
+        return Ok(available_nodes
+            .into_iter()
+            .filter(|node| !node.id.is_root())
+            .filter(|node| matched_package_names.contains(&node.id.package))
+            .map(|node| node.id.clone())
+            .collect());
+    }
+
     collect_requested_subgraph(CollectSubgraphRequest {
         task_graph,
         selection,
@@ -86,6 +108,10 @@ fn selection_uses_default_scope(selection: &TaskSelection<'_>) -> bool {
 
 fn selection_requests_only_top_level(selection: &TaskSelection<'_>) -> bool {
     selection.top_level && selection.requested_tasks.is_empty() && selection.packages.is_empty()
+}
+
+fn selection_requests_packages_without_tasks(selection: &TaskSelection<'_>) -> bool {
+    selection.requested_tasks.is_empty() && !selection.packages.is_empty() && !selection.top_level
 }
 
 /// Print logs for a single task.

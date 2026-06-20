@@ -75,22 +75,53 @@ done
     worker
 }
 
-fn footer_duration_ms(stderr: &str) -> u64 {
-    for (needle, millis) in [
-        ("0.0s", 0),
-        ("0.1s", 100),
-        ("0.2s", 200),
-        ("0.3s", 300),
-        ("0.4s", 400),
-        ("0.5s", 500),
-        ("1m ", 60_000),
-    ] {
-        if stderr.contains(needle) {
-            return millis;
-        }
-    }
+#[test]
+fn footer_duration_ms_parses_seconds_and_minute_forms() {
+    let cases = [
+        ("──◀ duration=0.2s exit=7 cache=unknown\n", 200),
+        ("──◀ duration=1m 5s exit=1 cache=unknown\n", 65_000),
+        ("──◀ duration=92.3s exit=1 cache=unknown\n", 92_300),
+    ];
 
-    panic!("unsupported duration footer format: {stderr}");
+    for (stderr, expected_ms) in cases {
+        let start = stderr
+            .find("duration=")
+            .unwrap_or_else(|| panic!("missing duration footer format: {stderr}"))
+            + "duration=".len();
+        let rest = &stderr[start..];
+        let end = rest
+            .find(" exit=")
+            .unwrap_or_else(|| panic!("missing exit footer format after duration: {stderr}"));
+        let trimmed = rest[..end].trim();
+        let token = trimmed
+            .strip_prefix("\u{1b}[2m")
+            .unwrap_or(trimmed)
+            .strip_suffix("\u{1b}[0m")
+            .unwrap_or(trimmed);
+
+        let duration_ms = if let Some((minutes, seconds)) = token.split_once("m ") {
+            let minutes_ms = minutes
+                .parse::<u64>()
+                .unwrap_or_else(|_| panic!("invalid minute duration token: {token}"));
+            let seconds_ms = seconds
+                .strip_suffix('s')
+                .unwrap_or_else(|| panic!("invalid second duration token: {token}"))
+                .parse::<u64>()
+                .unwrap_or_else(|_| panic!("invalid second duration token: {token}"));
+            (minutes_ms * 60_000) + (seconds_ms * 1_000)
+        } else {
+            let seconds = token
+                .strip_suffix('s')
+                .unwrap_or_else(|| panic!("unsupported duration token: {token}"));
+            (seconds
+                .parse::<f64>()
+                .unwrap_or_else(|_| panic!("invalid seconds duration token: {token}"))
+                * 1_000.0)
+                .round() as u64
+        };
+
+        assert_eq!(duration_ms, expected_ms);
+    }
 }
 
 fn assert_contains_all(haystack: &str, needles: &[&str]) {
@@ -226,7 +257,27 @@ fn run_failure_output_uses_real_start_time_for_non_cacheable_failures() {
 
     let output = run_workspace_command(&temp, "run", &["fail"]).failure();
     let stderr = String::from_utf8_lossy(&output.get_output().stderr);
-    let duration_ms = footer_duration_ms(&stderr);
+    let duration_start = stderr
+        .find("duration=")
+        .unwrap_or_else(|| panic!("missing duration footer format: {stderr}"))
+        + "duration=".len();
+    let duration_rest = &stderr[duration_start..];
+    let duration_end = duration_rest
+        .find(" exit=")
+        .unwrap_or_else(|| panic!("missing exit footer format after duration: {stderr}"));
+    let duration_trimmed = duration_rest[..duration_end].trim();
+    let duration_token = duration_trimmed
+        .strip_prefix("\u{1b}[2m")
+        .unwrap_or(duration_trimmed)
+        .strip_suffix("\u{1b}[0m")
+        .unwrap_or(duration_trimmed)
+        .strip_suffix('s')
+        .unwrap_or_else(|| panic!("unsupported duration token: {stderr}"));
+    let duration_ms = (duration_token
+        .parse::<f64>()
+        .unwrap_or_else(|_| panic!("invalid seconds duration token: {duration_token}"))
+        * 1_000.0)
+        .round() as u64;
 
     assert!(
         duration_ms >= 100,

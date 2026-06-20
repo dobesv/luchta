@@ -139,6 +139,36 @@ fn logs_filters_task_selection() {
     });
     assert_logs_case(LogsCase {
         scenario: LogsScenario {
+            task_json: BUILD_AND_TEST_TASKS,
+            extra_files: SINGLE_BUILD_FILES,
+        },
+        run_tasks: &["build", "test"],
+        args: &["-p", "app"],
+        assertions: &[
+            LogAssertion {
+                needle: "──▶",
+                present: true,
+                message: "expected header marker in output",
+            },
+            LogAssertion {
+                needle: "──◀",
+                present: true,
+                message: "expected footer marker in output",
+            },
+            LogAssertion {
+                needle: "app#build",
+                present: true,
+                message: "expected app#build task in output",
+            },
+            LogAssertion {
+                needle: "app#test",
+                present: true,
+                message: "expected app#test task in output",
+            },
+        ],
+    });
+    assert_logs_case(LogsCase {
+        scenario: LogsScenario {
             task_json: r#""app#fast":{"cache":{},"worker":"shell","inputs":["src.txt"],"outputs":["fast.txt"],"command":"echo fast > fast.txt"},"app#slow":{"cache":{},"worker":"shell","inputs":["src.txt"],"outputs":["slow.txt"],"command":"sleep 0.2 && echo slow > slow.txt"}"#,
             extra_files: SINGLE_BUILD_FILES,
         },
@@ -160,6 +190,30 @@ fn logs_filters_task_selection() {
 }
 
 #[test]
+fn logs_package_filter_errors_when_no_packages_match() {
+    let temp = setup_logs_workspace(LogsScenario {
+        task_json: BUILD_AND_TEST_TASKS,
+        extra_files: SINGLE_BUILD_FILES,
+    });
+    common::run_luchta(&temp, "build").success();
+
+    let mut cmd = Command::cargo_bin("luchta").unwrap();
+    cmd.env("NO_COLOR", "1");
+    cmd.arg("logs")
+        .arg("-p")
+        .arg("bogus")
+        .arg("--workspace-root")
+        .arg(temp.path());
+    let output = cmd.assert().failure();
+    let stderr = String::from_utf8_lossy(&output.get_output().stderr);
+
+    assert!(
+        stderr.contains("No packages matched: [bogus]. -p matches package names, not paths."),
+        "expected helpful package mismatch error: {stderr}"
+    );
+}
+
+#[test]
 fn logs_shows_metadata_views() {
     let cases = [
         LogsCase {
@@ -178,6 +232,7 @@ fn logs_shows_metadata_views() {
                 LogAssertion {
                     needle: "src.txt",
                     present: true,
+
                     message: "expected input file path in output",
                 },
             ],
