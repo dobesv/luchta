@@ -79,5 +79,35 @@ pub enum Commands {
         #[arg(long, value_name = "GIT_REF")]
         since: Option<String>,
     },
+    /// View cached logs and metadata for previously executed tasks.
+    Logs {
+        /// Task names to match; supports glob wildcards.
+        tasks: Vec<String>,
+
+        /// Match package NAMEs (not paths); supports glob wildcards. Repeat to target multiple packages.
+        #[arg(short = 'p', long = "package")]
+        packages: Vec<String>,
+
+        /// Match the given task names as top-level (workspace-root) tasks
+        /// instead of package tasks.
+        #[arg(short = 'T', long = "top-level")]
+        top_level: bool,
+
+        /// Filter to tasks that took at least this many milliseconds.
+        #[arg(long = "time-taken", value_name = "MS")]
+        time_taken: Option<u64>,
+
+        /// Filter to tasks that failed (succeeded == false).
+        #[arg(long)]
+        failed: bool,
+
+        /// Show input file metadata (path, size, mtime, hash) for each task.
+        #[arg(long = "show-inputs")]
+        show_inputs: bool,
+
+        /// Show output file metadata (path, size, mtime, hash) for each task.
+        #[arg(long = "show-outputs")]
+        show_outputs: bool,
+    },
     Check,
 }

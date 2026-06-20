@@ -154,18 +154,28 @@ pub fn git_commit_paths(repo: &std::path::Path, paths: &[&str], message: &str) {
     git_in(repo, &["commit", "-m", message]);
 }
 
+/// Extra JSON fragments injected into shell-worker `done` messages.
+pub struct WorkerDoneFields<'a> {
+    pub json_fragment: Option<&'a str>,
+}
+
 /// Create a shell worker script that handles resolveTask and run messages.
 pub fn shell_worker(temp: &assert_fs::TempDir) -> assert_fs::fixture::ChildPath {
-    shell_worker_with_done_fields(temp, None)
+    shell_worker_with_done_fields(
+        temp,
+        WorkerDoneFields {
+            json_fragment: None,
+        },
+    )
 }
 
 /// Create a shell worker script with optional extra done fields.
 pub fn shell_worker_with_done_fields(
     temp: &assert_fs::TempDir,
-    done_fields: Option<&str>,
+    done_fields: WorkerDoneFields<'_>,
 ) -> assert_fs::fixture::ChildPath {
     let script = temp.child("shell-worker.sh");
-    let done_fields = done_fields.unwrap_or("");
+    let done_fields = done_fields.json_fragment.unwrap_or("");
     script
         .write_str(&format!(
             r#"#!/bin/sh
@@ -195,22 +205,44 @@ done
 /// Write a task config with a counter command.
 pub fn write_counter_task_config(temp: &assert_fs::TempDir, task_json: &str) {
     let worker = shell_worker(temp);
-    write_task_config_with_worker(temp, worker.path(), task_json);
+    write_task_config_with_shell_worker(temp, worker.path(), task_json);
 }
 
-/// Write a task config script that invokes the given worker.
+pub struct WorkerConfig<'a> {
+    pub name: &'a str,
+    pub command: &'a Path,
+}
+
+/// Write a task config script that invokes given worker.
 pub fn write_task_config_with_worker(
     temp: &assert_fs::TempDir,
-    worker_command: &Path,
+    worker: WorkerConfig<'_>,
     task_json: &str,
 ) {
     write_executable(
         temp.child("luchta-config.sh").path(),
         &format!(
-            "#!/bin/sh\necho '{{\"concurrency\":{{\"maxWeight\":4}},\"workers\":{{\"shell\":{{\"command\":\"{}\"}}}},\"tasks\":{{{}}}}}'\n",
-            worker_command.display(),
+            "#!/bin/sh\necho '{{\"concurrency\":{{\"maxWeight\":4}},\"workers\":{{\"{}\":{{\"command\":\"{}\"}}}},\"tasks\":{{{}}}}}'\n",
+            worker.name,
+            worker.command.display(),
             task_json
         ),
+    );
+}
+
+/// Write a task config script that invokes shell worker.
+pub fn write_task_config_with_shell_worker(
+    temp: &assert_fs::TempDir,
+    worker_command: &Path,
+    task_json: &str,
+) {
+    write_task_config_with_worker(
+        temp,
+        WorkerConfig {
+            name: "shell",
+            command: worker_command,
+        },
+        task_json,
     );
 }
 

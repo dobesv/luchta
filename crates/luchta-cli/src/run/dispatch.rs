@@ -11,7 +11,7 @@ use super::*;
 use luchta_cache::shared::{
     combined_dep_outputs_hash, derive_input_key, RestoredHit, StoreOutcome,
 };
-use luchta_cache::{decide_shared_restore, FileEntry, RunArtifacts};
+use luchta_cache::{decide_shared_restore, task_cache_key, FileEntry, RunArtifacts};
 use luchta_types::EnvSpec;
 use luchta_worker::BUILTIN_PASSTHROUGH_ENV;
 
@@ -31,13 +31,52 @@ fn split_captured_logs(sink: &ExecutionLogSink) -> (Vec<u8>, Vec<u8>) {
     (out, err)
 }
 
-fn print_captured_logs(sink: &ExecutionLogSink) {
-    for line in sink.lines() {
-        match line.stream {
-            LogStream::Stdout => println!("{}", line.line),
-            LogStream::Stderr => eprintln!("{}", line.line),
+struct FailureLogContext<'a> {
+    task_id: &'a TaskId,
+    start_unix_ms: u64,
+    end_unix_ms: u64,
+    exit_status: Option<i32>,
+}
+
+fn format_captured_failure_logs(context: FailureLogContext<'_>, sink: &ExecutionLogSink) -> String {
+    let FailureLogContext {
+        task_id,
+        start_unix_ms,
+        end_unix_ms,
+        exit_status,
+    } = context;
+    let (stdout, stderr) = split_captured_logs(sink);
+    let stdout = String::from_utf8_lossy(&stdout);
+    let stderr = String::from_utf8_lossy(&stderr);
+
+    let mut body = stdout.into_owned();
+    if !stderr.is_empty() {
+        if !body.is_empty() && !body.ends_with('\n') {
+            body.push('\n');
         }
+        body.push_str(&stderr);
     }
+
+    let lines: Vec<&str> = body.lines().collect();
+
+    let cache_hash_full = task_cache_key(&task_id.to_string());
+    let cache_hash_12 = &cache_hash_full[..12];
+    let (package_display, task_display) = crate::format::package_and_task_display(task_id);
+
+    let (shown_lines, _) = crate::format::truncate_output(&lines, package_display, task_display);
+    let body = shown_lines.join("\n");
+
+    crate::format::format_task_log_block(
+        &crate::format::LogBlockMeta {
+            package: package_display,
+            task: task_display,
+            start: Some(start_unix_ms),
+            duration_ms: Some(end_unix_ms.saturating_sub(start_unix_ms)),
+            exit_status,
+            cache_hash: Some(cache_hash_12),
+        },
+        &body,
+    )
 }
 
 pub(super) fn dispatch_ready_task(
@@ -115,18 +154,14 @@ pub(super) fn dispatch_ready_task(
 
 fn build_task_run_context(
     task_id: &TaskId,
-    cache_enabled: bool,
+    _cache_enabled: bool,
     ctx: &DispatchContext<'_>,
 ) -> TaskRunContext {
     let output_hash_record =
         build_output_hash_record_context(task_id, ctx.task_graph, ctx.packages, ctx.workspace_root);
-    let cache_write = if cache_enabled {
-        match build_cache_write_context(task_id, ctx) {
-            CacheInputState::Ready(cache_ctx) => Some(*cache_ctx),
-            CacheInputState::Disabled => None,
-        }
-    } else {
-        None
+    let cache_write = match build_cache_write_context(task_id, ctx) {
+        CacheInputState::Ready(cache_ctx) => Some(*cache_ctx),
+        CacheInputState::Disabled => None,
     };
 
     TaskRunContext {
@@ -138,6 +173,99 @@ fn build_task_run_context(
         cache_write,
         output_hash_record,
         shared_cache: ctx.shared_cache.clone(),
+    }
+}
+
+struct SpawnedTaskOutcome {
+    outcome_res: Result<TaskRunOutcome, luchta_engine::ExecutorError>,
+    succeeded: bool,
+    start_unix_ms: u64,
+    end_unix_ms: u64,
+}
+
+struct SpawnedTaskRun<F> {
+    executor: Arc<WeightedExecutor>,
+    request: ExecutionRequest,
+    on_start: F,
+    log_sink: ExecutionLogSink,
+    cache_enabled: bool,
+    repo_root: PathBuf,
+    task_ctx: TaskRunContext,
+    task_start_unix_ms: u64,
+}
+
+fn prepare_task_log_sink(request: &mut ExecutionRequest) -> ExecutionLogSink {
+    let log_sink = ExecutionLogSink::new();
+    request.log_sink = Some(log_sink.clone());
+    log_sink
+}
+
+async fn run_task_and_persist_cache<F>(run: SpawnedTaskRun<F>) -> SpawnedTaskOutcome
+where
+    F: FnOnce() + Send + 'static,
+{
+    let SpawnedTaskRun {
+        executor,
+        request,
+        on_start,
+        log_sink,
+        cache_enabled,
+        repo_root,
+        task_ctx,
+        task_start_unix_ms,
+    } = run;
+    let TaskRunContext {
+        executor: _,
+        any_failed,
+        interrupted,
+        cache,
+        output_hashes,
+        cache_write,
+        output_hash_record,
+        shared_cache,
+    } = task_ctx;
+    let outcome_res = executor.run_with_on_start(&request, on_start).await;
+    let end_unix_ms = now_unix_ms();
+    let succeeded = matches!(&outcome_res, Ok(result) if result.status.success());
+    let output_hash_record =
+        output_hash_record.map(|record| record.with_effective_patterns(outcome_res.as_ref().ok()));
+    let start_unix_ms = cache_write
+        .as_ref()
+        .map(|cache_ctx| cache_ctx.start_unix_ms)
+        .unwrap_or(task_start_unix_ms);
+    let expansion_error = persist_cache_state(CachePersistInputs {
+        cache,
+        cache_write,
+        output_hashes: &output_hashes,
+        output_hash_record: output_hash_record.as_ref(),
+        log_sink: Some(&log_sink),
+        outcome: outcome_res.as_ref().ok(),
+        succeeded,
+        end_unix_ms,
+        shared_cache: cache_enabled.then_some(shared_cache).flatten(),
+        shared_store_enabled: cache_enabled,
+        repo_root,
+    })
+    .await;
+
+    if let Some(expansion_error) = expansion_error {
+        any_failed.store(true, Ordering::SeqCst);
+        if !interrupted.load(Ordering::SeqCst) {
+            eprintln!("{} {}", "✖".red(), expansion_error.red());
+        }
+        return SpawnedTaskOutcome {
+            outcome_res,
+            succeeded: false,
+            start_unix_ms,
+            end_unix_ms,
+        };
+    }
+
+    SpawnedTaskOutcome {
+        outcome_res,
+        succeeded,
+        start_unix_ms,
+        end_unix_ms,
     }
 }
 
@@ -243,7 +371,6 @@ fn build_cache_write_context(task_id: &TaskId, ctx: &DispatchContext<'_>) -> Cac
 enum BuildRecordResult {
     Ok(Box<TaskRunRecord>),
     ExpansionError(String),
-    Skip,
 }
 
 fn build_run_record(
@@ -259,11 +386,9 @@ fn build_run_record(
     let inputs = match resolve_cache_inputs(cache_ctx, &input_patterns) {
         CacheInputResult::Ok(entries) => entries,
         CacheInputResult::ExpansionError(msg) => return BuildRecordResult::ExpansionError(msg),
-        CacheInputResult::IoError => return BuildRecordResult::Skip,
+        CacheInputResult::IoError => Vec::new(),
     };
-    let Some(outputs) = resolve_cache_outputs(cache_ctx, &output_patterns) else {
-        return BuildRecordResult::Skip;
-    };
+    let outputs = resolve_cache_outputs(cache_ctx, &output_patterns).unwrap_or_default();
     let outputs_hash = combined_outputs_hash(&outputs);
     let exit_status = outcome
         .map(|result| result.status.code().unwrap_or(1))
@@ -322,7 +447,7 @@ fn resolve_cache_inputs(
         Ok(inputs) => CacheInputResult::Ok(inputs),
         Err(error) => {
             eprintln!(
-                "warning: skipping cache write for task '{}': failed to resolve cache inputs: {error}",
+                "warning: failed to resolve cache inputs for task '{}': {error} — recording run with empty inputs",
                 cache_ctx.task_id
             );
             CacheInputResult::IoError
@@ -338,7 +463,7 @@ fn resolve_cache_outputs(
         Ok(outputs) => Some(outputs),
         Err(error) => {
             eprintln!(
-                "warning: skipping cache write for task '{}': failed to resolve cache outputs: {error}",
+                "warning: failed to resolve cache outputs for task '{}': {error} — recording run with empty outputs",
                 cache_ctx.task_id
             );
             None
@@ -363,12 +488,12 @@ async fn write_run_record(
     succeeded: bool,
     end_unix_ms: u64,
     shared_cache: Option<Arc<SharedCache>>,
+    shared_store_enabled: bool,
     repo_root: PathBuf,
 ) -> WriteRecordResult {
     let record = match build_run_record(&cache_ctx, outcome, succeeded, end_unix_ms) {
         BuildRecordResult::Ok(record) => record,
         BuildRecordResult::ExpansionError(msg) => return WriteRecordResult::ExpansionError(msg),
-        BuildRecordResult::Skip => return WriteRecordResult::Ok,
     };
     record_output_hash(&output_hashes, &cache_ctx.task_id, record.outputs_hash);
     let (stdout, stderr) = log_sink.map(split_captured_logs).unwrap_or_default();
@@ -405,54 +530,56 @@ async fn write_run_record(
 
         // Shared cache store (after local write, only if enabled)
         // Path-escape at this point is FATAL and propagates as expansion error.
-        if let Some(shared) = shared_cache {
-            let _duration_ms = end_unix_ms.saturating_sub(start_unix_ms);
-            let input_key = derive_input_key(
-                task_spec_hash,
-                env_hash,
-                pkg_dep_hash,
-                combined_dep_outputs_hash(&dep_outputs),
-            );
+        if shared_store_enabled {
+            if let Some(shared) = shared_cache {
+                let _duration_ms = end_unix_ms.saturating_sub(start_unix_ms);
+                let input_key = derive_input_key(
+                    task_spec_hash,
+                    env_hash,
+                    pkg_dep_hash,
+                    combined_dep_outputs_hash(&dep_outputs),
+                );
 
-            // Gather package-relative output paths from record.outputs (skip absent entries)
-            let rel_output_paths: Vec<std::path::PathBuf> = record_for_shared
-                .outputs
-                .iter()
-                .filter(|f| !f.absent)
-                .map(|f| std::path::PathBuf::from(&f.path))
-                .collect();
+                // Gather package-relative output paths from record.outputs (skip absent entries)
+                let rel_output_paths: Vec<std::path::PathBuf> = record_for_shared
+                    .outputs
+                    .iter()
+                    .filter(|f| !f.absent)
+                    .map(|f| std::path::PathBuf::from(&f.path))
+                    .collect();
 
-            match shared.store(
-                &task_id_str,
-                &input_key,
-                &outputs_hash,
-                &package_dir,
-                &rel_output_paths,
-                &record_for_shared,
-                &stdout,
-                &stderr,
-                &repo_root,
-            ) {
-                Ok(StoreOutcome::Stored) => {}
-                Ok(StoreOutcome::SkippedNotSucceeded) => {}
-                Ok(StoreOutcome::SkippedTooFast { duration_ms: _ }) => {}
-                Ok(StoreOutcome::SkippedTooLarge { bytes: _ }) => {}
-                Ok(StoreOutcome::SkippedCrossPackage) => {}
-                Ok(StoreOutcome::SkippedLockUnavailable) => {}
-                Ok(StoreOutcome::Disabled) => {}
-                Err(e) => {
-                    if e.kind() == std::io::ErrorKind::InvalidData {
-                        // Path-escape is a security hard-fail.
-                        return Some(format!(
-                            "shared cache store failed for task '{}': {}",
+                match shared.store(
+                    &task_id_str,
+                    &input_key,
+                    &outputs_hash,
+                    &package_dir,
+                    &rel_output_paths,
+                    &record_for_shared,
+                    &stdout,
+                    &stderr,
+                    &repo_root,
+                ) {
+                    Ok(StoreOutcome::Stored) => {}
+                    Ok(StoreOutcome::SkippedNotSucceeded) => {}
+                    Ok(StoreOutcome::SkippedTooFast { duration_ms: _ }) => {}
+                    Ok(StoreOutcome::SkippedTooLarge { bytes: _ }) => {}
+                    Ok(StoreOutcome::SkippedCrossPackage) => {}
+                    Ok(StoreOutcome::SkippedLockUnavailable) => {}
+                    Ok(StoreOutcome::Disabled) => {}
+                    Err(e) => {
+                        if e.kind() == std::io::ErrorKind::InvalidData {
+                            // Path-escape is a security hard-fail.
+                            return Some(format!(
+                                "shared cache store failed for task '{}': {}",
+                                task_id_str, e
+                            ));
+                        }
+
+                        eprintln!(
+                            "warning: shared cache store failed for task '{}': {}; continuing with local cache",
                             task_id_str, e
-                        ));
+                        );
                     }
-
-                    eprintln!(
-                        "warning: shared cache store failed for task '{}': {}; continuing with local cache",
-                        task_id_str, e
-                    );
                 }
             }
         }
@@ -633,84 +760,107 @@ fn spawn_task_runner(ready: ReadyTask, ctx: &DispatchContext<'_>) {
         done_tx,
         cache_enabled,
     } = ready;
-    let TaskRunContext {
-        executor,
-        any_failed,
-        interrupted,
-        cache,
-        output_hashes,
-        cache_write,
-        output_hash_record,
-        shared_cache,
-    } = build_task_run_context(&task_id, cache_enabled, ctx);
-
-    let log_sink = ExecutionLogSink::new();
-    request.log_sink = Some(log_sink.clone());
-
-    // Clone reporter Arc to move into the spawned future.
+    let task_start_unix_ms = now_unix_ms();
+    let task_ctx = build_task_run_context(&task_id, cache_enabled, ctx);
     let reporter = Arc::clone(ctx.reporter);
-
     let started_task_id = task_id.clone();
     let repo_root = ctx.workspace_root.to_path_buf();
 
-    tokio::spawn(async move {
-        let outcome_res = executor
-            .run_with_on_start(&request, {
-                let reporter = Arc::clone(&reporter);
-                move || reporter.task_started(&started_task_id)
-            })
-            .await;
-        let end_unix_ms = now_unix_ms();
-        let succeeded = matches!(&outcome_res, Ok(result) if result.status.success());
-        // Override the declared output patterns with worker-detected outputs
-        // (when emitted) so uncached-dependency coupling matches the cache-write
-        // path's `effective_output_patterns` precedence.
-        let output_hash_record = output_hash_record
-            .map(|record| record.with_effective_patterns(outcome_res.as_ref().ok()));
+    let executor = Arc::clone(&task_ctx.executor);
+    let any_failed = Arc::clone(&task_ctx.any_failed);
+    let interrupted = Arc::clone(&task_ctx.interrupted);
+    let log_sink = prepare_task_log_sink(&mut request);
 
-        let expansion_error = persist_cache_state(CachePersistInputs {
-            cache,
-            cache_write,
-            output_hashes: &output_hashes,
-            output_hash_record: output_hash_record.as_ref(),
-            log_sink: Some(&log_sink),
-            outcome: outcome_res.as_ref().ok(),
+    tokio::spawn(async move {
+        let on_start = {
+            let reporter = Arc::clone(&reporter);
+            move || reporter.task_started(&started_task_id)
+        };
+        let SpawnedTaskOutcome {
+            outcome_res,
             succeeded,
+            start_unix_ms,
             end_unix_ms,
-            shared_cache,
+        } = run_task_and_persist_cache(SpawnedTaskRun {
+            executor,
+            request,
+            on_start,
+            log_sink: log_sink.clone(),
+            cache_enabled,
             repo_root,
+            task_ctx,
+            task_start_unix_ms,
         })
         .await;
 
-        // Handle expansion errors as hard failures
-        if let Some(expansion_error) = expansion_error {
-            any_failed.store(true, Ordering::SeqCst);
-            if !interrupted.load(Ordering::SeqCst) {
-                eprintln!("{} {}", "✖".red(), expansion_error.red());
-            }
-            reporter.task_finished_other(&task_id);
-            let _ = done_tx.send(false);
-            return;
-        }
-
-        let interrupted_run = interrupted.load(Ordering::SeqCst);
-        let failed = !succeeded;
-        if failed && !interrupted_run {
-            print_captured_logs(&log_sink);
-        }
-
-        report_task_outcome(&task_id, &outcome_res, &any_failed, &interrupted);
-
-        // Report task completion to the progress reporter.
-        if succeeded {
-            reporter.task_ran(&task_id);
-        } else {
-            // Failed tasks are NOT counted in done/skipped.
-            reporter.task_finished_other(&task_id);
-        }
-
-        let _ = done_tx.send(succeeded);
+        finalize_task_run(TaskRunFinalization {
+            task_id: &task_id,
+            done_tx,
+            reporter: &reporter,
+            any_failed: &any_failed,
+            interrupted: &interrupted,
+            log_sink: &log_sink,
+            outcome_res: &outcome_res,
+            succeeded,
+            start_unix_ms,
+            end_unix_ms,
+        });
     });
+}
+
+struct TaskRunFinalization<'a> {
+    task_id: &'a TaskId,
+    done_tx: CompletionSignal,
+    reporter: &'a Arc<ProgressReporter>,
+    any_failed: &'a Arc<AtomicBool>,
+    interrupted: &'a Arc<AtomicBool>,
+    log_sink: &'a ExecutionLogSink,
+    outcome_res: &'a Result<TaskRunOutcome, luchta_engine::ExecutorError>,
+    succeeded: bool,
+    start_unix_ms: u64,
+    end_unix_ms: u64,
+}
+
+fn finalize_task_run(finalization: TaskRunFinalization<'_>) {
+    let TaskRunFinalization {
+        task_id,
+        done_tx,
+        reporter,
+        any_failed,
+        interrupted,
+        log_sink,
+        outcome_res,
+        succeeded,
+        start_unix_ms,
+        end_unix_ms,
+    } = finalization;
+
+    let interrupted_run = interrupted.load(Ordering::SeqCst);
+    if !succeeded && !interrupted_run {
+        let failure_logs = format_captured_failure_logs(
+            FailureLogContext {
+                task_id,
+                start_unix_ms,
+                end_unix_ms,
+                exit_status: outcome_res
+                    .as_ref()
+                    .ok()
+                    .and_then(|result| result.status.code()),
+            },
+            log_sink,
+        );
+        eprint!("{}", failure_logs);
+    }
+
+    report_task_outcome(task_id, outcome_res, any_failed, interrupted);
+
+    if succeeded {
+        reporter.task_ran(task_id);
+    } else {
+        reporter.task_finished_other(task_id);
+    }
+
+    let _ = done_tx.send(succeeded);
 }
 
 /// Inputs for persisting a finished task's cache state.
@@ -725,6 +875,8 @@ struct CachePersistInputs<'a> {
     end_unix_ms: u64,
     /// Shared cache for storing successful task results.
     shared_cache: Option<Arc<SharedCache>>,
+    /// Whether shared-cache store is enabled for this task.
+    shared_store_enabled: bool,
     /// Repo root for scope classification during shared cache write.
     repo_root: PathBuf,
 }
@@ -750,6 +902,7 @@ async fn persist_cache_state(inputs: CachePersistInputs<'_>) -> Option<String> {
         succeeded,
         end_unix_ms,
         shared_cache,
+        shared_store_enabled,
         repo_root,
     } = inputs;
 
@@ -763,6 +916,7 @@ async fn persist_cache_state(inputs: CachePersistInputs<'_>) -> Option<String> {
             succeeded,
             end_unix_ms,
             shared_cache,
+            shared_store_enabled,
             repo_root,
         )
         .await;
