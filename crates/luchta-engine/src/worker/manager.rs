@@ -39,8 +39,12 @@ pub enum WorkerError {
         detail: Option<String>,
         detail_suffix: String,
     },
-    #[error("worker protocol error for job '{id}': {detail}")]
-    Protocol { id: String, detail: String },
+    #[error("worker '{worker}' protocol error for job '{id}': {detail}")]
+    Protocol {
+        worker: String,
+        id: String,
+        detail: String,
+    },
     #[error("resident workers are only supported on Unix (worker '{worker}', job '{id}')")]
     Unsupported { worker: String, id: String },
 }
@@ -177,6 +181,7 @@ impl WorkerManager {
                         Some(value) => break Ok(value),
                         None => {
                             break Err(WorkerError::Protocol {
+                                worker: worker_name.to_owned(),
                                 id: job_id.clone(),
                                 detail: format!("unexpected '{kind}' response"),
                             })
@@ -281,7 +286,7 @@ impl WorkerManager {
     ) -> WorkerError {
         self.evict_if_current(worker_name, handle).await;
         self.wait_for_crash_detail(handle).await;
-        let detail = handle.crash_info().await;
+        let detail = handle.crash_info(worker_name).await;
         self.crashed_error(worker_name, job_id, detail)
     }
 

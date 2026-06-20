@@ -16,7 +16,7 @@ use tempfile::TempDir;
 use tokio::{process::Command, sync::Barrier, time::Instant};
 
 use super::{WorkerError, WorkerManager};
-use crate::WorkerRequest;
+use crate::{task_graph::TaskResolver, WorkerRequest};
 use luchta_worker::WorkerDonePayload;
 
 #[derive(Clone, Copy)]
@@ -290,6 +290,49 @@ done
 }
 
 #[tokio::test]
+async fn unexpected_done_response_to_resolve_returns_protocol_error_with_worker_and_id() {
+    let temp = TempDir::new().expect("tempdir");
+    let worker_path = write_worker_script(
+        temp.path(),
+        "unexpected-done-worker.sh",
+        r#"#!/bin/sh
+read -r line
+id=$(printf '%s
+' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+printf '{"type":"done","id":"%s","exitCode":0}
+' "$id"
+while IFS= read -r _; do :; done
+"#,
+    );
+    let manager = manager_with_worker(TestWorkerRef::new("fake"), &worker_path);
+
+    let error = manager
+        .resolve(
+            "fake",
+            luchta_worker::ResolveTask {
+                id: "pkg#protocol".to_string(),
+                name: "build".to_string(),
+                command: String::new(),
+                package: "pkg".to_string(),
+                cwd: None,
+                scripts: Vec::new(),
+                mode: luchta_worker::ResolveMode::Run,
+            },
+        )
+        .await
+        .expect_err("unexpected done response should fail protocol check");
+
+    assert!(
+        error.contains(
+            "worker 'fake' protocol error for job 'pkg#protocol': unexpected 'done' response"
+        ),
+        "unexpected protocol display: {error}"
+    );
+
+    manager.shutdown().await;
+}
+
+#[tokio::test]
 async fn worker_exit_without_done_returns_crashed() {
     let temp = TempDir::new().expect("tempdir");
     let worker_path = write_worker_script(
@@ -375,7 +418,12 @@ done
         .expect_err("first job crashes worker");
     assert_crash_detail_contains(
         &first_error,
-        &["exit status code 17", "boom from first worker"],
+        &[
+            "exited with code 17",
+            "--- worker 'fake' stderr (last 1 lines) ---",
+            "boom from first worker",
+            "--- end worker 'fake' stderr ---",
+        ],
     );
 
     let second = tokio::time::timeout(
@@ -429,7 +477,17 @@ done
         .run_job("fake", WorkerRequest::new("pkg#crash", "echo hi"), None)
         .await
         .expect_err("first worker should crash");
-    assert_crash_detail_contains(&error, &["exit status code 23", "first instance crashed"]);
+    assert_crash_detail_contains(
+        &error,
+        &[
+            "worker 'fake'",
+            "pkg#crash",
+            "exited with code 23",
+            "--- worker 'fake' stderr (last 1 lines) ---",
+            "first instance crashed",
+            "--- end worker 'fake' stderr ---",
+        ],
+    );
 
     let outcome = manager
         .run_job("fake", WorkerRequest::new("pkg#ok", "echo hi"), None)
@@ -473,8 +531,10 @@ exit 19
     assert_crash_detail_contains(
         &error,
         &[
-            "exit status code 19",
+            "exited with code 19",
+            "--- worker 'fake' stderr (last 1 lines) ---",
             "worker error: io error: Resource temporarily unavailable (os error 11)",
+            "--- end worker 'fake' stderr ---",
         ],
     );
     manager.shutdown().await;
@@ -485,7 +545,7 @@ async fn wait_error_is_recorded_in_crash_info() {
     let mut crash_state = super::super::handle::WorkerCrashState::default();
     crash_state.set_wait_error(std::io::Error::other("wait blew up"));
 
-    let crash_info = crash_state.crash_info().expect("crash info present");
+    let crash_info = crash_state.crash_info("fake").expect("crash info present");
     assert!(crash_info.detail.contains("wait error: wait blew up"));
 }
 
@@ -674,11 +734,12 @@ fn assert_crash_detail_contains(error: &WorkerError, expected_parts: &[&str]) {
     let WorkerError::Crashed { detail, .. } = error else {
         panic!("expected crashed worker error, got {error:?}");
     };
-    let detail = detail.as_deref().expect("crash detail present");
+    let rendered = error.to_string();
+    detail.as_deref().expect("crash detail present");
     for part in expected_parts {
         assert!(
-            detail.contains(part),
-            "expected crash detail '{detail}' to contain '{part}'"
+            rendered.contains(part),
+            "expected crashed display '{rendered}' to contain '{part}'"
         );
     }
 }

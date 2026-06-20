@@ -3,7 +3,7 @@ use std::process;
 use std::sync::Arc;
 
 use luchta_worker::{
-    split_current_process_argv, DelegateHandle, LogStream, ProxyError, ResolveResult, ResolveTask,
+    split_current_process_argv, DelegateHandle, ProxyError, ResolveResult, ResolveTask,
     WorkerMessage, WorkerResponse,
 };
 use tokio::io::{stdin, stdout, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
@@ -135,26 +135,10 @@ async fn async_main() -> i32 {
                 }
             }
             WorkerMessage::Run(request) => {
-                let request_id = request.id.clone();
                 if let Err(error) = delegate.send(WorkerMessage::Run(request)).await {
-                    let line = format!("delegate failed before done: {error}");
-                    if let Err(write_error) = write_response(
-                        &stdout_writer,
-                        &WorkerResponse::log(&request_id, LogStream::Stderr, line),
-                    )
-                    .await
-                    {
-                        eprintln!("failed to write delegate error log: {write_error}");
-                        exit_code = 1;
-                        break;
-                    }
-                    if let Err(write_error) =
-                        write_response(&stdout_writer, &WorkerResponse::done(&request_id, 1)).await
-                    {
-                        eprintln!("failed to write delegate error done: {write_error}");
-                        exit_code = 1;
-                        break;
-                    }
+                    eprintln!("delegate failed: {error}");
+                    exit_code = 1;
+                    break;
                 }
             }
         }

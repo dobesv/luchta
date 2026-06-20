@@ -76,7 +76,10 @@ fn shell_single_quote_path(path: &Path) -> String {
     path.display().to_string().replace('\'', "'\\''")
 }
 
-fn run_worker(delegate_command: &[String], input: &str) -> (Vec<Value>, String) {
+fn run_worker(
+    delegate_command: &[String],
+    input: &str,
+) -> (std::process::ExitStatus, Vec<Value>, String) {
     let mut command = Command::cargo_bin("luchta-lazy-worker").expect("binary exists");
     command
         .arg("--")
@@ -94,19 +97,14 @@ fn run_worker(delegate_command: &[String], input: &str) -> (Vec<Value>, String) 
     }
 
     let output = child.wait_with_output().expect("wait for worker output");
-    assert!(
-        output.status.success(),
-        "worker failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
+    let status = output.status;
     let stdout = String::from_utf8(output.stdout).expect("stdout utf8");
     let responses = stdout
         .lines()
         .map(|line| serde_json::from_str::<Value>(line).expect("valid jsonl response"))
         .collect();
     let stderr = String::from_utf8(output.stderr).expect("stderr utf8");
-    (responses, stderr)
+    (status, responses, stderr)
 }
 
 fn read_count_file(path: &Path) -> String {
@@ -125,7 +123,8 @@ fn resolve_accepts_without_spawning_delegate() {
     let (_temp, sentinel, _count) = sentinel_paths();
     let input = format!("{}\n", resolve_line(resolve_task("job-resolve")));
 
-    let (output, _stderr) = run_worker(&loopback_delegate_command(&sentinel), &input);
+    let (status, output, _stderr) = run_worker(&loopback_delegate_command(&sentinel), &input);
+    assert!(status.success(), "worker failed");
 
     assert_eq!(output.len(), 1);
     assert_eq!(output[0]["type"].as_str(), Some("resolved"));
@@ -144,10 +143,11 @@ fn first_run_spawns_delegate_and_second_run_reuses_it() {
     writeln!(input, "{}", run_line(WorkerRequest::new("job-1", "build"))).expect("write run");
     writeln!(input, "{}", run_line(WorkerRequest::new("job-2", "test"))).expect("write run");
 
-    let (output, _stderr) = run_worker(
+    let (status, output, _stderr) = run_worker(
         &loopback_delegate_command(&sentinel),
         &String::from_utf8(input).expect("stdin utf8"),
     );
+    assert!(status.success(), "worker failed");
 
     assert!(sentinel.exists(), "delegate should start on first run");
     assert_eq!(read_count_file(&count).trim(), "1");
@@ -168,7 +168,8 @@ fn propagates_delegate_logs_and_exit_codes() {
     let (_temp, sentinel, _count) = sentinel_paths();
     let input = format!("{}\n", run_line(WorkerRequest::new("job-fail", "fail")));
 
-    let (output, _stderr) = run_worker(&loopback_delegate_command(&sentinel), &input);
+    let (status, output, _stderr) = run_worker(&loopback_delegate_command(&sentinel), &input);
+    assert!(status.success(), "worker failed");
 
     assert!(output.iter().any(|value| {
         value["type"].as_str() == Some("log")
@@ -184,27 +185,25 @@ fn propagates_delegate_logs_and_exit_codes() {
 }
 
 #[test]
-fn delegate_failure_on_first_run_returns_terminal_done_without_hanging() {
+fn delegate_failure_on_first_run_exits_nonzero_and_reports_stderr() {
     let (_temp, sentinel, _count) = sentinel_paths();
     let input = format!("{}\n", run_line(WorkerRequest::new("job-dead", "build")));
 
-    let (output, _stderr) = run_worker(&immediate_exit_delegate_command(&sentinel), &input);
+    let (status, output, stderr) = run_worker(&immediate_exit_delegate_command(&sentinel), &input);
 
     assert!(
         sentinel.exists(),
         "failing delegate should still have started"
     );
-    assert!(output.iter().any(|value| {
-        value["type"].as_str() == Some("log")
-            && value["id"].as_str() == Some("job-dead")
-            && value["stream"].as_str() == Some("stderr")
-            && value["line"]
-                .as_str()
-                .is_some_and(|line| line.contains("delegate failed before done"))
-    }));
-    assert!(output.iter().any(|value| {
-        value["type"].as_str() == Some("done")
-            && value["id"].as_str() == Some("job-dead")
-            && value["exitCode"].as_i64() == Some(1)
-    }));
+    assert!(!status.success(), "worker unexpectedly succeeded");
+    assert!(
+        stderr.contains("delegate failed"),
+        "stderr missing delegate failure: {stderr}"
+    );
+    assert!(
+        output.iter().all(|value| {
+            !(value["type"].as_str() == Some("done") && value["id"].as_str() == Some("job-dead"))
+        }),
+        "unexpected terminal done emitted: {output:?}"
+    );
 }
