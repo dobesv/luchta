@@ -630,6 +630,7 @@ mod tests {
                 &sample_record(true, duration_ms),
                 stdout,
                 stderr,
+                &[],
                 harness.temp_repo.path(),
             )
             .unwrap();
@@ -970,6 +971,7 @@ mod tests {
                 &sample_record(true, 200),
                 b"stdout",
                 b"stderr",
+                &[],
                 temp_repo.path(),
             )
             .unwrap();
@@ -1069,6 +1071,7 @@ mod tests {
                 &sample_record(true, 340),
                 b"stdout-dedup",
                 b"stderr-dedup",
+                &[],
                 harness.temp_repo.path(),
             )
             .unwrap();
@@ -1214,6 +1217,7 @@ mod tests {
                 &sample_record(true, 320),
                 b"stdout-compact",
                 b"stderr-compact",
+                &[],
                 harness.temp_repo.path(),
             )
             .unwrap();

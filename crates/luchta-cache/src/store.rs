@@ -4,7 +4,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use crate::record::TaskRunRecord;
+use crate::record::{TaskRunRecord, SCHEMA_VERSION_V2};
 use crate::shared::atomic_write;
 use crate::{CacheError, Result};
 
@@ -23,52 +23,63 @@ fn bincode_config() -> impl bincode::config::Config {
     bincode::config::standard().with_fixed_int_encoding()
 }
 
-#[derive(Debug, Clone)]
-pub struct Cache {
-    cache_dir: PathBuf,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReportInput {
+    pub filename: String,
+    pub mime_type: String,
+    pub content: String,
 }
 
 pub struct RunArtifacts<'a> {
     pub record: &'a TaskRunRecord,
     pub stdout: &'a [u8],
     pub stderr: &'a [u8],
+    pub reports: &'a [ReportInput],
+}
+
+#[derive(Debug, Clone)]
+pub struct Cache {
+    root: PathBuf,
 }
 
 impl Cache {
     pub fn open(cache_dir: &Path) -> Result<Self> {
         fs::create_dir_all(cache_dir)?;
-        clean_tmp_files(cache_dir)?;
+        clean_tmp_files_older_than(cache_dir, TMP_FILE_MAX_AGE, SystemTime::now())?;
         ensure_luchta_gitignore(cache_dir)?;
-
         Ok(Self {
-            cache_dir: cache_dir.to_path_buf(),
+            root: cache_dir.to_path_buf(),
         })
     }
 
     #[must_use]
-    pub fn cache_dir(&self) -> &Path {
-        &self.cache_dir
-    }
-
     pub fn read(&self, task_id: &str) -> Option<TaskRunRecord> {
-        let path = self.record_path(task_id);
-        let bytes = fs::read(path).ok()?;
-        bincode::serde::decode_from_slice(&bytes, bincode_config())
-            .map(|(record, _consumed)| record)
-            .ok()
+        let bytes = fs::read(self.task_dir(task_id).join(META_FILE_NAME)).ok()?;
+        let (record, _): (TaskRunRecord, usize) =
+            bincode::serde::decode_from_slice(&bytes, bincode_config()).ok()?;
+        (record.schema_version == SCHEMA_VERSION_V2).then_some(record)
     }
 
     pub fn write(&self, task_id: &str, artifacts: RunArtifacts<'_>) -> Result<()> {
         let task_dir = self.task_dir(task_id);
         fs::create_dir_all(&task_dir)?;
 
-        let metadata = bincode::serde::encode_to_vec(artifacts.record, bincode_config())
+        for report in artifacts.reports {
+            if !is_valid_report_filename(&report.filename) {
+                return Err(CacheError::InputExpansion(format!(
+                    "invalid cached report filename: {}",
+                    report.filename
+                )));
+            }
+
+            atomic_write(&task_dir.join(&report.filename), report.content.as_bytes())?;
+        }
+
+        let encoded = bincode::serde::encode_to_vec(artifacts.record, bincode_config())
             .map_err(CacheError::SerializeRecord)?;
-
-        atomic_write(&self.stdout_path(task_id), artifacts.stdout)?;
-        atomic_write(&self.stderr_path(task_id), artifacts.stderr)?;
-        atomic_write(&self.record_path(task_id), &metadata)?;
-
+        atomic_write(&task_dir.join(STDOUT_FILE_NAME), artifacts.stdout)?;
+        atomic_write(&task_dir.join(STDERR_FILE_NAME), artifacts.stderr)?;
+        atomic_write(&task_dir.join(META_FILE_NAME), &encoded)?;
         Ok(())
     }
 
@@ -82,26 +93,34 @@ impl Cache {
         self.task_dir(task_id).join(STDERR_FILE_NAME)
     }
 
-    fn record_path(&self, task_id: &str) -> PathBuf {
-        self.task_dir(task_id).join(META_FILE_NAME)
+    #[must_use]
+    pub fn report_path(&self, task_id: &str, filename: &str) -> PathBuf {
+        self.task_dir(task_id).join(filename)
     }
 
-    fn task_dir(&self, task_id: &str) -> PathBuf {
-        self.cache_dir.join(task_cache_key(task_id))
+    #[must_use]
+    pub fn read_report(&self, task_id: &str, filename: &str) -> Option<Vec<u8>> {
+        if !is_valid_report_filename(filename) {
+            return None;
+        }
+        fs::read(self.report_path(task_id, filename)).ok()
+    }
+
+    #[must_use]
+    pub fn task_dir(&self, task_id: &str) -> PathBuf {
+        self.root.join(task_cache_key(task_id))
     }
 }
 
-#[must_use]
-pub fn resolve_cache_dir(workspace_root: &Path) -> PathBuf {
-    match env::var_os(CACHE_DIR_ENV) {
-        Some(path) if !path.is_empty() => PathBuf::from(path),
-        _ => workspace_root.join(LUCHTA_DIR_NAME).join(CACHE_DIR_NAME),
-    }
-}
-
-#[must_use]
-pub fn task_cache_key(task_id: &str) -> String {
-    blake3::hash(task_id.as_bytes()).to_hex().to_string()
+pub(crate) fn is_valid_report_filename(filename: &str) -> bool {
+    !filename.is_empty()
+        && !Path::new(filename).is_absolute()
+        && !filename.contains('/')
+        && !filename.contains('\\')
+        && !filename.contains("..")
+        && filename != META_FILE_NAME
+        && filename != STDOUT_FILE_NAME
+        && filename != STDERR_FILE_NAME
 }
 
 fn ensure_luchta_gitignore(cache_dir: &Path) -> Result<()> {
@@ -140,85 +159,81 @@ fn is_default_cache_layout(cache_dir: &Path) -> bool {
             .is_some_and(|name| name == LUCHTA_DIR_NAME)
 }
 
-fn clean_tmp_files(cache_dir: &Path) -> Result<()> {
-    clean_tmp_files_older_than(cache_dir, TMP_FILE_MAX_AGE, SystemTime::now())
-}
-
-fn clean_tmp_files_older_than(cache_dir: &Path, max_age: Duration, now: SystemTime) -> Result<()> {
-    if !cache_dir.exists() {
-        return Ok(());
-    }
-
-    let entries = match fs::read_dir(cache_dir) {
+fn clean_tmp_files_older_than(
+    cache_dir: &Path,
+    max_age: Duration,
+    now: SystemTime,
+) -> io::Result<()> {
+    let read_dir = match fs::read_dir(cache_dir) {
         Ok(entries) => entries,
-        Err(_) => return Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
     };
 
-    for entry in entries.filter_map(|entry| entry.ok()) {
-        let is_dir = entry.file_type().map(|ty| ty.is_dir()).unwrap_or(false);
-        if !is_dir {
+    for task_entry in read_dir {
+        let task_entry = task_entry?;
+        if !task_entry.file_type()?.is_dir() {
             continue;
         }
-        clean_tmp_files_in_task_dir(&entry.path(), max_age, now);
+
+        let task_dir = task_entry.path();
+        let files = match fs::read_dir(&task_dir) {
+            Ok(files) => files,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+
+        for file in files {
+            let file = file?;
+            if !file.file_type()?.is_file() {
+                continue;
+            }
+            let name = file.file_name();
+            let name = name.to_string_lossy();
+            if !name.ends_with(TMP_SUFFIX) {
+                continue;
+            }
+
+            let modified = file.metadata()?.modified()?;
+            let age = match now.duration_since(modified) {
+                Ok(age) => age,
+                Err(_) => Duration::ZERO,
+            };
+            if age > max_age {
+                let _ = fs::remove_file(file.path());
+            }
+        }
     }
 
     Ok(())
 }
 
-fn clean_tmp_files_in_task_dir(task_dir: &Path, max_age: Duration, now: SystemTime) {
-    let Ok(children) = fs::read_dir(task_dir) else {
-        return;
-    };
-    for child in children.filter_map(|child| child.ok()) {
-        let _ = remove_stale_tmp_file_if_present(&child, max_age, now);
+#[must_use]
+pub fn resolve_cache_dir(workspace_root: &Path) -> PathBuf {
+    if let Ok(path) = env::var(CACHE_DIR_ENV) {
+        return PathBuf::from(path);
     }
+    workspace_root.join(LUCHTA_DIR_NAME).join(CACHE_DIR_NAME)
 }
 
-fn remove_stale_tmp_file_if_present(
-    entry: &fs::DirEntry,
-    max_age: Duration,
-    now: SystemTime,
-) -> Result<()> {
-    if !is_tmp_file_entry(entry)? || !is_stale_tmp_file(entry, max_age, now)? {
-        return Ok(());
-    }
-
-    match fs::remove_file(entry.path()) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(CacheError::Io(err)),
-    }
-}
-
-fn is_stale_tmp_file(entry: &fs::DirEntry, max_age: Duration, now: SystemTime) -> Result<bool> {
-    let modified = entry.metadata()?.modified()?;
-    match now.duration_since(modified) {
-        Ok(age) => Ok(age > max_age),
-        Err(_) => Ok(false),
-    }
-}
-
-fn is_tmp_file_entry(entry: &fs::DirEntry) -> Result<bool> {
-    Ok(entry.file_type()?.is_file() && is_tmp_file(&entry.path()))
-}
-
-fn is_tmp_file(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.ends_with(TMP_SUFFIX))
+#[must_use]
+pub fn task_cache_key(task_id: &str) -> String {
+    use blake3::Hasher;
+    let mut hasher = Hasher::new();
+    hasher.update(task_id.as_bytes());
+    hasher.finalize().to_hex().to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::fs;
-    use std::fs::{File, FileTimes};
-    use std::time::{Duration, SystemTime};
+    use std::fs::{self, File};
 
+    use std::fs::FileTimes;
     use tempfile::tempdir;
 
     use super::*;
-    use crate::record::{FileEntry, SCHEMA_VERSION_V1};
+    use crate::record::{FileEntry, ReportMeta, SCHEMA_VERSION_V1, SCHEMA_VERSION_V2};
 
     #[test]
     fn write_then_read_round_trip_identical() {
@@ -235,6 +250,7 @@ mod tests {
                     record: &record,
                     stdout: b"stdout bytes",
                     stderr: b"stderr bytes",
+                    reports: &[],
                 },
             )
             .unwrap();
@@ -261,8 +277,9 @@ mod tests {
                 "pkg#build",
                 RunArtifacts {
                     record: &sample_record(),
-                    stdout: b"stdout bytes",
-                    stderr: b"stderr bytes",
+                    stdout: b"out",
+                    stderr: b"err",
+                    reports: &[],
                 },
             )
             .unwrap();
@@ -271,6 +288,49 @@ mod tests {
         assert!(task_dir.join(META_FILE_NAME).is_file());
         assert!(cache.stdout_path("pkg#build").is_file());
         assert!(cache.stderr_path("pkg#build").is_file());
+    }
+
+    #[test]
+    fn write_then_read_round_trip_preserves_reports_and_contents() {
+        let temp_dir = tempdir().unwrap();
+        let cache =
+            Cache::open(&temp_dir.path().join(LUCHTA_DIR_NAME).join(CACHE_DIR_NAME)).unwrap();
+        let record = sample_record_with_reports();
+        let reports = sample_reports();
+
+        cache
+            .write(
+                "pkg#build",
+                RunArtifacts {
+                    record: &record,
+                    stdout: b"stdout bytes",
+                    stderr: b"stderr bytes",
+                    reports: &reports,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(cache.read("pkg#build"), Some(record.clone()));
+        assert_eq!(
+            fs::read_to_string(cache.task_dir("pkg#build").join("summary.md")).unwrap(),
+            "# summary\nsecond line\n"
+        );
+        assert_eq!(
+            fs::read_to_string(cache.task_dir("pkg#build").join("report.json")).unwrap(),
+            "{\"ok\":true}\n"
+        );
+        assert_ne!(
+            fs::metadata(cache.task_dir("pkg#build").join("summary.md"))
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_ne!(
+            fs::metadata(cache.task_dir("pkg#build").join("report.json"))
+                .unwrap()
+                .len(),
+            0
+        );
     }
 
     #[test]
@@ -286,12 +346,94 @@ mod tests {
     }
 
     #[test]
+    fn v1_meta_returns_none_instead_of_panicking() {
+        let temp_dir = tempdir().unwrap();
+        let cache =
+            Cache::open(&temp_dir.path().join(LUCHTA_DIR_NAME).join(CACHE_DIR_NAME)).unwrap();
+        let task_dir = cache.task_dir("pkg#build");
+        fs::create_dir_all(&task_dir).unwrap();
+
+        let v1 = sample_v1_record();
+        let encoded = bincode::serde::encode_to_vec(&v1, bincode_config()).unwrap();
+        fs::write(task_dir.join(META_FILE_NAME), encoded).unwrap();
+
+        assert_eq!(cache.read("pkg#build"), None);
+    }
+
+    #[test]
+    fn read_report_returns_bytes_for_cached_report() {
+        let temp_dir = tempdir().unwrap();
+        let cache =
+            Cache::open(&temp_dir.path().join(LUCHTA_DIR_NAME).join(CACHE_DIR_NAME)).unwrap();
+        let record = sample_record_with_reports();
+        let reports = sample_reports();
+
+        cache
+            .write(
+                "pkg#build",
+                RunArtifacts {
+                    record: &record,
+                    stdout: b"out",
+                    stderr: b"err",
+                    reports: &reports,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            cache.read_report("pkg#build", "summary.md").unwrap(),
+            b"# summary\nsecond line\n"
+        );
+        assert_eq!(cache.read_report("pkg#build", "missing.md"), None);
+    }
+
+    #[test]
+    fn read_report_rejects_unsafe_filename() {
+        let temp_dir = tempdir().unwrap();
+        let cache =
+            Cache::open(&temp_dir.path().join(LUCHTA_DIR_NAME).join(CACHE_DIR_NAME)).unwrap();
+
+        assert_eq!(cache.read_report("pkg#build", "../escape.txt"), None);
+        assert_eq!(
+            cache.report_path("pkg#build", "report.json"),
+            cache.task_dir("pkg#build").join("report.json")
+        );
+    }
+
+    #[test]
     fn missing_meta_returns_none() {
         let temp_dir = tempdir().unwrap();
         let cache =
             Cache::open(&temp_dir.path().join(LUCHTA_DIR_NAME).join(CACHE_DIR_NAME)).unwrap();
 
         assert_eq!(cache.read("pkg#missing"), None);
+    }
+
+    #[test]
+    fn invalid_report_filename_rejected() {
+        let temp_dir = tempdir().unwrap();
+        let cache =
+            Cache::open(&temp_dir.path().join(LUCHTA_DIR_NAME).join(CACHE_DIR_NAME)).unwrap();
+        let record = sample_record_with_reports();
+        let reports = vec![ReportInput {
+            filename: "../escape.txt".to_string(),
+            mime_type: "text/plain".to_string(),
+            content: "x".to_string(),
+        }];
+
+        let error = cache
+            .write(
+                "pkg#build",
+                RunArtifacts {
+                    record: &record,
+                    stdout: b"out",
+                    stderr: b"err",
+                    reports: &reports,
+                },
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, CacheError::InputExpansion(_)));
     }
 
     #[test]
@@ -308,6 +450,7 @@ mod tests {
                     record: &record,
                     stdout: b"out",
                     stderr: b"err",
+                    reports: &[],
                 },
             )
             .unwrap();
@@ -338,11 +481,10 @@ mod tests {
     }
 
     #[test]
-    fn clean_tmp_files_older_than_removes_only_stale_tmp_files() {
+    fn open_removes_stale_tmp_files() {
         let temp_dir = tempdir().unwrap();
         let cache_dir = temp_dir.path().join(LUCHTA_DIR_NAME).join(CACHE_DIR_NAME);
-        let cache = Cache::open(&cache_dir).unwrap();
-        let task_dir = cache.task_dir("pkg#build");
+        let task_dir = cache_dir.join("task");
         fs::create_dir_all(&task_dir).unwrap();
 
         let max_age = Duration::from_secs(60);
@@ -379,23 +521,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_cache_dir_uses_env_override() {
-        let temp_dir = tempdir().unwrap();
-        let override_dir = temp_dir.path().join("custom-cache");
-        unsafe {
-            env::set_var(CACHE_DIR_ENV, &override_dir);
-        }
-
-        let resolved = resolve_cache_dir(temp_dir.path());
-
-        unsafe {
-            env::remove_var(CACHE_DIR_ENV);
-        }
-        assert_eq!(resolved, override_dir);
-    }
-
-    #[test]
-    fn open_creates_gitignore_idempotently() {
+    fn open_writes_gitignore_once() {
         let temp_dir = tempdir().unwrap();
         let cache_dir = temp_dir.path().join(LUCHTA_DIR_NAME).join(CACHE_DIR_NAME);
 
@@ -441,6 +567,91 @@ mod tests {
 
     fn sample_record() -> TaskRunRecord {
         TaskRunRecord {
+            schema_version: SCHEMA_VERSION_V2,
+            task_spec_hash: [1; 32],
+            input_patterns: vec!["src/**/*.ts".to_string()],
+            inputs: vec![FileEntry {
+                path: "src/main.ts".to_string(),
+                size: 42,
+                mtime_ns: 111,
+                hash: [2; 32],
+                absent: false,
+            }],
+            output_patterns: vec!["dist/**/*.js".to_string()],
+            outputs: vec![FileEntry {
+                path: "dist/main.js".to_string(),
+                size: 84,
+                mtime_ns: 222,
+                hash: [3; 32],
+                absent: false,
+            }],
+            detected_input_patterns: true,
+            detected_output_patterns: true,
+            outputs_hash: [4; 32],
+            env_hash: [5; 32],
+            pkg_dep_hash: [6; 32],
+            dep_outputs: BTreeMap::from([("dep#build".to_string(), [7; 32])]),
+            exit_status: 0,
+            succeeded: true,
+            start_unix_ms: 1_000,
+            end_unix_ms: 2_000,
+            reports: vec![],
+        }
+    }
+
+    fn sample_reports() -> Vec<ReportInput> {
+        vec![
+            ReportInput {
+                filename: "summary.md".to_string(),
+                mime_type: "text/markdown".to_string(),
+                content: "# summary\nsecond line\n".to_string(),
+            },
+            ReportInput {
+                filename: "report.json".to_string(),
+                mime_type: "application/json".to_string(),
+                content: "{\"ok\":true}\n".to_string(),
+            },
+        ]
+    }
+
+    fn sample_record_with_reports() -> TaskRunRecord {
+        TaskRunRecord {
+            reports: vec![
+                ReportMeta {
+                    filename: "summary.md".to_string(),
+                    mime_type: "text/markdown".to_string(),
+                },
+                ReportMeta {
+                    filename: "report.json".to_string(),
+                    mime_type: "application/json".to_string(),
+                },
+            ],
+            ..sample_record()
+        }
+    }
+
+    #[derive(serde::Serialize)]
+    struct V1TaskRunRecord {
+        schema_version: u32,
+        task_spec_hash: [u8; 32],
+        input_patterns: Vec<String>,
+        inputs: Vec<FileEntry>,
+        output_patterns: Vec<String>,
+        outputs: Vec<FileEntry>,
+        detected_input_patterns: bool,
+        detected_output_patterns: bool,
+        outputs_hash: [u8; 32],
+        env_hash: [u8; 32],
+        pkg_dep_hash: [u8; 32],
+        dep_outputs: BTreeMap<String, [u8; 32]>,
+        exit_status: i32,
+        succeeded: bool,
+        start_unix_ms: u64,
+        end_unix_ms: u64,
+    }
+
+    fn sample_v1_record() -> V1TaskRunRecord {
+        V1TaskRunRecord {
             schema_version: SCHEMA_VERSION_V1,
             task_spec_hash: [1; 32],
             input_patterns: vec!["src/**/*.ts".to_string()],

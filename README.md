@@ -338,8 +338,26 @@ All executed tasks—even those that are not opt-in for caching—persist their 
 | `--failed` | Filter to tasks that failed (`succeeded == false`). |
 | `--show-inputs` | Show input file metadata (path, size, mtime, hash) for each task. |
 | `--show-outputs` | Show output file metadata for each task. |
+| `--file <NAME>` | Raw byte-exact passthrough of named report files (repeatable). |
 
 `luchta logs` always displays the full, non-truncated output for every matching task.
+
+#### Attached Reports
+
+By default, `luchta logs` surfaces all reports attached by workers after stdout/stderr. If a report's MIME type has a native renderer, it is pretty-printed; otherwise, it is dumped verbatim.
+
+Native MIME renderers:
+- `application/sarif+json`: SARIF format. Prints IDE-clickable `[LEVEL] message --> path:line:col` lines.
+- `application/vnd.ctrf+json`: CTRF format. Prints a pass/fail/skip summary plus details for each failed test.
+
+Dispatch is based on **MIME type only**, ignoring filename/extension. Pretty-printing automatically disables coloring when piped or when `NO_COLOR` is set.
+
+To retrieve the raw, unformatted content of specific reports (e.g., for mechanical consumers like `reviewdog`), use the `--file` flag:
+```bash
+luchta logs build --file sarif.json
+```
+The `--file` flag uses union task selection: a task is included if it has at least one of the named files. If no tasks match any of the requested files, the command exits with a non-zero error code.
+
 ### `dependsOn` Syntax
 
 Luchta supports flexible dependency definitions:
@@ -417,6 +435,21 @@ Injected worker dependencies are:
 - Persistent even if the worker's `resolve` protocol message tries to modify
   task dependencies.
 - Tolerant of pointing at pruned or missing tasks.
+
+#### Worker reports
+
+Workers can attach report files (e.g., test results or linting findings) to a task using the `report` message in the JSONL protocol:
+
+```json
+{"type":"report","id":"task-id","filename":"report.json","mimeType":"application/sarif+json","content":"..."}
+```
+
+- **content**: Must be UTF-8 text. The engine writes this verbatim to the task's cache directory (`.luchta/cache/<hash>/<filename>`) alongside `stdout.log` and `stderr.log`.
+- **filename**: Must be a safe, plain basename. Filenames containing path separators (`/`, `\`), reserved names (`stdout.log`, `stderr.log`, `meta.bincode`), or relative path segments (`.`, `..`) are rejected with a warning.
+- **mimeType**: Used by `luchta logs` to determine how to display the report. Natively supported MIME types: `application/sarif+json`, `application/vnd.ctrf+json`. Unknown MIMEs are shown verbatim. Dispatch is by MIME, not filename.
+- **Duplicate filenames**: If multiple `report` messages use the same filename within one task, the last message wins.
+
+Reports are recorded in the task metadata and can be viewed via `luchta logs`.
 
 #### Standard Worker Binaries
 - **luchta-yarn-worker** runs each task through Yarn so that Yarn-injected

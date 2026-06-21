@@ -686,12 +686,15 @@ use super::super::shared::{
 };
 use std::io::{Cursor, Read};
 
+use crate::store::ReportInput;
+
 /// Container for meta files extracted from a blob.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MetaFiles {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub record: Vec<u8>,
+    pub reports: Vec<ReportInput>,
 }
 
 /// Write blob with embedded meta files.
@@ -701,6 +704,7 @@ pub struct MetaFiles {
 /// - `.luchta-meta/stdout.log`
 /// - `.luchta-meta/stderr.log`
 /// - `.luchta-meta/meta.bincode`
+/// - `.luchta-meta/reports/<filename>`
 pub fn write_blob_with_meta(
     paths: &SharedCachePaths,
     outputs_hash: &[u8; 32],
@@ -742,7 +746,8 @@ pub fn write_blob_with_meta(
     }
 
     // Add meta file sizes to cap check (must happen BEFORE the empty check)
-    let meta_bytes = meta.stdout.len() + meta.stderr.len() + meta.record.len();
+    let report_bytes: usize = meta.reports.iter().map(|report| report.content.len()).sum();
+    let meta_bytes = meta.stdout.len() + meta.stderr.len() + meta.record.len() + report_bytes;
     total_bytes = total_bytes.saturating_add(meta_bytes as u64);
     if total_bytes > size_cap_bytes {
         return Ok(BlobWriteResult::SkippedTooLarge { bytes: total_bytes });
@@ -805,6 +810,18 @@ pub fn write_blob_with_meta(
                 &mut header,
                 meta_dir.join(META_RECORD_FILE_NAME),
                 Cursor::new(&meta.record),
+            )?;
+        }
+
+        for report in &meta.reports {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(report.content.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            tar.append_data(
+                &mut header,
+                meta_dir.join("reports").join(&report.filename),
+                Cursor::new(report.content.as_bytes()),
             )?;
         }
 
@@ -909,6 +926,7 @@ fn extract_blob_with_meta_to_staging(
     let mut meta_stdout = None;
     let mut meta_stderr = None;
     let mut meta_record = None;
+    let mut meta_reports = Vec::new();
 
     for entry in entries {
         let mut entry = entry.map_err(|_| RestoreError::Corrupt)?;
@@ -920,16 +938,33 @@ fn extract_blob_with_meta_to_staging(
         let meta_prefix = format!("{}/", META_DIR_NAME);
 
         if path_str.starts_with(&meta_prefix) {
-            let file_name = entry_path
-                .file_name()
-                .ok_or(RestoreError::Corrupt)?
-                .to_string_lossy();
-
             // Extract meta file contents into memory
             let mut contents = Vec::new();
             entry
                 .read_to_end(&mut contents)
                 .map_err(|_| RestoreError::Corrupt)?;
+
+            let report_prefix = format!("{}/reports/", META_DIR_NAME);
+            if path_str.starts_with(&report_prefix) {
+                let file_name = entry_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .ok_or(RestoreError::Corrupt)?;
+                if !crate::store::is_valid_report_filename(file_name) {
+                    return Err(RestoreError::Corrupt);
+                }
+                meta_reports.push(ReportInput {
+                    filename: file_name.to_string(),
+                    mime_type: String::new(),
+                    content: String::from_utf8_lossy(&contents).into_owned(),
+                });
+                continue;
+            }
+
+            let file_name = entry_path
+                .file_name()
+                .ok_or(RestoreError::Corrupt)?
+                .to_string_lossy();
 
             match file_name.as_ref() {
                 META_STDOUT_FILE_NAME => meta_stdout = Some(contents),
@@ -979,6 +1014,7 @@ fn extract_blob_with_meta_to_staging(
         stdout: meta_stdout.unwrap_or_default(),
         stderr: meta_stderr.unwrap_or_default(),
         record: meta_record.unwrap_or_default(),
+        reports: meta_reports,
     }))
 }
 

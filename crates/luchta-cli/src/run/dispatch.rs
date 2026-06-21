@@ -11,7 +11,9 @@ use super::*;
 use luchta_cache::shared::{
     combined_dep_outputs_hash, derive_input_key, RestoredHit, StoreOutcome,
 };
-use luchta_cache::{decide_shared_restore, task_cache_key, FileEntry, RunArtifacts};
+use luchta_cache::{
+    decide_shared_restore, task_cache_key, FileEntry, ReportInput, RunArtifacts, SCHEMA_VERSION_V2,
+};
 use luchta_types::EnvSpec;
 use luchta_worker::BUILTIN_PASSTHROUGH_ENV;
 
@@ -29,6 +31,17 @@ fn split_captured_logs(sink: &ExecutionLogSink) -> (Vec<u8>, Vec<u8>) {
         buf.push(b'\n');
     }
     (out, err)
+}
+
+fn collected_reports_for_cache(sink: &ExecutionLogSink) -> Vec<ReportInput> {
+    sink.reports()
+        .into_iter()
+        .map(|report| ReportInput {
+            filename: report.filename,
+            mime_type: report.mime_type,
+            content: report.content,
+        })
+        .collect()
 }
 
 struct FailureLogContext<'a> {
@@ -395,7 +408,7 @@ fn build_run_record(
         .unwrap_or(1);
 
     BuildRecordResult::Ok(Box::new(TaskRunRecord {
-        schema_version: SCHEMA_VERSION_V1,
+        schema_version: SCHEMA_VERSION_V2,
         task_spec_hash: cache_ctx.task_spec_hash,
         input_patterns,
         inputs,
@@ -411,6 +424,7 @@ fn build_run_record(
         succeeded,
         start_unix_ms: cache_ctx.start_unix_ms,
         end_unix_ms,
+        reports: vec![],
     }))
 }
 
@@ -497,6 +511,17 @@ async fn write_run_record(
     };
     record_output_hash(&output_hashes, &cache_ctx.task_id, record.outputs_hash);
     let (stdout, stderr) = log_sink.map(split_captured_logs).unwrap_or_default();
+    let reports = log_sink
+        .map(collected_reports_for_cache)
+        .unwrap_or_default();
+    let mut record = record;
+    record.reports = reports
+        .iter()
+        .map(|report| luchta_cache::ReportMeta {
+            filename: report.filename.clone(),
+            mime_type: report.mime_type.clone(),
+        })
+        .collect();
     let cache_key = cache_ctx.task_id.to_string();
 
     // Clone values needed for shared cache store before moving into spawn_blocking
@@ -520,6 +545,7 @@ async fn write_run_record(
                 record: &record_for_local,
                 stdout: &stdout,
                 stderr: &stderr,
+                reports: &reports,
             },
         ) {
             eprintln!(
@@ -557,6 +583,7 @@ async fn write_run_record(
                     &record_for_shared,
                     &stdout,
                     &stderr,
+                    &reports,
                     &repo_root,
                 ) {
                     Ok(StoreOutcome::Stored) => {}
@@ -1219,12 +1246,28 @@ fn outputs_lexically_in_package(output_patterns: &[String]) -> bool {
 /// worktree gets a normal local skip with correct downstream invalidation.
 fn hydrate_local_cache(cache: Arc<Cache>, task_id: TaskId, hit: &RestoredHit) {
     let cache_key = task_id.to_string();
+    let reports: Vec<ReportInput> = hit
+        .record
+        .reports
+        .iter()
+        .filter_map(|report| {
+            hit.reports
+                .iter()
+                .find(|stored| stored.filename == report.filename)
+                .map(|stored| ReportInput {
+                    filename: report.filename.clone(),
+                    mime_type: report.mime_type.clone(),
+                    content: stored.content.clone(),
+                })
+        })
+        .collect();
     if let Err(e) = cache.write(
         &cache_key,
         RunArtifacts {
             record: &hit.record,
             stdout: &hit.stdout,
             stderr: &hit.stderr,
+            reports: &reports,
         },
     ) {
         eprintln!(

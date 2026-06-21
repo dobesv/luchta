@@ -113,9 +113,17 @@ pub struct CapturedLogLine {
     pub line: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollectedReport {
+    pub filename: String,
+    pub mime_type: String,
+    pub content: String,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ExecutionLogSink {
     lines: Arc<Mutex<Vec<CapturedLogLine>>>,
+    reports: Arc<Mutex<Vec<CollectedReport>>>,
 }
 
 impl ExecutionLogSink {
@@ -134,9 +142,23 @@ impl ExecutionLogSink {
             });
     }
 
+    pub fn push_report(&self, report: CollectedReport) {
+        let mut reports = self.reports.lock().expect("execution log sink poisoned");
+        reports.retain(|existing| existing.filename != report.filename);
+        reports.push(report);
+    }
+
     #[must_use]
     pub fn lines(&self) -> Vec<CapturedLogLine> {
         self.lines
+            .lock()
+            .expect("execution log sink poisoned")
+            .clone()
+    }
+
+    #[must_use]
+    pub fn reports(&self) -> Vec<CollectedReport> {
+        self.reports
             .lock()
             .expect("execution log sink poisoned")
             .clone()

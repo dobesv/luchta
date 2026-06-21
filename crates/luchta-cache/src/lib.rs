@@ -8,14 +8,14 @@ mod store;
 pub use decide::{decide, decide_shared_restore, CurrentState, Decision, FileStateResolver};
 pub use hashing::{blake3_file, env_hash, pkg_dep_hash, task_spec_hash};
 pub use luchta_types::{classify_pattern, InputSemantics};
-pub use record::{FileEntry, TaskRunRecord, SCHEMA_VERSION_V1};
+pub use record::{FileEntry, ReportMeta, TaskRunRecord, SCHEMA_VERSION_V1, SCHEMA_VERSION_V2};
 pub use resolve::{
     combined_outputs_hash, resolve_inputs, resolve_inputs_with_semantics, resolve_outputs,
     ResolveRequest,
 };
 pub use store::{
-    resolve_cache_dir, task_cache_key, Cache, RunArtifacts, CACHE_DIR_ENV, CACHE_DIR_NAME,
-    GITIGNORE_CONTENTS, GITIGNORE_FILE_NAME, LUCHTA_DIR_NAME,
+    resolve_cache_dir, task_cache_key, Cache, ReportInput, RunArtifacts, CACHE_DIR_ENV,
+    CACHE_DIR_NAME, GITIGNORE_CONTENTS, GITIGNORE_FILE_NAME, LUCHTA_DIR_NAME,
 };
 
 #[derive(Debug, thiserror::Error)]

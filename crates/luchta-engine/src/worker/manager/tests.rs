@@ -290,6 +290,117 @@ done
 }
 
 #[tokio::test]
+async fn report_response_is_collected_and_run_completes_normally() {
+    let temp = TempDir::new().expect("tempdir");
+    let worker_path = write_worker_script(
+        temp.path(),
+        "report-worker.sh",
+        r##"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  printf '{"type":"report","id":"%s","filename":"summary.md","mimeType":"text/markdown","content":"# hi"}\n' "$id"
+  printf '{"type":"done","id":"%s","exitCode":0}\n' "$id"
+done
+"##,
+    );
+    let manager = manager_with_worker(TestWorkerRef::new("fake"), &worker_path);
+    let sink = crate::ExecutionLogSink::new();
+
+    let outcome = manager
+        .run_job(
+            "fake",
+            WorkerRequest::new("pkg#task", "echo hi"),
+            Some(&sink),
+        )
+        .await
+        .expect("job succeeds");
+
+    assert_eq!(outcome.0, 0);
+    assert_eq!(
+        sink.reports(),
+        vec![crate::CollectedReport {
+            filename: "summary.md".to_owned(),
+            mime_type: "text/markdown".to_owned(),
+            content: "# hi".to_owned(),
+        }]
+    );
+
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn invalid_report_filename_is_dropped_and_run_continues() {
+    let temp = TempDir::new().expect("tempdir");
+    let worker_path = write_worker_script(
+        temp.path(),
+        "invalid-report-worker.sh",
+        r##"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  printf '{"type":"report","id":"%s","filename":"../escape.txt","mimeType":"text/plain","content":"bad"}\n' "$id"
+  printf '{"type":"done","id":"%s","exitCode":0}\n' "$id"
+done
+"##,
+    );
+    let manager = manager_with_worker(TestWorkerRef::new("fake"), &worker_path);
+    let sink = crate::ExecutionLogSink::new();
+
+    let outcome = manager
+        .run_job(
+            "fake",
+            WorkerRequest::new("pkg#task", "echo hi"),
+            Some(&sink),
+        )
+        .await
+        .expect("job succeeds");
+
+    assert_eq!(outcome.0, 0);
+    assert!(sink.reports().is_empty());
+
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn duplicate_report_filename_uses_last_wins() {
+    let temp = TempDir::new().expect("tempdir");
+    let worker_path = write_worker_script(
+        temp.path(),
+        "duplicate-report-worker.sh",
+        r##"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  printf '{"type":"report","id":"%s","filename":"summary.md","mimeType":"text/plain","content":"first"}\n' "$id"
+  printf '{"type":"report","id":"%s","filename":"summary.md","mimeType":"text/plain","content":"second"}\n' "$id"
+  printf '{"type":"done","id":"%s","exitCode":0}\n' "$id"
+done
+"##,
+    );
+    let manager = manager_with_worker(TestWorkerRef::new("fake"), &worker_path);
+    let sink = crate::ExecutionLogSink::new();
+
+    let outcome = manager
+        .run_job(
+            "fake",
+            WorkerRequest::new("pkg#task", "echo hi"),
+            Some(&sink),
+        )
+        .await
+        .expect("job succeeds");
+
+    assert_eq!(outcome.0, 0);
+    assert_eq!(
+        sink.reports(),
+        vec![crate::CollectedReport {
+            filename: "summary.md".to_owned(),
+            mime_type: "text/plain".to_owned(),
+            content: "second".to_owned(),
+        }]
+    );
+
+    manager.shutdown().await;
+}
+
+#[tokio::test]
 async fn unexpected_done_response_to_resolve_returns_protocol_error_with_worker_and_id() {
     let temp = TempDir::new().expect("tempdir");
     let worker_path = write_worker_script(

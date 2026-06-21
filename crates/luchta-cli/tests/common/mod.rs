@@ -202,6 +202,66 @@ done
     script
 }
 
+/// Create shell worker script that emits pre-rendered report JSONL templates before done.
+pub fn shell_worker_with_reports(
+    temp: &assert_fs::TempDir,
+    reports: &[(&str, &str, &str)],
+) -> assert_fs::fixture::ChildPath {
+    const RUN_ID_TOKEN: &str = "@@LUCHTA_RUN_ID@@";
+
+    let script = temp.child("report-worker.sh");
+    let templates_path = temp.child("reports.jsonl.tmpl");
+
+    let template_lines = reports
+        .iter()
+        .map(|(filename, mime_type, content)| {
+            serde_json::to_string(&luchta_worker::WorkerResponse::report(
+                RUN_ID_TOKEN,
+                *filename,
+                *mime_type,
+                *content,
+            ))
+            .expect("serialize report template")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    templates_path
+        .write_str(&format!("{template_lines}\n"))
+        .expect("write report templates");
+
+    let script_body = format!(
+        r#"#!/bin/sh
+reports_tmpl='{reports_tmpl}'
+while IFS= read -r line; do
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  case "$line" in
+    *'"type":"resolveTask"'*)
+      printf '{{"type":"resolved","id":"%s","result":{{"decision":"accept"}}}}\n' "$id"
+      ;;
+    *'"type":"run"'*)
+      cmd=$(printf '%s\n' "$line" | sed -n 's/.*"command":"\([^"]*\)".*/\1/p' | sed 's/\\"/"/g; s/\\\\/\\/g')
+      cwd=$(printf '%s\n' "$line" | sed -n 's/.*"cwd":"\([^"]*\)".*/\1/p' | sed 's/\\"/"/g; s/\\\\/\\/g')
+      (cd "$cwd" && sh -lc "$cmd") >/dev/null
+      code=$?
+      while IFS= read -r report_line; do
+        [ -n "$report_line" ] || continue
+        printf '%s\n' "$report_line" | sed 's|{run_id_token}|'"$id"'|g'
+      done < "$reports_tmpl"
+      printf '{{"type":"done","id":"%s","exitCode":%s}}\n' "$id" "$code"
+      ;;
+  esac
+done
+"#,
+        reports_tmpl = templates_path.path().display(),
+        run_id_token = RUN_ID_TOKEN,
+    );
+    script
+        .write_str(&script_body)
+        .expect("write report worker script");
+    set_executable(script.path());
+    script
+}
+
 /// Write a task config with a counter command.
 pub fn write_counter_task_config(temp: &assert_fs::TempDir, task_json: &str) {
     let worker = shell_worker(temp);
