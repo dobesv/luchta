@@ -24,6 +24,7 @@ pub(crate) struct LogsOptions<'a> {
     pub failed: bool,
     pub show_inputs: bool,
     pub show_outputs: bool,
+    pub files: &'a [String],
 }
 
 /// Execute the `luchta logs` command.
@@ -48,8 +49,33 @@ pub async fn execute_logs(
     let mut sorted_ids: Vec<TaskId> = selected_ids.into_iter().collect();
     sorted_ids.sort_by_key(|id| id.to_string());
 
-    for task_id in sorted_ids {
-        print_task_logs(&cache, &task_id, options);
+    if options.files.is_empty() {
+        for task_id in sorted_ids {
+            print_task_logs(&cache, &task_id, options);
+        }
+    } else {
+        let mut records = Vec::new();
+        for task_id in &sorted_ids {
+            let task_id_str = task_id.to_string();
+            if let Some(record) = cache.read(&task_id_str) {
+                if record_passes_filters(&record, options) {
+                    records.push((task_id.clone(), record));
+                }
+            }
+        }
+
+        let matched =
+            tasks_with_requested_files(records.iter().map(|(id, r)| (id, r)), options.files)?;
+
+        for (task_id, matched_files) in matched {
+            let task_id_str = task_id.to_string();
+            for file_name in matched_files {
+                if let Some(bytes) = cache.read_report(&task_id_str, file_name) {
+                    use std::io::Write;
+                    let _ = std::io::stdout().write_all(&bytes);
+                }
+            }
+        }
     }
 
     Ok(())
@@ -132,6 +158,39 @@ fn print_task_logs(cache: &Cache, task_id: &TaskId, options: &LogsOptions<'_>) {
     let cache_hash_full = task_cache_key(&task_id_str);
     let meta = build_log_block_meta(task_id, &record, &cache_hash_full);
     print!("{}", format_task_log_block(&meta, &body));
+
+    for report in &record.reports {
+        if let Some(bytes) = cache.read_report(&task_id_str, &report.filename) {
+            use crate::format::{format_ctrf_pretty, format_sarif_pretty};
+            use crate::reports::{parse_ctrf, parse_sarif, printer_for, ReportKind};
+            use owo_colors::OwoColorize;
+
+            println!(
+                "  --- Report: {} ({}) ---",
+                report.filename.cyan(),
+                report.mime_type.dimmed()
+            );
+
+            match printer_for(&report.mime_type) {
+                Some(ReportKind::Sarif) => match parse_sarif(&bytes) {
+                    Ok(sarif) => print!("{}", format_sarif_pretty(&sarif)),
+                    Err(e) => println!("Failed to parse SARIF: {}", e),
+                },
+                Some(ReportKind::Ctrf) => match parse_ctrf(&bytes) {
+                    Ok(ctrf) => print!("{}", format_ctrf_pretty(&ctrf)),
+                    Err(e) => println!("Failed to parse CTRF: {}", e),
+                },
+                None => {
+                    use std::io::Write;
+                    let _ = std::io::stdout().write_all(&bytes);
+                    if !bytes.ends_with(b"\n") {
+                        println!();
+                    }
+                }
+            }
+        }
+    }
+
     render_file_sections(&record, options);
 }
 
@@ -151,8 +210,12 @@ fn record_passes_filters(record: &luchta_cache::TaskRunRecord, options: &LogsOpt
 }
 
 fn build_log_body(cache: &Cache, task_id_str: &str) -> String {
-    let stdout = std::fs::read_to_string(cache.stdout_path(task_id_str)).unwrap_or_default();
-    let stderr = std::fs::read_to_string(cache.stderr_path(task_id_str)).unwrap_or_default();
+    let stdout = std::fs::read(cache.stdout_path(task_id_str))
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .unwrap_or_default();
+    let stderr = std::fs::read(cache.stderr_path(task_id_str))
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .unwrap_or_default();
     join_output_streams(stdout, stderr)
 }
 
@@ -226,4 +289,119 @@ fn format_hash_12(hash: &[u8; 32]) -> String {
         out.push(HEX_CHARS[(byte & 0x0f) as usize] as char);
     }
     out
+}
+
+pub(crate) fn tasks_with_requested_files<'a>(
+    records_with_ids: impl Iterator<Item = (&'a TaskId, &'a luchta_cache::TaskRunRecord)>,
+    requested_files: &'a [String],
+) -> Result<Vec<(&'a TaskId, Vec<&'a String>)>> {
+    let mut matched = Vec::new();
+    let mut file_to_tasks: std::collections::BTreeMap<&String, Vec<&TaskId>> =
+        std::collections::BTreeMap::new();
+
+    let records: Vec<_> = records_with_ids.collect();
+
+    for (task_id, record) in &records {
+        let mut matched_files = Vec::new();
+        for file_name in requested_files {
+            if record.reports.iter().any(|r| r.filename == **file_name) {
+                matched_files.push(file_name);
+                file_to_tasks.entry(file_name).or_default().push(task_id);
+            }
+        }
+        if !matched_files.is_empty() {
+            matched.push((*task_id, matched_files));
+        }
+    }
+
+    for (file_name, tasks) in file_to_tasks {
+        if tasks.len() > 1 {
+            let mut task_names: Vec<String> = tasks.iter().map(|id| id.to_string()).collect();
+            task_names.sort();
+            miette::bail!(
+                "Requested file '{}' is ambiguous: it was found on multiple tasks ({}). Please narrow your selection (e.g. by task name or -p <package>).",
+                file_name,
+                task_names.join(", ")
+            );
+        }
+    }
+
+    if matched.is_empty() && !requested_files.is_empty() {
+        miette::bail!("No task matching the selection contained any of the requested files.");
+    }
+
+    Ok(matched)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use luchta_cache::{ReportMeta, TaskRunRecord};
+    use luchta_types::TaskId;
+    use std::collections::BTreeMap;
+
+    fn dummy_record(reports: Vec<&str>) -> TaskRunRecord {
+        TaskRunRecord {
+            schema_version: 1,
+            task_spec_hash: [0; 32],
+            input_patterns: vec![],
+            inputs: vec![],
+            output_patterns: vec![],
+            outputs: vec![],
+            detected_input_patterns: false,
+            detected_output_patterns: false,
+            outputs_hash: [0; 32],
+            env_hash: [0; 32],
+            pkg_dep_hash: [0; 32],
+            dep_outputs: BTreeMap::new(),
+            exit_status: 0,
+            succeeded: true,
+            start_unix_ms: 0,
+            end_unix_ms: 0,
+            reports: reports
+                .into_iter()
+                .map(|f| ReportMeta {
+                    filename: f.to_string(),
+                    mime_type: "text/plain".to_string(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn test_tasks_with_requested_files_union() {
+        let task1 = TaskId::new("pkg1", "build");
+        let task2 = TaskId::new("pkg2", "test");
+
+        let rec1 = dummy_record(vec!["report.json", "coverage.xml"]);
+        let rec2 = dummy_record(vec!["coverage.xml", "lint.json"]);
+
+        let records = vec![(&task1, &rec1), (&task2, &rec2)];
+
+        let requested = vec!["report.json".to_string(), "lint.json".to_string()];
+
+        let matched = tasks_with_requested_files(records.into_iter(), &requested).unwrap();
+
+        assert_eq!(matched.len(), 2);
+        assert_eq!(matched[0].0, &task1);
+        assert_eq!(matched[0].1, vec![&"report.json".to_string()]);
+
+        assert_eq!(matched[1].0, &task2);
+        assert_eq!(matched[1].1, vec![&"lint.json".to_string()]);
+    }
+
+    #[test]
+    fn test_tasks_with_requested_files_no_match() {
+        let task1 = TaskId::new("pkg1", "build");
+        let rec1 = dummy_record(vec!["report.json"]);
+
+        let records = vec![(&task1, &rec1)];
+        let requested = vec!["missing.json".to_string()];
+
+        let err = tasks_with_requested_files(records.into_iter(), &requested).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "No task matching the selection contained any of the requested files."
+        );
+    }
 }

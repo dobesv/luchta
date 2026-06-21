@@ -1,7 +1,7 @@
 pub mod proxy;
 mod runtime;
 
-use std::collections::HashMap;
+use std::{collections::HashMap, path::Path};
 
 use luchta_types::{DependsOn, TaskDefinition};
 use serde::{Deserialize, Serialize};
@@ -122,6 +122,13 @@ pub enum WorkerResponse {
         line: String,
     },
     #[serde(rename_all = "camelCase")]
+    Report {
+        id: String,
+        filename: String,
+        mime_type: String,
+        content: String,
+    },
+    #[serde(rename_all = "camelCase")]
     Done {
         id: String,
         exit_code: i32,
@@ -133,6 +140,27 @@ pub enum WorkerResponse {
     /// Worker's decision for a `ResolveTask` request, correlated by `id`.
     #[serde(rename_all = "camelCase")]
     Resolved { id: String, result: ResolveResult },
+}
+
+/// Returns true when `name` is safe to use as worker report basename.
+pub fn is_valid_report_filename(name: &str) -> bool {
+    if name.is_empty() || matches!(name, "." | "..") || name.contains("..") {
+        return false;
+    }
+
+    if name.contains(['/', '\\']) {
+        return false;
+    }
+
+    if Path::new(name).is_absolute() {
+        return false;
+    }
+
+    if name.starts_with("\\") {
+        return false;
+    }
+
+    !matches!(name, "stdout.log" | "stderr.log" | "meta.bincode")
 }
 
 pub type WorkerDonePayload = (
@@ -148,6 +176,20 @@ impl WorkerResponse {
             id: id.into(),
             stream,
             line: line.into(),
+        }
+    }
+
+    pub fn report(
+        id: impl Into<String>,
+        filename: impl Into<String>,
+        mime_type: impl Into<String>,
+        content: impl Into<String>,
+    ) -> Self {
+        Self::Report {
+            id: id.into(),
+            filename: filename.into(),
+            mime_type: mime_type.into(),
+            content: content.into(),
         }
     }
 
@@ -183,7 +225,10 @@ impl WorkerResponse {
 
     pub fn id(&self) -> &str {
         match self {
-            Self::Log { id, .. } | Self::Done { id, .. } | Self::Resolved { id, .. } => id,
+            Self::Log { id, .. }
+            | Self::Report { id, .. }
+            | Self::Done { id, .. }
+            | Self::Resolved { id, .. } => id,
         }
     }
 
@@ -191,6 +236,7 @@ impl WorkerResponse {
     pub fn kind(&self) -> &'static str {
         match self {
             Self::Log { .. } => "log",
+            Self::Report { .. } => "report",
             Self::Done { .. } => "done",
             Self::Resolved { .. } => "resolved",
         }
@@ -434,6 +480,8 @@ mod tests {
 
     use luchta_types::{DependsOn, TaskName};
 
+    use crate::is_valid_report_filename;
+
     use super::{
         LogStream, ResolveMode, ResolveResult, ResolveTask, TaskModification, WorkerMessage,
         WorkerRequest, WorkerResponse,
@@ -582,6 +630,45 @@ mod tests {
         assert_eq!(decoded, WorkerResponse::done("pkg#task", 9));
     }
 
+    #[test]
+    fn worker_response_report_round_trips_and_uses_camel_case_mime_type() {
+        let response =
+            WorkerResponse::report("pkg#build", "sarif.json", "application/sarif+json", "{}");
+        let value = serde_json::to_value(&response).expect("response serializes");
+        assert_eq!(value["type"], Value::String("report".to_owned()));
+        assert_eq!(
+            value["mimeType"],
+            Value::String("application/sarif+json".to_owned())
+        );
+
+        let decoded: WorkerResponse = serde_json::from_value(value).expect("response deserializes");
+        assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn report_filename_validator_rejects_invalid_names() {
+        for name in [
+            "",
+            ".",
+            "..",
+            "../x",
+            "a/b",
+            "a\\b",
+            "/abs",
+            "stdout.log",
+            "stderr.log",
+            "meta.bincode",
+        ] {
+            assert!(!is_valid_report_filename(name), "expected invalid: {name}");
+        }
+    }
+
+    #[test]
+    fn report_filename_validator_accepts_safe_basenames() {
+        for name in ["sarif.json", "report.ctrf.json"] {
+            assert!(is_valid_report_filename(name), "expected valid: {name}");
+        }
+    }
     #[test]
     fn malformed_worker_protocol_line_returns_error() {
         let err = serde_json::from_str::<WorkerResponse>("not json");

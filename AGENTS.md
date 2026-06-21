@@ -58,6 +58,7 @@ here.
 - **No `target/`:** Never commit `target/` directories.
 - **Error Types:** Library errors should be clear and descriptive using `thiserror`.
 - **Async Traits:** Use native stable `async fn` in traits where possible (refer to `luchta-engine` for specific patterns).
+- **Worker reports**: Workers can attach reports via the `report` JSONL message. These are stored verbatim in the task cache and can be retrieved raw via `luchta logs --file <NAME>`. Native pretty-printing in `luchta logs` supports `application/sarif+json` and `application/vnd.ctrf+json` (dispatch by MIME type).
 
 ## Changeset Files
 

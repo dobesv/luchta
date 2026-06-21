@@ -1,5 +1,5 @@
 use jiff::{fmt::temporal::DateTimePrinter, tz::TimeZone, Timestamp};
-use owo_colors::OwoColorize;
+use owo_colors::{OwoColorize, Stream};
 
 pub struct LogBlockMeta<'a> {
     pub package: &'a str,
@@ -128,6 +128,122 @@ pub fn truncate_output<'a>(
     shown.push(leaked);
     shown.extend_from_slice(&lines[lines.len() - TAIL_LINES..]);
     (shown, true)
+}
+
+use crate::reports::Ctrf;
+
+pub fn format_sarif_pretty(sarif: &serde_sarif::sarif::Sarif) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+
+    for run in &sarif.runs {
+        if let Some(results) = &run.results {
+            for result in results {
+                let level_str = match &result.level {
+                    Some(level) => format!("{}", level),
+                    None => "warning".to_string(),
+                };
+
+                let level_colored = match level_str.as_str() {
+                    "error" => format!(
+                        "[{}]",
+                        "error".if_supports_color(Stream::Stdout, |t| t.red())
+                    ),
+                    "warning" => format!(
+                        "[{}]",
+                        "warning".if_supports_color(Stream::Stdout, |t| t.yellow())
+                    ),
+                    "note" => format!(
+                        "[{}]",
+                        "note".if_supports_color(Stream::Stdout, |t| t.green())
+                    ),
+                    other => format!("[{}]", other),
+                };
+
+                let message = result.message.text.as_deref().unwrap_or("No message");
+
+                let mut path = "-".to_string();
+                let mut line = "0".to_string();
+                let mut col = "0".to_string();
+
+                if let Some(locations) = &result.locations {
+                    if let Some(loc) = locations.first() {
+                        if let Some(pl) = &loc.physical_location {
+                            if let Some(al) = &pl.artifact_location {
+                                if let Some(uri) = &al.uri {
+                                    path = uri.clone();
+                                }
+                            }
+                            if let Some(reg) = &pl.region {
+                                if let Some(sl) = reg.start_line {
+                                    line = sl.to_string();
+                                }
+                                if let Some(sc) = reg.start_column {
+                                    col = sc.to_string();
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let location_clickable = format!("{}:{}:{}", path, line, col)
+                    .if_supports_color(Stream::Stdout, |t| t.cyan())
+                    .to_string();
+                let _ = writeln!(
+                    out,
+                    "{} {} --> {}",
+                    level_colored, message, location_clickable
+                );
+            }
+        }
+    }
+
+    out
+}
+
+pub fn format_ctrf_pretty(ctrf: &Ctrf) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+
+    let summary = &ctrf.results.summary;
+    let failed_str = if summary.failed > 0 {
+        format!(
+            "{} failed",
+            summary
+                .failed
+                .if_supports_color(Stream::Stdout, |t| t.red())
+        )
+    } else {
+        format!("{} failed", summary.failed)
+    };
+
+    let passed_str = format!(
+        "{} passed",
+        summary
+            .passed
+            .if_supports_color(Stream::Stdout, |t| t.green())
+    );
+    let skipped_str = format!("{} skipped", summary.skipped);
+
+    let _ = writeln!(out, "{}, {}, {}", passed_str, failed_str, skipped_str);
+
+    for test in &ctrf.results.tests {
+        if test.status == "failed" {
+            let msg = test.message.as_deref().unwrap_or("No message");
+            let _ = writeln!(
+                out,
+                "  {} {}",
+                "✗".if_supports_color(Stream::Stdout, |t| t.red()),
+                test.name.if_supports_color(Stream::Stdout, |t| t.red())
+            );
+            let _ = writeln!(out, "    {}", msg);
+            if let Some(trace) = &test.trace {
+                let _ = writeln!(out, "    Trace: {}", trace);
+            }
+        }
+    }
+
+    out
 }
 
 #[cfg(test)]
@@ -321,5 +437,50 @@ mod tests {
             output.contains("app#build"),
             "expected label 'app#build' for non-root task, got: {output}"
         );
+    }
+    #[test]
+    fn format_sarif_pretty_test() {
+        let sarif_json = r#"{
+            "version": "2.1.0",
+            "runs": [{
+                "tool": { "driver": { "name": "test" } },
+                "results": [{
+                    "level": "error",
+                    "message": { "text": "Something is wrong" },
+                    "locations": [{
+                        "physicalLocation": {
+                            "artifactLocation": { "uri": "src/main.rs" },
+                            "region": { "startLine": 10, "startColumn": 5 }
+                        }
+                    }]
+                }]
+            }]
+        }"#;
+        let sarif: serde_sarif::sarif::Sarif = serde_json::from_str(sarif_json).unwrap();
+        let formatted = format_sarif_pretty(&sarif);
+        assert!(formatted.contains("Something is wrong"));
+        assert!(formatted.contains("src/main.rs:10:5"));
+    }
+
+    #[test]
+    fn format_ctrf_pretty_test() {
+        let ctrf_json = r#"{
+            "results": {
+                "tool": { "name": "jest" },
+                "summary": { "tests": 2, "passed": 1, "failed": 1, "pending": 0, "skipped": 0, "start": 0, "stop": 0 },
+                "tests": [
+                    { "name": "test 1", "status": "passed", "duration": 10 },
+                    { "name": "test 2", "status": "failed", "message": "Expected 1 to be 2", "trace": "Error at line 1" }
+                ]
+            }
+        }"#;
+        use crate::reports::parse_ctrf;
+        let ctrf = parse_ctrf(ctrf_json.as_bytes()).unwrap();
+        let formatted = format_ctrf_pretty(&ctrf);
+        assert!(formatted.contains("passed"));
+        assert!(formatted.contains("failed"));
+        assert!(formatted.contains("test 2"));
+        assert!(formatted.contains("Expected 1 to be 2"));
+        assert!(formatted.contains("Trace: Error at line 1"));
     }
 }

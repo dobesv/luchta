@@ -7,6 +7,7 @@ mod format;
 mod logs;
 mod memory_pressure;
 mod progress;
+mod reports;
 mod rss;
 mod run;
 mod since;
@@ -67,6 +68,7 @@ async fn run(cli: Cli) -> Result<()> {
             failed,
             show_inputs,
             show_outputs,
+            files,
         } => {
             let options = LogsOptions {
                 tasks: &tasks,
@@ -76,6 +78,7 @@ async fn run(cli: Cli) -> Result<()> {
                 failed,
                 show_inputs,
                 show_outputs,
+                files: &files,
             };
             logs::execute_logs(&workspace_root, &options).await
         }

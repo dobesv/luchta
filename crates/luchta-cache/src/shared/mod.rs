@@ -52,6 +52,7 @@ pub struct RestoredHit {
     pub record: TaskRunRecord,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
+    pub reports: Vec<crate::store::ReportInput>,
 }
 
 /// A staged candidate from the shared cache, waiting for validation.
@@ -65,6 +66,7 @@ pub struct StagedCandidate {
     pub record: TaskRunRecord,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
+    pub reports: Vec<crate::store::ReportInput>,
     staged: blob::StagedRestore,
 }
 
@@ -77,6 +79,7 @@ impl StagedCandidate {
             record: self.record,
             stdout: self.stdout,
             stderr: self.stderr,
+            reports: self.reports,
         })
     }
 
@@ -413,6 +416,7 @@ impl SharedCache {
             record,
             stdout: meta.stdout,
             stderr: meta.stderr,
+            reports: meta.reports,
             staged,
         })
     }
@@ -501,6 +505,7 @@ impl SharedCache {
         record: &TaskRunRecord,
         stdout: &[u8],
         stderr: &[u8],
+        reports: &[crate::store::ReportInput],
         repo_root: &Path,
     ) -> io::Result<StoreOutcome> {
         // Check if cache is disabled (no write key).
@@ -543,6 +548,7 @@ impl SharedCache {
             stdout: stdout.to_vec(),
             stderr: stderr.to_vec(),
             record: meta_record,
+            reports: reports.to_vec(),
         };
 
         // Write blob with meta.
@@ -678,7 +684,7 @@ mod tests {
     pub(crate) fn sample_record(succeeded: bool, duration_ms: u64) -> TaskRunRecord {
         let start = 1_000_000_000_000_u64;
         TaskRunRecord {
-            schema_version: crate::record::SCHEMA_VERSION_V1,
+            schema_version: crate::record::SCHEMA_VERSION_V2,
             task_spec_hash: [1; 32],
             input_patterns: vec!["src/**/*.ts".to_string()],
             inputs: vec![],
@@ -700,6 +706,7 @@ mod tests {
             succeeded,
             start_unix_ms: start,
             end_unix_ms: start + duration_ms,
+            reports: vec![],
         }
     }
 
@@ -736,6 +743,7 @@ mod tests {
                 &record,
                 b"stdout output",
                 b"stderr output",
+                &[],
                 temp_repo.path(),
             )
             .unwrap();
@@ -774,6 +782,7 @@ mod tests {
                     record: &hit.record,
                     stdout: &hit.stdout,
                     stderr: &hit.stderr,
+                    reports: &[],
                 },
             )
             .unwrap();
@@ -819,6 +828,7 @@ mod tests {
                 &record,
                 b"",
                 b"",
+                &[],
                 temp_repo.path(),
             )
             .unwrap();
@@ -870,6 +880,7 @@ mod tests {
                 &record,
                 b"",
                 b"",
+                &[],
                 temp_repo.path(),
             )
             .unwrap();
@@ -908,6 +919,7 @@ mod tests {
                 &record,
                 b"",
                 b"",
+                &[],
                 temp_repo.path(),
             )
             .unwrap();
@@ -944,6 +956,7 @@ mod tests {
                 &record,
                 b"",
                 b"",
+                &[],
                 temp_repo.path(),
             )
             .unwrap();
@@ -1005,6 +1018,7 @@ mod tests {
                 &record,
                 b"",
                 b"",
+                &[],
                 temp_repo.path(),
             )
             .unwrap();
@@ -1041,6 +1055,7 @@ mod tests {
             &record,
             b"",
             b"",
+            &[],
             temp_repo.path(),
         );
         assert!(result.is_err());
@@ -1087,6 +1102,7 @@ mod tests {
                 &record,
                 b"",
                 b"",
+                &[],
                 temp_repo.path(),
             )
             .unwrap();
@@ -1141,6 +1157,7 @@ mod tests {
             stdout: b"stdout v1".to_vec(),
             stderr: b"stderr v1".to_vec(),
             record: bincode::serde::encode_to_vec(&record, bincode_config()).unwrap(),
+            reports: vec![],
         };
         write_blob_with_meta(
             &cache.paths,
@@ -1366,6 +1383,7 @@ mod tests {
                 &record,
                 b"",
                 b"",
+                &[],
                 temp_repo.path(),
             )
             .unwrap();
@@ -1431,6 +1449,7 @@ mod tests {
                 &record,
                 b"stdout content",
                 b"stderr content",
+                &[],
                 temp_repo.path(),
             )
             .unwrap();

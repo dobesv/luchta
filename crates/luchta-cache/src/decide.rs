@@ -201,7 +201,7 @@ fn file_identity_changed(prior: &FileEntry, current: &FileEntry) -> bool {
 mod tests {
     use std::{cell::RefCell, collections::BTreeMap, path::Path};
 
-    use crate::{CacheError, FileEntry, TaskRunRecord, SCHEMA_VERSION_V1};
+    use crate::{CacheError, FileEntry, TaskRunRecord, SCHEMA_VERSION_V2};
 
     use super::{decide, CurrentState, Decision, FileStateResolver};
 
@@ -552,7 +552,7 @@ mod tests {
 
     fn sample_record() -> TaskRunRecord {
         TaskRunRecord {
-            schema_version: SCHEMA_VERSION_V1,
+            schema_version: SCHEMA_VERSION_V2,
             task_spec_hash: [1; 32],
             input_patterns: vec!["src/**/*.ts".to_owned()],
             inputs: vec![file_entry("src/main.ts", 10, 100, [2; 32])],
@@ -568,6 +568,7 @@ mod tests {
             succeeded: true,
             start_unix_ms: 1,
             end_unix_ms: 2,
+            reports: vec![],
         }
     }
 

@@ -9,8 +9,8 @@ use luchta_workspace::WorkspaceError;
 use thiserror::Error;
 
 pub use executor::{
-    ExecutionLogSink, ExecutionRequest, ExecutorError, TaskExecutor, TaskRunOutcome,
-    WeightedExecutor,
+    CollectedReport, ExecutionLogSink, ExecutionRequest, ExecutorError, TaskExecutor,
+    TaskRunOutcome, WeightedExecutor,
 };
 pub use input_expansion::{expand_input_patterns, InputExpansionError};
 pub use luchta_worker::{

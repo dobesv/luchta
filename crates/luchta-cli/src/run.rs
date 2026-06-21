@@ -14,7 +14,7 @@ use globset::{Glob, GlobSet, GlobSetBuilder};
 use luchta_cache::shared::SharedCache;
 use luchta_cache::{
     combined_outputs_hash, decide, resolve_cache_dir, resolve_inputs_with_semantics,
-    resolve_outputs, Cache, Decision, TaskRunRecord, SCHEMA_VERSION_V1,
+    resolve_outputs, Cache, Decision, TaskRunRecord,
 };
 use luchta_engine::{
     expand_input_patterns, is_root_task, CompletionSignal, ExecutionLogSink, ExecutionRequest,

@@ -437,6 +437,78 @@ fn cross_package_output_skips_shared_cache() {
     );
 }
 
+#[test]
+fn shared_cache_hit_restores_reports_into_local_cache_and_logs_file() {
+    let shared_cache_dir = tempfile::tempdir().unwrap();
+    let temp = assert_fs::TempDir::new().unwrap();
+    common::setup_workspace(&temp);
+
+    let worker = common::shell_worker_with_reports(
+        &temp,
+        &[("shared.json", "application/json", "{\"shared\":true}\n")],
+    );
+    common::write_task_config_with_shell_worker(
+        &temp,
+        worker.path(),
+        r#""a#build":{"cache":{},"worker":"shell","inputs":["src.txt"],"outputs":[],"command":"sleep 0.15 && echo running"}"#,
+    );
+    common::init_git(&temp);
+
+    Command::cargo_bin("luchta")
+        .unwrap()
+        .arg("run")
+        .arg("build")
+        .arg("--workspace-root")
+        .arg(temp.path())
+        .env("LUCHTA_SHARED_CACHE", "1")
+        .env("LUCHTA_SHARED_CACHE_DIR", shared_cache_dir.path())
+        .assert()
+        .success();
+
+    std::fs::remove_dir_all(temp.child(".luchta/cache").path()).unwrap();
+
+    let second = Command::cargo_bin("luchta")
+        .unwrap()
+        .arg("run")
+        .arg("build")
+        .arg("--workspace-root")
+        .arg(temp.path())
+        .env("LUCHTA_SHARED_CACHE", "1")
+        .env("LUCHTA_SHARED_CACHE_DIR", shared_cache_dir.path())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let second_stdout = String::from_utf8(second).unwrap();
+    assert!(
+        second_stdout.contains("📥 1"),
+        "stdout was:
+{second_stdout}"
+    );
+
+    let cache = luchta_cache::Cache::open(&temp.path().join(".luchta/cache")).unwrap();
+    let report = cache
+        .read_report("a#build", "shared.json")
+        .expect("restored report");
+    assert_eq!(report, b"{\"shared\":true}\n");
+
+    let output = Command::cargo_bin("luchta")
+        .unwrap()
+        .env("NO_COLOR", "1")
+        .arg("logs")
+        .arg("--file")
+        .arg("shared.json")
+        .arg("--workspace-root")
+        .arg(temp.path())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(output, b"{\"shared\":true}\n");
+}
+
 /// Test: genuine E2E cross-build cache flow.
 #[test]
 fn e2e_cross_build_shared_cache_hit() {

@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 
 /// First schema version for filesystem-backed run-record metadata.
 pub const SCHEMA_VERSION_V1: u32 = 1;
+/// Second schema version for filesystem-backed run-record metadata.
+pub const SCHEMA_VERSION_V2: u32 = 2;
 
 /// Serialized cache metadata for one task execution.
 ///
@@ -38,6 +40,13 @@ pub struct TaskRunRecord {
     pub succeeded: bool,
     pub start_unix_ms: u64,
     pub end_unix_ms: u64,
+    pub reports: Vec<ReportMeta>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReportMeta {
+    pub filename: String,
+    pub mime_type: String,
 }
 
 /// Snapshot of one resolved input or output path.

@@ -18,9 +18,10 @@ clap = { workspace = true }
 miette = { workspace = true }
 serde = { workspace = true }
 serde_json.workspace = true
+serde-sarif = "0.8"
 serde_path_to_error = "0.1"
 tokio = { workspace = true }
-owo-colors = "4.0"
+owo-colors = { version = "4.0", features = ["supports-colors"] }
 jiff = "0.2.28"
 petgraph.workspace = true
 globset = { workspace = true }

@@ -108,6 +108,10 @@ pub enum Commands {
         /// Show output file metadata (path, size, mtime, hash) for each task.
         #[arg(long = "show-outputs")]
         show_outputs: bool,
+
+        /// Exact names of attached report files to extract verbatim. Repeat to target multiple files.
+        #[arg(long = "file", value_name = "NAME")]
+        files: Vec<String>,
     },
     Check,
 }

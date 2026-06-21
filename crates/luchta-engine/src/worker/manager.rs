@@ -20,7 +20,7 @@ use crate::worker::{
     io_tasks::ReaperContext,
     protocol::{LogStream, WorkerMessage, WorkerResponse},
 };
-use crate::{ExecutionLogSink, TaskResolver};
+use crate::{CollectedReport, ExecutionLogSink, TaskResolver};
 
 #[derive(Debug, thiserror::Error)]
 pub enum WorkerError {
@@ -174,6 +174,28 @@ impl WorkerManager {
                         stream,
                         &line,
                     )
+                }
+                Some(WorkerResponse::Report {
+                    filename,
+                    mime_type,
+                    content,
+                    ..
+                }) => {
+                    if !luchta_worker::is_valid_report_filename(&filename) {
+                        eprintln!(
+                            "warning: dropping worker report with invalid filename for worker '{}' job '{}': {}",
+                            worker_name, job_id, filename
+                        );
+                        continue;
+                    }
+
+                    if let Some(sink) = sink {
+                        sink.push_report(CollectedReport {
+                            filename,
+                            mime_type,
+                            content,
+                        });
+                    }
                 }
                 Some(response) => {
                     let kind = response.kind();
