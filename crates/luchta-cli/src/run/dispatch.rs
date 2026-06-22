@@ -101,7 +101,7 @@ pub(super) fn dispatch_ready_task(
 
     if !ctx.tasks_to_run.contains(&task_id) {
         // Task not in requested subgraph — not counted.
-        ctx.reporter.task_finished_other(&task_id);
+        ctx.reporter.task_finished_uncounted(&task_id);
         let _ = done_tx.send(true);
         return;
     }
@@ -111,22 +111,23 @@ pub(super) fn dispatch_ready_task(
     if let Some(message) = ctx.invalid.get(&task_id) {
         ctx.any_failed.store(true, Ordering::SeqCst);
         eprintln!("{} {}", "✖".red(), message.red());
-        // Invalid/config-error — NOT counted (failure path handles it).
-        ctx.reporter.task_finished_other(&task_id);
+        // Invalid/config-error — counted in totals via wave map, but completion is
+        // still recorded as uncounted because it is neither done nor cache-skipped.
+        ctx.reporter.task_finished_uncounted(&task_id);
         let _ = done_tx.send(false);
         return;
     }
 
     let Some(request) = ctx.commands.get(&task_id).cloned() else {
-        // No command — treat ordering-only node as completed, not skipped.
-        ctx.reporter.task_ran(&task_id);
+        // No worker/no command ordering node — uncounted connector, not runnable work.
+        ctx.reporter.task_finished_uncounted(&task_id);
         let _ = done_tx.send(true);
         return;
     };
 
     if ctx.any_failed.load(Ordering::SeqCst) {
         // Skipped due to previous failure — not counted.
-        ctx.reporter.task_finished_other(&task_id);
+        ctx.reporter.task_finished_uncounted(&task_id);
         let _ = done_tx.send(false);
         return;
     }
@@ -884,7 +885,7 @@ fn finalize_task_run(finalization: TaskRunFinalization<'_>) {
     if succeeded {
         reporter.task_ran(task_id);
     } else {
-        reporter.task_finished_other(task_id);
+        reporter.task_finished_uncounted(task_id);
     }
 
     let _ = done_tx.send(succeeded);
@@ -1156,9 +1157,9 @@ pub(super) fn build_command_map(
                 .unwrap_or_default();
             (command, Some(workspace))
         } else {
-            match resolve_non_worker_command(task_def) {
-                NonWorkerCommand::NoOp => continue,
-                NonWorkerCommand::CommandWithoutWorker => {
+            match task_def {
+                Some(definition) if !definition.counts_in_progress() => continue,
+                Some(_) => {
                     invalid.insert(
                         task_id.clone(),
                         format!(
@@ -1167,6 +1168,7 @@ pub(super) fn build_command_map(
                     );
                     continue;
                 }
+                None => continue,
             }
         };
 
@@ -1306,6 +1308,7 @@ mod tests {
     use std::sync::atomic::AtomicBool;
 
     /// Test that report_task_outcome sets any_failed and formats messages correctly.
+
     #[test]
     fn report_task_outcome_sets_any_failed_on_failure() {
         #[cfg(unix)]

@@ -261,6 +261,20 @@ impl TaskDefinition {
     pub fn cache_enabled(&self) -> bool {
         self.cache.is_some()
     }
+
+    /// Counts toward runtime progress/stat totals when task represents runnable
+    /// work (`worker`) or selected misconfiguration (`command` without worker).
+    /// Pure ordering connectors — no worker and no non-blank command — stay out
+    /// of counted stats even though they still participate in wave topology.
+    #[must_use]
+    pub fn counts_in_progress(&self) -> bool {
+        self.worker.is_some()
+            || self
+                .command
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|command| !command.is_empty())
+    }
 }
 
 impl Default for TaskDefinition {
