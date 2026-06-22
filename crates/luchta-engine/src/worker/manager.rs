@@ -20,7 +20,12 @@ use crate::worker::{
     io_tasks::ReaperContext,
     protocol::{LogStream, WorkerMessage, WorkerResponse},
 };
-use crate::{CollectedReport, ExecutionLogSink, TaskResolver};
+use crate::{ExecutionLogSink, TaskResolver};
+// `CollectedReport` is only referenced from the `#[cfg(unix)]` worker
+// implementation, so gate the import to avoid an unused-import error on
+// non-unix targets (e.g. Windows CI).
+#[cfg(unix)]
+use crate::CollectedReport;
 
 #[derive(Debug, thiserror::Error)]
 pub enum WorkerError {
