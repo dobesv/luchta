@@ -300,6 +300,10 @@ impl SnapshotStore {
         for shard in shards {
             let bytes = match fs::read(shard.path()) {
                 Ok(bytes) => bytes,
+                // A missing shard is an expected, benign condition (e.g. the
+                // shard was pruned or never synced from a remote cache), so
+                // skip it silently instead of emitting a warning.
+                Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
                 Err(err) => {
                     eprintln!(
                         "warning: failed to read snapshot shard {}: {err}; skipping shard",
@@ -1011,6 +1015,60 @@ mod tests {
                 .insert(input_key_hex(entry.input_key), entry);
         }
         snapshot
+    }
+
+    #[test]
+    fn snapshot_store_skips_missing_shard_without_error() {
+        let temp_dir = tempdir().unwrap();
+        let paths = open_shared_paths(temp_dir.path()).unwrap();
+        let store = SnapshotStore::new(paths);
+        let commit_key = "commit-missing";
+        let present_entry = sample_entry_with_seed(20, [9; 32]);
+        let missing_entry = sample_entry_with_seed(21, [10; 32]);
+
+        for snapshot in [
+            snapshot_with_entries([present_entry.clone()]),
+            snapshot_with_entries([missing_entry.clone()]),
+        ] {
+            let bytes = bincode::serde::encode_to_vec(&snapshot, bincode_config()).unwrap();
+            let shard_id = blake3::hash(&bytes).to_hex().to_string();
+            write_snapshot_file(
+                &store
+                    .shard_dir_path(commit_key)
+                    .join(format!("{shard_id}.{SNAPSHOT_FILE_EXTENSION}")),
+                snapshot,
+            );
+        }
+
+        // Capture the shard list, then delete one shard file out from under it
+        // to simulate a shard that was pruned or never synced from a remote
+        // cache. The stale entry must be skipped silently.
+        let shards = store.list_snapshot_shards(commit_key);
+        assert_eq!(shards.len(), 2);
+        let missing_bytes = bincode::serde::encode_to_vec(
+            snapshot_with_entries([missing_entry.clone()]),
+            bincode_config(),
+        )
+        .unwrap();
+        let missing_shard_id = blake3::hash(&missing_bytes).to_hex().to_string();
+        fs::remove_file(
+            store
+                .shard_dir_path(commit_key)
+                .join(format!("{missing_shard_id}.{SNAPSHOT_FILE_EXTENSION}")),
+        )
+        .unwrap();
+
+        let merged = store
+            .load_merged_snapshot_from_shards(commit_key, shards)
+            .expect("surviving shard should still load");
+        assert_eq!(merged.entries.len(), 1);
+        assert_eq!(
+            merged.entries.get(&input_key_hex(present_entry.input_key)),
+            Some(&present_entry)
+        );
+        assert!(!merged
+            .entries
+            .contains_key(&input_key_hex(missing_entry.input_key)));
     }
 
     fn write_snapshot_file(path: &Path, snapshot: Snapshot) {
