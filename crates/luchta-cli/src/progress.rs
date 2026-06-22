@@ -17,12 +17,12 @@ use crate::{
 
 /// Outcome of a task as recorded by the progress reporter.
 ///
-/// A successful run (including ordering-only no-command nodes) increments the
-/// wave's `done` bucket; a cache hit increments `skipped`. Shared-cache hits
-/// also increment a dedicated `shared_hits` counter. Everything else —
-/// previous-failure skips, config errors, tasks outside the requested subgraph,
-/// and execution failures — is `Uncounted`: removed from the running set but
-/// not added to the done or skipped totals.
+/// A successful run increments the wave's `done` bucket; a cache hit increments
+/// `skipped`. Shared-cache hits also increment a dedicated `shared_hits`
+/// counter. Everything else — ordering-only no-worker nodes, previous-failure
+/// skips, config errors, tasks outside the requested subgraph, and execution
+/// failures — is `Uncounted`: removed from running set but not added to done or
+/// skipped totals.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskOutcome {
     /// Task executed successfully (increments the wave's done count).
@@ -75,6 +75,10 @@ impl ProgressReporter {
     }
 
     pub fn task_started(&self, id: &TaskId) {
+        if !self.wave_of.contains_key(id) {
+            return;
+        }
+
         let mut running = self
             .running
             .lock()
@@ -94,7 +98,7 @@ impl ProgressReporter {
         self.finish_task(id, TaskOutcome::SkippedSharedCache);
     }
 
-    pub fn task_finished_other(&self, id: &TaskId) {
+    pub fn task_finished_uncounted(&self, id: &TaskId) {
         self.finish_task(id, TaskOutcome::Uncounted);
     }
 
@@ -130,8 +134,8 @@ impl ProgressReporter {
             .iter()
             .enumerate()
             .filter(|(wave_index, wave_total)| {
-                **wave_total > 0
-                    && self.wave_done[*wave_index].load(Ordering::SeqCst)
+                **wave_total == 0
+                    || self.wave_done[*wave_index].load(Ordering::SeqCst)
                         + self.wave_skipped[*wave_index].load(Ordering::SeqCst)
                         == **wave_total
             })
@@ -459,6 +463,18 @@ mod tests {
         );
     }
 
+    fn reporter_with_completed_tasks(
+        wave_of: HashMap<TaskId, usize>,
+        total_waves: usize,
+        completed_tasks: &[&TaskId],
+    ) -> ProgressReporter {
+        let reporter = ProgressReporter::new(OutputMode::Default, wave_of, total_waves);
+        for task in completed_tasks {
+            reporter.task_ran(task);
+        }
+        reporter
+    }
+
     #[test]
     fn render_progress_omits_zero_skipped_and_shows_pending_when_work_remains() {
         let wave_of = HashMap::from([(task_id("pkg-a", "build"), 0)]);
@@ -573,9 +589,70 @@ mod tests {
                 free_threshold: 0,
             },
         );
+        assert_progress_line_shape(
+            &out,
+            "✔ 3 ⏩ 1 ⌛ 1 🏃 1 (pkg-d#build) ⌚ ",
+            "24 MB",
+            "1 / 3",
+        );
         assert!(out.contains("🌊 1 / 3"));
         assert!(!out.contains("W1 "));
         assert!(!out.contains("done ·"));
+    }
+
+    #[test]
+    fn render_progress_ignores_uncounted_tasks_for_running_done_pending_and_waves() {
+        let counted = task_id("pkg-a", "build");
+        let uncounted = task_id("pkg-b", "build");
+        let reporter = ProgressReporter::new(
+            OutputMode::Default,
+            HashMap::from([(counted.clone(), 0)]),
+            1,
+        );
+
+        reporter.task_started(&uncounted);
+        reporter.task_finished_uncounted(&uncounted);
+
+        let initial = reporter.render_progress("24 MB", &[], &pressure_snapshot(None, 0, 0));
+        assert_progress_line_shape(&initial, "✔ 0 ⌛ 1 ⌚ ", "24 MB", "0 / 1");
+        assert!(!initial.contains("🏃"), "output was: {initial}");
+
+        reporter.task_ran(&counted);
+        let finished = reporter.render_progress("24 MB", &[], &pressure_snapshot(None, 0, 0));
+        assert_progress_line_shape(&finished, "✔ 1 ⌚ ", "24 MB", "1 / 1");
+        assert!(!finished.contains("⌛"), "output was: {finished}");
+        assert!(!finished.contains("🏃"), "output was: {finished}");
+    }
+
+    #[test]
+    fn render_progress_counts_zero_task_waves_as_complete_for_denominator() {
+        let task_a = task_id("pkg-a", "build");
+        let task_b = task_id("pkg-b", "build");
+        let reporter = reporter_with_completed_tasks(
+            HashMap::from([(task_a.clone(), 0), (task_b.clone(), 2)]),
+            3,
+            &[&task_a, &task_b],
+        );
+
+        let out = reporter.render_progress("24 MB", &[], &pressure_snapshot(None, 0, 0));
+        assert_progress_line_shape(&out, "✔ 2 ⌚ ", "24 MB", "3 / 3");
+    }
+
+    #[test]
+    fn render_progress_all_uncounted_selection_keeps_zero_counters_and_reaches_wave_parity() {
+        let connector_a = task_id("pkg-a", "noop-a");
+        let connector_b = task_id("pkg-a", "noop-b");
+        let reporter = ProgressReporter::new(OutputMode::Default, HashMap::new(), 2);
+
+        reporter.task_started(&connector_a);
+        reporter.task_finished_uncounted(&connector_a);
+        reporter.task_started(&connector_b);
+        reporter.task_finished_uncounted(&connector_b);
+
+        let out = reporter.render_progress("24 MB", &[], &pressure_snapshot(None, 0, 0));
+        assert_progress_line_shape(&out, "✔ 0 ⌚ ", "24 MB", "2 / 2");
+        assert!(!out.contains("⌛"), "output was: {out}");
+        assert!(!out.contains("🏃"), "output was: {out}");
     }
 
     #[test]

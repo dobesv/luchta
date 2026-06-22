@@ -253,9 +253,9 @@ echo '{{"concurrency":{{"maxWeight":4}},"workers":{{"shell":{{"command":"{worker
     write_executable(temp.child("luchta-config.sh").path(), &config_content);
     init_git(&temp);
 
-    // `a#build` runs (cacheable) and the no-command `b#build` counts as done; no
-    // skips on the first run. On rerun `a#build` is a cache hit (the only
-    // "skipped"), so the done count stays 2 with one skip.
+    // `a#build` runs (cacheable) and worker-less `b#build` is an uncounted
+    // ordering node; no skips on first run. On rerun `a#build` is cache hit (only
+    // counted skip), so done count stays 1 with one skip.
     let run = |label: &str, expected: DoneLine| {
         let output = Command::cargo_bin("luchta")
             .unwrap()
@@ -277,7 +277,7 @@ echo '{{"concurrency":{{"maxWeight":4}},"workers":{{"shell":{{"command":"{worker
     run(
         "first run",
         DoneLine {
-            done: 2,
+            done: 1,
             skipped: 0,
             waves: 1,
         },
@@ -285,7 +285,7 @@ echo '{{"concurrency":{{"maxWeight":4}},"workers":{{"shell":{{"command":"{worker
     run(
         "second run",
         DoneLine {
-            done: 2,
+            done: 1,
             skipped: 1,
             waves: 1,
         },

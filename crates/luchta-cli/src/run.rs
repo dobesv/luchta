@@ -558,11 +558,12 @@ pub async fn dry_run_tasks(workspace_root: &Path, selection: &TaskSelection<'_>)
     );
 
     let waves = compute_execution_waves(&task_graph, &tasks_to_run);
+    let selected_task_total: usize = waves.iter().map(Vec::len).sum();
 
     println!(
         "{} {} task(s) across {} wave(s) (tasks within a wave can run in parallel):",
         "dry-run:".bold(),
-        tasks_to_run.len(),
+        selected_task_total,
         waves.len()
     );
 
@@ -627,15 +628,9 @@ fn resolve_since_selection(
 
     Ok(SinceSelection::Proceed(Some(affected)))
 }
-/// Compute longest-path wave indices over subgraph induced by `tasks_to_run`.
-///
-/// A task lands in wave `N` where `N` is one greater than deepest wave of any
-/// of its dependencies that are also in `tasks_to_run`. Tasks with no
-/// in-subgraph dependencies are in wave 0. Returns `(wave_of, total_waves)`,
-/// where `total_waves` is `max_wave + 1`, or `0` when `tasks_to_run` is empty.
-fn compute_wave_indices(
+fn compute_longest_path_waves(
     task_graph: &TaskGraph,
-    tasks_to_run: &HashSet<TaskId>,
+    included_tasks: &HashSet<TaskId>,
 ) -> (HashMap<TaskId, usize>, usize) {
     // Resolve each task's wave by recursing through its dependencies. Memoize so
     // repeated dependencies are only computed once. The graph is acyclic
@@ -643,7 +638,7 @@ fn compute_wave_indices(
     fn resolve_depth(
         task_id: &TaskId,
         task_graph: &TaskGraph,
-        tasks_to_run: &HashSet<TaskId>,
+        included_tasks: &HashSet<TaskId>,
         wave_of: &mut HashMap<TaskId, usize>,
     ) -> usize {
         if let Some(&depth) = wave_of.get(task_id) {
@@ -652,11 +647,11 @@ fn compute_wave_indices(
 
         let mut depth = 0;
         for dependency in task_graph.dependencies_of(task_id) {
-            if !tasks_to_run.contains(&dependency.id) {
+            if !included_tasks.contains(&dependency.id) {
                 continue;
             }
             let dependency_depth =
-                resolve_depth(&dependency.id, task_graph, tasks_to_run, wave_of) + 1;
+                resolve_depth(&dependency.id, task_graph, included_tasks, wave_of) + 1;
             depth = depth.max(dependency_depth);
         }
 
@@ -664,31 +659,57 @@ fn compute_wave_indices(
         depth
     }
 
-    if tasks_to_run.is_empty() {
+    if included_tasks.is_empty() {
         return (HashMap::new(), 0);
     }
 
-    let mut wave_of: HashMap<TaskId, usize> = HashMap::with_capacity(tasks_to_run.len());
+    let mut wave_of: HashMap<TaskId, usize> = HashMap::with_capacity(included_tasks.len());
     let mut max_depth = 0;
-    for task_id in tasks_to_run {
-        let depth = resolve_depth(task_id, task_graph, tasks_to_run, &mut wave_of);
+    for task_id in included_tasks {
+        let depth = resolve_depth(task_id, task_graph, included_tasks, &mut wave_of);
         max_depth = max_depth.max(depth);
     }
 
     (wave_of, max_depth + 1)
 }
 
-/// Group the selected tasks into ordered execution "waves" using longest-path
-/// layering over the subgraph induced by `tasks_to_run`.
+/// Compute runtime progress wave indices from full selected topology, then drop
+/// uncounted tasks from returned stats map.
 ///
-/// This mirrors how the walker releases work: a task only becomes ready once
-/// all of its dependencies have completed. Within each returned wave, task ids
-/// are sorted for stable, readable output.
+/// Longest-path depth is resolved over whole selected subgraph so ordering-only
+/// connectors preserve real stage boundaries. Returned `wave_of` only includes
+/// tasks that count toward runtime stats/progress via
+/// `TaskDefinition::counts_in_progress()`. `total_waves` keeps full-topology wave
+/// count, including waves that become empty after filtering, so runtime `🌊 X / Y`
+/// stays aligned with dry-run numbering and can still reach `Y / Y` at completion.
+fn compute_wave_indices(
+    task_graph: &TaskGraph,
+    tasks_to_run: &HashSet<TaskId>,
+) -> (HashMap<TaskId, usize>, usize) {
+    let (full_wave_of, total_waves) = compute_longest_path_waves(task_graph, tasks_to_run);
+    let counted_wave_of = full_wave_of
+        .into_iter()
+        .filter(|(task_id, _)| {
+            task_graph
+                .task_definition(task_id)
+                .is_some_and(TaskDefinition::counts_in_progress)
+        })
+        .collect();
+
+    (counted_wave_of, total_waves)
+}
+
+/// Group selected tasks into ordered execution "waves" using longest-path
+/// layering over full subgraph induced by `tasks_to_run`.
+///
+/// Dry-run lists selected tasks, not counted runtime stats, so ordering-only
+/// connectors stay visible. Within each returned wave, task ids are sorted for
+/// stable, readable output.
 fn compute_execution_waves(
     task_graph: &TaskGraph,
     tasks_to_run: &HashSet<TaskId>,
 ) -> Vec<Vec<TaskId>> {
-    let (wave_of, total_waves) = compute_wave_indices(task_graph, tasks_to_run);
+    let (wave_of, total_waves) = compute_longest_path_waves(task_graph, tasks_to_run);
     if total_waves == 0 {
         return Vec::new();
     }
@@ -973,31 +994,6 @@ fn compute_prefix_width(task_graph: &TaskGraph, tasks_to_run: &HashSet<TaskId>) 
         .unwrap_or(0)
 }
 
-/// Outcome of resolving the command for a non-worker task.
-enum NonWorkerCommand {
-    /// No worker and no command: a pure no-op node (ordering only).
-    NoOp,
-    /// A command is declared without a worker. This is a configuration error,
-    /// but it must only fail the task itself *if it is actually executed* — it
-    /// must not abort the whole run during graph construction.
-    CommandWithoutWorker,
-}
-
-fn resolve_non_worker_command(task_def: Option<&TaskDefinition>) -> NonWorkerCommand {
-    // A blank/whitespace-only command is treated as absent — matching the
-    // worker path's `resolve_script_name` normalization and `check`'s
-    // `has_non_blank_command` — so it is a no-op node, not a config error.
-    let has_command = task_def
-        .and_then(|def| def.command.as_deref())
-        .map(str::trim)
-        .is_some_and(|command| !command.is_empty());
-    if has_command {
-        NonWorkerCommand::CommandWithoutWorker
-    } else {
-        NonWorkerCommand::NoOp
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1133,11 +1129,19 @@ mod tests {
             TaskName::from("build"),
             TaskDefinition {
                 depends_on: depends_on(TaskName::from("build")),
+                worker: Some("test-worker".to_string()),
                 ..TaskDefinition::default()
             },
         )]);
 
         TaskGraph::build(&package_graph, &pipeline).expect("build task graph")
+    }
+
+    fn assert_wave_lookup(wave_of: &HashMap<TaskId, usize>, expected: &[(&str, &str, usize)]) {
+        assert_eq!(wave_of.len(), expected.len());
+        for &(package, task, wave) in expected {
+            assert_eq!(wave_of[&TaskId::new(package, task)], wave);
+        }
     }
 
     #[test]
@@ -1153,14 +1157,96 @@ mod tests {
 
         let (wave_of, total_waves) = compute_wave_indices(&task_graph, &tasks_to_run);
 
-        assert_eq!(wave_of.len(), tasks_to_run.len());
-        for task_id in &tasks_to_run {
-            assert!(wave_of.contains_key(task_id), "missing {task_id}");
-        }
         assert_eq!(total_waves, 3);
-        assert_eq!(wave_of[&TaskId::new("@repo/c", "build")], 0);
-        assert_eq!(wave_of[&TaskId::new("@repo/b", "build")], 1);
-        assert_eq!(wave_of[&TaskId::new("@repo/a", "build")], 2);
+        assert_wave_lookup(
+            &wave_of,
+            &[
+                ("@repo/c", "build", 0),
+                ("@repo/b", "build", 1),
+                ("@repo/a", "build", 2),
+            ],
+        );
+    }
+
+    #[test]
+    fn compute_wave_indices_excludes_no_worker_tasks_and_empty_waves() {
+        let (task_graph, tasks_to_run) = no_worker_connector_plan();
+
+        let (wave_of, total_waves) = compute_wave_indices(&task_graph, &tasks_to_run);
+
+        assert_eq!(total_waves, 4);
+        assert_wave_lookup(
+            &wave_of,
+            &[("@repo/app", "build", 1), ("@repo/app", "test", 3)],
+        );
+    }
+
+    #[test]
+    fn compute_execution_waves_keeps_no_worker_connectors_in_dry_run_plan() {
+        let (task_graph, tasks_to_run) = no_worker_connector_plan();
+
+        let waves = compute_execution_waves(&task_graph, &tasks_to_run);
+
+        assert_eq!(waves.len(), 4);
+        assert_eq!(waves[0], vec![TaskId::new("@repo/app", "noop-root")]);
+        assert_eq!(waves[1], vec![TaskId::new("@repo/app", "build")]);
+        assert_eq!(waves[2], vec![TaskId::new("@repo/app", "noop-mid")]);
+        assert_eq!(waves[3], vec![TaskId::new("@repo/app", "test")]);
+    }
+
+    #[test]
+    fn compute_wave_indices_counts_command_without_worker_config_error() {
+        let package = "@repo/app";
+        let task_graph = package_task_graph(
+            vec![(package, "packages/app", Vec::new())],
+            vec![
+                task_entry("build", Vec::new()),
+                (
+                    TaskName::from("misconfigured"),
+                    TaskDefinition {
+                        depends_on: vec![DependsOn::SamePackage(TaskName::from("build"))],
+                        command: Some("echo nope".to_string()),
+                        ..TaskDefinition::default()
+                    },
+                ),
+            ],
+        );
+        let tasks_to_run = HashSet::from([
+            TaskId::new(package, "build"),
+            TaskId::new(package, "misconfigured"),
+        ]);
+
+        let (wave_of, total_waves) = compute_wave_indices(&task_graph, &tasks_to_run);
+
+        assert_eq!(total_waves, 2);
+        assert_wave_lookup(
+            &wave_of,
+            &[(package, "build", 0), (package, "misconfigured", 1)],
+        );
+    }
+
+    #[test]
+    fn compute_wave_indices_allows_all_uncounted_selection_with_zero_counters() {
+        let package = "@repo/app";
+        let task_graph = package_task_graph(
+            vec![(package, "packages/app", Vec::new())],
+            vec![
+                no_worker_task_entry("noop-root", Vec::new()),
+                no_worker_task_entry(
+                    "noop-leaf",
+                    vec![DependsOn::SamePackage(TaskName::from("noop-root"))],
+                ),
+            ],
+        );
+        let tasks_to_run = HashSet::from([
+            TaskId::new(package, "noop-root"),
+            TaskId::new(package, "noop-leaf"),
+        ]);
+
+        let (wave_of, total_waves) = compute_wave_indices(&task_graph, &tasks_to_run);
+
+        assert!(wave_of.is_empty());
+        assert_eq!(total_waves, 2);
     }
 
     fn matching_scope_task_graph() -> TaskGraph {
@@ -1214,13 +1300,56 @@ mod tests {
     }
 
     fn task_entry(name: &str, depends_on: Vec<DependsOn>) -> (TaskName, TaskDefinition) {
+        test_task_entry(name, depends_on, true)
+    }
+
+    fn no_worker_task_entry(name: &str, depends_on: Vec<DependsOn>) -> (TaskName, TaskDefinition) {
+        test_task_entry(name, depends_on, false)
+    }
+
+    fn test_task_entry(
+        name: &str,
+        depends_on: Vec<DependsOn>,
+        has_worker: bool,
+    ) -> (TaskName, TaskDefinition) {
         (
             TaskName::from(name),
             TaskDefinition {
                 depends_on,
+                worker: has_worker.then(|| "test-worker".to_string()),
                 ..TaskDefinition::default()
             },
         )
+    }
+
+    fn no_worker_connector_plan() -> (TaskGraph, HashSet<TaskId>) {
+        let package = "@repo/app";
+        let task_graph = package_task_graph(
+            vec![(package, "packages/app", Vec::new())],
+            vec![
+                no_worker_task_entry("noop-root", Vec::new()),
+                task_entry(
+                    "build",
+                    vec![DependsOn::SamePackage(TaskName::from("noop-root"))],
+                ),
+                no_worker_task_entry(
+                    "noop-mid",
+                    vec![DependsOn::SamePackage(TaskName::from("build"))],
+                ),
+                task_entry(
+                    "test",
+                    vec![DependsOn::SamePackage(TaskName::from("noop-mid"))],
+                ),
+            ],
+        );
+        let tasks_to_run = HashSet::from([
+            TaskId::new(package, "noop-root"),
+            TaskId::new(package, "build"),
+            TaskId::new(package, "noop-mid"),
+            TaskId::new(package, "test"),
+        ]);
+
+        (task_graph, tasks_to_run)
     }
 
     fn package_selection_task_graph() -> TaskGraph {
