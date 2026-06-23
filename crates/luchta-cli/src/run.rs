@@ -24,7 +24,7 @@ use luchta_engine::{
 use luchta_types::{EnvSpec, PackageName, TaskDefinition, TaskId, TaskName, WorkerDefinition};
 use luchta_workspace::{PackageGraph, PackageNode, WorkspaceDiscovery, YarnWorkspace};
 use miette::{bail, Context, IntoDiagnostic, Result};
-use owo_colors::OwoColorize;
+use owo_colors::{OwoColorize, Stream};
 
 use crate::cache_ctx::{
     build_current_state, gather_pkg_dep_pairs, load_lockfile_state, LockfileState,

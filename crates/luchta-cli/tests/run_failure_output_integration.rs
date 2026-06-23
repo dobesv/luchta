@@ -78,19 +78,19 @@ done
 #[test]
 fn footer_duration_ms_parses_seconds_and_minute_forms() {
     let cases = [
-        ("──◀ duration=0.2s exit=7 cache=unknown\n", 200),
-        ("──◀ duration=1m 5s exit=1 cache=unknown\n", 65_000),
-        ("──◀ duration=92.3s exit=1 cache=unknown\n", 92_300),
+        ("╰─ 0.2s · exit 7 · cache unknown\n", 200),
+        ("╰─ 1m 5s · exit 1 · cache unknown\n", 65_000),
+        ("╰─ 92.3s · exit 1 · cache unknown\n", 92_300),
     ];
 
     for (stderr, expected_ms) in cases {
         let start = stderr
-            .find("duration=")
+            .find("╰─ ")
             .unwrap_or_else(|| panic!("missing duration footer format: {stderr}"))
-            + "duration=".len();
+            + "╰─ ".len();
         let rest = &stderr[start..];
         let end = rest
-            .find(" exit=")
+            .find(" · exit ")
             .unwrap_or_else(|| panic!("missing exit footer format after duration: {stderr}"));
         let trimmed = rest[..end].trim();
         let token = trimmed
@@ -150,19 +150,18 @@ struct WrappedFailureView<'a> {
 impl WrappedFailureView<'_> {
     fn assert_wrapped_failure(&self) {
         assert!(
-            !self.stdout.contains("──▶") && !self.stdout.contains("──◀"),
+            !self.stdout.contains("╭─") && !self.stdout.contains("╰─"),
             "expected wrapped failure output on stderr only, stdout was: {}",
             self.stdout
         );
         for needle in [
-            "──▶",
+            "╭─",
             "app#fail",
-            "start=",
-            "──◀",
-            "duration=",
-            "exit=",
+            " · ",
+            "╰─",
+            "exit ",
             "7",
-            "cache=",
+            "cache ",
             "task 'app#fail' failed with status 7",
         ] {
             assert!(
@@ -258,12 +257,12 @@ fn run_failure_output_uses_real_start_time_for_non_cacheable_failures() {
     let output = run_workspace_command(&temp, "run", &["fail"]).failure();
     let stderr = String::from_utf8_lossy(&output.get_output().stderr);
     let duration_start = stderr
-        .find("duration=")
+        .find("╰─ ")
         .unwrap_or_else(|| panic!("missing duration footer format: {stderr}"))
-        + "duration=".len();
+        + "╰─ ".len();
     let duration_rest = &stderr[duration_start..];
     let duration_end = duration_rest
-        .find(" exit=")
+        .find(" · exit ")
         .unwrap_or_else(|| panic!("missing exit footer format after duration: {stderr}"));
     let duration_trimmed = duration_rest[..duration_end].trim();
     let duration_token = duration_trimmed
@@ -284,7 +283,7 @@ fn run_failure_output_uses_real_start_time_for_non_cacheable_failures() {
         "expected non-cacheable failed task to report real elapsed time, got {duration_ms}ms; stderr={stderr}"
     );
     assert!(
-        !stderr.contains("duration=0.0s"),
+        !stderr.contains("╰─ 0.0s · exit"),
         "expected failure footer duration to avoid 0.0s fallback; stderr={stderr}"
     );
 }
