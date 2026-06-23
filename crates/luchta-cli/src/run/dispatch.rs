@@ -1192,6 +1192,8 @@ pub(super) fn build_command_map(
             log_sink: None,
             worker,
             workspace,
+            inputs: task_def.map(|definition| definition.inputs.clone()),
+            outputs: task_def.map(|definition| definition.outputs.clone()),
         };
         task_envs.insert(task_id.clone(), merged_env);
         commands.insert(task_id.clone(), request);

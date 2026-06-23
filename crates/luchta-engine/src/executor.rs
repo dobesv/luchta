@@ -26,6 +26,8 @@ pub struct ExecutionRequest {
     pub env: HashMap<String, String>,
     pub worker: Option<String>,
     pub workspace: Option<String>,
+    pub inputs: Option<Vec<String>>,
+    pub outputs: Option<Vec<String>>,
     pub log_sink: Option<ExecutionLogSink>,
 }
 
@@ -38,6 +40,8 @@ impl ExecutionRequest {
             env: HashMap::new(),
             worker: None,
             workspace: None,
+            inputs: None,
+            outputs: None,
             log_sink: None,
         }
     }
@@ -54,6 +58,16 @@ impl ExecutionRequest {
 
     pub fn with_worker(mut self, name: impl Into<String>) -> Self {
         self.worker = Some(name.into());
+        self
+    }
+
+    pub fn with_inputs(mut self, inputs: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.inputs = Some(inputs.into_iter().map(Into::into).collect());
+        self
+    }
+
+    pub fn with_outputs(mut self, outputs: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.outputs = Some(outputs.into_iter().map(Into::into).collect());
         self
     }
 
@@ -294,6 +308,8 @@ impl WeightedExecutor {
                                 .cwd
                                 .as_ref()
                                 .map(|path| path.to_string_lossy().into_owned()),
+                            inputs: request.inputs.clone(),
+                            outputs: request.outputs.clone(),
                             workspace: request.workspace.clone(),
                             env: request.env.clone(),
                         },
