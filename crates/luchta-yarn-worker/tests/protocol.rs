@@ -81,6 +81,33 @@ fn failing_request_preserves_exit_code() {
 }
 
 #[test]
+fn done_response_preserves_declared_inputs_and_outputs() {
+    let request = WorkerRequest::new("job-io", "echo hi")
+        .with_inputs(["src/**/*.ts"])
+        .with_outputs(["dist/**"]);
+    let input = format!("{}\n", run_line(request));
+    let (output, _stderr) = run_worker(&input);
+
+    let done = output
+        .iter()
+        .find(|value| {
+            value["type"].as_str() == Some("done") && value["id"].as_str() == Some("job-io")
+        })
+        .expect("done response present");
+    assert_eq!(
+        done["inputs"],
+        Value::Array(vec![
+            Value::String("package.json".to_owned()),
+            Value::String("src/**/*.ts".to_owned()),
+        ])
+    );
+    assert_eq!(
+        done["outputs"],
+        Value::Array(vec![Value::String("dist/**".to_owned())])
+    );
+}
+
+#[test]
 fn invalid_cwd_still_emits_done_with_non_zero_exit_code() {
     let request = WorkerRequest::new("job-bad-cwd", "echo hi").with_cwd(
         Path::new("/definitely/missing/luchta-worker-cwd-xyz")

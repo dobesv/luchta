@@ -23,8 +23,8 @@ impl Worker for YarnWorker {
         WorkerResponse::done_with_io(
             req.id.clone(),
             exit_code,
-            detected_inputs_with_package_json(None),
-            None,
+            detected_inputs_with_package_json(req.inputs.as_deref()),
+            req.outputs.clone(),
         )
     }
 
@@ -150,11 +150,21 @@ mod tests {
 
     #[test]
     fn done_response_includes_package_json_input() {
-        let response = YarnWorker.done_response(&WorkerRequest::new("job", "build"), 0);
+        let response = YarnWorker.done_response(
+            &WorkerRequest::new("job", "build")
+                .with_inputs(["src/**/*.ts"])
+                .with_outputs(["dist/**"]),
+            0,
+        );
 
         assert_eq!(
             response,
-            WorkerResponse::done_with_io("job", 0, Some(vec!["package.json".to_owned()]), None,)
+            WorkerResponse::done_with_io(
+                "job",
+                0,
+                Some(vec!["package.json".to_owned(), "src/**/*.ts".to_owned()]),
+                Some(vec!["dist/**".to_owned()]),
+            )
         );
     }
 

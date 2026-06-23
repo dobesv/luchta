@@ -75,6 +75,18 @@ pub struct WorkerRequest {
     pub id: String,
     pub command: String,
     pub cwd: Option<String>,
+    /// The task's declared input/output glob patterns, forwarded so a worker can
+    /// *edit* them (e.g. yarn worker returns declared inputs plus `package.json`)
+    /// rather than reconstruct the set from scratch. This is the run-time analogue
+    /// of resolve-time [`TaskModification`]: `TaskModification` edits the task spec
+    /// (command/depends_on/weight) before execution, while these fields feed the
+    /// worker's `Done` response, which the engine uses as the task's effective I/O
+    /// patterns for cache hashing. `None` means the worker leaves the engine's
+    /// declared patterns untouched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inputs: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outputs: Option<Vec<String>>,
     /// Yarn workspace hint for yarn worker.
     /// `None` => run `command` as raw shell command (generic behavior).
     /// `Some("")` => run `yarn <command>` at workspace root.
@@ -91,6 +103,8 @@ impl WorkerRequest {
             id: id.into(),
             command: command.into(),
             cwd: None,
+            inputs: None,
+            outputs: None,
             workspace: None,
             env: HashMap::new(),
         }
@@ -98,6 +112,16 @@ impl WorkerRequest {
 
     pub fn with_cwd(mut self, cwd: impl Into<String>) -> Self {
         self.cwd = Some(cwd.into());
+        self
+    }
+
+    pub fn with_inputs(mut self, inputs: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.inputs = Some(inputs.into_iter().map(Into::into).collect());
+        self
+    }
+
+    pub fn with_outputs(mut self, outputs: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.outputs = Some(outputs.into_iter().map(Into::into).collect());
         self
     }
 
@@ -494,6 +518,8 @@ mod tests {
 
         let request = WorkerRequest::new("pkg#task", "yarn test")
             .with_cwd("packages/pkg")
+            .with_inputs(["src/**/*.ts"])
+            .with_outputs(["dist/**"])
             .with_env(env.clone());
 
         let json = serde_json::to_string(&request).expect("request serializes");
@@ -502,6 +528,8 @@ mod tests {
         let decoded: WorkerRequest = serde_json::from_str(&json).expect("request deserializes");
         assert_eq!(decoded, request);
         assert_eq!(decoded.env, env);
+        assert_eq!(decoded.inputs, Some(vec!["src/**/*.ts".to_owned()]));
+        assert_eq!(decoded.outputs, Some(vec!["dist/**".to_owned()]));
     }
 
     #[test]
@@ -552,9 +580,17 @@ mod tests {
     }
 
     #[test]
+    fn worker_request_none_inputs_and_outputs_omit_keys() {
+        let value = serde_json::to_value(WorkerRequest::new("pkg#task", "yarn test"))
+            .expect("request serializes");
+        let object = value.as_object().expect("request is object");
+        assert!(!object.contains_key("inputs"));
+        assert!(!object.contains_key("outputs"));
+    }
+
+    #[test]
     fn worker_request_json_uses_camel_case_fields() {
         let request = WorkerRequest::new("pkg#task", "yarn test").with_cwd("packages/pkg");
-
         let value = serde_json::to_value(request).expect("request serializes");
         assert_eq!(
             value,
@@ -686,6 +722,8 @@ mod tests {
 
         assert_eq!(decoded.env, HashMap::new());
         assert_eq!(decoded.workspace, None);
+        assert_eq!(decoded.inputs, None);
+        assert_eq!(decoded.outputs, None);
     }
 
     #[test]
