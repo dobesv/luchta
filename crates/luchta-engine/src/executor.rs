@@ -927,6 +927,7 @@ while IFS= read -r line; do
                 command: worker_path.display().to_string(),
                 depends_on: Vec::new(),
                 env: std::collections::BTreeMap::new(),
+                cache: None,
             },
         );
         WorkerManager::new(definitions)

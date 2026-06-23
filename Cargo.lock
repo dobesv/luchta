@@ -1961,6 +1961,7 @@ dependencies = [
  "luchta-workspace",
  "miette",
  "owo-colors",
+ "percent-encoding",
  "petgraph",
  "predicates",
  "serde",

@@ -2,13 +2,14 @@ use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Deserializer};
 
-use crate::{DependsOn, EnvSpec, TaskDefinition};
+use crate::{CacheConfig, DependsOn, EnvSpec, TaskDefinition};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// Worker command definition shared across crates.
 pub struct WorkerDefinition {
     pub command: String,
     pub depends_on: Vec<DependsOn>,
+    pub cache: Option<CacheConfig>,
     pub env: BTreeMap<String, EnvSpec>,
 }
 
@@ -20,6 +21,8 @@ enum WorkerDefinitionRepr {
         command: String,
         #[serde(default, rename = "dependsOn", alias = "depends_on")]
         depends_on: Vec<DependsOn>,
+        #[serde(default)]
+        cache: Option<CacheConfig>,
         #[serde(default)]
         env: BTreeMap<String, EnvSpec>,
     },
@@ -34,15 +37,18 @@ impl<'de> Deserialize<'de> for WorkerDefinition {
             WorkerDefinitionRepr::Command(command) => Ok(Self {
                 command,
                 depends_on: Vec::new(),
+                cache: None,
                 env: BTreeMap::new(),
             }),
             WorkerDefinitionRepr::Object {
                 command,
                 depends_on,
+                cache,
                 env,
             } => Ok(Self {
                 command,
                 depends_on,
+                cache,
                 env,
             }),
         }
@@ -67,6 +73,9 @@ pub struct LuchtaConfig {
     /// Environment variables provided to all tasks, keyed by variable name.
     #[serde(default)]
     pub env: BTreeMap<String, EnvSpec>,
+    /// Global cache settings applied when config object is present.
+    #[serde(default)]
+    pub cache: Option<CacheConfig>,
 }
 
 /// Scheduler concurrency settings from `[concurrency]` table.
@@ -92,7 +101,8 @@ mod tests {
 
     use super::{ConcurrencyConfig, LuchtaConfig};
     use crate::{
-        DependsOn, EnvSpec, PackageName, TaskDefinition, TaskId, TaskName, WorkerDefinition,
+        CacheConfig, DependsOn, EnvSpec, PackageName, TaskDefinition, TaskId, TaskName,
+        WorkerDefinition,
     };
 
     #[test]
@@ -196,6 +206,7 @@ mod tests {
             Some(&WorkerDefinition {
                 command: "node worker.js".to_owned(),
                 depends_on: vec![],
+                cache: None,
                 env: BTreeMap::new(),
             })
         );
@@ -222,6 +233,7 @@ mod tests {
                     )),
                     DependsOn::Root(TaskName::from("prep")),
                 ],
+                cache: None,
                 env: BTreeMap::new(),
             })
         );
@@ -242,6 +254,7 @@ mod tests {
             Some(&WorkerDefinition {
                 command: "luchta-babel-worker".to_owned(),
                 depends_on: vec![DependsOn::DirectUpstream(TaskName::from("build"))],
+                cache: None,
                 env: BTreeMap::new(),
             })
         );
@@ -261,9 +274,55 @@ mod tests {
             Some(&WorkerDefinition {
                 command: "luchta-babel-worker".to_owned(),
                 depends_on: vec![],
+                cache: None,
                 env: BTreeMap::new(),
             })
         );
+    }
+
+    #[test]
+    fn deserializes_global_cache_with_nonce() {
+        let config: LuchtaConfig =
+            serde_json::from_str(r#"{"cache":{"nonce":"g1"}}"#).expect("global cache config");
+
+        assert_eq!(
+            config.cache,
+            Some(CacheConfig {
+                cache_nonce: Some("g1".to_owned()),
+            })
+        );
+    }
+
+    #[test]
+    fn deserializes_without_global_cache() {
+        let config: LuchtaConfig = serde_json::from_str("{}").expect("config without cache");
+
+        assert_eq!(config.cache, None);
+    }
+
+    #[test]
+    fn deserializes_worker_object_with_cache() {
+        assert_worker_definition(
+            r#"{"workers":{"babel":{"command":"x","cache":{"nonce":"w1"}}}}"#,
+            WorkerDefinition {
+                command: "x".to_owned(),
+                depends_on: vec![],
+                cache: Some(CacheConfig {
+                    cache_nonce: Some("w1".to_owned()),
+                }),
+                env: BTreeMap::new(),
+            },
+        );
+    }
+
+    #[test]
+    fn deserializes_worker_object_without_cache() {
+        assert_worker_without_cache(r#"{"workers":{"babel":{"command":"x"}}}"#, "x");
+    }
+
+    #[test]
+    fn deserializes_worker_bare_string_definition_without_cache() {
+        assert_worker_without_cache(r#"{"workers":{"babel":"some-cmd"}}"#, "some-cmd");
     }
 
     #[test]
@@ -276,6 +335,23 @@ mod tests {
         let config: LuchtaConfig = toml::from_str(sample).expect("config should deserialize");
 
         assert_eq!(config.tasks["test"].worker.as_deref(), Some("jest-worker"));
+    }
+
+    fn assert_worker_definition(input: &str, expected: WorkerDefinition) {
+        let config: LuchtaConfig = serde_json::from_str(input).expect("worker definition");
+        assert_eq!(config.workers.get("babel"), Some(&expected));
+    }
+
+    fn assert_worker_without_cache(input: &str, command: &str) {
+        assert_worker_definition(
+            input,
+            WorkerDefinition {
+                command: command.to_owned(),
+                depends_on: vec![],
+                cache: None,
+                env: BTreeMap::new(),
+            },
+        );
     }
 
     #[test]

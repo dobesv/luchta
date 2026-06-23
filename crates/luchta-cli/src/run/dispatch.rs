@@ -12,7 +12,8 @@ use luchta_cache::shared::{
     combined_dep_outputs_hash, derive_input_key, RestoredHit, StoreOutcome,
 };
 use luchta_cache::{
-    decide_shared_restore, task_cache_key, FileEntry, ReportInput, RunArtifacts, SCHEMA_VERSION_V2,
+    decide_shared_restore, task_cache_key, CurrentState, FileEntry, ReportInput, RunArtifacts,
+    SCHEMA_VERSION_V3,
 };
 use luchta_types::EnvSpec;
 use luchta_worker::BUILTIN_PASSTHROUGH_ENV;
@@ -97,6 +98,8 @@ fn format_captured_failure_logs(context: FailureLogContext<'_>, sink: &Execution
             duration_ms: Some(end_unix_ms.saturating_sub(start_unix_ms)),
             exit_status,
             cache_hash: Some(cache_hash_12),
+            show_cache_nonce: false,
+            cache_nonce: None,
         },
         &body,
         &reports,
@@ -329,6 +332,10 @@ fn build_cache_write_context(task_id: &TaskId, ctx: &DispatchContext<'_>) -> Cac
     let Some(task_def) = ctx.task_graph.task_definition(task_id).cloned() else {
         return CacheInputState::Disabled;
     };
+
+    // Resolve nonce using the same helper as the read path.
+    let nonce = ctx.resolve_task_nonce(&task_def);
+
     let Some(cache_package) = cache_package_context_for(ctx.packages, ctx.workspace_root, task_id)
     else {
         return CacheInputState::Disabled;
@@ -372,6 +379,7 @@ fn build_cache_write_context(task_id: &TaskId, ctx: &DispatchContext<'_>) -> Cac
         dep_outputs.clone(),
         &pkg_dep_pairs,
         &resolver,
+        nonce.as_deref(),
     );
     let task_spec_hash = current.task_spec_hash;
     let env_hash = current.env_hash;
@@ -389,6 +397,7 @@ fn build_cache_write_context(task_id: &TaskId, ctx: &DispatchContext<'_>) -> Cac
         repo_root: ctx.workspace_root.to_path_buf(),
         source_pkg: cache_package.package_name.clone(),
         package_graph: ctx.package_graph.clone(),
+        cache_nonce: nonce,
     }))
 }
 
@@ -421,7 +430,7 @@ fn build_run_record(
         .unwrap_or(1);
 
     BuildRecordResult::Ok(Box::new(TaskRunRecord {
-        schema_version: SCHEMA_VERSION_V2,
+        schema_version: SCHEMA_VERSION_V3,
         task_spec_hash: cache_ctx.task_spec_hash,
         input_patterns,
         inputs,
@@ -438,6 +447,7 @@ fn build_run_record(
         start_unix_ms: cache_ctx.start_unix_ms,
         end_unix_ms,
         reports: vec![],
+        cache_nonce: cache_ctx.cache_nonce.clone(),
     }))
 }
 
@@ -665,6 +675,10 @@ fn format_task_error(error: &luchta_engine::ExecutorError) -> String {
 
 fn try_cache_skip(task_id: &TaskId, ctx: &DispatchContext<'_>) -> Option<Decision> {
     let task_def = ctx.task_graph.task_definition(task_id)?;
+
+    // Resolve nonce using the same helper as the write path.
+    let nonce = ctx.resolve_task_nonce(task_def);
+
     let cache_package = cache_package_context_for(ctx.packages, ctx.workspace_root, task_id)?;
     let resolver = PackageDirResolver::new(
         cache_package.package_path.clone(),
@@ -704,6 +718,7 @@ fn try_cache_skip(task_id: &TaskId, ctx: &DispatchContext<'_>) -> Option<Decisio
         dep_outputs.clone(),
         &pkg_dep_pairs,
         &resolver,
+        nonce.as_deref(),
     );
     let prior = ctx.cache.read(&task_id.to_string());
     let decision = decide(prior.as_ref(), &current);
@@ -714,69 +729,88 @@ fn try_cache_skip(task_id: &TaskId, ctx: &DispatchContext<'_>) -> Option<Decisio
         return Some(decision);
     }
 
-    // Local cache miss -> try shared cache if available.
-    // Read-time scope gate: skip shared cache for tasks with outputs that lexically
-    // escape the package directory (e.g. absolute paths or patterns starting with ../).
-    if let Some(ref shared_cache) = ctx.shared_cache {
-        if !outputs_lexically_in_package(&task_def.outputs) {
-            // Outputs may escape package dir -> not read-eligible for shared cache.
-            // Falls through to run normally (write-time scope check in P4.3).
-            return Some(Decision::Run);
-        }
-
-        // Compute input_key from the SAME hashes used for local cache.
-        let dep_outputs_hash = combined_dep_outputs_hash(&dep_outputs);
-        let input_key = derive_input_key(
-            current.task_spec_hash,
-            current.env_hash,
-            current.pkg_dep_hash,
-            dep_outputs_hash,
-        );
-
-        // Try restore from shared cache with validation.
-        // Iterate candidates newest-first; validate each before committing.
-        for candidate in shared_cache.try_restore_candidates(
-            &task_id.to_string(),
-            &input_key,
-            &cache_package.package_path,
-        ) {
-            // VALIDATE: Use decide_shared_restore to check if this candidate matches current tree state.
-            // Unlike full decide(), this does NOT require outputs to exist in the tree —
-            // we're ABOUT to restore outputs from the blob.
-            if decide_shared_restore(&candidate.record, &current) {
-                // Candidate is VALID - inputs match current tree.
-                // Commit the staged restore.
-                match candidate.commit() {
-                    Ok(hit) => {
-                        // Shared cache HIT (validated):
-                        // (a) Outputs now restored to package dir.
-                        // (b) Hydrate local cache for next build.
-                        hydrate_local_cache(ctx.cache.clone(), task_id.clone(), &hit);
-                        // (c) Replay logs via reporter (so output appears as if task ran).
-                        replay_logs(&hit, ctx.reporter);
-                        // (d) Record output hash for downstream invalidation.
-                        record_output_hash(ctx.output_hashes, task_id, hit.outputs_hash);
-                        // (e) Return dedicated shared-hit decision so dispatcher can count it.
-                        return Some(Decision::SharedHit);
-                    }
-                    Err(e) => {
-                        // Commit failed - log and continue to next candidate
-                        eprintln!("warning: shared cache restore commit failed: {e}");
-                        continue;
-                    }
-                }
-            } else {
-                // Candidate is STALE - inputs do not match current tree.
-                // Discard staging and try next candidate.
-                if let Err(e) = candidate.discard() {
-                    eprintln!("warning: shared cache discard failed: {e}");
-                }
-                continue;
-            }
-        }
+    if let Some(decision) = try_shared_cache_skip(
+        task_id,
+        ctx,
+        task_def,
+        &cache_package,
+        &current,
+        &dep_outputs,
+    ) {
+        return Some(decision);
     }
 
     Some(decision)
+}
+
+fn try_shared_cache_skip(
+    task_id: &TaskId,
+    ctx: &DispatchContext<'_>,
+    task_def: &TaskDefinition,
+    cache_package: &CachePackageContext<'_>,
+    current: &CurrentState<'_>,
+    dep_outputs: &BTreeMap<String, [u8; 32]>,
+) -> Option<Decision> {
+    let shared_cache = ctx.shared_cache.as_ref()?;
+
+    // Outputs may escape package dir -> not read-eligible for shared cache.
+    // Falls through to run normally (write-time scope check in P4.3).
+    if !outputs_lexically_in_package(&task_def.outputs) {
+        return Some(Decision::Run);
+    }
+
+    // Compute input_key from the SAME hashes used for local cache.
+    let dep_outputs_hash = combined_dep_outputs_hash(dep_outputs);
+    let input_key = derive_input_key(
+        current.task_spec_hash,
+        current.env_hash,
+        current.pkg_dep_hash,
+        dep_outputs_hash,
+    );
+
+    // Try restore from shared cache with validation.
+    // Iterate candidates newest-first; validate each before committing.
+    for candidate in shared_cache.try_restore_candidates(
+        &task_id.to_string(),
+        &input_key,
+        &cache_package.package_path,
+    ) {
+        // VALIDATE: Use decide_shared_restore to check if this candidate matches current tree state.
+        // Unlike full decide(), this does NOT require outputs to exist in the tree —
+        // we're ABOUT to restore outputs from the blob.
+        if decide_shared_restore(&candidate.record, current) {
+            // Candidate is VALID - inputs match current tree.
+            // Commit the staged restore.
+            match candidate.commit() {
+                Ok(hit) => {
+                    // Shared cache HIT (validated):
+                    // (a) Outputs now restored to package dir.
+                    // (b) Hydrate local cache for next build.
+                    hydrate_local_cache(ctx.cache.clone(), task_id.clone(), &hit);
+                    // (c) Replay logs via reporter (so output appears as if task ran).
+                    replay_logs(&hit, ctx.reporter);
+                    // (d) Record output hash for downstream invalidation.
+                    record_output_hash(ctx.output_hashes, task_id, hit.outputs_hash);
+                    // (e) Return dedicated shared-hit decision so dispatcher can count it.
+                    return Some(Decision::SharedHit);
+                }
+                Err(e) => {
+                    // Commit failed - log and continue to next candidate
+                    eprintln!("warning: shared cache restore commit failed: {e}");
+                    continue;
+                }
+            }
+        } else {
+            // Candidate is STALE - inputs do not match current tree.
+            // Discard staging and try next candidate.
+            if let Err(e) = candidate.discard() {
+                eprintln!("warning: shared cache discard failed: {e}");
+            }
+            continue;
+        }
+    }
+
+    None
 }
 
 /// A ready task to spawn: what to run, where to report completion, and whether

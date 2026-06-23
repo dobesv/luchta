@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 pub const SCHEMA_VERSION_V1: u32 = 1;
 /// Second schema version for filesystem-backed run-record metadata.
 pub const SCHEMA_VERSION_V2: u32 = 2;
+/// Third schema version: adds `cache_nonce` field.
+pub const SCHEMA_VERSION_V3: u32 = 3;
 
 /// Serialized cache metadata for one task execution.
 ///
@@ -41,6 +43,8 @@ pub struct TaskRunRecord {
     pub start_unix_ms: u64,
     pub end_unix_ms: u64,
     pub reports: Vec<ReportMeta>,
+    /// Resolved cache nonce string for cache invalidation.
+    pub cache_nonce: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

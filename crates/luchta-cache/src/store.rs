@@ -4,7 +4,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use crate::record::{TaskRunRecord, SCHEMA_VERSION_V2};
+use crate::record::{TaskRunRecord, SCHEMA_VERSION_V3};
 use crate::shared::atomic_write;
 use crate::{CacheError, Result};
 
@@ -57,7 +57,8 @@ impl Cache {
         let bytes = fs::read(self.task_dir(task_id).join(META_FILE_NAME)).ok()?;
         let (record, _): (TaskRunRecord, usize) =
             bincode::serde::decode_from_slice(&bytes, bincode_config()).ok()?;
-        (record.schema_version == SCHEMA_VERSION_V2).then_some(record)
+        // Only accept V3 records. Older versions -> clean cache miss.
+        (record.schema_version == SCHEMA_VERSION_V3).then_some(record)
     }
 
     pub fn write(&self, task_id: &str, artifacts: RunArtifacts<'_>) -> Result<()> {
@@ -233,7 +234,9 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::record::{FileEntry, ReportMeta, SCHEMA_VERSION_V1, SCHEMA_VERSION_V2};
+    use crate::record::{
+        FileEntry, ReportMeta, SCHEMA_VERSION_V1, SCHEMA_VERSION_V2, SCHEMA_VERSION_V3,
+    };
 
     #[test]
     fn write_then_read_round_trip_identical() {
@@ -347,17 +350,12 @@ mod tests {
 
     #[test]
     fn v1_meta_returns_none_instead_of_panicking() {
-        let temp_dir = tempdir().unwrap();
-        let cache =
-            Cache::open(&temp_dir.path().join(LUCHTA_DIR_NAME).join(CACHE_DIR_NAME)).unwrap();
-        let task_dir = cache.task_dir("pkg#build");
-        fs::create_dir_all(&task_dir).unwrap();
+        assert_previous_schema_record_is_cache_miss("pkg#build", sample_v1_record());
+    }
 
-        let v1 = sample_v1_record();
-        let encoded = bincode::serde::encode_to_vec(&v1, bincode_config()).unwrap();
-        fs::write(task_dir.join(META_FILE_NAME), encoded).unwrap();
-
-        assert_eq!(cache.read("pkg#build"), None);
+    #[test]
+    fn v2_meta_returns_none_instead_of_panicking() {
+        assert_previous_schema_record_is_cache_miss("pkg#build", sample_v2_record());
     }
 
     #[test]
@@ -565,9 +563,46 @@ mod tests {
         assert!(!present.absent);
     }
 
+    #[test]
+    fn read_returns_none_for_previous_schema_record() {
+        assert_previous_schema_record_is_cache_miss("pkg#build", sample_v1_record());
+    }
+
+    #[test]
+    fn read_returns_none_for_truncated_or_garbage_meta() {
+        let temp_dir = tempdir().unwrap();
+        let cache =
+            Cache::open(&temp_dir.path().join(LUCHTA_DIR_NAME).join(CACHE_DIR_NAME)).unwrap();
+        let task_dir = cache.root.join(task_cache_key("pkg#build"));
+        fs::create_dir_all(&task_dir).unwrap();
+
+        fs::write(task_dir.join(META_FILE_NAME), b"not bincode at all").unwrap();
+        assert_eq!(cache.read("pkg#build"), None);
+
+        let bytes = bincode::serde::encode_to_vec(sample_record(), bincode_config()).unwrap();
+        fs::write(task_dir.join(META_FILE_NAME), &bytes[..bytes.len() / 2]).unwrap();
+        assert_eq!(cache.read("pkg#build"), None);
+    }
+
+    fn assert_previous_schema_record_is_cache_miss<T>(task_id: &str, previous_record: T)
+    where
+        T: serde::Serialize,
+    {
+        let temp_dir = tempdir().unwrap();
+        let cache =
+            Cache::open(&temp_dir.path().join(LUCHTA_DIR_NAME).join(CACHE_DIR_NAME)).unwrap();
+        let task_dir = cache.root.join(task_cache_key(task_id));
+        fs::create_dir_all(&task_dir).unwrap();
+
+        let bytes = bincode::serde::encode_to_vec(&previous_record, bincode_config()).unwrap();
+        fs::write(task_dir.join(META_FILE_NAME), bytes).unwrap();
+
+        assert_eq!(cache.read(task_id), None);
+    }
+
     fn sample_record() -> TaskRunRecord {
         TaskRunRecord {
-            schema_version: SCHEMA_VERSION_V2,
+            schema_version: SCHEMA_VERSION_V3,
             task_spec_hash: [1; 32],
             input_patterns: vec!["src/**/*.ts".to_string()],
             inputs: vec![FileEntry {
@@ -596,6 +631,7 @@ mod tests {
             start_unix_ms: 1_000,
             end_unix_ms: 2_000,
             reports: vec![],
+            cache_nonce: None,
         }
     }
 
@@ -648,6 +684,80 @@ mod tests {
         succeeded: bool,
         start_unix_ms: u64,
         end_unix_ms: u64,
+    }
+
+    #[derive(serde::Serialize)]
+    struct V2TaskRunRecord {
+        schema_version: u32,
+        task_spec_hash: [u8; 32],
+        input_patterns: Vec<String>,
+        inputs: Vec<FileEntry>,
+        output_patterns: Vec<String>,
+        outputs: Vec<FileEntry>,
+        detected_input_patterns: bool,
+        detected_output_patterns: bool,
+        outputs_hash: [u8; 32],
+        env_hash: [u8; 32],
+        pkg_dep_hash: [u8; 32],
+        dep_outputs: BTreeMap<String, [u8; 32]>,
+        exit_status: i32,
+        succeeded: bool,
+        start_unix_ms: u64,
+        end_unix_ms: u64,
+        reports: Vec<ReportMeta>,
+    }
+
+    fn sample_inputs() -> Vec<FileEntry> {
+        vec![FileEntry {
+            path: "src/main.ts".to_string(),
+            size: 42,
+            mtime_ns: 111,
+            hash: [12; 32],
+            absent: false,
+        }]
+    }
+
+    fn sample_outputs() -> Vec<FileEntry> {
+        vec![FileEntry {
+            path: "dist/main.js".to_string(),
+            size: 84,
+            mtime_ns: 222,
+            hash: [13; 32],
+            absent: false,
+        }]
+    }
+
+    fn sample_dep_outputs() -> BTreeMap<String, [u8; 32]> {
+        BTreeMap::from([("dep#build".to_string(), [17; 32])])
+    }
+
+    fn sample_reports_meta() -> Vec<ReportMeta> {
+        vec![ReportMeta {
+            filename: "summary.md".to_string(),
+            mime_type: "text/markdown".to_string(),
+        }]
+    }
+
+    fn sample_v2_record() -> V2TaskRunRecord {
+        V2TaskRunRecord {
+            schema_version: SCHEMA_VERSION_V2,
+            task_spec_hash: [11; 32],
+            input_patterns: vec!["src/**/*.ts".to_string()],
+            inputs: sample_inputs(),
+            output_patterns: vec!["dist/**/*.js".to_string()],
+            outputs: sample_outputs(),
+            detected_input_patterns: true,
+            detected_output_patterns: true,
+            outputs_hash: [14; 32],
+            env_hash: [15; 32],
+            pkg_dep_hash: [16; 32],
+            dep_outputs: sample_dep_outputs(),
+            exit_status: 0,
+            succeeded: true,
+            start_unix_ms: 1_000,
+            end_unix_ms: 2_000,
+            reports: sample_reports_meta(),
+        }
     }
 
     fn sample_v1_record() -> V1TaskRunRecord {

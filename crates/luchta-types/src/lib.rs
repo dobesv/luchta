@@ -190,7 +190,10 @@ impl EnvSpec {
 
 /// Task configuration shared across package graph and execution layers.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
-pub struct CacheConfig {}
+pub struct CacheConfig {
+    #[serde(default, rename = "nonce", alias = "cache_nonce")]
+    pub cache_nonce: Option<String>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TaskDefinition {
@@ -908,6 +911,27 @@ mod tests {
 
         assert_eq!(task.cache, Some(CacheConfig::default()));
         assert!(task.cache_enabled());
+    }
+
+    #[test]
+    fn cache_config_deserializes_with_nonce() {
+        let cache: CacheConfig =
+            serde_json::from_str(r#"{"nonce":"abc"}"#).expect("deserialize cache config");
+
+        assert_eq!(
+            cache,
+            CacheConfig {
+                cache_nonce: Some("abc".to_owned()),
+            }
+        );
+    }
+
+    #[test]
+    fn cache_config_deserializes_without_nonce() {
+        let cache: CacheConfig =
+            serde_json::from_str("{}").expect("deserialize empty cache config");
+
+        assert_eq!(cache, CacheConfig { cache_nonce: None });
     }
 
     #[test]

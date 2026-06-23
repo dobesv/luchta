@@ -109,6 +109,10 @@ pub enum Commands {
         #[arg(long = "show-outputs")]
         show_outputs: bool,
 
+        /// Show the persisted cache nonce per task.
+        #[arg(long = "show-cache-nonce")]
+        show_cache_nonce: bool,
+
         /// Exact names of attached report files to extract verbatim. Repeat to target multiple files.
         #[arg(long = "file", value_name = "NAME")]
         files: Vec<String>,

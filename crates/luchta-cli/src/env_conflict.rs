@@ -138,6 +138,32 @@ mod tests {
         }
     }
 
+    fn worker_with_conflict(var_name: &str) -> WorkerDefinition {
+        let mut env = BTreeMap::new();
+        env.insert(var_name.to_owned(), make_conflicting_spec());
+        WorkerDefinition {
+            command: "echo".to_owned(),
+            depends_on: vec![],
+            env,
+            cache: None,
+        }
+    }
+
+    fn task_with_conflict(var_name: &str) -> TaskDefinition {
+        let mut env = BTreeMap::new();
+        env.insert(var_name.to_owned(), make_conflicting_spec());
+        TaskDefinition {
+            depends_on: vec![],
+            weight: 1,
+            command: None,
+            worker: None,
+            cache: None,
+            inputs: vec![],
+            outputs: vec![],
+            env,
+        }
+    }
+
     #[test]
     fn detects_conflict_in_global_env() {
         let mut global_env = BTreeMap::new();
@@ -162,6 +188,7 @@ mod tests {
                 command: "echo".to_owned(),
                 depends_on: vec![],
                 env: worker_env,
+                cache: None,
             },
         );
 
@@ -237,59 +264,13 @@ mod tests {
 
         // Workers: "worker-b", "worker-a" (sorted to worker-a, worker-b)
         let mut workers = HashMap::new();
-        let mut worker_a_env = BTreeMap::new();
-        worker_a_env.insert("A_WORKER".to_owned(), make_conflicting_spec());
-        workers.insert(
-            "worker-a".to_owned(),
-            WorkerDefinition {
-                command: "echo".to_owned(),
-                depends_on: vec![],
-                env: worker_a_env,
-            },
-        );
-        let mut worker_b_env = BTreeMap::new();
-        worker_b_env.insert("B_WORKER".to_owned(), make_conflicting_spec());
-        workers.insert(
-            "worker-b".to_owned(),
-            WorkerDefinition {
-                command: "echo".to_owned(),
-                depends_on: vec![],
-                env: worker_b_env,
-            },
-        );
+        workers.insert("worker-a".to_owned(), worker_with_conflict("A_WORKER"));
+        workers.insert("worker-b".to_owned(), worker_with_conflict("B_WORKER"));
 
         // Tasks: "test", "build" (sorted to build, test)
         let mut pipeline = HashMap::new();
-        let mut build_env = BTreeMap::new();
-        build_env.insert("BUILD_VAR".to_owned(), make_conflicting_spec());
-        pipeline.insert(
-            TaskName::from("build"),
-            TaskDefinition {
-                depends_on: vec![],
-                weight: 1,
-                command: None,
-                worker: None,
-                cache: None,
-                inputs: vec![],
-                outputs: vec![],
-                env: build_env,
-            },
-        );
-        let mut test_env = BTreeMap::new();
-        test_env.insert("TEST_VAR".to_owned(), make_conflicting_spec());
-        pipeline.insert(
-            TaskName::from("test"),
-            TaskDefinition {
-                depends_on: vec![],
-                weight: 1,
-                command: None,
-                worker: None,
-                cache: None,
-                inputs: vec![],
-                outputs: vec![],
-                env: test_env,
-            },
-        );
+        pipeline.insert(TaskName::from("build"), task_with_conflict("BUILD_VAR"));
+        pipeline.insert(TaskName::from("test"), task_with_conflict("TEST_VAR"));
 
         let conflicts = detect_env_conflicts(&global_env, &workers, &pipeline);
 
@@ -327,6 +308,7 @@ mod tests {
                 command: "echo".to_owned(),
                 depends_on: vec![],
                 env: worker_env,
+                cache: None,
             },
         );
 

@@ -26,6 +26,7 @@ pub(crate) struct LogsOptions<'a> {
     pub failed: bool,
     pub show_inputs: bool,
     pub show_outputs: bool,
+    pub show_cache_nonce: bool,
     pub files: &'a [String],
 }
 
@@ -176,7 +177,7 @@ fn print_task_logs(cache: &Cache, task_id: &TaskId, options: &LogsOptions<'_>) {
         Stream::Stdout,
     );
     let cache_hash_full = task_cache_key(&task_id_str);
-    let meta = build_log_block_meta(task_id, &record, &cache_hash_full);
+    let meta = build_log_block_meta(task_id, &record, &cache_hash_full, options.show_cache_nonce);
     print!(
         "{}",
         format_task_log_block(&meta, &body, &reports, Stream::Stdout)
@@ -224,6 +225,7 @@ fn build_log_block_meta<'a>(
     task_id: &'a TaskId,
     record: &'a luchta_cache::TaskRunRecord,
     cache_hash_full: &'a str,
+    show_cache_nonce: bool,
 ) -> LogBlockMeta<'a> {
     let cache_hash_12 = &cache_hash_full[..12];
     let (package_display, task_display) = package_and_task_display(task_id);
@@ -236,6 +238,8 @@ fn build_log_block_meta<'a>(
         duration_ms: Some(duration_ms),
         exit_status: Some(record.exit_status),
         cache_hash: Some(cache_hash_12),
+        show_cache_nonce,
+        cache_nonce: record.cache_nonce.as_deref(),
     }
 }
 
@@ -356,6 +360,7 @@ mod tests {
                     mime_type: "text/plain".to_string(),
                 })
                 .collect(),
+            cache_nonce: None,
         }
     }
 
@@ -405,6 +410,8 @@ mod tests {
             duration_ms: None,
             exit_status: Some(1),
             cache_hash: Some("abcdef123456"),
+            show_cache_nonce: false,
+            cache_nonce: None,
         };
         let body = join_output_streams("stdout line".to_string(), "stderr line".to_string());
         let reports = render_reports_pretty(
