@@ -101,11 +101,13 @@ pub enum Commands {
         #[arg(long)]
         failed: bool,
 
-        /// Show input file metadata (path, size, mtime, hash) for each task.
+        /// Show the stored effective input patterns (globs, marked detected or
+        /// declared) plus input file metadata (path, size, mtime, hash) for each task.
         #[arg(long = "show-inputs")]
         show_inputs: bool,
 
-        /// Show output file metadata (path, size, mtime, hash) for each task.
+        /// Show the stored effective output patterns (globs, marked detected or
+        /// declared) plus output file metadata (path, size, mtime, hash) for each task.
         #[arg(long = "show-outputs")]
         show_outputs: bool,
 

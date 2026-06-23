@@ -225,6 +225,11 @@ fn logs_shows_metadata_views() {
             args: &["--show-inputs"],
             assertions: &[
                 LogAssertion {
+                    needle: "input patterns (declared):",
+                    present: true,
+                    message: "expected input patterns section with declared marker in output",
+                },
+                LogAssertion {
                     needle: "inputs:",
                     present: true,
                     message: "expected inputs section in output",
@@ -245,6 +250,11 @@ fn logs_shows_metadata_views() {
             run_tasks: &["build"],
             args: &["--show-outputs"],
             assertions: &[
+                LogAssertion {
+                    needle: "output patterns (declared):",
+                    present: true,
+                    message: "expected output patterns section with declared marker in output",
+                },
                 LogAssertion {
                     needle: "outputs:",
                     present: true,
