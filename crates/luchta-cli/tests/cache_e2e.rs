@@ -542,12 +542,12 @@ fn cache_failed_task_always_reruns() {
 
     run_luchta(&temp, "pkgfail")
         .failure()
-        .stderr(predicate::str::contains("task 'app#pkgfail' failed"));
+        .stderr(predicate::str::contains("╭─ app#pkgfail"));
     temp.child("packages/app/fail-count.txt").assert("1\n");
 
     run_luchta(&temp, "pkgfail")
         .failure()
-        .stderr(predicate::str::contains("task 'app#pkgfail' failed"));
+        .stderr(predicate::str::contains("╭─ app#pkgfail"));
     temp.child("packages/app/fail-count.txt").assert("2\n");
 }
 

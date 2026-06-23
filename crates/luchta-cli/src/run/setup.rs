@@ -71,7 +71,10 @@ pub(super) fn report_run_outcome(
         pressure_state.snapshot().sample,
         crate::rss::process_tree_rss_bytes,
     );
-    println!("{}", reporter.render_summary(&crate::rss::format_rss(rss)));
+    println!(
+        "{}",
+        reporter.render_summary(&crate::rss::format_rss(rss), owo_colors::Stream::Stdout)
+    );
     Ok(())
 }
 

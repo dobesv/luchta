@@ -14,6 +14,8 @@ use std::time::{Duration, Instant};
 
 use assert_cmd::cargo::cargo_bin;
 use assert_fs::prelude::*;
+mod common;
+
 use predicates::prelude::*;
 
 /// A workspace package: name, build script, and whether it depends on `a`.
@@ -452,6 +454,70 @@ fn worker_crash_propagates_task_failure() {
         .arg(temp.path())
         .assert()
         .failure();
+
+    temp.close().expect("cleanup temp dir");
+}
+
+#[test]
+fn worker_crash_renders_single_wrapped_failure_block() {
+    let temp = assert_fs::TempDir::new().expect("create temp dir");
+    temp.child("package.json")
+        .write_str(
+            r#"{
+  "name": "root",
+  "private": true,
+  "workspaces": ["packages/*"]
+}"#,
+        )
+        .expect("write root package.json");
+    common::write_basic_package(&temp, "build");
+    let worker = write_executable(
+        &temp,
+        "crashing-worker.sh",
+        "#!/bin/sh\nwhile IFS= read -r line; do\n  case \"$line\" in\n    *'\"type\":\"resolveTask\"'*)\n      id=$(printf '%s\\n' \"$line\" | sed -n 's/.*\"id\":\"\\([^\"]*\\)\".*/\\1/p')\n      printf '{\"type\":\"resolved\",\"id\":\"%s\",\"result\":{\"decision\":\"accept\"}}\\n' \"$id\"\n      ;;\n    *'\"type\":\"run\"'*)\n      exit 1\n      ;;\n  esac\ndone\n",
+    );
+    common::write_task_config_with_worker(
+        &temp,
+        common::WorkerConfig {
+            name: "crash-worker",
+            command: worker.as_path(),
+        },
+        r#""app#build":{"worker":"crash-worker","command":"echo ignored"}"#,
+    );
+    common::init_git(&temp);
+
+    let output = assert_cmd::Command::cargo_bin("luchta")
+        .expect("find binary")
+        .env("NO_COLOR", "1")
+        .arg("run")
+        .arg("build")
+        .arg("--workspace-root")
+        .arg(temp.path())
+        .output()
+        .expect("run command");
+
+    assert!(!output.status.success(), "worker crash should fail run");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let detail =
+        "failed: task app#build worker error: worker 'crash-worker' crashed during job 'app#build': exited with code 1";
+    assert!(
+        stderr.contains("╭─ app#build"),
+        "missing failure header: {stderr}"
+    );
+    assert!(
+        stderr.contains(detail),
+        "missing worker crash detail in block: {stderr}"
+    );
+    assert!(
+        stderr.contains("╰─") && stderr.contains("exit unknown") && stderr.contains("cache "),
+        "missing failure footer: {stderr}"
+    );
+    assert_eq!(
+        stderr.matches(detail).count(),
+        1,
+        "worker crash detail should print once: {stderr}"
+    );
 
     temp.close().expect("cleanup temp dir");
 }

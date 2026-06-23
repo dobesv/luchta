@@ -154,16 +154,7 @@ impl WrappedFailureView<'_> {
             "expected wrapped failure output on stderr only, stdout was: {}",
             self.stdout
         );
-        for needle in [
-            "╭─",
-            "app#fail",
-            " · ",
-            "╰─",
-            "exit ",
-            "7",
-            "cache ",
-            "task 'app#fail' failed with status 7",
-        ] {
+        for needle in ["╭─", "app#fail", " · ", "╰─", "exit ", "7", "cache "] {
             assert!(
                 self.stderr.contains(needle),
                 "expected wrapped failure markers in stderr: missing {needle}; text={}",

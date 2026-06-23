@@ -45,19 +45,21 @@ fn collected_reports_for_cache(sink: &ExecutionLogSink) -> Vec<ReportInput> {
         .collect()
 }
 
-struct FailureLogContext<'a> {
-    task_id: &'a TaskId,
+struct FailureLogContext {
+    task_id: TaskId,
     start_unix_ms: u64,
     end_unix_ms: u64,
     exit_status: Option<i32>,
+    fallback_detail: Option<String>,
 }
 
-fn format_captured_failure_logs(context: FailureLogContext<'_>, sink: &ExecutionLogSink) -> String {
+fn format_captured_failure_logs(context: FailureLogContext, sink: &ExecutionLogSink) -> String {
     let FailureLogContext {
         task_id,
         start_unix_ms,
         end_unix_ms,
         exit_status,
+        fallback_detail,
     } = context;
     let (stdout, stderr) = split_captured_logs(sink);
     let stdout = String::from_utf8_lossy(&stdout);
@@ -69,6 +71,16 @@ fn format_captured_failure_logs(context: FailureLogContext<'_>, sink: &Execution
             body.push('\n');
         }
         body.push_str(&stderr);
+    }
+    if let Some(detail) = fallback_detail {
+        if body.trim().is_empty() {
+            body = detail;
+        } else {
+            if !body.ends_with('\n') {
+                body.push('\n');
+            }
+            body.push_str(&detail);
+        }
     }
 
     let lines: Vec<&str> = body.lines().collect();
@@ -85,7 +97,7 @@ fn format_captured_failure_logs(context: FailureLogContext<'_>, sink: &Execution
 
     let cache_hash_full = task_cache_key(&task_id.to_string());
     let cache_hash_12 = &cache_hash_full[..12];
-    let (package_display, task_display) = crate::format::package_and_task_display(task_id);
+    let (package_display, task_display) = crate::format::package_and_task_display(&task_id);
 
     let (shown_lines, _) = crate::format::truncate_output(&lines, package_display, task_display);
     let body = shown_lines.join("\n");
@@ -649,23 +661,12 @@ async fn write_run_record(
 }
 
 fn report_task_outcome(
-    task_id: &TaskId,
     outcome: &Result<TaskRunOutcome, luchta_engine::ExecutorError>,
     any_failed: &Arc<AtomicBool>,
-    interrupted: &Arc<AtomicBool>,
 ) {
     match outcome {
         Ok(result) if result.status.success() => {}
-        Ok(result) => {
-            let detail = match result.status.code() {
-                Some(code) => format!("failed with status {code}"),
-                None => "failed".to_string(),
-            };
-            report_task_failure(task_id, &detail, any_failed, interrupted)
-        }
-        Err(error) => {
-            report_task_failure(task_id, &format_task_error(error), any_failed, interrupted)
-        }
+        Ok(_) | Err(_) => any_failed.store(true, Ordering::SeqCst),
     }
 }
 
@@ -913,20 +914,21 @@ fn finalize_task_run(finalization: TaskRunFinalization<'_>) {
     if !succeeded && !interrupted_run {
         let failure_logs = format_captured_failure_logs(
             FailureLogContext {
-                task_id,
+                task_id: task_id.clone(),
                 start_unix_ms,
                 end_unix_ms,
                 exit_status: outcome_res
                     .as_ref()
                     .ok()
                     .and_then(|result| result.status.code()),
+                fallback_detail: outcome_res.as_ref().err().map(format_task_error),
             },
             log_sink,
         );
         eprint!("{}", failure_logs);
     }
 
-    report_task_outcome(task_id, outcome_res, any_failed, interrupted);
+    report_task_outcome(outcome_res, any_failed);
 
     if succeeded {
         reporter.task_ran(task_id);
@@ -1009,20 +1011,6 @@ fn cache_write_error(result: WriteRecordResult) -> Option<String> {
     match result {
         WriteRecordResult::Ok => None,
         WriteRecordResult::ExpansionError(msg) => Some(msg),
-    }
-}
-
-/// Marks the run as failed and prints a concise message, unless the run is
-/// being interrupted (where killed jobs are expected and must stay quiet).
-fn report_task_failure(
-    task_id: &TaskId,
-    detail: &str,
-    any_failed: &Arc<AtomicBool>,
-    interrupted: &Arc<AtomicBool>,
-) {
-    any_failed.store(true, Ordering::SeqCst);
-    if !interrupted.load(Ordering::SeqCst) {
-        eprintln!("task '{task_id}' {detail}");
     }
 }
 
@@ -1365,10 +1353,7 @@ mod tests {
         use std::process::ExitStatus;
 
         let any_failed = Arc::new(AtomicBool::new(false));
-        let interrupted = Arc::new(AtomicBool::new(true)); // suppressed output
-        let task_id: TaskId = TaskId::new("test-pkg", "test-task");
 
-        // Exit status with code 1
         #[cfg(unix)]
         let status_with_code = ExitStatus::from_raw(256); // 1 << 8
         #[cfg(windows)]
@@ -1381,56 +1366,9 @@ mod tests {
                 detected_outputs: None,
             });
 
-        report_task_outcome(&task_id, &outcome_with_code, &any_failed, &interrupted);
+        report_task_outcome(&outcome_with_code, &any_failed);
 
-        // any_failed should be set
         assert!(any_failed.load(Ordering::SeqCst));
-    }
-
-    // Test the exact formatting logic used in report_task_outcome.
-    // Verifies: (1) output contains "failed with status 1" for code Some(1)
-    //           (2) output does NOT contain "Some("
-    //           (3) output for signal-terminated (None) is "failed"
-    #[test]
-    fn status_code_format_omits_some_wrapper() {
-        #[cfg(unix)]
-        use std::os::unix::process::ExitStatusExt;
-        use std::process::ExitStatus;
-
-        // Simulate code() == Some(1)
-        #[cfg(unix)]
-        let status_with_code = ExitStatus::from_raw(256); // 1 << 8
-        #[cfg(windows)]
-        let status_with_code = ExitStatus::from_raw(1);
-
-        let detail = match status_with_code.code() {
-            Some(code) => format!("failed with status {code}"),
-            None => "failed".to_string(),
-        };
-
-        assert!(
-            !detail.contains("Some("),
-            "detail must not contain 'Some(': got: {:?}",
-            detail
-        );
-        assert_eq!(detail, "failed with status 1");
-
-        // Simulate code() == None (signal termination on Unix)
-        #[cfg(unix)]
-        {
-            let status_killed = ExitStatus::from_raw(9); // SIGKILL
-            let detail_none = match status_killed.code() {
-                Some(code) => format!("failed with status {code}"),
-                None => "failed".to_string(),
-            };
-
-            assert!(
-                !detail_none.contains("Some("),
-                "detail must not contain 'Some(': got: {:?}",
-                detail_none
-            );
-            assert_eq!(detail_none, "failed");
-        }
     }
 
     // Tests for outputs_lexically_in_package read-time scope gate.
@@ -1535,10 +1473,11 @@ mod tests {
 
         let rendered = format_captured_failure_logs(
             FailureLogContext {
-                task_id: &task_id,
+                task_id: task_id.clone(),
                 start_unix_ms: 10,
                 end_unix_ms: 20,
                 exit_status: Some(1),
+                fallback_detail: None,
             },
             &sink,
         );
@@ -1552,6 +1491,83 @@ mod tests {
         assert!(
             report_index < footer_index,
             "report must render before footer: {rendered}"
+        );
+    }
+
+    #[test]
+    fn format_captured_failure_logs_appends_fallback_detail_after_output() {
+        let task_id = TaskId::new("app", "build");
+        let sink = ExecutionLogSink::new();
+        sink.push(LogStream::Stdout, "stdout line");
+        sink.push(LogStream::Stderr, "stderr line");
+        let detail =
+            "failed: worker 'crash-worker' crashed during job 'app#build': exited with code 1";
+
+        let rendered = format_captured_failure_logs(
+            FailureLogContext {
+                task_id: task_id.clone(),
+                start_unix_ms: 10,
+                end_unix_ms: 20,
+                exit_status: None,
+                fallback_detail: Some(detail.to_string()),
+            },
+            &sink,
+        );
+        let stdout_index = rendered.find("stdout line").unwrap();
+        let stderr_index = rendered.find("stderr line").unwrap();
+        let detail_index = rendered.find(detail).unwrap();
+        let footer_index = rendered.find("╰─").unwrap();
+
+        assert!(
+            stdout_index < stderr_index && stderr_index < detail_index,
+            "captured output should appear before fallback detail: {rendered}"
+        );
+        assert!(
+            detail_index < footer_index,
+            "fallback detail must render inside block before footer: {rendered}"
+        );
+        assert_eq!(
+            rendered.matches(detail).count(),
+            1,
+            "fallback detail should appear exactly once: {rendered}"
+        );
+        assert!(
+            rendered.contains("exit unknown") && rendered.contains("cache 71d474512380"),
+            "missing failure footer: {rendered}"
+        );
+    }
+
+    #[test]
+    fn format_captured_failure_logs_uses_fallback_detail_when_output_empty() {
+        let task_id = TaskId::new("app", "build");
+        let sink = ExecutionLogSink::new();
+        let detail =
+            "failed: worker 'crash-worker' crashed during job 'app#build': exited with code 1";
+
+        let rendered = format_captured_failure_logs(
+            FailureLogContext {
+                task_id: task_id.clone(),
+                start_unix_ms: 10,
+                end_unix_ms: 20,
+                exit_status: None,
+                fallback_detail: Some(detail.to_string()),
+            },
+            &sink,
+        );
+
+        assert!(
+            rendered.contains("╭─"),
+            "missing failure header: {rendered}"
+        );
+        assert!(
+            rendered.contains(detail),
+            "fallback detail should render inside block: {rendered}"
+        );
+        assert!(
+            rendered.contains("╰─")
+                && rendered.contains("exit unknown")
+                && rendered.contains("cache 71d474512380"),
+            "missing failure footer: {rendered}"
         );
     }
     #[test]
