@@ -23,6 +23,14 @@ const CTRF_FIXTURE: &str = r#"{"results":{"tool":{"name":"test-runner"},"summary
 /// Plain text report for unknown-MIME verbatim test.
 const PLAIN_TEXT_FIXTURE: &str = "Build Summary:\n- Compiled 5 files\n- 0 warnings\n- 0 errors\n";
 
+fn report_input(filename: &str, mime_type: &str, content: &str) -> luchta_cache::ReportInput {
+    luchta_cache::ReportInput {
+        filename: filename.to_string(),
+        mime_type: mime_type.to_string(),
+        content: content.to_string(),
+    }
+}
+
 // ============================================================================
 // HELPER: Shell worker that emits report(s) before done
 // ============================================================================
@@ -88,9 +96,7 @@ fn setup_two_package_report_workspace(temp: &assert_fs::TempDir) {
 
 #[test]
 fn cache_write_read_report_byte_exact() {
-    use luchta_cache::{
-        Cache, ReportInput, RunArtifacts, TaskRunRecord, CACHE_DIR_NAME, LUCHTA_DIR_NAME,
-    };
+    use luchta_cache::{Cache, RunArtifacts, TaskRunRecord, CACHE_DIR_NAME, LUCHTA_DIR_NAME};
     use std::collections::BTreeMap;
     use tempfile::tempdir;
 
@@ -99,7 +105,7 @@ fn cache_write_read_report_byte_exact() {
 
     // Create record with reports
     let record = TaskRunRecord {
-        schema_version: 2,
+        schema_version: 3,
         task_spec_hash: [1u8; 32],
         input_patterns: vec!["src/**/*.ts".to_string()],
         inputs: vec![],
@@ -125,6 +131,7 @@ fn cache_write_read_report_byte_exact() {
                 mime_type: "text/plain".to_string(),
             },
         ],
+        cache_nonce: None,
     };
 
     // Content with specific bytes including trailing newline
@@ -132,16 +139,8 @@ fn cache_write_read_report_byte_exact() {
     let txt_content = "Hello\nWorld\n";
 
     let reports = vec![
-        ReportInput {
-            filename: "sarif.json".to_string(),
-            mime_type: "application/sarif+json".to_string(),
-            content: sarif_content.to_string(),
-        },
-        ReportInput {
-            filename: "report.txt".to_string(),
-            mime_type: "text/plain".to_string(),
-            content: txt_content.to_string(),
-        },
+        report_input("sarif.json", "application/sarif+json", sarif_content),
+        report_input("report.txt", "text/plain", txt_content),
     ];
 
     cache
@@ -216,7 +215,7 @@ fn cache_duplicate_filename_last_wins() {
     let cache = Cache::open(&temp_dir.path().join(LUCHTA_DIR_NAME).join(CACHE_DIR_NAME)).unwrap();
 
     let record = TaskRunRecord {
-        schema_version: 2,
+        schema_version: 3,
         task_spec_hash: [1u8; 32],
         input_patterns: vec![],
         inputs: vec![],
@@ -236,6 +235,7 @@ fn cache_duplicate_filename_last_wins() {
             filename: "report.json".to_string(),
             mime_type: "application/json".to_string(),
         }],
+        cache_nonce: None,
     };
 
     // Two reports with same filename - last should win
@@ -287,7 +287,7 @@ fn cache_rejects_traversal_filename() {
     let cache = Cache::open(&temp_dir.path().join(LUCHTA_DIR_NAME).join(CACHE_DIR_NAME)).unwrap();
 
     let record = TaskRunRecord {
-        schema_version: 2,
+        schema_version: 3,
         task_spec_hash: [1u8; 32],
         input_patterns: vec![],
         inputs: vec![],
@@ -304,6 +304,7 @@ fn cache_rejects_traversal_filename() {
         start_unix_ms: 0,
         end_unix_ms: 0,
         reports: vec![],
+        cache_nonce: None,
     };
 
     // Try to write with path traversal filename
@@ -349,7 +350,7 @@ fn cache_rejects_reserved_filename() {
     let cache = Cache::open(&temp_dir.path().join(LUCHTA_DIR_NAME).join(CACHE_DIR_NAME)).unwrap();
 
     let record = TaskRunRecord {
-        schema_version: 2,
+        schema_version: 3,
         task_spec_hash: [1u8; 32],
         input_patterns: vec![],
         inputs: vec![],
@@ -366,6 +367,7 @@ fn cache_rejects_reserved_filename() {
         start_unix_ms: 0,
         end_unix_ms: 0,
         reports: vec![],
+        cache_nonce: None,
     };
 
     // Try to write with reserved filename

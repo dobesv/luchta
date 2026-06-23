@@ -128,9 +128,16 @@ interface EnvSpec {
   input?: boolean;
 }
 
+interface CacheConfig {
+  /** Optional nonce; change to force-bust this scope's cache. */
+  nonce?: string;
+}
+
 interface TaskDefinition {
   /** Tasks that must finish before this one runs. */
   dependsOn?: DependsOn[];
+  /** Opt-in build cache configuration. */
+  cache?: CacheConfig;
   /** Relative cost for the weighted scheduler. Defaults to 1. */
   weight?: number;
   /**
@@ -149,6 +156,8 @@ interface TaskDefinition {
 interface WorkerDefinition {
   /** Command that launches the long-lived worker process. */
   command: string;
+  /** Optional cache configuration for all tasks on this worker. */
+  cache?: CacheConfig;
   /** Environment variables for all tasks running on this worker. Overrides global env. */
   env?: Record<string, EnvSpec>;
 }
@@ -156,6 +165,8 @@ interface WorkerDefinition {
 interface LuchtaConfig {
   /** Global environment variables for all tasks. */
   env?: Record<string, EnvSpec>;
+  /** Global cache configuration for all tasks. */
+  cache?: CacheConfig;
   /** Pipeline task definitions, keyed by task name (or pkg#task, #task). */
   tasks?: Record<string, TaskDefinition>;
   /** Stay-resident worker definitions, keyed by worker name (Unix only). */
@@ -171,9 +182,11 @@ const config = {
   env: {
     NODE_ENV: { value: "production" }
   },
+  cache: { nonce: "v1" },
   tasks: {
     build: {
       dependsOn: ["^build"],
+      cache: { nonce: "v1" },
       weight: 2,
       env: {
         BUILD_TYPE: { value: "full" }
@@ -197,6 +210,7 @@ const config = {
   workers: {
     yarn: {
       command: "luchta-yarn-worker",
+      cache: { nonce: "v1" },
       env: {
         YARN_CACHE_FOLDER: { default: "./.yarn-cache" }
       }
@@ -217,7 +231,7 @@ The top-level `tasks` map defines the pipeline. Each task may set:
   from the package's `package.json` is used.
 - `worker`: name of a long-lived worker (from the `workers` map) that should
   execute this task. The named worker **must** be defined or the run fails.
-- `cache`: opt-in build cache. Provide an object (`cache: {}`) to enable change-detection skips for successful prior runs; omit the field to disable. (Reserved for future per-task cache options.)
+- `cache`: opt-in build cache. Provide an object (e.g. `cache: {}`) to enable change-detection skips for successful prior runs; omit the field to disable. Set the `nonce` field (e.g. `cache: { nonce: "v1" }`) to force-bust this task's cache. See [Cache Nonce](#cache-nonce-force-busting-stale-cache) for details.
 - `inputs`: relative input paths/globs. Literal paths and glob matches are hashed from git-tracked files, so `.gitignore` is respected. See [Input Pattern Prefixes](#input-pattern-prefixes).
 - `outputs`: relative output paths/globs. These are checked on disk, so missing/deleted outputs invalidate cache entries even if ignored by git.
 - `env`: environment variables for the task. See [Environment Variables](#environment-variables) for details on scopes and resolution modes.
@@ -299,6 +313,7 @@ To prevent extremely large logs from flooding the terminal, `luchta run` truncat
 
 Precedence: flag > env var > default.
 
+
 Behavior: luchta pauses dispatching **NEW** tasks while process-tree RSS exceeds `--mem-usage-threshold` **or** system available memory drops below `--mem-free-threshold`. In-flight tasks run to completion. There is no timeout or auto-abort while paused; use Ctrl-C to abort.
 
 Status line: while paused, periodic progress output appends `⚠️ mem usage high` and/or `⚠️ system free memory low`.
@@ -311,6 +326,13 @@ Status line: while paused, periodic progress output appends `⚠️ mem usage hi
   - Default: `concurrency.maxWeight` from config, or available parallelism.
 
 Precedence: flag > env var > config `concurrency.maxWeight` > default.
+
+#### Cache Nonce override
+
+- `LUCHTA_CACHE_NONCE`
+  - An independent global nonce that is read once per run and busts ALL task caches.
+  - Combines with (does not override) any nonces defined in the configuration files.
+  - Use this to quickly force-bust the entire workspace cache from a CI script or local shell.
 
 
 ### Viewing Logs
@@ -338,6 +360,7 @@ All executed tasks—even those that are not opt-in for caching—persist their 
 | `--failed` | Filter to tasks that failed (`succeeded == false`). |
 | `--show-inputs` | Show input file metadata (path, size, mtime, hash) for each task. |
 | `--show-outputs` | Show output file metadata for each task. |
+| `--show-cache-nonce` | Show the resolved nonce string persisted for the task. |
 | `--file <NAME>` | Raw byte-exact passthrough of named report files (repeatable). |
 
 `luchta logs` always displays the full, non-truncated output for every matching task.
@@ -533,6 +556,25 @@ build: {
 ```
 
 
+
+### Cache Nonce (force-busting stale cache)
+
+The `nonce` knob lets you force-bust stale cache entries. This is useful if a task's inputs were previously under-reported (poisoning the cache) or if you need to ensure a fresh run.
+
+Nonces are available at four scopes and are **additive**:
+- **Global:** `cache: { nonce: "..." }` on the top-level `LuchtaConfig`.
+- **Worker:** `cache: { nonce: "..." }` on a worker definition. Affects all tasks using that worker.
+- **Task:** `cache: { nonce: "..." }` on a task definition.
+- **Environment variable:** `LUCHTA_CACHE_NONCE` — an independent global 4th nonce, read once per run.
+
+#### Semantics
+- **Combine:** All nonces combine; changing any single one invalidates the affected scope's cache. Empty/absent everywhere has no effect.
+- **Stale Entries:** Setting a nonce does NOT delete old cache entries; it changes the hash so a fresh entry is written. The local cache keeps only the most recent entry per task, so reverting a nonce is a fresh cache miss (the task re-runs) rather than restoring the old result; the shared cache may still hold a matching prior candidate.
+- **Recovery (GitHub #118):** If a worker under-reports a task's inputs (a worker bug), a cache entry can be "poisoned" with wrong outputs. Fixing the worker does NOT invalidate that entry, because the task spec hash does not include the worker's version/code. To recover, bump the relevant-scope `nonce` (e.g. change `nonce: "v1"` → `"v2"`) or set `LUCHTA_CACHE_NONCE`.
+- **Upgrade Note:** Shipping this feature changed the on-disk cache record layout; the first run after upgrading will re-run all cached tasks once.
+
+#### Inspection
+Use `luchta logs --show-cache-nonce` to view the resolved nonce string persisted per task (shows `(none)` when no nonce is applied).
 
 ### Shared Build Cache
 

@@ -89,6 +89,8 @@ pub struct PreparedWorkspace {
     /// The resident worker manager used for resolution; reused for execution so
     /// resolve and run share the same worker processes.
     pub worker_manager: Arc<WorkerManager>,
+    /// Global cache nonce from LuchtaConfig.cache.
+    pub global_cache_nonce: Option<String>,
 }
 
 enum SinceSelection {
@@ -163,6 +165,7 @@ pub async fn prepare_workspace(
         pruned,
         pruned_ids,
         worker_manager,
+        global_cache_nonce: config.cache.and_then(|c| c.cache_nonce),
     })
 }
 
@@ -176,6 +179,8 @@ struct RunContext {
     pruned: Vec<PrunedTask>,
     worker_manager: Arc<WorkerManager>,
     since_affected: Option<HashSet<PackageName>>,
+    /// Global cache nonce from LuchtaConfig.cache.
+    global_cache_nonce: Option<String>,
 }
 
 pub async fn run_tasks(
@@ -237,6 +242,8 @@ pub async fn run_tasks(
         memory_monitor: &mut memory_monitor,
         pressure_state: &pressure_state,
         shared_cache,
+        workers: &run.workers,
+        global_cache_nonce: run.global_cache_nonce,
     })
     .await
 }
@@ -260,6 +267,8 @@ struct RunDispatch<'a> {
     memory_monitor: &'a mut crate::memory_pressure::MemoryMonitor,
     pressure_state: &'a Arc<crate::memory_pressure::PressureState>,
     shared_cache: Option<Arc<SharedCache>>,
+    workers: &'a HashMap<String, WorkerDefinition>,
+    global_cache_nonce: Option<String>,
 }
 
 async fn prepare_run_context(
@@ -278,6 +287,7 @@ async fn prepare_run_context(
         pruned,
         pruned_ids: _,
         worker_manager,
+        global_cache_nonce,
     } = prepare_workspace(workspace_root, ResolveMode::Run, max_weight_override).await?;
 
     if packages.is_empty() {
@@ -308,6 +318,7 @@ async fn prepare_run_context(
         pruned,
         worker_manager,
         since_affected,
+        global_cache_nonce,
     }))
 }
 
@@ -326,6 +337,9 @@ async fn run_dispatch_loop(d: RunDispatch<'_>) -> Result<()> {
     let interrupted = Arc::new(AtomicBool::new(false));
     let lockfile_state = load_lockfile_state(d.workspace_root);
 
+    // Read LUCHTA_CACHE_NONCE exactly once at startup.
+    let env_cache_nonce = std::env::var("LUCHTA_CACHE_NONCE").ok();
+
     let ctx = DispatchContext {
         tasks_to_run: d.tasks_to_run,
         commands: d.commands,
@@ -343,6 +357,9 @@ async fn run_dispatch_loop(d: RunDispatch<'_>) -> Result<()> {
         reporter: d.reporter,
         lockfile: &lockfile_state,
         shared_cache: d.shared_cache.clone(),
+        workers: d.workers,
+        global_cache_nonce: d.global_cache_nonce,
+        env_cache_nonce,
     };
     let run_result = dispatch_loop(&mut receiver, &ctx, d.memory_monitor, d.pressure_state).await;
 
@@ -370,6 +387,34 @@ struct DispatchContext<'a> {
     lockfile: &'a LockfileState,
     /// Shared cache for cross-worktree cache hits. `None` if shared cache disabled.
     shared_cache: Option<Arc<SharedCache>>,
+    /// Workers map for nonce resolution.
+    workers: &'a HashMap<String, WorkerDefinition>,
+    /// Global cache nonce from LuchtaConfig.cache.
+    global_cache_nonce: Option<String>,
+    /// Environment nonce from LUCHTA_CACHE_NONCE (read once at startup).
+    env_cache_nonce: Option<String>,
+}
+
+impl<'a> DispatchContext<'a> {
+    /// Resolves the cache nonce for a task, combining all four sources.
+    fn resolve_task_nonce(&self, task_def: &TaskDefinition) -> Option<String> {
+        let env_nonce = self.env_cache_nonce.as_deref();
+        let global_nonce = self.global_cache_nonce.as_deref();
+        // Worker nonce: sparse lookup — missing worker or dangling ref yields None
+        let worker_nonce = task_def
+            .worker
+            .as_deref()
+            .and_then(|w| self.workers.get(w))
+            .and_then(|wd| wd.cache.as_ref())
+            .and_then(|c| c.cache_nonce.as_deref());
+        // Task nonce
+        let task_nonce = task_def
+            .cache
+            .as_ref()
+            .and_then(|c| c.cache_nonce.as_deref());
+
+        crate::cache_nonce::resolve_cache_nonce(env_nonce, global_nonce, worker_nonce, task_nonce)
+    }
 }
 
 struct TaskRunContext {
@@ -396,6 +441,8 @@ struct CacheWriteContext {
     repo_root: PathBuf,
     source_pkg: PackageName,
     package_graph: PackageGraph,
+    /// Resolved cache nonce string for this task.
+    cache_nonce: Option<String>,
 }
 
 struct OutputHashRecordContext {
@@ -519,6 +566,7 @@ pub async fn dry_run_tasks(workspace_root: &Path, selection: &TaskSelection<'_>)
         pruned,
         pruned_ids: _,
         worker_manager,
+        global_cache_nonce: _,
     } = prepare_workspace(workspace_root, ResolveMode::Run, None).await?;
 
     // Resolution may have spawned resident workers; shut them down once the

@@ -781,6 +781,7 @@ fn manager_with_worker_timeout(
             command: worker_path.display().to_string(),
             depends_on: Vec::new(),
             env: std::collections::BTreeMap::new(),
+            cache: None,
         },
     );
     WorkerManager::with_shutdown_timeout(definitions, timeout)

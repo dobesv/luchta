@@ -10,6 +10,8 @@ pub struct LogBlockMeta<'a> {
     pub duration_ms: Option<u64>,
     pub exit_status: Option<i32>,
     pub cache_hash: Option<&'a str>,
+    pub show_cache_nonce: bool,
+    pub cache_nonce: Option<&'a str>,
 }
 
 const TIMESTAMP_PRINTER: DateTimePrinter = DateTimePrinter::new().precision(Some(0));
@@ -62,6 +64,9 @@ pub fn format_task_log_block(
             out.push('\n');
         }
     }
+
+    push_cache_nonce_line(&mut out, meta.show_cache_nonce, meta.cache_nonce);
+
     out.push_str(&format!(
         "{} {} · {} {} · {} {}\n",
         FOOTER_MARKER.if_supports_color(stream, |t| t.blue()),
@@ -72,6 +77,15 @@ pub fn format_task_log_block(
         cache.if_supports_color(stream, |t| t.dimmed())
     ));
     out
+}
+
+fn push_cache_nonce_line(out: &mut String, show_cache_nonce: bool, cache_nonce: Option<&str>) {
+    if !show_cache_nonce {
+        return;
+    }
+
+    let nonce_str = cache_nonce.unwrap_or("(none)");
+    out.push_str(&format!("  Cache nonce: {}\n", nonce_str));
 }
 
 pub struct ReportRenderInput<'a> {
@@ -597,18 +611,21 @@ mod tests {
         assert_eq!(package_and_task_display(&task_id), ("app", "test"));
     }
 
-    #[test]
-    fn format_task_log_block_root_task_label_single_hash() {
-        // Root task: package is "#" → label should be "#build", not "##build"
-        let meta = LogBlockMeta {
-            package: "#",
+    fn test_log_meta(package: &'static str) -> LogBlockMeta<'static> {
+        LogBlockMeta {
+            package,
             task: "build",
             start: None,
             duration_ms: None,
             exit_status: None,
             cache_hash: None,
-        };
-        let output = format_task_log_block(&meta, "body", "", Stream::Stdout);
+            show_cache_nonce: false,
+            cache_nonce: None,
+        }
+    }
+    #[test]
+    fn format_task_log_block_root_task_label_single_hash() {
+        let output = format_task_log_block(&test_log_meta("#"), "body", "", Stream::Stdout);
         assert!(
             output.contains("#build"),
             "expected label '#build' for root task, got: {output}"
@@ -621,16 +638,7 @@ mod tests {
 
     #[test]
     fn format_task_log_block_non_root_task_label_package_hash() {
-        // Non-root task: package is "app" → label should be "app#build"
-        let meta = LogBlockMeta {
-            package: "app",
-            task: "build",
-            start: None,
-            duration_ms: None,
-            exit_status: None,
-            cache_hash: None,
-        };
-        let output = format_task_log_block(&meta, "body", "", Stream::Stdout);
+        let output = format_task_log_block(&test_log_meta("app"), "body", "", Stream::Stdout);
         assert!(
             output.contains("app#build"),
             "expected label 'app#build' for non-root task, got: {output}"
@@ -833,6 +841,8 @@ mod tests {
             duration_ms: None,
             exit_status: None,
             cache_hash: None,
+            show_cache_nonce: false,
+            cache_nonce: None,
         };
 
         let output = format_task_log_block(&meta, "body line", "report line\n", Stream::Stdout);
@@ -933,6 +943,8 @@ mod tests {
             duration_ms: Some(1_234),
             exit_status: Some(1),
             cache_hash: Some("deadbeefcafe"),
+            show_cache_nonce: false,
+            cache_nonce: None,
         };
         let reports = render_reports_pretty(
             [ReportRenderInput {
@@ -985,5 +997,32 @@ mod tests {
         assert!(formatted.contains("test 2"));
         assert!(formatted.contains("Expected 1 to be 2"));
         assert!(formatted.contains("Trace: Error at line 1"));
+    }
+    #[test]
+    fn format_task_log_block_shows_cache_nonce() {
+        let mut meta = LogBlockMeta {
+            package: "app",
+            task: "build",
+            start: None,
+            duration_ms: None,
+            exit_status: None,
+            cache_hash: None,
+            show_cache_nonce: true,
+            cache_nonce: Some("env=v1&task=t1"),
+        };
+
+        // True + Some
+        let output = format_task_log_block(&meta, "body", "", Stream::Stdout);
+        assert!(output.contains("Cache nonce: env=v1&task=t1"));
+
+        // True + None
+        meta.cache_nonce = None;
+        let output = format_task_log_block(&meta, "body", "", Stream::Stdout);
+        assert!(output.contains("Cache nonce: (none)"));
+
+        // False
+        meta.show_cache_nonce = false;
+        let output = format_task_log_block(&meta, "body", "", Stream::Stdout);
+        assert!(!output.contains("Cache nonce:"));
     }
 }

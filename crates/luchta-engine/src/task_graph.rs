@@ -1895,6 +1895,7 @@ mod tests {
                 command: "echo".to_string(),
                 depends_on: vec![],
                 env: BTreeMap::new(),
+                cache: None,
             },
         )]);
         TaskGraph::validate_tasks(&package_graph, &pipeline, &workers)
@@ -2403,6 +2404,7 @@ mod tests {
                 command: "yarn".to_string(),
                 depends_on: vec![],
                 env: BTreeMap::new(),
+                cache: None,
             },
         )]);
 
@@ -2442,6 +2444,7 @@ mod tests {
                 command: "yarn".to_string(),
                 depends_on: vec![],
                 env: BTreeMap::new(),
+                cache: None,
             },
         )]);
 
@@ -2467,6 +2470,7 @@ mod tests {
                 command: "yarn".to_string(),
                 depends_on: vec![DependsOn::Root(TaskName::from("missing"))],
                 env: BTreeMap::new(),
+                cache: None,
             },
         )]);
 
@@ -2492,6 +2496,7 @@ mod tests {
                 command: "yarn".to_string(),
                 depends_on: vec![DependsOn::Specific(TaskId::new("@repo/a", "build"))],
                 env: BTreeMap::new(),
+                cache: None,
             },
         )]);
         let pruned_ids = HashSet::from([TaskId::new("@repo/a", "build")]);
@@ -2522,6 +2527,7 @@ mod tests {
                 command: "yarn".to_string(),
                 depends_on: vec![],
                 env: BTreeMap::new(),
+                cache: None,
             },
         )]);
 
@@ -2560,6 +2566,7 @@ mod tests {
                 command: "yarn".to_string(),
                 depends_on: vec![injected_dep.clone()],
                 env: BTreeMap::new(),
+                cache: None,
             },
         )]);
 
@@ -2612,6 +2619,7 @@ mod tests {
                 command: "yarn".to_string(),
                 depends_on: vec![injected_dep.clone()],
                 env: BTreeMap::new(),
+                cache: None,
             },
         )]);
 
@@ -2666,6 +2674,7 @@ mod tests {
                 command: "yarn".to_string(),
                 depends_on: vec![injected_dep.clone()],
                 env: BTreeMap::new(),
+                cache: None,
             },
         )]);
 
@@ -2711,6 +2720,7 @@ mod tests {
                 command: "yarn".to_string(),
                 depends_on: vec![DependsOn::Specific(TaskId::new("@repo/a", "nonexistent"))],
                 env: BTreeMap::new(),
+                cache: None,
             },
         )]);
 
@@ -2752,6 +2762,7 @@ mod tests {
                 command: "yarn".to_string(),
                 depends_on: vec![DependsOn::DirectUpstream(TaskName::from("prepare"))],
                 env: BTreeMap::new(),
+                cache: None,
             },
         )]);
 

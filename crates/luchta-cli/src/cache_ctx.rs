@@ -188,9 +188,10 @@ pub fn build_current_state<'a>(
     dep_outputs: BTreeMap<String, [u8; 32]>,
     pkg_dep_pairs: &'a [(String, String)],
     resolver: &'a dyn FileStateResolver,
+    nonce: Option<&str>,
 ) -> CurrentState<'a> {
     CurrentState {
-        task_spec_hash: task_spec_hash(task_def),
+        task_spec_hash: task_spec_hash(task_def, nonce),
         // Hash declared merged EnvSpec only. Built-in passthrough whitelist vars are
         // injected later into ExecutionRequest.env, so whitelist-only ambient changes
         // never enter env_hash.

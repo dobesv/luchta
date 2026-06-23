@@ -1,4 +1,5 @@
 mod cache_ctx;
+mod cache_nonce;
 mod cli;
 mod config;
 mod env_conflict;
@@ -68,6 +69,7 @@ async fn run(cli: Cli) -> Result<()> {
             failed,
             show_inputs,
             show_outputs,
+            show_cache_nonce,
             files,
         } => {
             let options = LogsOptions {
@@ -78,6 +80,7 @@ async fn run(cli: Cli) -> Result<()> {
                 failed,
                 show_inputs,
                 show_outputs,
+                show_cache_nonce,
                 files: &files,
             };
             logs::execute_logs(&workspace_root, &options).await

@@ -20,7 +20,7 @@ pub fn blake3_file(path: &Path) -> crate::Result<[u8; 32]> {
 }
 
 #[must_use]
-pub fn task_spec_hash(task_def: &TaskDefinition) -> [u8; 32] {
+pub fn task_spec_hash(task_def: &TaskDefinition, nonce: Option<&str>) -> [u8; 32] {
     let spec = TaskSpecHashInput {
         command: task_def.command.as_deref(),
         worker: task_def.worker.as_deref(),
@@ -29,6 +29,7 @@ pub fn task_spec_hash(task_def: &TaskDefinition) -> [u8; 32] {
         cache_enabled: task_def.cache_enabled(),
         inputs: &task_def.inputs,
         outputs: &task_def.outputs,
+        nonce,
     };
     let bytes = bincode::serde::encode_to_vec(spec, bincode_config())
         .expect("task spec canonical bincode serialization should succeed");
@@ -88,6 +89,14 @@ struct TaskSpecHashInput<'a> {
     // `env_hash`, which honors the `input: false` opt-out.
     inputs: &'a [String],
     outputs: &'a [String],
+    // Cache nonce belongs in task_spec_hash, not env_hash: unlike env, this is
+    // cache-control with no opt-out semantics, so any supplied value must always
+    // invalidate task-spec identity. See docs/hash-boundary-task-spec-vs-separate
+    // for prior art on why env stays tracked separately by env_hash. Adding this
+    // Option also changes bincode layout even for None because Option serializes a
+    // discriminant byte, so on-disk hashes invalidate once on upgrade; accepted by
+    // plan decision.
+    nonce: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -128,90 +137,190 @@ mod tests {
     #[test]
     fn task_spec_hash_changes_when_command_changes() {
         let mut task = sample_task_definition();
-        let baseline = task_spec_hash(&task);
+        let baseline = task_spec_hash(&task, None);
         task.command = Some("pnpm run test".to_owned());
 
-        assert_ne!(baseline, task_spec_hash(&task));
+        assert_ne!(baseline, task_spec_hash(&task, None));
     }
 
     #[test]
     fn task_spec_hash_changes_when_weight_changes() {
         let mut task = sample_task_definition();
-        let baseline = task_spec_hash(&task);
+        let baseline = task_spec_hash(&task, None);
         task.weight += 1;
 
-        assert_ne!(baseline, task_spec_hash(&task));
+        assert_ne!(baseline, task_spec_hash(&task, None));
     }
 
     #[test]
     fn task_spec_hash_changes_when_worker_changes() {
         let mut task = sample_task_definition();
-        let baseline = task_spec_hash(&task);
+        let baseline = task_spec_hash(&task, None);
         task.worker = Some("shell".to_owned());
 
-        assert_ne!(baseline, task_spec_hash(&task));
+        assert_ne!(baseline, task_spec_hash(&task, None));
     }
 
     #[test]
     fn task_spec_hash_changes_when_depends_on_changes() {
         let mut task = sample_task_definition();
-        let baseline = task_spec_hash(&task);
+        let baseline = task_spec_hash(&task, None);
         task.depends_on
             .push(DependsOn::Root(TaskName::from("lint")));
 
-        assert_ne!(baseline, task_spec_hash(&task));
+        assert_ne!(baseline, task_spec_hash(&task, None));
     }
 
     #[test]
     fn task_spec_hash_changes_when_cache_enabled_toggles() {
         let mut task = sample_task_definition();
-        let baseline = task_spec_hash(&task);
+        let baseline = task_spec_hash(&task, None);
         task.cache = None;
 
-        assert_ne!(baseline, task_spec_hash(&task));
+        assert_ne!(baseline, task_spec_hash(&task, None));
     }
 
     #[test]
     fn task_spec_hash_ignores_significant_env_changes() {
         let mut task = sample_task_definition();
-        let baseline = task_spec_hash(&task);
+        let baseline = task_spec_hash(&task, None);
         task.env.get_mut("NODE_ENV").expect("NODE_ENV").value = Some("prod".to_owned());
 
-        assert_eq!(baseline, task_spec_hash(&task));
+        assert_eq!(baseline, task_spec_hash(&task, None));
     }
 
     #[test]
     fn task_spec_hash_ignores_input_false_env_changes() {
         let mut task = sample_task_definition();
-        let baseline = task_spec_hash(&task);
+        let baseline = task_spec_hash(&task, None);
         task.env.get_mut("API_TOKEN").expect("API_TOKEN").value = Some("secret".to_owned());
 
-        assert_eq!(baseline, task_spec_hash(&task));
+        assert_eq!(baseline, task_spec_hash(&task, None));
     }
 
     #[test]
     fn task_spec_hash_changes_when_inputs_change() {
         let mut task = sample_task_definition();
-        let baseline = task_spec_hash(&task);
+        let baseline = task_spec_hash(&task, None);
         task.inputs.push("src/extra.ts".to_owned());
 
-        assert_ne!(baseline, task_spec_hash(&task));
+        assert_ne!(baseline, task_spec_hash(&task, None));
     }
 
     #[test]
     fn task_spec_hash_changes_when_outputs_change() {
         let mut task = sample_task_definition();
-        let baseline = task_spec_hash(&task);
+        let baseline = task_spec_hash(&task, None);
         task.outputs.push("coverage/**".to_owned());
 
-        assert_ne!(baseline, task_spec_hash(&task));
+        assert_ne!(baseline, task_spec_hash(&task, None));
     }
 
     #[test]
-    fn task_spec_hash_is_deterministic_for_identical_input() {
+    fn task_spec_hash_without_nonce_is_deterministic() {
+        let task = sample_task_definition();
+        let first = task_spec_hash(&task, None);
+        let second = task_spec_hash(&task, None);
+
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn task_spec_hash_without_nonce_matches_pinned_regression_value() {
         let task = sample_task_definition();
 
-        assert_eq!(task_spec_hash(&task), task_spec_hash(&task));
+        // Pinned after cacheNonce feature landed. Value changed once at feature
+        // introduction because bincode encodes Option with discriminant byte even
+        // for None, so future changes here should be deliberate.
+        assert_eq!(
+            task_spec_hash(&task, None),
+            [
+                201, 120, 202, 56, 231, 47, 51, 49, 237, 176, 254, 210, 159, 66, 141, 128, 16, 179,
+                43, 250, 104, 128, 87, 241, 7, 85, 210, 63, 25, 128, 83, 172,
+            ]
+        );
+    }
+
+    #[test]
+    fn task_spec_hash_changes_when_nonce_added() {
+        let task = sample_task_definition();
+
+        assert_ne!(
+            task_spec_hash(&task, Some("x")),
+            task_spec_hash(&task, None)
+        );
+    }
+
+    #[test]
+    fn task_spec_hash_changes_when_nonce_changes() {
+        let task = sample_task_definition();
+
+        assert_ne!(
+            task_spec_hash(&task, Some("a")),
+            task_spec_hash(&task, Some("b"))
+        );
+    }
+
+    #[test]
+    fn task_spec_hash_distinguishes_scope_specific_and_combined_nonces() {
+        let task = sample_task_definition();
+        let env_only = Some("env=env-only");
+        let global_only = Some("global=global-only");
+        let worker_only = Some("worker=worker-only");
+        let task_only = Some("task=task-only");
+        let combined = Some("env=env-only&global=global-only&worker=worker-only&task=task-only");
+
+        let hashes = [
+            task_spec_hash(&task, env_only),
+            task_spec_hash(&task, global_only),
+            task_spec_hash(&task, worker_only),
+            task_spec_hash(&task, task_only),
+            task_spec_hash(&task, combined),
+        ];
+
+        for (left_index, left_hash) in hashes.iter().enumerate() {
+            for right_hash in hashes.iter().skip(left_index + 1) {
+                assert_ne!(left_hash, right_hash);
+            }
+        }
+    }
+
+    #[test]
+    fn task_spec_hash_changes_when_any_nonce_source_changes() {
+        let task = sample_task_definition();
+        let baseline = task_spec_hash(
+            &task,
+            Some("env=env-a&global=global-a&worker=worker-a&task=task-a"),
+        );
+
+        assert_ne!(
+            baseline,
+            task_spec_hash(
+                &task,
+                Some("env=env-b&global=global-a&worker=worker-a&task=task-a"),
+            )
+        );
+        assert_ne!(
+            baseline,
+            task_spec_hash(
+                &task,
+                Some("env=env-a&global=global-b&worker=worker-a&task=task-a"),
+            )
+        );
+        assert_ne!(
+            baseline,
+            task_spec_hash(
+                &task,
+                Some("env=env-a&global=global-a&worker=worker-b&task=task-a"),
+            )
+        );
+        assert_ne!(
+            baseline,
+            task_spec_hash(
+                &task,
+                Some("env=env-a&global=global-a&worker=worker-a&task=task-b"),
+            )
+        );
     }
 
     #[test]

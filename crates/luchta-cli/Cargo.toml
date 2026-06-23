@@ -28,6 +28,7 @@ globset = { workspace = true }
 thiserror = { workspace = true }
 gix = { workspace = true }
 sysinfo = { workspace = true }
+percent-encoding = "2.3.2"
 luchta-types = { path = "../luchta-types" }
 luchta-workspace = { path = "../luchta-workspace" }
 luchta-engine = { path = "../luchta-engine" }
