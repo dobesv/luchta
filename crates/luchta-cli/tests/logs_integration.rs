@@ -84,11 +84,11 @@ fn logs_no_args_shows_all_cached_tasks() {
     let stdout = run_logs(&temp, &[]);
 
     assert!(
-        stdout.contains("──▶"),
+        stdout.contains("╭─"),
         "expected header marker in output: {stdout}"
     );
     assert!(
-        stdout.contains("──◀"),
+        stdout.contains("╰─"),
         "expected footer marker in output: {stdout}"
     );
     assert!(
@@ -146,12 +146,12 @@ fn logs_filters_task_selection() {
         args: &["-p", "app"],
         assertions: &[
             LogAssertion {
-                needle: "──▶",
+                needle: "╭─",
                 present: true,
                 message: "expected header marker in output",
             },
             LogAssertion {
-                needle: "──◀",
+                needle: "╰─",
                 present: true,
                 message: "expected footer marker in output",
             },
@@ -331,11 +331,14 @@ fn logs_header_contains_start() {
     common::run_luchta(&temp, "build").success();
 
     let stdout = run_logs(&temp, &[]);
+    let header = stdout
+        .lines()
+        .find(|line| line.contains("╭─"))
+        .unwrap_or_else(|| panic!("expected header marker: {stdout}"));
     assert!(
-        stdout.contains("start="),
-        "expected start timestamp in header: {stdout}"
+        header.contains(" · "),
+        "expected start timestamp separator in header: {stdout}"
     );
-    assert!(stdout.contains("──▶"), "expected header marker: {stdout}");
 }
 
 #[test]
@@ -344,16 +347,20 @@ fn logs_footer_contains_duration_exit_cache() {
     common::run_luchta(&temp, "build").success();
 
     let stdout = run_logs(&temp, &[]);
+    let footer = stdout
+        .lines()
+        .find(|line| line.contains("╰─"))
+        .unwrap_or_else(|| panic!("expected footer marker in output: {stdout}"));
     assert!(
-        stdout.contains("duration="),
-        "expected duration in footer: {stdout}"
+        footer.contains(" · exit "),
+        "expected duration + exit delimiter in footer: {stdout}"
     );
     assert!(
-        stdout.contains("exit=") && stdout.contains("0"),
+        footer.contains("exit 0"),
         "expected exit status in footer: {stdout}"
     );
     assert!(
-        stdout.contains("cache="),
+        footer.contains("cache "),
         "expected cache hash in footer: {stdout}"
     );
 }

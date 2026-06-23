@@ -71,6 +71,16 @@ fn format_captured_failure_logs(context: FailureLogContext<'_>, sink: &Execution
     }
 
     let lines: Vec<&str> = body.lines().collect();
+    let reports_raw = sink.reports();
+    let reports = crate::format::render_reports_pretty(
+        reports_raw
+            .iter()
+            .map(|report| crate::format::ReportRenderInput {
+                mime_type: &report.mime_type,
+                bytes: report.content.as_bytes(),
+            }),
+        Stream::Stderr,
+    );
 
     let cache_hash_full = task_cache_key(&task_id.to_string());
     let cache_hash_12 = &cache_hash_full[..12];
@@ -89,6 +99,8 @@ fn format_captured_failure_logs(context: FailureLogContext<'_>, sink: &Execution
             cache_hash: Some(cache_hash_12),
         },
         &body,
+        &reports,
+        Stream::Stderr,
     )
 }
 
@@ -1305,6 +1317,7 @@ fn replay_logs(hit: &RestoredHit, _reporter: &Arc<ProgressReporter>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use luchta_engine::CollectedReport;
     use std::sync::atomic::AtomicBool;
 
     /// Test that report_task_outcome sets any_failed and formats messages correctly.
@@ -1457,6 +1470,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn format_captured_failure_logs_includes_reports_inside_block() {
+        let task_id = TaskId::new("pkg", "build");
+        let sink = ExecutionLogSink::new();
+        sink.push(LogStream::Stdout, "stdout line");
+        sink.push_report(CollectedReport {
+            filename: "report.sarif".to_string(),
+            mime_type: "application/sarif+json".to_string(),
+            content: r#"{
+                "version": "2.1.0",
+                "runs": [{
+                    "tool": { "driver": { "name": "test" } },
+                    "results": [{
+                        "level": "error",
+                        "message": { "text": "Failure details" },
+                        "locations": [{
+                            "physicalLocation": {
+                                "artifactLocation": { "uri": "src/main.rs" },
+                                "region": { "startLine": 7, "startColumn": 2 }
+                            }
+                        }]
+                    }]
+                }]
+            }"#
+            .to_string(),
+        });
+
+        let rendered = format_captured_failure_logs(
+            FailureLogContext {
+                task_id: &task_id,
+                start_unix_ms: 10,
+                end_unix_ms: 20,
+                exit_status: Some(1),
+            },
+            &sink,
+        );
+        let report_index = rendered
+            .find("src/main.rs:7:2: error: Failure details")
+            .unwrap();
+        let footer_index = rendered.find("╰─").unwrap();
+
+        assert!(rendered.contains("stdout line"));
+        assert!(rendered.contains("src/main.rs:7:2: error: Failure details"));
+        assert!(
+            report_index < footer_index,
+            "report must render before footer: {rendered}"
+        );
+    }
     #[test]
     fn empty_outputs_are_eligible() {
         // Empty output list has no escapes

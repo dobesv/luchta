@@ -6,9 +6,11 @@
 use luchta_cache::{resolve_cache_dir, task_cache_key, Cache, FileEntry};
 use luchta_types::TaskId;
 use miette::Result;
+use owo_colors::Stream;
 
 use crate::format::{
-    format_task_log_block, format_unix_ms_local, package_and_task_display, LogBlockMeta,
+    format_task_log_block, format_unix_ms_local, package_and_task_display, render_reports_pretty,
+    LogBlockMeta, ReportRenderInput,
 };
 use crate::run::{
     build_globset, collect_matched_package_names, collect_requested_subgraph, prepare_workspace,
@@ -155,41 +157,30 @@ fn print_task_logs(cache: &Cache, task_id: &TaskId, options: &LogsOptions<'_>) {
     }
 
     let body = build_log_body(cache, &task_id_str);
+    let report_bytes: Vec<_> = record
+        .reports
+        .iter()
+        .filter_map(|report| {
+            cache
+                .read_report(&task_id_str, &report.filename)
+                .map(|bytes| (report, bytes))
+        })
+        .collect();
+    let reports = render_reports_pretty(
+        report_bytes
+            .iter()
+            .map(|(report, bytes)| ReportRenderInput {
+                mime_type: &report.mime_type,
+                bytes,
+            }),
+        Stream::Stdout,
+    );
     let cache_hash_full = task_cache_key(&task_id_str);
     let meta = build_log_block_meta(task_id, &record, &cache_hash_full);
-    print!("{}", format_task_log_block(&meta, &body));
-
-    for report in &record.reports {
-        if let Some(bytes) = cache.read_report(&task_id_str, &report.filename) {
-            use crate::format::{format_ctrf_pretty, format_sarif_pretty};
-            use crate::reports::{parse_ctrf, parse_sarif, printer_for, ReportKind};
-            use owo_colors::OwoColorize;
-
-            println!(
-                "  --- Report: {} ({}) ---",
-                report.filename.cyan(),
-                report.mime_type.dimmed()
-            );
-
-            match printer_for(&report.mime_type) {
-                Some(ReportKind::Sarif) => match parse_sarif(&bytes) {
-                    Ok(sarif) => print!("{}", format_sarif_pretty(&sarif)),
-                    Err(e) => println!("Failed to parse SARIF: {}", e),
-                },
-                Some(ReportKind::Ctrf) => match parse_ctrf(&bytes) {
-                    Ok(ctrf) => print!("{}", format_ctrf_pretty(&ctrf)),
-                    Err(e) => println!("Failed to parse CTRF: {}", e),
-                },
-                None => {
-                    use std::io::Write;
-                    let _ = std::io::stdout().write_all(&bytes);
-                    if !bytes.ends_with(b"\n") {
-                        println!();
-                    }
-                }
-            }
-        }
-    }
+    print!(
+        "{}",
+        format_task_log_block(&meta, &body, &reports, Stream::Stdout)
+    );
 
     render_file_sections(&record, options);
 }
@@ -402,6 +393,35 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "No task matching the selection contained any of the requested files."
+        );
+    }
+
+    #[test]
+    fn format_task_log_block_keeps_reports_before_footer() {
+        let meta = LogBlockMeta {
+            package: "pkg",
+            task: "lint",
+            start: None,
+            duration_ms: None,
+            exit_status: Some(1),
+            cache_hash: Some("abcdef123456"),
+        };
+        let body = join_output_streams("stdout line".to_string(), "stderr line".to_string());
+        let reports = render_reports_pretty(
+            [ReportRenderInput {
+                mime_type: "text/plain",
+                bytes: b"report body",
+            }],
+            Stream::Stdout,
+        );
+        let block = format_task_log_block(&meta, &body, &reports, Stream::Stdout);
+        let report_index = block.find("report body").unwrap();
+        let footer_index = block.find("╰─").unwrap();
+
+        assert!(block.contains("stdout line\nstderr line"));
+        assert!(
+            report_index < footer_index,
+            "report must render before footer: {block}"
         );
     }
 }
