@@ -8,6 +8,7 @@ use crate::{
     memory_pressure::{MemoryMonitor, MemoryPressure, PressureState},
 };
 use luchta_engine::ReadyTaskMessage;
+use owo_colors::OwoColorize;
 
 /// Events that can occur during a pause-loop tick.
 ///
@@ -139,7 +140,12 @@ fn render_status_line(
     let rss = crate::rss::format_rss(pressure.sample.map(|sample| sample.tree_rss));
     eprintln!(
         "{}",
-        reporter.render_progress(&rss, &pressure.reasons, &pressure)
+        reporter.render_progress(
+            &rss,
+            &pressure.reasons,
+            &pressure,
+            owo_colors::Stream::Stderr
+        )
     );
 }
 
@@ -171,13 +177,14 @@ pub(super) async fn dispatch_loop(
                     .sample
                     .map(|sample| sample.tree_rss)
                     .or_else(crate::rss::process_tree_rss_bytes);
-                eprintln!(
+                let msg = format!(
                     "Interrupted by {}: {} tasks running after {}s; RSS: {}",
                     shutdown.name(),
                     ctx.reporter.running_count(),
                     ctx.reporter.start.elapsed().as_secs(),
                     crate::rss::format_rss(rss),
                 );
+                eprintln!("{}", msg.as_str().if_supports_color(owo_colors::Stream::Stderr, |t| t.red()));
                 break Err(miette::miette!("interrupted"));
             }
             message = receiver.recv() => {
@@ -215,11 +222,16 @@ fn interrupted_during_pause(
         .sample
         .map(|sample| sample.tree_rss)
         .or_else(crate::rss::process_tree_rss_bytes);
-    eprintln!(
+    let msg = format!(
         "Interrupted: {} tasks running after {}s; RSS: {}",
         ctx.reporter.running_count(),
         ctx.reporter.start.elapsed().as_secs(),
         crate::rss::format_rss(rss),
+    );
+    eprintln!(
+        "{}",
+        msg.as_str()
+            .if_supports_color(owo_colors::Stream::Stderr, |t| t.red())
     );
     Err(miette::miette!("interrupted"))
 }
@@ -401,6 +413,7 @@ mod tests {
             &crate::rss::format_rss(pressure.sample.map(|sample| sample.tree_rss)),
             &pressure.reasons,
             &pressure,
+            owo_colors::Stream::Stderr,
         );
 
         assert!(line.contains("🐏 32 MB"));

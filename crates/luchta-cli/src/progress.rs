@@ -9,6 +9,7 @@ use std::{
 };
 
 use luchta_types::TaskId;
+use owo_colors::{OwoColorize, Stream};
 
 use crate::{
     cli::OutputMode,
@@ -115,6 +116,7 @@ impl ProgressReporter {
         rss_formatted: &str,
         warnings: &[PressureReason],
         pressure: &PressureSnapshot,
+        stream: Stream,
     ) -> String {
         let elapsed_total = self.start.elapsed().as_secs();
         let running = self
@@ -141,47 +143,94 @@ impl ProgressReporter {
             })
             .count();
 
-        let mut segments = vec![format!("✔ {done_or_skipped}")];
+        let mut segments = vec![format!("✔ {done_or_skipped}")
+            .if_supports_color(stream, |t| t.green())
+            .to_string()];
         if skipped > 0 {
-            segments.push(format!("⏩ {skipped}"));
+            segments.push(
+                format!("⏩ {skipped}")
+                    .if_supports_color(stream, |t| t.cyan())
+                    .to_string(),
+            );
         }
         if shared_hits > 0 {
-            segments.push(format!("📥 {shared_hits}"));
+            segments.push(
+                format!("📥 {shared_hits}")
+                    .if_supports_color(stream, |t| t.cyan())
+                    .to_string(),
+            );
         }
         if pending > 0 {
-            segments.push(format!("⌛ {pending}"));
+            segments.push(
+                format!("⌛ {pending}")
+                    .if_supports_color(stream, |t| t.dimmed())
+                    .to_string(),
+            );
         }
         if running_count > 0 {
-            segments.push(format!(
-                "🏃 {running_count} ({})",
-                render_running_task_list(&running)
-            ));
+            segments.push(
+                format!(
+                    "🏃 {running_count} ({})",
+                    render_running_task_list(&running)
+                )
+                .if_supports_color(stream, |t| t.yellow())
+                .to_string(),
+            );
         }
-        segments.push(format!("⌚ {elapsed_total}s"));
-        segments.push(format!("🐏 {rss_formatted}"));
-        segments.push(format!("🌊 {waves_done} / {}", self.total_waves));
+        segments.push(
+            format!("⌚ {elapsed_total}s")
+                .if_supports_color(stream, |t| t.dimmed())
+                .to_string(),
+        );
+        segments.push(
+            format!("🐏 {rss_formatted}")
+                .if_supports_color(stream, |t| t.dimmed())
+                .to_string(),
+        );
+        segments.push(
+            format!("🌊 {waves_done} / {}", self.total_waves)
+                .if_supports_color(stream, |t| t.dimmed())
+                .to_string(),
+        );
 
         let mut line = segments.join(" ");
-        line.push_str(&pressure_suffix(warnings, pressure));
+        line.push_str(&pressure_suffix(warnings, pressure, stream));
         line
     }
 
-    pub fn render_summary(&self, rss_formatted: &str) -> String {
+    pub fn render_summary(&self, rss_formatted: &str, stream: Stream) -> String {
         let elapsed_total = self.start.elapsed().as_secs();
         let done = self.done.load(Ordering::SeqCst);
         let skipped = self.skipped.load(Ordering::SeqCst);
         let shared_hits = self.shared_hits.load(Ordering::SeqCst);
         let done_or_skipped = done + skipped;
+        let done_str = format!("✔ {done_or_skipped}")
+            .if_supports_color(stream, |t| t.green())
+            .to_string();
+
+        let skipped_str = format!("⏩ {skipped}")
+            .if_supports_color(stream, |t| t.cyan())
+            .to_string();
+
         let shared_segment = if shared_hits > 0 {
             format!(" 📥 {shared_hits}")
+                .if_supports_color(stream, |t| t.cyan())
+                .to_string()
         } else {
             String::new()
         };
 
-        format!(
-            "✔ {done_or_skipped} ⏩ {skipped}{shared_segment} ⌚ {elapsed_total}s 🐏 {rss_formatted} 🌊 {} / {}",
-            self.total_waves, self.total_waves
-        )
+        let elapsed_str = format!("⌚ {elapsed_total}s")
+            .if_supports_color(stream, |t| t.dimmed())
+            .to_string();
+        let rss_str = format!("🐏 {rss_formatted}")
+            .if_supports_color(stream, |t| t.dimmed())
+            .to_string();
+        let waves_str = format!("🌊 {} / {}", self.total_waves, self.total_waves)
+            .if_supports_color(stream, |t| t.dimmed())
+            .to_string();
+
+        format!("{done_str} {skipped_str}{shared_segment} {elapsed_str} {rss_str} {waves_str}")
     }
 
     fn finish_task(&self, id: &TaskId, kind: TaskOutcome) {
@@ -364,7 +413,11 @@ fn render_package_group(mut tasks: Vec<&TaskId>) -> String {
     }
 }
 
-fn pressure_suffix(warnings: &[PressureReason], pressure: &PressureSnapshot) -> String {
+fn pressure_suffix(
+    warnings: &[PressureReason],
+    pressure: &PressureSnapshot,
+    stream: Stream,
+) -> String {
     let mut suffix = String::new();
     let sample = pressure.sample;
     for warning in warnings {
@@ -372,14 +425,20 @@ fn pressure_suffix(warnings: &[PressureReason], pressure: &PressureSnapshot) -> 
             PressureReason::UsageHigh => {
                 let measured = crate::rss::format_rss(sample.map(|sample| sample.tree_rss));
                 let threshold = crate::rss::format_rss(Some(pressure.usage_threshold));
-                suffix.push_str(&format!(" ❗ mem usage high ({measured} / {threshold})"));
+                suffix.push_str(
+                    &format!(" ❗ mem usage high ({measured} / {threshold})")
+                        .if_supports_color(stream, |t| t.red())
+                        .to_string(),
+                );
             }
             PressureReason::FreeLow => {
                 let measured = crate::rss::format_rss(sample.map(|sample| sample.system_available));
                 let threshold = crate::rss::format_rss(Some(pressure.free_threshold));
-                suffix.push_str(&format!(
-                    " ❗ system free memory low ({measured} / {threshold})"
-                ));
+                suffix.push_str(
+                    &format!(" ❗ system free memory low ({measured} / {threshold})")
+                        .if_supports_color(stream, |t| t.red())
+                        .to_string(),
+                );
             }
         }
     }
@@ -480,7 +539,12 @@ mod tests {
         let wave_of = HashMap::from([(task_id("pkg-a", "build"), 0)]);
         let reporter = ProgressReporter::new(OutputMode::Default, wave_of, 1);
 
-        let out = reporter.render_progress("10 MB", &[], &pressure_snapshot(None, 0, 0));
+        let out = reporter.render_progress(
+            "10 MB",
+            &[],
+            &pressure_snapshot(None, 0, 0),
+            owo_colors::Stream::Stdout,
+        );
         assert_progress_line_shape(&out, "✔ 0 ⌛ 1 ⌚ ", "10 MB", "0 / 1");
         assert!(!out.contains("⏩"));
         assert!(!out.contains("🏃"));
@@ -505,7 +569,12 @@ mod tests {
         reporter.task_skipped_cache_hit(&task_b);
         reporter.task_started(&task_c);
 
-        let out = reporter.render_progress("10 MB", &[], &pressure_snapshot(None, 0, 0));
+        let out = reporter.render_progress(
+            "10 MB",
+            &[],
+            &pressure_snapshot(None, 0, 0),
+            owo_colors::Stream::Stdout,
+        );
         assert_progress_line_shape(&out, "✔ 2 ⏩ 1 🏃 1 (pkg-c#build) ⌚ ", "10 MB", "0 / 1");
         assert!(!out.contains("⌛"));
     }
@@ -523,7 +592,12 @@ mod tests {
         reporter.task_ran(&task_a);
         reporter.task_skipped_shared_cache(&task_b);
 
-        let out = reporter.render_progress("10 MB", &[], &pressure_snapshot(None, 0, 0));
+        let out = reporter.render_progress(
+            "10 MB",
+            &[],
+            &pressure_snapshot(None, 0, 0),
+            owo_colors::Stream::Stdout,
+        );
 
         assert!(out.contains("📥 1"), "output was: {out}");
         assert!(out.contains("⏩ 1"), "output was: {out}");
@@ -553,6 +627,7 @@ mod tests {
                 usage_threshold: 0,
                 free_threshold: 0,
             },
+            owo_colors::Stream::Stdout,
         );
         assert_progress_line_shape(
             &out,
@@ -588,6 +663,7 @@ mod tests {
                 usage_threshold: 0,
                 free_threshold: 0,
             },
+            owo_colors::Stream::Stdout,
         );
         assert_progress_line_shape(
             &out,
@@ -613,12 +689,22 @@ mod tests {
         reporter.task_started(&uncounted);
         reporter.task_finished_uncounted(&uncounted);
 
-        let initial = reporter.render_progress("24 MB", &[], &pressure_snapshot(None, 0, 0));
+        let initial = reporter.render_progress(
+            "24 MB",
+            &[],
+            &pressure_snapshot(None, 0, 0),
+            owo_colors::Stream::Stdout,
+        );
         assert_progress_line_shape(&initial, "✔ 0 ⌛ 1 ⌚ ", "24 MB", "0 / 1");
         assert!(!initial.contains("🏃"), "output was: {initial}");
 
         reporter.task_ran(&counted);
-        let finished = reporter.render_progress("24 MB", &[], &pressure_snapshot(None, 0, 0));
+        let finished = reporter.render_progress(
+            "24 MB",
+            &[],
+            &pressure_snapshot(None, 0, 0),
+            owo_colors::Stream::Stdout,
+        );
         assert_progress_line_shape(&finished, "✔ 1 ⌚ ", "24 MB", "1 / 1");
         assert!(!finished.contains("⌛"), "output was: {finished}");
         assert!(!finished.contains("🏃"), "output was: {finished}");
@@ -634,7 +720,12 @@ mod tests {
             &[&task_a, &task_b],
         );
 
-        let out = reporter.render_progress("24 MB", &[], &pressure_snapshot(None, 0, 0));
+        let out = reporter.render_progress(
+            "24 MB",
+            &[],
+            &pressure_snapshot(None, 0, 0),
+            owo_colors::Stream::Stdout,
+        );
         assert_progress_line_shape(&out, "✔ 2 ⌚ ", "24 MB", "3 / 3");
     }
 
@@ -649,7 +740,12 @@ mod tests {
         reporter.task_started(&connector_b);
         reporter.task_finished_uncounted(&connector_b);
 
-        let out = reporter.render_progress("24 MB", &[], &pressure_snapshot(None, 0, 0));
+        let out = reporter.render_progress(
+            "24 MB",
+            &[],
+            &pressure_snapshot(None, 0, 0),
+            owo_colors::Stream::Stdout,
+        );
         assert_progress_line_shape(&out, "✔ 0 ⌚ ", "24 MB", "2 / 2");
         assert!(!out.contains("⌛"), "output was: {out}");
         assert!(!out.contains("🏃"), "output was: {out}");
@@ -784,7 +880,7 @@ mod tests {
 
         reporter.task_ran(&task);
 
-        let summary = reporter.render_summary("10 MB");
+        let summary = reporter.render_summary("10 MB", owo_colors::Stream::Stdout);
 
         DoneSummaryExpectation {
             done: 1,
@@ -808,7 +904,7 @@ mod tests {
         reporter.task_ran(&task_a);
         reporter.task_skipped_cache_hit(&task_b);
 
-        let summary = reporter.render_summary("10 MB");
+        let summary = reporter.render_summary("10 MB", owo_colors::Stream::Stdout);
 
         DoneSummaryExpectation {
             done: 2,
@@ -832,7 +928,7 @@ mod tests {
         reporter.task_ran(&task_a);
         reporter.task_skipped_shared_cache(&task_b);
 
-        let summary = reporter.render_summary("10 MB");
+        let summary = reporter.render_summary("10 MB", owo_colors::Stream::Stdout);
 
         assert!(summary.contains("✔ 2 ⏩ 1 📥 1"), "summary was: {summary}");
     }
@@ -849,6 +945,7 @@ mod tests {
             "10 MB",
             &[crate::memory_pressure::PressureReason::UsageHigh],
             &pressure_snapshot(Some(sample), threshold, 0),
+            owo_colors::Stream::Stdout,
         );
         assert!(out.contains("mem usage high ("));
         assert!(out.contains(&rss::format_rss(Some(sample.tree_rss))));
@@ -868,6 +965,7 @@ mod tests {
             "10 MB",
             &[crate::memory_pressure::PressureReason::FreeLow],
             &pressure_snapshot(Some(sample), 0, threshold),
+            owo_colors::Stream::Stdout,
         );
         assert!(out.contains("system free memory low ("));
         assert!(out.contains(&rss::format_rss(Some(sample.system_available))));
@@ -890,6 +988,7 @@ mod tests {
             "10 MB",
             &warnings,
             &pressure_snapshot(Some(sample), 30 * 1024 * 1024, 16 * 1024 * 1024),
+            owo_colors::Stream::Stdout,
         );
         assert!(out.contains("❗ mem usage high ("));
         assert!(out.contains("❗ system free memory low ("));
@@ -903,8 +1002,121 @@ mod tests {
     #[test]
     fn render_progress_warnings_none() {
         let reporter = ProgressReporter::new(OutputMode::Default, HashMap::new(), 0);
-        let out = reporter.render_progress("10 MB", &[], &pressure_snapshot(None, 0, 0));
+        let out = reporter.render_progress(
+            "10 MB",
+            &[],
+            &pressure_snapshot(None, 0, 0),
+            owo_colors::Stream::Stdout,
+        );
         assert!(!out.contains("❗"));
+    }
+
+    #[test]
+    fn render_progress_emits_no_ansi_when_color_unsupported() {
+        // Captured (non-tty) output must degrade to plain text identical to the
+        // pre-color behavior: no ANSI escape sequences.
+        let task = task_id("pkg", "build");
+        let reporter =
+            ProgressReporter::new(OutputMode::Default, HashMap::from([(task.clone(), 0)]), 1);
+        reporter.task_ran(&task);
+
+        let out = owo_colors::with_override(false, || {
+            reporter.render_progress(
+                "10 MB",
+                &[],
+                &pressure_snapshot(None, 0, 0),
+                owo_colors::Stream::Stdout,
+            )
+        });
+
+        assert!(
+            !out.contains('\u{1b}'),
+            "plain status line must not contain ANSI escapes: {out:?}"
+        );
+        assert!(out.contains("✔ 1"), "output was: {out}");
+    }
+
+    #[test]
+    fn render_summary_emits_no_ansi_when_color_unsupported() {
+        let task = task_id("pkg", "build");
+        let reporter =
+            ProgressReporter::new(OutputMode::Summary, HashMap::from([(task.clone(), 0)]), 1);
+        reporter.task_ran(&task);
+
+        let summary = owo_colors::with_override(false, || {
+            reporter.render_summary("10 MB", owo_colors::Stream::Stdout)
+        });
+
+        assert!(
+            !summary.contains('\u{1b}'),
+            "plain summary must not contain ANSI escapes: {summary:?}"
+        );
+    }
+
+    #[test]
+    fn render_progress_emits_ansi_when_color_forced() {
+        // When color is force-enabled, the status line carries ANSI escapes,
+        // while the underlying text (counts/emoji) is preserved. Exercise the
+        // shared-cache (cyan) and pressure-warning (red) coloring paths too, not
+        // just the done (green) segment.
+        let task = task_id("pkg", "build");
+        let shared = task_id("pkg", "shared");
+        let reporter = ProgressReporter::new(
+            OutputMode::Default,
+            HashMap::from([(task.clone(), 0), (shared.clone(), 0)]),
+            1,
+        );
+        reporter.task_ran(&task);
+        reporter.task_skipped_shared_cache(&shared);
+
+        let sample = MemorySample {
+            tree_rss: 32 * 1024 * 1024,
+            system_available: 99 * 1024 * 1024,
+        };
+        let out = owo_colors::with_override(true, || {
+            reporter.render_progress(
+                "10 MB",
+                &[crate::memory_pressure::PressureReason::UsageHigh],
+                &pressure_snapshot(Some(sample), 30 * 1024 * 1024, 0),
+                owo_colors::Stream::Stdout,
+            )
+        });
+
+        assert!(
+            out.contains('\u{1b}'),
+            "forced-color status line must contain ANSI escapes: {out:?}"
+        );
+        // Underlying text preserved across the colored segments.
+        assert!(
+            out.contains("✔ 2"),
+            "colored output still carries text: {out}"
+        );
+        assert!(out.contains("📥 1"), "shared-cache segment present: {out}");
+        assert!(
+            out.contains("❗ mem usage high ("),
+            "pressure warning segment present: {out}"
+        );
+    }
+
+    #[test]
+    fn render_summary_emits_ansi_when_color_forced() {
+        let task = task_id("pkg", "build");
+        let reporter =
+            ProgressReporter::new(OutputMode::Summary, HashMap::from([(task.clone(), 0)]), 1);
+        reporter.task_ran(&task);
+
+        let summary = owo_colors::with_override(true, || {
+            reporter.render_summary("10 MB", owo_colors::Stream::Stdout)
+        });
+
+        assert!(
+            summary.contains('\u{1b}'),
+            "forced-color summary must contain ANSI escapes: {summary:?}"
+        );
+        assert!(
+            summary.contains("✔ 1"),
+            "colored summary still carries text: {summary}"
+        );
     }
     fn running_tasks(tasks: &[(&str, &str)]) -> Vec<&'static TaskId> {
         let leaked = Box::leak(
