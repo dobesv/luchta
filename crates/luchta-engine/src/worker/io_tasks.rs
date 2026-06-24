@@ -28,11 +28,15 @@ use super::{
     protocol::{LogStream, WorkerMessage, WorkerResponse},
 };
 
-const MAX_LINE_LENGTH: usize = 1 << 20;
+// Worker report payloads can be large (e.g. multi-MiB SARIF), so the per-line
+// cap is generous. Lines over this still surface a clear diagnostic rather than
+// silently dropping the connection (see `handle_reader_frame`).
+const MAX_LINE_LENGTH: usize = 1 << 26;
 
 pub(crate) struct ReaderContext {
     pub(crate) jobs: JobMap,
     pub(crate) is_shutdown: Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) crash_state: Arc<Mutex<WorkerCrashState>>,
 }
 
 pub(crate) struct LogLineContext<'a> {
@@ -181,7 +185,19 @@ async fn handle_reader_frame(
 ) -> ReaderStep {
     match result {
         Ok(line) => ReaderStep::Continue(line),
-        Err(_error) => {
+        Err(error) => {
+            // Distinguish the over-length case (the silent-crash bug this guards
+            // against) from generic I/O failures so the recorded diagnostic
+            // names the real cause instead of always blaming line length.
+            let detail = match &error {
+                LinesCodecError::MaxLineLengthExceeded => {
+                    format!("worker output line exceeded MAX_LINE_LENGTH ({MAX_LINE_LENGTH} bytes)")
+                }
+                LinesCodecError::Io(io_error) => {
+                    format!("failed to read worker output: {io_error}")
+                }
+            };
+            context.crash_state.lock().await.record_stderr_line(detail);
             crash_reader_jobs(context).await;
             ReaderStep::Stop
         }
@@ -394,9 +410,77 @@ mod tests {
         time::Duration,
     };
 
-    use tokio::sync::Notify;
+    use tokio::{
+        io::AsyncWriteExt,
+        sync::{Mutex, Notify},
+    };
+    use tokio_stream::StreamExt;
+    use tokio_util::codec::{FramedRead, LinesCodec, LinesCodecError};
 
-    use super::wait_for_exit_signal;
+    use crate::worker::handle::WorkerCrashState;
+
+    use super::{
+        handle_reader_frame, wait_for_exit_signal, ReaderContext, ReaderStep, MAX_LINE_LENGTH,
+    };
+
+    #[tokio::test]
+    async fn records_oversize_reader_line_into_crash_state() {
+        let crash_state = Arc::new(Mutex::new(WorkerCrashState::default()));
+        let context = ReaderContext {
+            jobs: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            is_shutdown: Arc::new(AtomicBool::new(false)),
+            crash_state: Arc::clone(&crash_state),
+        };
+
+        let (mut writer, reader) = tokio::io::duplex(MAX_LINE_LENGTH + 1024);
+        let oversized_line = "x".repeat(MAX_LINE_LENGTH + 1);
+        let write_task = tokio::spawn(async move {
+            writer.write_all(oversized_line.as_bytes()).await.unwrap();
+            writer.write_all(b"\n").await.unwrap();
+        });
+
+        let mut framed = FramedRead::new(reader, LinesCodec::new_with_max_length(MAX_LINE_LENGTH));
+        let step = handle_reader_frame(&context, framed.next().await.unwrap()).await;
+        write_task.await.unwrap();
+
+        assert!(matches!(step, ReaderStep::Stop));
+
+        let crash_info = crash_state
+            .lock()
+            .await
+            .crash_info("worker")
+            .expect("oversize line should be recorded");
+        assert!(crash_info.detail.contains(&format!(
+            "worker output line exceeded MAX_LINE_LENGTH ({MAX_LINE_LENGTH} bytes)"
+        )));
+        // The over-length path must NOT be mislabeled as a generic I/O failure.
+        assert!(!crash_info.detail.contains("failed to read worker output"));
+    }
+
+    #[tokio::test]
+    async fn records_io_reader_error_as_io_failure_not_length() {
+        let crash_state = Arc::new(Mutex::new(WorkerCrashState::default()));
+        let context = ReaderContext {
+            jobs: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            is_shutdown: Arc::new(AtomicBool::new(false)),
+            crash_state: Arc::clone(&crash_state),
+        };
+
+        let io_error = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "pipe gone");
+        let step = handle_reader_frame(&context, Err(LinesCodecError::Io(io_error))).await;
+
+        assert!(matches!(step, ReaderStep::Stop));
+
+        let crash_info = crash_state
+            .lock()
+            .await
+            .crash_info("worker")
+            .expect("io error should be recorded");
+        // A generic I/O error must be reported as such, not as a length overflow.
+        assert!(crash_info.detail.contains("failed to read worker output"));
+        assert!(crash_info.detail.contains("pipe gone"));
+        assert!(!crash_info.detail.contains("MAX_LINE_LENGTH"));
+    }
 
     #[tokio::test]
     async fn returns_immediately_when_already_exited() {
