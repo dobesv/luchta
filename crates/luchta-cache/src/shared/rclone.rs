@@ -108,17 +108,9 @@ struct DaemonState {
     pid: u32,
 }
 
-struct RuntimeCall<'a, P> {
-    state: &'a mut State,
-    runtime: &'a Runtime,
-    endpoint: &'a str,
-    payload: P,
-    timeout: Duration,
-}
-
 impl RcloneRcd {
     pub fn new(default_timeout: Duration) -> Result<Self, RcloneError> {
-        let runtime = Builder::new_current_thread().enable_all().build()?;
+        let runtime = Builder::new_multi_thread().enable_all().build()?;
         Ok(Self {
             runtime: Some(runtime),
             state: Mutex::new(State { daemon: None }),
@@ -175,6 +167,23 @@ impl RcloneRcd {
                 "srcRemote": copy.src_remote,
                 "dstFs": copy.dst_fs,
                 "dstRemote": copy.dst_remote,
+            }),
+            timeout,
+        )
+        .map(|_| ())
+    }
+
+    pub fn copy_dir(
+        &self,
+        src_fs: &str,
+        dst_fs: &str,
+        timeout: Duration,
+    ) -> Result<(), RcloneError> {
+        self.call::<_, EmptyResponse>(
+            "sync/copy",
+            json!({
+                "srcFs": src_fs,
+                "dstFs": dst_fs,
             }),
             timeout,
         )
@@ -255,15 +264,45 @@ impl RcloneRcd {
         P: Serialize,
         T: DeserializeOwned,
     {
-        let mut state = self.lock_state()?;
+        let payload = serde_json::to_value(payload)?;
         let runtime = self.runtime();
-        call_on_runtime_thread(RuntimeCall {
-            state: &mut state,
-            runtime,
-            endpoint,
-            payload,
-            timeout,
-        })
+        let socket_path = {
+            let mut state = self.lock_state()?;
+            if state.daemon.is_none() {
+                state.daemon = Some(std::thread::scope(|scope| {
+                    scope
+                        .spawn(move || runtime.block_on(RcloneRcd::spawn_daemon(timeout)))
+                        .join()
+                        .map_err(|_| RcloneError::Process {
+                            reason: "rclone spawn thread panicked".to_string(),
+                        })?
+                })?);
+            }
+            state
+                .daemon
+                .as_ref()
+                .expect("daemon initialized")
+                .socket_path
+                .clone()
+        };
+        let response = std::thread::scope(|scope| {
+            scope
+                .spawn(move || -> Result<Value, RcloneError> {
+                    let client = Client::unix();
+                    runtime.block_on(post_json_with_client(
+                        &client,
+                        &socket_path,
+                        endpoint,
+                        payload,
+                        timeout,
+                    ))
+                })
+                .join()
+                .map_err(|_| RcloneError::Process {
+                    reason: "rclone call thread panicked".to_string(),
+                })?
+        })?;
+        serde_json::from_value(response).map_err(RcloneError::from)
     }
 
     fn lock_state(&self) -> Result<std::sync::MutexGuard<'_, State>, RcloneError> {
@@ -321,34 +360,63 @@ impl RcloneRcd {
     }
 }
 
-fn call_on_runtime_thread<P, T>(call: RuntimeCall<'_, P>) -> Result<T, RcloneError>
+async fn post_json_with_client<P, T>(
+    client: &Client<hyperlocal::UnixConnector, Full<Bytes>>,
+    socket_path: &std::path::Path,
+    endpoint: &str,
+    payload: P,
+    timeout_duration: Duration,
+) -> Result<T, RcloneError>
 where
     P: Serialize,
     T: DeserializeOwned,
 {
-    let RuntimeCall {
-        state,
-        runtime,
-        endpoint,
-        payload,
-        timeout,
-    } = call;
-    let payload = serde_json::to_value(payload)?;
-    let response = std::thread::scope(|scope| {
-        scope
-            .spawn(move || -> Result<Value, RcloneError> {
-                if state.daemon.is_none() {
-                    state.daemon = Some(runtime.block_on(RcloneRcd::spawn_daemon(timeout))?);
-                }
-                let daemon = state.daemon.as_mut().expect("daemon initialized");
-                runtime.block_on(daemon.post_json::<_, Value>(endpoint, payload, timeout))
+    let uri: hyper::Uri = Uri::new(socket_path, &format!("/{endpoint}")).into();
+    let body = serde_json::to_vec(&payload)?;
+    let request = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header(CONTENT_TYPE, "application/json")
+        .body(Full::new(Bytes::from(body)))
+        .map_err(|err| RcloneError::Request {
+            reason: err.to_string(),
+        })?;
+
+    let response = timeout(timeout_duration, client.request(request))
+        .await
+        .map_err(|_| RcloneError::Timeout {
+            timeout: timeout_duration,
+        })
+        .and_then(|result| {
+            result.map_err(|err| RcloneError::Request {
+                reason: err.to_string(),
             })
-            .join()
-            .map_err(|_| RcloneError::Process {
-                reason: "rclone call thread panicked".to_string(),
-            })?
-    })?;
-    serde_json::from_value(response).map_err(RcloneError::from)
+        })?;
+
+    let status = response.status();
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .map_err(|err| RcloneError::Request {
+            reason: err.to_string(),
+        })?
+        .to_bytes();
+    if !status.is_success() {
+        let body = String::from_utf8_lossy(&bytes).into_owned();
+        return Err(RcloneError::HttpStatus {
+            status: status.as_u16(),
+            body,
+        });
+    }
+
+    let value: Value = serde_json::from_slice(&bytes)?;
+    if let Some(error) = value.get("error").and_then(Value::as_str) {
+        return Err(RcloneError::Rc {
+            message: error.to_string(),
+        });
+    }
+    serde_json::from_value(value).map_err(RcloneError::from)
 }
 
 /// Sends `core/quit` and waits for the daemon to exit, on the given runtime.

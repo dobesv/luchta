@@ -4,10 +4,9 @@
 //! rclone rcd sidecar — and its run-wide disable-and-warn state. Kept separate
 //! from `mod.rs` so the local cache and the remote sync concerns stay cohesive.
 
-use std::collections::HashSet;
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -86,14 +85,6 @@ pub(crate) struct PushArtifacts<'a> {
     pub(crate) merge: MergeEntryOutcome,
 }
 
-/// Per-commit context shared across the shard pulls of one snapshot directory.
-struct PullCommit<'a> {
-    snapshots_dir: PathBuf,
-    commit_key: &'a str,
-    remote_fs: &'a str,
-    merged_sidecars: &'a HashSet<String>,
-}
-
 impl RemoteSync {
     #[must_use]
     pub(crate) fn new(rclone: Arc<RcloneRcd>, remote_base_fs: impl Into<String>) -> Self {
@@ -156,24 +147,6 @@ impl RemoteSync {
 
 /// Splits a remote snapshot-dir listing into shard file names and the set of
 /// `.merged` sidecar names present, ignoring directories and other entries.
-fn classify_remote_listing(entries: Vec<rclone::Entry>) -> (Vec<String>, HashSet<String>) {
-    let mut shard_names = Vec::new();
-    let mut merged_sidecars = HashSet::new();
-    for entry in entries {
-        if entry.is_dir {
-            continue;
-        }
-        let path = entry.path;
-        if path.ends_with(&format!(".{SNAPSHOT_MERGED_EXTENSION}")) {
-            merged_sidecars.insert(path);
-        } else if path.ends_with(&format!(".{SNAPSHOT_FILE_EXTENSION}")) {
-            shard_names.push(path);
-        }
-    }
-    (shard_names, merged_sidecars)
-}
-
-/// Maps a typed rclone error to a short human-readable disable reason.
 fn remote_disable_reason(err: &rclone::RcloneError) -> String {
     match err {
         rclone::RcloneError::Timeout { timeout } => {
@@ -197,72 +170,19 @@ impl RemoteSync {
             return;
         }
         let remote_fs = self.snapshots_fs(commit_key);
-        // First remote interaction of the run; bounded by the configured
-        // sync_timeout (RcloneRcd default). A failure here disables remote for
-        // the rest of the run and the build continues local-only.
-        let entries = match self
+        let local_dir = snapshot_store.paths().snapshots_dir.join(commit_key);
+        if let Err(err) = fs::create_dir_all(&local_dir) {
+            eprintln!("debug: local snapshot dir prep failed for commit={commit_key}: {err}");
+            return;
+        }
+        let local_fs = format!(":local:{}", local_dir.display());
+        if let Err(err) = self
             .rclone
-            .list(&remote_fs, "", self.rclone.default_timeout())
-        {
-            Ok(entries) => entries,
-            Err(err) => {
-                self.record_remote_error(&err);
-                eprintln!("debug: remote snapshot list failed for commit={commit_key}: {err}");
-                return;
-            }
-        };
-
-        let (shard_names, merged_sidecars) = classify_remote_listing(entries);
-        let ctx = PullCommit {
-            snapshots_dir: snapshot_store.paths().snapshots_dir.join(commit_key),
-            commit_key,
-            remote_fs: &remote_fs,
-            merged_sidecars: &merged_sidecars,
-        };
-        for shard_name in shard_names {
-            // Pull each shard (and its `.merged` sidecar if present). Any failure
-            // disables the remote and stops further pulls for the rest of the run.
-            if self.pull_one_shard(&ctx, &shard_name).is_err() {
-                return;
-            }
-        }
-    }
-
-    /// Pulls a single shard and its `.merged` sidecar (if listed) into the local
-    /// cache. Returns `Err(())` if a genuine remote failure occurred (the caller
-    /// stops pulling); a normal miss/already-present case returns `Ok(())`.
-    fn pull_one_shard(&self, ctx: &PullCommit<'_>, shard_name: &str) -> Result<(), ()> {
-        let commit_key = ctx.commit_key;
-        let local_path = ctx.snapshots_dir.join(shard_name);
-        if !local_path.exists() {
-            if let Err(err) = self.copy_remote_file_down(ctx.remote_fs, shard_name, &local_path) {
-                self.record_remote_error(&err);
-                eprintln!(
-                    "debug: remote snapshot pull failed for commit={commit_key} shard={shard_name}: {err}"
-                );
-                return Err(());
-            }
-        }
-
-        let shard_id = shard_name.trim_end_matches(&format!(".{SNAPSHOT_FILE_EXTENSION}"));
-        let merged_name = format!("{shard_id}.{SNAPSHOT_MERGED_EXTENSION}");
-        if !ctx.merged_sidecars.contains(&merged_name) {
-            return Ok(());
-        }
-        let merged_local_path = ctx.snapshots_dir.join(&merged_name);
-        if merged_local_path.exists() {
-            return Ok(());
-        }
-        if let Err(err) =
-            self.copy_remote_file_down(ctx.remote_fs, &merged_name, &merged_local_path)
+            .copy_dir(&remote_fs, &local_fs, self.rclone.default_timeout())
         {
             self.record_remote_error(&err);
-            eprintln!(
-                "debug: remote merged sidecar pull failed for commit={commit_key} shard={merged_name}: {err}"
-            );
-            return Err(());
+            eprintln!("debug: remote snapshot copy failed for commit={commit_key}: {err}");
         }
-        Ok(())
     }
 
     pub(crate) fn pull_blob(
@@ -1237,5 +1157,62 @@ mod tests {
             merge2_id
         );
         assert_snapshot_shard_count(&snapshot_files, 2, 2);
+    }
+
+    #[test]
+    fn remote_restore_from_async_runtime_does_not_nested_panic_when_rclone_enabled() {
+        if !should_run_rclone_test() {
+            eprintln!("skipping rclone-gated async shared-cache pull test; rclone not on PATH or LUCHTA_TEST_RCLONE disabled");
+            return;
+        }
+
+        let seed = seed_remote_store(
+            "console.log('async-restore');\n",
+            [0x81; 32],
+            420,
+            (b"stdout-async", b"stderr-async"),
+        );
+        let local_cache = TempDir::new().unwrap();
+        let pull_cache = open_cache_with_remote(
+            seed.harness.temp_repo.path(),
+            local_cache.path(),
+            &seed.harness.remote,
+        );
+        let restore_dir = seed.harness.temp_repo.path().join("restore-remote-async");
+        fs::create_dir_all(&restore_dir).unwrap();
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let restore_dir_for_async = restore_dir.clone();
+        let hit = runtime.block_on(async move {
+            pull_cache
+                .try_restore_candidates("pkg#build", &seed.input_key, &restore_dir_for_async)
+                .next()
+                .expect("async runtime should still restore from remote")
+                .commit()
+                .expect("async remote restore should succeed")
+        });
+
+        assert_remote_restore_result(
+            &restore_dir,
+            &hit,
+            (b"stdout-async", b"stderr-async"),
+            "console.log('async-restore');\n",
+        );
+        assert!(local_cache
+            .path()
+            .join("snapshots")
+            .join(&seed.harness.commit)
+            .exists());
+        assert!(local_cache
+            .path()
+            .join("blobs")
+            .read_dir()
+            .unwrap()
+            .next()
+            .is_some());
     }
 }
