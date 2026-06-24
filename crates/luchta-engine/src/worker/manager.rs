@@ -349,6 +349,7 @@ impl WorkerManager {
             ReaderContext {
                 jobs: Arc::clone(&jobs),
                 is_shutdown: Arc::clone(&is_shutdown),
+                crash_state: Arc::clone(&crash_state),
             },
             stdout,
         );
