@@ -32,10 +32,13 @@ pub use snapshot::{
     combined_dep_outputs_hash, derive_input_key, input_key_hex, MergeEntryOutcome, MergeResult,
     Snapshot, SnapshotEntry, SnapshotStore, SNAPSHOT_SCHEMA_VERSION,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+
+#[cfg(unix)]
+use tokio::task::JoinSet;
 
 use crate::record::TaskRunRecord;
 
@@ -445,6 +448,9 @@ impl SharedCache {
     }
 
     fn build_index(&self, #[cfg(unix)] remote: Option<&RemoteSync>) -> MergedIndex {
+        #[cfg(unix)]
+        self.pull_candidate_commits(remote);
+
         let mut merged = MergedIndex::new();
 
         // Iterate in reverse order (oldest first) so that newest overwrites.
@@ -463,6 +469,93 @@ impl SharedCache {
         merged
     }
 
+    #[cfg(unix)]
+    fn pull_candidate_commits(&self, remote: Option<&RemoteSync>) {
+        let Some(remote) = remote.cloned() else {
+            return;
+        };
+        Self::run_candidate_pulls_on_dedicated_thread(
+            remote,
+            self.snapshot_store.clone(),
+            self.candidate_keys.clone(),
+        );
+    }
+
+    #[cfg(unix)]
+    fn run_candidate_pulls_on_dedicated_thread(
+        remote: RemoteSync,
+        snapshot_store: SnapshotStore,
+        candidate_keys: Vec<String>,
+    ) {
+        let concurrency = candidate_keys.len().clamp(1, 4);
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(concurrency)
+            .enable_all()
+            .build()
+            .expect("candidate pull runtime");
+        std::thread::scope(|scope| {
+            scope
+                .spawn(move || {
+                    runtime.block_on(async move {
+                        Self::pull_candidate_commits_with_runtime(
+                            remote,
+                            snapshot_store,
+                            candidate_keys,
+                            concurrency,
+                        )
+                        .await;
+                    })
+                })
+                .join()
+                .expect("candidate snapshot pull thread panicked");
+        });
+    }
+
+    #[cfg(unix)]
+    async fn pull_candidate_commits_with_runtime(
+        remote: RemoteSync,
+        snapshot_store: SnapshotStore,
+        candidate_keys: Vec<String>,
+        concurrency: usize,
+    ) {
+        let mut pending: VecDeque<_> = candidate_keys.into();
+        let mut in_flight = JoinSet::new();
+        while in_flight.len() < concurrency {
+            let Some(commit_key) = pending.pop_front() else {
+                break;
+            };
+            Self::spawn_candidate_pull(
+                &mut in_flight,
+                remote.clone(),
+                snapshot_store.clone(),
+                commit_key,
+            );
+        }
+        while let Some(result) = in_flight.join_next().await {
+            result.expect("candidate snapshot pull task panicked");
+            if let Some(commit_key) = pending.pop_front() {
+                Self::spawn_candidate_pull(
+                    &mut in_flight,
+                    remote.clone(),
+                    snapshot_store.clone(),
+                    commit_key,
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn spawn_candidate_pull(
+        in_flight: &mut JoinSet<()>,
+        remote: RemoteSync,
+        snapshot_store: SnapshotStore,
+        commit_key: String,
+    ) {
+        in_flight.spawn_blocking(move || {
+            remote.pull_snapshot_commit(&snapshot_store, &commit_key);
+        });
+    }
+
     /// Pull (if remote-enabled) and merge a single commit's snapshot into the index.
     fn load_commit_into_index(
         &self,
@@ -471,9 +564,7 @@ impl SharedCache {
         #[cfg(unix)] remote: Option<&RemoteSync>,
     ) {
         #[cfg(unix)]
-        if let Some(remote) = remote {
-            remote.pull_snapshot_commit(&self.snapshot_store, commit_key);
-        }
+        let _ = remote;
         let Some(snapshot) = self.snapshot_store.load(commit_key) else {
             return;
         };
