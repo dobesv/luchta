@@ -127,70 +127,138 @@ pub(super) fn dispatch_ready_task(
     let task_id = task_node.id.clone();
 
     if !ctx.tasks_to_run.contains(&task_id) {
-        // Task not in requested subgraph — not counted.
-        ctx.reporter.task_finished_uncounted(&task_id);
-        let _ = done_tx.send(true);
+        mark_task_outside_selection(ctx.reporter, &task_id, done_tx);
         return;
     }
 
-    // A misconfigured task (e.g. command without worker) only fails when it is
-    // actually selected to run — it must not abort unrelated tasks.
+    // In default mode, once a failure has occurred no further work is dispatched
+    // — including tasks that turn out to be invalid/config errors. Check the
+    // fast-stop gate before invalid/connector handling so a late invalid task is
+    // suppressed (uncounted) rather than reported as an additional failure.
+    if should_skip_for_fast_stop(ctx) {
+        skip_task_after_prior_failure(ctx.reporter, &task_id, done_tx);
+        return;
+    }
+
     if let Some(message) = ctx.invalid.get(&task_id) {
-        ctx.any_failed.store(true, Ordering::SeqCst);
-        eprintln!("{} {}", "✖".red(), message.red());
-        // Invalid/config-error — counted in totals via wave map, but completion is
-        // still recorded as uncounted because it is neither done nor cache-skipped.
-        ctx.reporter.task_finished_uncounted(&task_id);
-        let _ = done_tx.send(false);
+        fail_invalid_task(&task_id, message, done_tx, ctx);
         return;
     }
 
     let Some(request) = ctx.commands.get(&task_id).cloned() else {
-        // No worker/no command ordering node — uncounted connector, not runnable work.
-        ctx.reporter.task_finished_uncounted(&task_id);
-        let _ = done_tx.send(true);
+        mark_ordering_connector(ctx.reporter, &task_id, done_tx);
         return;
     };
-
-    if ctx.any_failed.load(Ordering::SeqCst) {
-        // Skipped due to previous failure — not counted.
-        ctx.reporter.task_finished_uncounted(&task_id);
-        let _ = done_tx.send(false);
-        return;
-    }
 
     let cache_enabled = ctx
         .task_graph
         .task_definition(&task_id)
         .is_some_and(TaskDefinition::cache_enabled);
-    if cache_enabled {
-        if let Some(decision) = try_cache_skip(&task_id, ctx) {
-            match decision {
-                Decision::Skip => {
-                    // Local cache hit — this IS the legacy "skipped" count.
-                    ctx.reporter.task_skipped_cache_hit(&task_id);
-                    let _ = done_tx.send(true);
-                    return;
-                }
-                Decision::SharedHit => {
-                    ctx.reporter.task_skipped_shared_cache(&task_id);
-                    let _ = done_tx.send(true);
-                    return;
-                }
-                Decision::Run => {}
-            }
-        }
+    let mut done_tx = Some(done_tx);
+    if handle_cache_skip(cache_enabled, &task_id, &mut done_tx, ctx) {
+        return;
     }
 
     spawn_task_runner(
         ReadyTask {
             task_id,
             request,
-            done_tx,
+            done_tx: done_tx.expect("cache skip path should consume completion sender"),
             cache_enabled,
         },
         ctx,
     );
+}
+
+fn mark_task_outside_selection(
+    reporter: &ProgressReporter,
+    task_id: &TaskId,
+    done_tx: CompletionSignal,
+) {
+    // Task not in requested subgraph — not counted.
+    reporter.task_finished_uncounted(task_id);
+    let _ = done_tx.send(true);
+}
+
+fn fail_invalid_task(
+    task_id: &TaskId,
+    message: &str,
+    done_tx: CompletionSignal,
+    ctx: &DispatchContext<'_>,
+) {
+    // A misconfigured task (e.g. command without worker) only fails when it is
+    // actually selected to run — it must not abort unrelated tasks.
+    trigger_fast_stop_on_first_failure(
+        ctx.any_failed,
+        ctx.interrupted,
+        ctx.continue_on_failure,
+        ctx.worker_manager,
+    );
+    eprintln!("{} {}", "✖".red(), message.red());
+    // Invalid/config-error — counted in totals via wave map, but completion is
+    // recorded as failed because it is neither done nor cache-skipped.
+    ctx.reporter.task_failed(task_id);
+    let _ = done_tx.send(false);
+}
+
+fn mark_ordering_connector(
+    reporter: &ProgressReporter,
+    task_id: &TaskId,
+    done_tx: CompletionSignal,
+) {
+    // No worker/no command ordering node — uncounted connector, not runnable work.
+    reporter.task_finished_uncounted(task_id);
+    let _ = done_tx.send(true);
+}
+
+fn should_skip_for_fast_stop(ctx: &DispatchContext<'_>) -> bool {
+    !ctx.continue_on_failure && ctx.any_failed.load(Ordering::SeqCst)
+}
+
+fn skip_task_after_prior_failure(
+    reporter: &ProgressReporter,
+    task_id: &TaskId,
+    done_tx: CompletionSignal,
+) {
+    // Skipped due to previous failure — not counted.
+    reporter.task_finished_uncounted(task_id);
+    let _ = done_tx.send(false);
+}
+
+fn handle_cache_skip(
+    cache_enabled: bool,
+    task_id: &TaskId,
+    done_tx: &mut Option<CompletionSignal>,
+    ctx: &DispatchContext<'_>,
+) -> bool {
+    if !cache_enabled {
+        return false;
+    }
+
+    let Some(decision) = try_cache_skip(task_id, ctx) else {
+        return false;
+    };
+
+    match decision {
+        Decision::Skip => {
+            // Local cache hit — this IS the legacy "skipped" count.
+            ctx.reporter.task_skipped_cache_hit(task_id);
+            let _ = done_tx
+                .take()
+                .expect("cache hit should own completion sender")
+                .send(true);
+            true
+        }
+        Decision::SharedHit => {
+            ctx.reporter.task_skipped_shared_cache(task_id);
+            let _ = done_tx
+                .take()
+                .expect("shared cache hit should own completion sender")
+                .send(true);
+            true
+        }
+        Decision::Run => false,
+    }
 }
 
 fn build_task_run_context(
@@ -257,7 +325,7 @@ where
     } = run;
     let TaskRunContext {
         executor: _,
-        any_failed,
+        any_failed: _,
         interrupted,
         cache,
         output_hashes,
@@ -274,6 +342,7 @@ where
         .as_ref()
         .map(|cache_ctx| cache_ctx.start_unix_ms)
         .unwrap_or(task_start_unix_ms);
+    let persist_failure_record = succeeded || !interrupted.load(Ordering::SeqCst);
     let expansion_error = persist_cache_state(CachePersistInputs {
         cache,
         cache_write,
@@ -282,6 +351,7 @@ where
         log_sink: Some(&log_sink),
         outcome: outcome_res.as_ref().ok(),
         succeeded,
+        persist_failure_record,
         end_unix_ms,
         shared_cache: cache_enabled.then_some(shared_cache).flatten(),
         shared_store_enabled: cache_enabled,
@@ -290,7 +360,6 @@ where
     .await;
 
     if let Some(expansion_error) = expansion_error {
-        any_failed.store(true, Ordering::SeqCst);
         if !interrupted.load(Ordering::SeqCst) {
             eprintln!("{} {}", "✖".red(), expansion_error.red());
         }
@@ -660,14 +729,25 @@ async fn write_run_record(
     WriteRecordResult::Ok
 }
 
-fn report_task_outcome(
-    outcome: &Result<TaskRunOutcome, luchta_engine::ExecutorError>,
+fn trigger_fast_stop_on_first_failure(
     any_failed: &Arc<AtomicBool>,
-) {
-    match outcome {
-        Ok(result) if result.status.success() => {}
-        Ok(_) | Err(_) => any_failed.store(true, Ordering::SeqCst),
+    interrupted: &Arc<AtomicBool>,
+    continue_on_failure: bool,
+    worker_manager: &Arc<WorkerManager>,
+) -> bool {
+    let first_failure = any_failed
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok();
+
+    if first_failure && !continue_on_failure {
+        interrupted.store(true, Ordering::SeqCst);
+        let worker_manager = Arc::clone(worker_manager);
+        tokio::spawn(async move {
+            worker_manager.shutdown_immediate().await;
+        });
     }
+
+    first_failure
 }
 
 fn format_task_error(error: &luchta_engine::ExecutorError) -> String {
@@ -844,6 +924,8 @@ fn spawn_task_runner(ready: ReadyTask, ctx: &DispatchContext<'_>) {
     let executor = Arc::clone(&task_ctx.executor);
     let any_failed = Arc::clone(&task_ctx.any_failed);
     let interrupted = Arc::clone(&task_ctx.interrupted);
+    let worker_manager = Arc::clone(ctx.worker_manager);
+    let continue_on_failure = ctx.continue_on_failure;
     let log_sink = prepare_task_log_sink(&mut request);
 
     tokio::spawn(async move {
@@ -874,6 +956,8 @@ fn spawn_task_runner(ready: ReadyTask, ctx: &DispatchContext<'_>) {
             reporter: &reporter,
             any_failed: &any_failed,
             interrupted: &interrupted,
+            worker_manager: &worker_manager,
+            continue_on_failure,
             log_sink: &log_sink,
             outcome_res: &outcome_res,
             succeeded,
@@ -889,6 +973,8 @@ struct TaskRunFinalization<'a> {
     reporter: &'a Arc<ProgressReporter>,
     any_failed: &'a Arc<AtomicBool>,
     interrupted: &'a Arc<AtomicBool>,
+    worker_manager: &'a Arc<WorkerManager>,
+    continue_on_failure: bool,
     log_sink: &'a ExecutionLogSink,
     outcome_res: &'a Result<TaskRunOutcome, luchta_engine::ExecutorError>,
     succeeded: bool,
@@ -903,6 +989,8 @@ fn finalize_task_run(finalization: TaskRunFinalization<'_>) {
         reporter,
         any_failed,
         interrupted,
+        worker_manager,
+        continue_on_failure,
         log_sink,
         outcome_res,
         succeeded,
@@ -911,7 +999,15 @@ fn finalize_task_run(finalization: TaskRunFinalization<'_>) {
     } = finalization;
 
     let interrupted_run = interrupted.load(Ordering::SeqCst);
-    if !succeeded && !interrupted_run {
+    let failure_kind = classify_task_failure(TaskFailureContext {
+        succeeded,
+        any_failed,
+        interrupted,
+        continue_on_failure,
+        worker_manager,
+    });
+
+    if should_print_failure_logs(failure_kind, interrupted_run) {
         let failure_logs = format_captured_failure_logs(
             FailureLogContext {
                 task_id: task_id.clone(),
@@ -928,15 +1024,67 @@ fn finalize_task_run(finalization: TaskRunFinalization<'_>) {
         eprint!("{}", failure_logs);
     }
 
-    report_task_outcome(outcome_res, any_failed);
+    record_task_outcome(reporter, task_id, failure_kind);
+    let _ = done_tx.send(succeeded);
+}
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TaskFailureKind {
+    Succeeded,
+    Failed,
+    CollateralFastStop,
+}
+
+struct TaskFailureContext<'a> {
+    succeeded: bool,
+    any_failed: &'a Arc<AtomicBool>,
+    interrupted: &'a Arc<AtomicBool>,
+    continue_on_failure: bool,
+    worker_manager: &'a Arc<WorkerManager>,
+}
+
+fn classify_task_failure(context: TaskFailureContext<'_>) -> TaskFailureKind {
+    let TaskFailureContext {
+        succeeded,
+        any_failed,
+        interrupted,
+        continue_on_failure,
+        worker_manager,
+    } = context;
     if succeeded {
-        reporter.task_ran(task_id);
-    } else {
-        reporter.task_finished_uncounted(task_id);
+        return TaskFailureKind::Succeeded;
     }
 
-    let _ = done_tx.send(succeeded);
+    let first_failure = trigger_fast_stop_on_first_failure(
+        any_failed,
+        interrupted,
+        continue_on_failure,
+        worker_manager,
+    );
+    let collateral_fast_stop =
+        !continue_on_failure && interrupted.load(Ordering::SeqCst) && !first_failure;
+
+    if collateral_fast_stop {
+        TaskFailureKind::CollateralFastStop
+    } else {
+        TaskFailureKind::Failed
+    }
+}
+
+fn should_print_failure_logs(failure_kind: TaskFailureKind, interrupted_run: bool) -> bool {
+    matches!(failure_kind, TaskFailureKind::Failed) && !interrupted_run
+}
+
+fn record_task_outcome(
+    reporter: &ProgressReporter,
+    task_id: &TaskId,
+    failure_kind: TaskFailureKind,
+) {
+    match failure_kind {
+        TaskFailureKind::Succeeded => reporter.task_ran(task_id),
+        TaskFailureKind::Failed => reporter.task_failed(task_id),
+        TaskFailureKind::CollateralFastStop => reporter.task_finished_uncounted(task_id),
+    }
 }
 
 /// Inputs for persisting a finished task's cache state.
@@ -948,6 +1096,7 @@ struct CachePersistInputs<'a> {
     log_sink: Option<&'a ExecutionLogSink>,
     outcome: Option<&'a TaskRunOutcome>,
     succeeded: bool,
+    persist_failure_record: bool,
     end_unix_ms: u64,
     /// Shared cache for storing successful task results.
     shared_cache: Option<Arc<SharedCache>>,
@@ -976,6 +1125,7 @@ async fn persist_cache_state(inputs: CachePersistInputs<'_>) -> Option<String> {
         log_sink,
         outcome,
         succeeded,
+        persist_failure_record,
         end_unix_ms,
         shared_cache,
         shared_store_enabled,
@@ -983,28 +1133,87 @@ async fn persist_cache_state(inputs: CachePersistInputs<'_>) -> Option<String> {
     } = inputs;
 
     if let Some(cache_ctx) = cache_write {
-        let result = write_run_record(
+        return persist_cache_write(CacheWriteInputs {
             cache,
             cache_ctx,
-            Arc::clone(output_hashes),
+            output_hashes: Arc::clone(output_hashes),
             log_sink,
             outcome,
             succeeded,
+            persist_failure_record,
             end_unix_ms,
             shared_cache,
             shared_store_enabled,
             repo_root,
-        )
+        })
         .await;
-        return cache_write_error(result);
     }
 
-    if succeeded {
-        if let Some(record) = output_hash_record {
-            record_resolved_output_hash(output_hashes, record);
-        }
-    }
+    record_successful_output_hash(output_hashes, output_hash_record, succeeded);
     None
+}
+
+struct CacheWriteInputs<'a> {
+    cache: Arc<Cache>,
+    cache_ctx: CacheWriteContext,
+    output_hashes: Arc<Mutex<HashMap<TaskId, [u8; 32]>>>,
+    log_sink: Option<&'a ExecutionLogSink>,
+    outcome: Option<&'a TaskRunOutcome>,
+    succeeded: bool,
+    persist_failure_record: bool,
+    end_unix_ms: u64,
+    shared_cache: Option<Arc<SharedCache>>,
+    shared_store_enabled: bool,
+    repo_root: PathBuf,
+}
+
+async fn persist_cache_write(inputs: CacheWriteInputs<'_>) -> Option<String> {
+    let CacheWriteInputs {
+        cache,
+        cache_ctx,
+        output_hashes,
+        log_sink,
+        outcome,
+        succeeded,
+        persist_failure_record,
+        end_unix_ms,
+        shared_cache,
+        shared_store_enabled,
+        repo_root,
+    } = inputs;
+
+    if !succeeded && !persist_failure_record {
+        return None;
+    }
+
+    let result = write_run_record(
+        cache,
+        cache_ctx,
+        output_hashes,
+        log_sink,
+        outcome,
+        succeeded,
+        end_unix_ms,
+        shared_cache,
+        shared_store_enabled,
+        repo_root,
+    )
+    .await;
+    cache_write_error(result)
+}
+
+fn record_successful_output_hash(
+    output_hashes: &Arc<Mutex<HashMap<TaskId, [u8; 32]>>>,
+    output_hash_record: Option<&OutputHashRecordContext>,
+    succeeded: bool,
+) {
+    if !succeeded {
+        return;
+    }
+
+    if let Some(record) = output_hash_record {
+        record_resolved_output_hash(output_hashes, record);
+    }
 }
 
 fn cache_write_error(result: WriteRecordResult) -> Option<String> {
@@ -1341,34 +1550,213 @@ fn replay_logs(hit: &RestoredHit, _reporter: &Arc<ProgressReporter>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::OutputMode;
+    use crate::progress::ProgressReporter;
     use luchta_engine::CollectedReport;
     use std::sync::atomic::AtomicBool;
 
-    /// Test that report_task_outcome sets any_failed and formats messages correctly.
+    /// Fast-stop latch: first failure in default mode sets both any_failed and interrupted.
+    #[tokio::test]
+    async fn fast_stop_latch_default_mode_sets_any_failed_and_interrupted() {
+        let (first_call, any_failed, interrupted) = run_fast_stop_latch_case(false).await;
+
+        assert!(first_call);
+        assert!(any_failed, "any_failed should be set");
+        assert!(interrupted, "default mode should set interrupted");
+    }
+
+    async fn run_fast_stop_latch_case(continue_on_failure: bool) -> (bool, bool, bool) {
+        let any_failed = Arc::new(AtomicBool::new(false));
+        let interrupted = Arc::new(AtomicBool::new(false));
+        let worker_manager = Arc::new(WorkerManager::new(HashMap::new()));
+
+        let first_call = trigger_fast_stop_on_first_failure(
+            &any_failed,
+            &interrupted,
+            continue_on_failure,
+            &worker_manager,
+        );
+        tokio::task::yield_now().await;
+
+        (
+            first_call,
+            any_failed.load(Ordering::SeqCst),
+            interrupted.load(Ordering::SeqCst),
+        )
+    }
+
+    struct FastStopInvalidTaskFixture {
+        task_id: TaskId,
+        ctx: DispatchContext<'static>,
+    }
+
+    impl FastStopInvalidTaskFixture {
+        fn new() -> Self {
+            let temp_dir = Box::leak(Box::new(tempfile::tempdir().expect("create temp dir")));
+            let package = make_test_package(temp_dir.path());
+            let package_graph = Box::leak(Box::new(build_test_package_graph(&package)));
+            let task_graph = Box::leak(Box::new(build_test_task_graph(package_graph)));
+            let task_id = TaskId::new("pkg", "invalid");
+            let reporter = Box::leak(Box::new(Arc::new(ProgressReporter::new(
+                OutputMode::Default,
+                HashMap::from([(task_id.clone(), 0)]),
+                1,
+            ))));
+
+            let ctx = DispatchContext {
+                tasks_to_run: Box::leak(Box::new(HashSet::from([task_id.clone()]))),
+                commands: Box::leak(Box::new(HashMap::new())),
+                invalid: Box::leak(Box::new(HashMap::from([(
+                    task_id.clone(),
+                    "task missing worker".to_string(),
+                )]))),
+                task_envs: Box::leak(Box::new(HashMap::new())),
+                executor: Box::leak(Box::new(Arc::new(WeightedExecutor::new(1)))),
+                any_failed: Box::leak(Box::new(Arc::new(AtomicBool::new(true)))),
+                interrupted: Box::leak(Box::new(Arc::new(AtomicBool::new(false)))),
+                continue_on_failure: false,
+                worker_manager: Box::leak(Box::new(Arc::new(WorkerManager::new(HashMap::new())))),
+                workspace_root: temp_dir.path(),
+                package_graph,
+                packages: Box::leak(Box::new(vec![package])),
+                task_graph,
+                cache: Box::leak(Box::new(open_test_cache(temp_dir.path()))),
+                output_hashes: Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new())))),
+                reporter,
+                lockfile: Box::leak(Box::new(LockfileState::Absent)),
+                shared_cache: None,
+                workers: Box::leak(Box::new(HashMap::new())),
+                global_cache_nonce: None,
+                env_cache_nonce: None,
+            };
+
+            Self { task_id, ctx }
+        }
+
+        fn task_node(&self) -> TaskNode {
+            TaskNode {
+                id: self.task_id.clone(),
+                weight: 1,
+            }
+        }
+    }
+
+    fn assert_skip_progress_without_failure_marker(reporter: &ProgressReporter) {
+        let progress = reporter.render_progress(
+            "0 MB",
+            &[],
+            &crate::memory_pressure::PressureSnapshot {
+                reasons: Vec::new(),
+                sample: None,
+                usage_threshold: 0,
+                free_threshold: 0,
+            },
+            owo_colors::Stream::Stdout,
+        );
+        assert!(
+            progress.contains("⌛ 1"),
+            "skip path should leave task uncounted in pending bucket: {progress}"
+        );
+        assert!(
+            !progress.contains("× 1") && !progress.contains('✖'),
+            "skip path must not render failed marker: {progress}"
+        );
+    }
+    /// Fast-stop gate ordering: prior failure suppresses later invalid ready task.
+    fn make_test_package(workspace_root: &Path) -> PackageNode {
+        let package_dir = workspace_root.join("packages/pkg");
+        std::fs::create_dir_all(&package_dir).expect("create package dir");
+        std::fs::write(
+            package_dir.join("package.json"),
+            serde_json::json!({
+                "name": "pkg",
+                "version": "1.0.0",
+            })
+            .to_string(),
+        )
+        .expect("write package manifest");
+        PackageNode::new(PackageName::from("pkg"), &package_dir)
+    }
+
+    fn build_test_package_graph(package: &PackageNode) -> PackageGraph {
+        PackageGraph::build(vec![package.clone()]).expect("build package graph")
+    }
+
+    fn build_test_task_graph(package_graph: &PackageGraph) -> TaskGraph {
+        let pipeline = HashMap::from([(
+            TaskName::from("invalid"),
+            TaskDefinition {
+                worker: Some("missing-worker".to_string()),
+                ..TaskDefinition::default()
+            },
+        )]);
+        TaskGraph::build(package_graph, &pipeline).expect("build task graph")
+    }
+
+    fn open_test_cache(workspace_root: &Path) -> Arc<Cache> {
+        Arc::new(Cache::open(&workspace_root.join(".luchta/cache")).expect("open cache"))
+    }
 
     #[test]
-    fn report_task_outcome_sets_any_failed_on_failure() {
-        #[cfg(unix)]
-        use std::os::unix::process::ExitStatusExt;
-        use std::process::ExitStatus;
+    fn dispatch_ready_task_skips_invalid_task_after_prior_failure_in_default_mode() {
+        let fixture = FastStopInvalidTaskFixture::new();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
 
+        dispatch_ready_task(fixture.task_node(), done_tx, &fixture.ctx);
+
+        assert_eq!(
+            done_rx.blocking_recv(),
+            Ok(false),
+            "fast-stop skip should report incomplete downstream signal"
+        );
+        assert_eq!(
+            fixture.ctx.reporter.failed_count(),
+            0,
+            "invalid task after prior failure must not be counted as failed"
+        );
+        assert_skip_progress_without_failure_marker(fixture.ctx.reporter.as_ref());
+    }
+
+    /// Fast-stop latch: continue mode sets any_failed but leaves interrupted false.
+    #[tokio::test]
+    async fn fast_stop_latch_continue_mode_leaves_interrupted_false() {
+        let (first_call, any_failed, interrupted) = run_fast_stop_latch_case(true).await;
+
+        assert!(first_call);
+        assert!(any_failed, "any_failed should be set");
+        assert!(!interrupted, "continue mode should NOT set interrupted");
+    }
+
+    /// Fast-stop latch: second call returns false and does not re-trigger state transitions.
+    #[tokio::test]
+    async fn fast_stop_latch_second_call_returns_false_without_retrigger() {
         let any_failed = Arc::new(AtomicBool::new(false));
+        let interrupted = Arc::new(AtomicBool::new(false));
+        let worker_manager = Arc::new(WorkerManager::new(HashMap::new()));
 
-        #[cfg(unix)]
-        let status_with_code = ExitStatus::from_raw(256); // 1 << 8
-        #[cfg(windows)]
-        let status_with_code = ExitStatus::from_raw(1);
+        let first_call =
+            trigger_fast_stop_on_first_failure(&any_failed, &interrupted, false, &worker_manager);
+        tokio::task::yield_now().await;
+        assert!(first_call);
+        assert!(interrupted.load(Ordering::SeqCst));
 
-        let outcome_with_code: Result<TaskRunOutcome, luchta_engine::ExecutorError> =
-            Ok(TaskRunOutcome {
-                status: status_with_code,
-                detected_inputs: None,
-                detected_outputs: None,
-            });
+        interrupted.store(false, Ordering::SeqCst);
+        let second_call =
+            trigger_fast_stop_on_first_failure(&any_failed, &interrupted, false, &worker_manager);
+        tokio::task::yield_now().await;
 
-        report_task_outcome(&outcome_with_code, &any_failed);
-
-        assert!(any_failed.load(Ordering::SeqCst));
+        assert!(
+            !second_call,
+            "second call should return false after first failure latched"
+        );
+        assert!(
+            any_failed.load(Ordering::SeqCst),
+            "any_failed should stay set"
+        );
+        assert!(
+            !interrupted.load(Ordering::SeqCst),
+            "second call should not re-trigger interrupted once caller clears it"
+        );
     }
 
     // Tests for outputs_lexically_in_package read-time scope gate.

@@ -183,13 +183,24 @@ struct RunContext {
     global_cache_nonce: Option<String>,
 }
 
-pub async fn run_tasks(
-    workspace_root: &Path,
-    selection: &TaskSelection<'_>,
-    output: OutputMode,
-    memory_pressure: MemoryPressureConfig,
-    max_weight_override: Option<u32>,
-) -> Result<()> {
+pub struct RunTasksRequest<'a> {
+    pub workspace_root: &'a Path,
+    pub selection: &'a TaskSelection<'a>,
+    pub output: OutputMode,
+    pub continue_on_failure: bool,
+    pub memory_pressure: MemoryPressureConfig,
+    pub max_weight_override: Option<u32>,
+}
+
+pub async fn run_tasks(request: RunTasksRequest<'_>) -> Result<()> {
+    let RunTasksRequest {
+        workspace_root,
+        selection,
+        output,
+        continue_on_failure,
+        memory_pressure,
+        max_weight_override,
+    } = request;
     let (mut memory_monitor, pressure_state) = build_memory_pressure(memory_pressure);
     let Some(run) = prepare_run_context(workspace_root, selection, max_weight_override).await?
     else {
@@ -231,6 +242,7 @@ pub async fn run_tasks(
         package_nodes: &run.package_nodes,
         package_graph: &run.package_graph,
         workspace_root,
+        continue_on_failure,
         worker_manager: &run.worker_manager,
         reporter: &reporter,
         commands: &commands,
@@ -256,6 +268,7 @@ struct RunDispatch<'a> {
     package_nodes: &'a [PackageNode],
     package_graph: &'a PackageGraph,
     workspace_root: &'a Path,
+    continue_on_failure: bool,
     worker_manager: &'a Arc<WorkerManager>,
     reporter: &'a Arc<ProgressReporter>,
     commands: &'a HashMap<TaskId, ExecutionRequest>,
@@ -348,6 +361,8 @@ async fn run_dispatch_loop(d: RunDispatch<'_>) -> Result<()> {
         executor: d.executor,
         any_failed: &any_failed,
         interrupted: &interrupted,
+        continue_on_failure: d.continue_on_failure,
+        worker_manager: d.worker_manager,
         workspace_root: d.workspace_root,
         package_graph: d.package_graph,
         packages: d.package_nodes,
@@ -377,6 +392,8 @@ struct DispatchContext<'a> {
     executor: &'a Arc<WeightedExecutor>,
     any_failed: &'a Arc<AtomicBool>,
     interrupted: &'a Arc<AtomicBool>,
+    continue_on_failure: bool,
+    worker_manager: &'a Arc<WorkerManager>,
     workspace_root: &'a Path,
     package_graph: &'a PackageGraph,
     packages: &'a [PackageNode],

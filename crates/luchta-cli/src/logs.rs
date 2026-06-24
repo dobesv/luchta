@@ -149,7 +149,9 @@ fn selection_requests_packages_without_tasks(selection: &TaskSelection<'_>) -> b
 fn print_task_logs(cache: &Cache, task_id: &TaskId, options: &LogsOptions<'_>) {
     let task_id_str = task_id.to_string();
     let Some(record) = cache.read(&task_id_str) else {
-        println!("no cached output for {}", task_id_str);
+        if !options.failed {
+            println!("no cached output for {}", task_id_str);
+        }
         return;
     };
 

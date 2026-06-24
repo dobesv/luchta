@@ -16,7 +16,9 @@ use luchta_cache::Cache;
 use luchta_engine::{ExecutionRequest, TaskGraph, WeightedExecutor, WorkerManager};
 use luchta_types::{EnvSpec, TaskId, WorkerDefinition};
 use luchta_workspace::{PackageGraph, PackageNode};
-use miette::{bail, Context, IntoDiagnostic, Result};
+use miette::{Context, IntoDiagnostic, Result};
+
+use crate::outcome::TasksFailed;
 
 use super::{
     dispatch::{build_command_map, CommandMap},
@@ -53,8 +55,9 @@ pub(super) fn build_memory_pressure(
     (monitor, pressure_state)
 }
 
-/// Resolves the dispatch loop's result into the run's final outcome: propagate
-/// interruption, fail if any task failed, otherwise print the success summary.
+/// Resolves dispatch loop result into final outcome: propagate genuine setup or
+/// interrupt errors loudly, always print summary after successful setup, then
+/// return silent sentinel if one or more tasks failed.
 pub(super) fn report_run_outcome(
     run_result: Result<()>,
     any_failed: &AtomicBool,
@@ -62,10 +65,6 @@ pub(super) fn report_run_outcome(
     pressure_state: &crate::memory_pressure::PressureState,
 ) -> Result<()> {
     run_result?;
-
-    if any_failed.load(Ordering::SeqCst) {
-        bail!("one or more tasks failed");
-    }
 
     let rss = select_summary_rss(
         pressure_state.snapshot().sample,
@@ -75,6 +74,11 @@ pub(super) fn report_run_outcome(
         "{}",
         reporter.render_summary(&crate::rss::format_rss(rss), owo_colors::Stream::Stdout)
     );
+
+    if any_failed.load(Ordering::SeqCst) {
+        return Err(miette::Report::new(TasksFailed));
+    }
+
     Ok(())
 }
 

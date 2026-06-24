@@ -7,7 +7,9 @@ mod env_merge;
 mod format;
 mod logs;
 mod memory_pressure;
+mod outcome;
 mod progress;
+mod progress_task_list;
 mod reports;
 mod rss;
 mod run;
@@ -20,7 +22,9 @@ use luchta_engine::{
     DependencyValidationError, ResolveMode, TaskGraph, TaskValidationDiagnostic,
     TaskValidationReason,
 };
-use miette::Result;
+use miette::{Report, Result};
+
+use crate::outcome::TasksFailed;
 
 #[tokio::main]
 async fn main() {
@@ -34,12 +38,17 @@ async fn main() {
     let result = run(Cli::parse()).await;
     let exit_code = match result {
         Ok(()) => 0,
+        Err(err) if is_tasks_failed(&err) => 1,
         Err(err) => {
             eprintln!("{:?}", err);
             1
         }
     };
     std::process::exit(exit_code);
+}
+
+fn is_tasks_failed(err: &Report) -> bool {
+    err.downcast_ref::<TasksFailed>().is_some()
 }
 
 /// Reset SIGPIPE to its default disposition so broken-pipe writes terminate the
@@ -169,6 +178,7 @@ struct RunArgs {
     top_level: bool,
     dry_run: bool,
     output: OutputMode,
+    continue_on_failure: bool,
     thresholds: ThresholdInputs,
     max_weight_cli: Option<String>,
     since: Option<String>,
@@ -191,12 +201,14 @@ fn command_run_args(command: Commands) -> RunArgs {
             max_weight,
             mem_free_threshold,
             since,
+            continue_on_failure,
         } => RunArgs {
             tasks,
             packages,
             top_level,
             dry_run,
             output,
+            continue_on_failure,
             thresholds: ThresholdInputs {
                 usage_cli: mem_usage_threshold,
                 free_cli: mem_free_threshold,
@@ -230,13 +242,14 @@ async fn run_command(workspace_root: &std::path::Path, command: Commands) -> Res
     if args.dry_run {
         run::dry_run_tasks(workspace_root, &selection).await
     } else {
-        run::run_tasks(
+        run::run_tasks(run::RunTasksRequest {
             workspace_root,
-            &selection,
-            args.output,
+            selection: &selection,
+            output: args.output,
+            continue_on_failure: args.continue_on_failure,
             memory_pressure,
             max_weight_override,
-        )
+        })
         .await
     }
 }
@@ -365,6 +378,7 @@ mod tests {
                 max_weight: None,
                 mem_free_threshold: None,
                 since: None,
+                continue_on_failure: false,
             },
         };
 
