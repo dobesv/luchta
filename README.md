@@ -358,8 +358,8 @@ All executed tasks—even those that are not opt-in for caching—persist their 
 | `-T, --top-level` | Match tasks defined at the workspace root instead of package tasks. |
 | `--time-taken <MS>` | Filter to tasks that took at least this many milliseconds. |
 | `--failed` | Filter to tasks that failed (`succeeded == false`). |
-| `--show-inputs` | Show input file metadata (path, size, mtime, hash) for each task. |
-| `--show-outputs` | Show output file metadata for each task. |
+| `--show-inputs` | Show the stored effective input patterns (globs, marked `detected` or `declared`) plus input file metadata (path, size, mtime, hash) for each task. |
+| `--show-outputs` | Show the stored effective output patterns (globs, marked `detected` or `declared`) plus output file metadata for each task. |
 | `--show-cache-nonce` | Show the resolved nonce string persisted for the task. |
 | `--file <NAME>` | Raw byte-exact passthrough of named report files (repeatable). |
 

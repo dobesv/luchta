@@ -245,11 +245,43 @@ fn build_log_block_meta<'a>(
 
 fn render_file_sections(record: &luchta_cache::TaskRunRecord, options: &LogsOptions<'_>) {
     if options.show_inputs {
+        print_patterns(
+            "input patterns",
+            &record.input_patterns,
+            record.detected_input_patterns,
+        );
         print_file_entries("inputs", &record.inputs);
     }
     if options.show_outputs {
+        print_patterns(
+            "output patterns",
+            &record.output_patterns,
+            record.detected_output_patterns,
+        );
         print_file_entries("outputs", &record.outputs);
     }
+}
+
+/// Print the effective input/output patterns (globs) stored in the cache
+/// metadata, noting whether they were worker-detected or declared.
+fn print_patterns(label: &str, patterns: &[String], detected: bool) {
+    print!("{}", format_patterns_section(label, patterns, detected));
+}
+
+/// Render the patterns section as a string (one line per output line,
+/// trailing newline included). Split out from `print_patterns` so the
+/// formatting — including the `(detected)`/`(declared)` marker and the
+/// empty `(none)` case — is unit-testable without capturing stdout.
+fn format_patterns_section(label: &str, patterns: &[String], detected: bool) -> String {
+    let source = if detected { "detected" } else { "declared" };
+    if patterns.is_empty() {
+        return format!("  {label} ({source}): (none)\n");
+    }
+    let mut out = format!("  {label} ({source}):\n");
+    for pattern in patterns {
+        out.push_str(&format!("    {pattern}\n"));
+    }
+    out
 }
 
 /// Print file entries (inputs or outputs) with metadata.
@@ -334,6 +366,32 @@ mod tests {
     use luchta_cache::{ReportMeta, TaskRunRecord};
     use luchta_types::TaskId;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn format_patterns_section_marks_declared() {
+        let patterns = vec!["src/**/*.ts".to_string(), "package.json".to_string()];
+        let out = format_patterns_section("input patterns", &patterns, false);
+        assert_eq!(
+            out,
+            "  input patterns (declared):\n    src/**/*.ts\n    package.json\n"
+        );
+    }
+
+    #[test]
+    fn format_patterns_section_marks_detected() {
+        let patterns = vec!["dist/**".to_string()];
+        let out = format_patterns_section("output patterns", &patterns, true);
+        assert_eq!(out, "  output patterns (detected):\n    dist/**\n");
+    }
+
+    #[test]
+    fn format_patterns_section_empty_renders_none() {
+        let out = format_patterns_section("input patterns", &[], false);
+        assert_eq!(out, "  input patterns (declared): (none)\n");
+
+        let out_detected = format_patterns_section("output patterns", &[], true);
+        assert_eq!(out_detected, "  output patterns (detected): (none)\n");
+    }
 
     fn dummy_record(reports: Vec<&str>) -> TaskRunRecord {
         TaskRunRecord {
