@@ -32,7 +32,9 @@ pub use snapshot::{
     combined_dep_outputs_hash, derive_input_key, input_key_hex, MergeEntryOutcome, MergeResult,
     Snapshot, SnapshotEntry, SnapshotStore, SNAPSHOT_SCHEMA_VERSION,
 };
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
+#[cfg(unix)]
+use std::collections::VecDeque;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
