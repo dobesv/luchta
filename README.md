@@ -270,6 +270,7 @@ The `tasks` map defines how tasks are applied across the workspace:
 - `luchta run --since <GIT_REF> build`: Restricts goal tasks to packages changed since `GIT_REF`, plus their transitive dependents.
 - `luchta run 'test*'`: Task arguments also support glob wildcards (e.g. `test:*`, `build*`).
 - `luchta run -T -p app build`: Runs both `@repo/app#build` and the top-level `#build` task (`-T` is additive to `-p`).
+- `luchta run --continue build`: Keep building after a failure — independent tasks still run; only the failed task's transitive dependents are skipped. Exits non-zero if anything failed.
 
 Luchta uses a **Goal-not-filter** selection model. Filters select the entry-point goals you want to reach; transitive prerequisites of those goals always run, even if they live in packages or have task names that do not match the filter. Luchta ensures everything needed for your targets is built.
 
@@ -298,6 +299,18 @@ To prevent extremely large logs from flooding the terminal, `luchta run` truncat
 ...
 ──◀ app#build (1200ms)
 ```
+
+#### Stop-on-failure behavior
+
+By default, `luchta run` uses an aggressive fast-stop strategy. On the first task failure:
+1. New task dispatch stops immediately.
+2. In-flight workers are terminated via SIGTERM, followed by SIGKILL after a 1-second grace period.
+3. The process exits promptly with a non-zero code.
+
+Use the `--continue` flag to keep building independent tasks after a failure. In this mode, only the failed task's transitive dependents are skipped. The run still exits non-zero if any failures occurred.
+
+Failed tasks are displayed in the status line and final summary as `× <count> (<names>)`. The final summary (showing run, skipped, and failed counts) is printed on both success and failure.
+
 #### Memory-pressure backpressure
 
 `luchta run` can pause dispatching **new** tasks when memory pressure is high. In-flight tasks keep running to completion.

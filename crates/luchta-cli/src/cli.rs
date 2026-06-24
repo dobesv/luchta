@@ -78,6 +78,11 @@ pub enum Commands {
         /// Only run tasks for packages changed since this git ref (plus their dependents).
         #[arg(long, value_name = "GIT_REF")]
         since: Option<String>,
+
+        /// Continue running independent tasks after a task fails (only transitive dependents are
+        /// skipped); exit non-zero if any task failed.
+        #[arg(long = "continue")]
+        continue_on_failure: bool,
     },
     /// View cached logs and metadata for previously executed tasks.
     Logs {
