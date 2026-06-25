@@ -96,11 +96,12 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Commands::Check => {
             // Check mode: a worker `Reject` during resolution is a hard error
-            // (surfaced from prepare_workspace); a `Prune` is informational.
+            // (surfaced from prepare_workspace); a `Prune` is informational and
+            // intentionally not reported — the pruned-task list is noise on large
+            // workspaces (see GitHub issue #46).
             let prepared =
                 run::prepare_workspace(&workspace_root, ResolveMode::Check, None).await?;
             prepared.worker_manager.shutdown().await;
-            run::report_pruned_tasks(&prepared.pruned);
 
             let dep_diagnostics = match TaskGraph::validate_tasks_with_pruned(
                 &prepared.package_graph,

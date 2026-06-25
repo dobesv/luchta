@@ -978,9 +978,10 @@ fn explicit_command_resolves_against_scripts_for_pruning() {
 }
 
 #[test]
-fn check_reports_prunes_without_failing() {
-    // `luchta check` must succeed (Prune is informational) while still listing
-    // the pruned task.
+fn check_suppresses_prune_note_without_failing() {
+    // `luchta check` must succeed (Prune is informational). The pruned-task
+    // note is intentionally suppressed (GitHub issue #46) as it is noise on
+    // large workspaces, so the output must NOT list pruned tasks.
     let temp = assert_fs::TempDir::new().expect("create temp dir");
     write_mixed_scripts_workspace(&temp);
     let fake_yarn_bin = write_fake_yarn(&temp);
@@ -1001,10 +1002,10 @@ fn check_reports_prunes_without_failing() {
         .arg(temp.path())
         .assert()
         .success()
-        .stdout(
-            predicate::str::contains("pruned during resolution")
-                .and(predicate::str::contains("no-build#build")),
-        )
+        // The pruned-task note is suppressed (issue #46) — neither the header
+        // nor the individual pruned task may appear.
+        .stdout(predicate::str::contains("pruned during resolution").not())
+        .stdout(predicate::str::contains("no-build#build").not())
         .stdout(predicate::str::contains("Configuration valid"))
         // `check` resolves only — it must never reach the run phase, so the
         // surviving task is never executed through the (fake) yarn worker.
