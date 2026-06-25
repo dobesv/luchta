@@ -3,9 +3,9 @@ use std::io;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use bytes::Bytes;
+use bytes::{BufMut, Bytes, BytesMut};
 use http_body_util::{BodyExt, Full};
 use hyper::header::CONTENT_TYPE;
 use hyper::Request;
@@ -55,6 +55,16 @@ pub struct CopyFile<'a> {
     pub src_remote: &'a str,
     pub dst_fs: &'a str,
     pub dst_remote: &'a str,
+}
+
+/// Destination for an `operations/uploadfile` call. The bytes land at
+/// `<fs>/<remote_dir>/<file_name>`; `file_name` must be a plain file name (the
+/// multipart part's `filename`).
+pub struct UploadFile<'a> {
+    pub fs: &'a str,
+    pub remote_dir: &'a str,
+    pub file_name: &'a str,
+    pub bytes: &'a [u8],
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -173,6 +183,49 @@ impl RcloneRcd {
         .map(|_| ())
     }
 
+    /// Streams `bytes` straight to the remote via `operations/uploadfile`
+    /// (multipart/form-data) instead of staging a local temp file and calling
+    /// `operations/copyfile`. This avoids a race where the temp source file is
+    /// removed before rclone stats it, which surfaced as a spurious
+    /// `404 object not found` (on the SOURCE) under concurrent stores.
+    ///
+    /// The file lands at `<fs>/<remote_dir>/<file_name>`. `file_name` must be a
+    /// plain file name (no path separators); rclone takes it from the multipart
+    /// part's `filename`.
+    pub fn upload_bytes(
+        &self,
+        upload: UploadFile<'_>,
+        timeout: Duration,
+    ) -> Result<(), RcloneError> {
+        let runtime = self.runtime();
+        let socket_path = self.ensure_daemon_socket(timeout)?;
+        let query = format!(
+            "fs={}&remote={}",
+            url_encode_query_value(upload.fs),
+            url_encode_query_value(upload.remote_dir)
+        );
+        let boundary = multipart_boundary();
+        let body = build_upload_multipart_body(&boundary, upload.file_name, upload.bytes);
+        std::thread::scope(|scope| {
+            scope
+                .spawn(move || -> Result<(), RcloneError> {
+                    let client = Client::unix();
+                    runtime.block_on(post_multipart_with_client(
+                        &client,
+                        &socket_path,
+                        &query,
+                        &boundary,
+                        body,
+                        timeout,
+                    ))
+                })
+                .join()
+                .map_err(|_| RcloneError::Process {
+                    reason: "rclone upload thread panicked".to_string(),
+                })?
+        })
+    }
+
     pub fn copy_dir(
         &self,
         src_fs: &str,
@@ -266,25 +319,7 @@ impl RcloneRcd {
     {
         let payload = serde_json::to_value(payload)?;
         let runtime = self.runtime();
-        let socket_path = {
-            let mut state = self.lock_state()?;
-            if state.daemon.is_none() {
-                state.daemon = Some(std::thread::scope(|scope| {
-                    scope
-                        .spawn(move || runtime.block_on(RcloneRcd::spawn_daemon(timeout)))
-                        .join()
-                        .map_err(|_| RcloneError::Process {
-                            reason: "rclone spawn thread panicked".to_string(),
-                        })?
-                })?);
-            }
-            state
-                .daemon
-                .as_ref()
-                .expect("daemon initialized")
-                .socket_path
-                .clone()
-        };
+        let socket_path = self.ensure_daemon_socket(timeout)?;
         let response = std::thread::scope(|scope| {
             scope
                 .spawn(move || -> Result<Value, RcloneError> {
@@ -303,6 +338,31 @@ impl RcloneRcd {
                 })?
         })?;
         serde_json::from_value(response).map_err(RcloneError::from)
+    }
+
+    /// Spawns the rclone daemon once (under the state lock) if needed and returns
+    /// a clone of its unix socket path. The lock is held ONLY for the spawn and
+    /// path read, never for in-flight requests, so concurrent RC calls run
+    /// against the daemon without serializing behind this mutex.
+    fn ensure_daemon_socket(&self, timeout: Duration) -> Result<PathBuf, RcloneError> {
+        let runtime = self.runtime();
+        let mut state = self.lock_state()?;
+        if state.daemon.is_none() {
+            state.daemon = Some(std::thread::scope(|scope| {
+                scope
+                    .spawn(move || runtime.block_on(RcloneRcd::spawn_daemon(timeout)))
+                    .join()
+                    .map_err(|_| RcloneError::Process {
+                        reason: "rclone spawn thread panicked".to_string(),
+                    })?
+            })?);
+        }
+        Ok(state
+            .daemon
+            .as_ref()
+            .expect("daemon initialized")
+            .socket_path
+            .clone())
     }
 
     fn lock_state(&self) -> Result<std::sync::MutexGuard<'_, State>, RcloneError> {
@@ -394,10 +454,11 @@ where
         })?;
 
     let status = response.status();
-    let bytes = response
-        .into_body()
-        .collect()
+    let bytes = timeout(timeout_duration, response.into_body().collect())
         .await
+        .map_err(|_| RcloneError::Timeout {
+            timeout: timeout_duration,
+        })?
         .map_err(|err| RcloneError::Request {
             reason: err.to_string(),
         })?
@@ -417,6 +478,114 @@ where
         });
     }
     serde_json::from_value(value).map_err(RcloneError::from)
+}
+
+/// POSTs a multipart/form-data body to `operations/uploadfile` (with the
+/// `fs`/`remote` query string already built) over the rcd unix socket. Mirrors
+/// `post_json_with_client` for status/error handling but carries the file as a
+/// streamed multipart part rather than a JSON payload.
+async fn post_multipart_with_client(
+    client: &Client<hyperlocal::UnixConnector, Full<Bytes>>,
+    socket_path: &std::path::Path,
+    query: &str,
+    boundary: &str,
+    body: Bytes,
+    timeout_duration: Duration,
+) -> Result<(), RcloneError> {
+    let path = format!("/operations/uploadfile?{query}");
+    let uri: hyper::Uri = Uri::new(socket_path, &path).into();
+    let request = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header(
+            CONTENT_TYPE,
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .body(Full::new(body))
+        .map_err(|err| RcloneError::Request {
+            reason: err.to_string(),
+        })?;
+
+    let response = timeout(timeout_duration, client.request(request))
+        .await
+        .map_err(|_| RcloneError::Timeout {
+            timeout: timeout_duration,
+        })
+        .and_then(|result| {
+            result.map_err(|err| RcloneError::Request {
+                reason: err.to_string(),
+            })
+        })?;
+
+    let status = response.status();
+    let bytes = timeout(timeout_duration, response.into_body().collect())
+        .await
+        .map_err(|_| RcloneError::Timeout {
+            timeout: timeout_duration,
+        })?
+        .map_err(|err| RcloneError::Request {
+            reason: err.to_string(),
+        })?
+        .to_bytes();
+    if !status.is_success() {
+        let body = String::from_utf8_lossy(&bytes).into_owned();
+        return Err(RcloneError::HttpStatus {
+            status: status.as_u16(),
+            body,
+        });
+    }
+
+    // uploadfile returns 200 with an (empty) JSON object on success, but may
+    // still carry an `error` field; surface it like the JSON path does, reusing
+    // the shared `detect_rc_error` helper.
+    if !bytes.is_empty() {
+        let body = String::from_utf8_lossy(&bytes);
+        if let Some(message) = detect_rc_error(&body)? {
+            return Err(RcloneError::Rc { message });
+        }
+    }
+    Ok(())
+}
+
+fn build_upload_multipart_body(boundary: &str, file_name: &str, bytes: &[u8]) -> Bytes {
+    let mut body =
+        BytesMut::with_capacity(boundary.len() * 2 + file_name.len() + bytes.len() + 160);
+    body.put(format!("--{boundary}\r\n").as_bytes());
+    body.put(
+        format!(
+            "Content-Disposition: form-data; name=\"file0\"; filename=\"{}\"\r\n",
+            escape_multipart_header_value(file_name)
+        )
+        .as_bytes(),
+    );
+    body.put(b"Content-Type: application/octet-stream\r\n\r\n".as_slice());
+    body.put(bytes);
+    body.put(format!("\r\n--{boundary}--\r\n").as_bytes());
+    body.freeze()
+}
+
+fn escape_multipart_header_value(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn multipart_boundary() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0_u128, |duration| duration.as_nanos());
+    format!("luchta-rclone-upload-{nanos:x}")
+}
+
+fn url_encode_query_value(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(char::from(byte));
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
 }
 
 /// Sends `core/quit` and waits for the daemon to exit, on the given runtime.
@@ -765,5 +934,82 @@ mod tests {
             !std::path::Path::new(&format!("/proc/{pid}")).exists(),
             "rclone pid {pid} still alive after drop"
         );
+    }
+
+    #[test]
+    fn upload_bytes_writes_exact_file_contents() {
+        if !should_run_rclone_test() {
+            eprintln!("skipping rclone upload integration test; rclone not on PATH or LUCHTA_TEST_RCLONE disabled");
+            return;
+        }
+
+        let timeout = Duration::from_secs(10);
+        let remote_dir = TempDir::new().unwrap();
+        let rclone = RcloneRcd::new(timeout).unwrap();
+        rclone.noop(timeout).unwrap();
+        let remote_fs = format!(
+            ":local:{}",
+            remote_dir.path().join("snapshots/commit").display()
+        );
+        let file_name = "part-01.bincode";
+        let payload = b"snapshot-bytes\nwith-second-line";
+
+        rclone
+            .upload_bytes(
+                UploadFile {
+                    fs: &remote_fs,
+                    remote_dir: "",
+                    file_name,
+                    bytes: payload,
+                },
+                timeout,
+            )
+            .unwrap();
+
+        let remote_path = remote_dir.path().join("snapshots/commit").join(file_name);
+        assert_eq!(fs::read(&remote_path).unwrap(), payload);
+        let stat = rclone
+            .stat(&remote_fs, file_name, timeout)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stat.path, file_name);
+    }
+
+    #[test]
+    fn upload_bytes_into_nested_remote_dir_writes_to_joined_path() {
+        if !should_run_rclone_test() {
+            eprintln!("skipping rclone nested upload integration test; rclone not on PATH or LUCHTA_TEST_RCLONE disabled");
+            return;
+        }
+
+        // We always pass a plain file name; the destination subdir is supplied
+        // via `remote_dir` (the `remote` query param), which rclone joins under
+        // `fs`. Verify the bytes land at `<fs>/<remote_dir>/<file_name>` exactly,
+        // including creating the nested dir on a fresh prefix (the empty-prefix
+        // case that previously surfaced spurious 404s on the copyfile path).
+        let timeout = Duration::from_secs(10);
+        let remote_dir = TempDir::new().unwrap();
+        let rclone = RcloneRcd::new(timeout).unwrap();
+        rclone.noop(timeout).unwrap();
+        let remote_fs = format!(":local:{}", remote_dir.path().display());
+        let payload = b"nested-payload";
+
+        rclone
+            .upload_bytes(
+                UploadFile {
+                    fs: &remote_fs,
+                    remote_dir: "snapshots/commit",
+                    file_name: "shard.bincode",
+                    bytes: payload,
+                },
+                timeout,
+            )
+            .unwrap();
+
+        let written = remote_dir
+            .path()
+            .join("snapshots/commit")
+            .join("shard.bincode");
+        assert_eq!(fs::read(&written).unwrap(), payload);
     }
 }

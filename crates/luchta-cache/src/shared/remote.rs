@@ -341,10 +341,15 @@ impl RemoteSync {
         dst_fs: &str,
         dst_remote: &str,
     ) -> Result<(), rclone::RcloneError> {
-        let temp_dir = tempfile::Builder::new().prefix("remote-push-").tempdir()?;
-        let local_path = temp_dir.path().join(dst_remote);
-        fs::write(&local_path, bytes)?;
-        self.copy_local_file_up(&local_path, dst_fs, dst_remote)
+        self.rclone.upload_bytes(
+            rclone::UploadFile {
+                fs: dst_fs,
+                remote_dir: "",
+                file_name: dst_remote,
+                bytes,
+            },
+            self.rclone.default_timeout(),
+        )
     }
 
     fn copy_local_file_up(
@@ -756,29 +761,34 @@ mod tests {
         );
         let upload = merge3.new_snapshot_upload.as_mut().unwrap();
         let expected_subsumed = merge3.subsumed_shard_ids.clone();
-        let missing_source_err = rclone::RcloneError::HttpStatus {
-            status: 500,
-            body: format!(
-                "failed to open source object: lstat {}: no such file or directory",
-                cache
-                    .paths()
-                    .snapshots_dir
-                    .join(&harness.commit)
-                    .join("vanished-shard.bincode")
-                    .display()
-            ),
-        };
-        assert!(remote_disable_reason(&missing_source_err).contains("HTTP 500"));
-        assert!(is_missing_local_source_copy_error(&missing_source_err));
-        harness.remote.record_remote_error(&missing_source_err);
-        assert!(!harness.remote.is_disabled_for_test());
-        upload.shard_id = "missing-parent/subsuming-shard".to_string();
+        upload.shard_id = "subsuming-shard".to_string();
+
+        // Force the new shard's `operations/uploadfile` to fail ON THE REAL
+        // REMOTE that we then verify: pre-create the upload's destination path
+        // as a DIRECTORY, so rclone returns HTTP 500 ("is a directory") when it
+        // tries to write the file. Crucially the failure is on the same remote
+        // root (`harness.remote_root`) whose snapshot dir we assert against, and
+        // deletes of the existing shards on that root would still succeed — so a
+        // regression that deleted the subsumed shards after a failed upload WOULD
+        // be observable here. The push must instead SKIP those deletes.
+        let blocking_path = harness
+            .remote_root
+            .path()
+            .join("snapshots")
+            .join(&harness.commit)
+            .join(format!("subsuming-shard.{SNAPSHOT_FILE_EXTENSION}"));
+        fs::create_dir_all(&blocking_path).unwrap();
         harness.remote.push_store_artifacts(PushArtifacts {
             paths: cache.paths(),
             commit_key: &harness.commit,
             outputs_hash: &[23; 32],
             merge: merge3,
         });
+        // The failed upload must not have disabled the remote permanently in a
+        // way that hides a delete — but it must have skipped the subsumed-shard
+        // deletes. Remove the blocking dir so the snapshot listing below only
+        // sees the original shard files.
+        fs::remove_dir(&blocking_path).unwrap();
         drop(seed_cache);
         let expected_present_ids: Vec<&str> = std::iter::once(merge2_id.as_str())
             .chain(expected_subsumed.iter().map(String::as_str))
@@ -962,6 +972,53 @@ mod tests {
             seed.harness.remote_root.path(),
             &seed.harness.commit,
             &seed.outputs_hash,
+        );
+    }
+
+    #[test]
+    fn remote_store_streams_snapshot_bytes_to_expected_remote_files() {
+        if !should_run_rclone_test() {
+            eprintln!("skipping rclone-gated shared-cache uploadfile path test; rclone not on PATH or LUCHTA_TEST_RCLONE disabled");
+            return;
+        }
+
+        let seed = seed_remote_store(
+            "console.log('uploadfile');\n",
+            [0x45; 32],
+            310,
+            (b"stdout-uploadfile", b"stderr-uploadfile"),
+        );
+
+        let snapshot_dir = seed
+            .harness
+            .remote_root
+            .path()
+            .join("snapshots")
+            .join(&seed.harness.commit);
+        let mut bincode_files = Vec::new();
+        let mut merged_files = Vec::new();
+        for entry in fs::read_dir(&snapshot_dir).unwrap() {
+            let entry = entry.unwrap();
+            let file_name = entry.file_name().into_string().unwrap();
+            if file_name.ends_with(".bincode") {
+                bincode_files.push(file_name);
+            } else if file_name.ends_with(".merged") {
+                merged_files.push(file_name);
+            }
+        }
+        assert_eq!(bincode_files.len(), 1);
+        assert_eq!(merged_files.len(), 1);
+
+        let local_snapshot_dir = seed.cache.paths().snapshots_dir.join(&seed.harness.commit);
+        let local_shard_name = bincode_files.pop().unwrap();
+        let local_merged_name = merged_files.pop().unwrap();
+        assert_eq!(
+            fs::read(snapshot_dir.join(&local_shard_name)).unwrap(),
+            fs::read(local_snapshot_dir.join(&local_shard_name)).unwrap()
+        );
+        assert_eq!(
+            fs::read(snapshot_dir.join(&local_merged_name)).unwrap(),
+            fs::read(local_snapshot_dir.join(&local_merged_name)).unwrap()
         );
     }
 
