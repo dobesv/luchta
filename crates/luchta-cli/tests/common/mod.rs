@@ -296,10 +296,20 @@ pub fn write_task_config_with_shell_worker(
     worker_command: &Path,
     task_json: &str,
 ) {
+    write_task_config_with_named_worker(temp, "shell", worker_command, task_json);
+}
+
+/// Write a task config script that invokes a named worker.
+pub fn write_task_config_with_named_worker(
+    temp: &assert_fs::TempDir,
+    worker_name: &str,
+    worker_command: &Path,
+    task_json: &str,
+) {
     write_task_config_with_worker(
         temp,
         WorkerConfig {
-            name: "shell",
+            name: worker_name,
             command: worker_command,
         },
         task_json,
