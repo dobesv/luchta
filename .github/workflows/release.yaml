@@ -119,37 +119,48 @@ jobs:
     - name: Build
       shell: bash
       run: |
-        $BUILD_CMD build --locked --release --target=${{ matrix.target }} -p luchta-cli -p luchta-yarn-worker -p luchta-bash-worker
+        $BUILD_CMD build --locked --release --target=${{ matrix.target }} \
+          -p luchta-cli \
+          -p luchta-yarn-worker \
+          -p luchta-bash-worker \
+          -p luchta-command-filter \
+          -p luchta-file-exists-filter \
+          -p luchta-lazy-worker \
+          -p luchta-yarn-filter
 
-    # Smoke test: run the freshly built binary so a broken artifact (bad
+    # Smoke test: run each freshly built binary so a broken artifact (bad
     # dynamic linking, missing symbols) fails the job before it is published.
     # Only run on native (`use-cross: false`) targets — the host can execute
     # those: windows-latest is x86_64, and macos-latest (ARM) runs the
     # x86_64-apple-darwin binary via Rosetta 2. cross targets can't run here.
-    # `luchta` has no `--version` flag, so `--help` (exit 0) is the probe.
-    # `luchta-yarn-worker` and `luchta-bash-worker` are stdin-driven JSONL workers
-    # without CLI flags; feed them empty stdin to hit EOF and exit 0 cleanly.
-    - name: Smoke test binary
+    #
+    # Each binary has its own clean exit-0 probe:
+    # - `luchta` has no `--version` flag, so `--help` is the probe.
+    # - `luchta-yarn-worker` / `luchta-bash-worker` are stdin-driven JSONL workers
+    #   without CLI flags; empty stdin hits EOF and exits 0.
+    # - The proxy filters/worker require `<args> -- <delegate command>`. Empty
+    #   stdin makes the read loop hit EOF and exit 0 before the delegate is ever
+    #   spawned (it spawns lazily on the first forwarded message), so the
+    #   placeholder `true` delegate is never executed — it only satisfies arg
+    #   validation. command-filter needs a predicate token; file-exists-filter
+    #   needs a glob pattern.
+    - name: Smoke test binaries
       if: ${{ !matrix.use-cross }}
       shell: bash
       run: |
-        bin="target/${{ matrix.target }}/release/luchta"
+        ext=""
         if [[ "$RUNNER_OS" == "Windows" ]]; then
-          bin="$bin.exe"
+          ext=".exe"
         fi
-        "$bin" --help
+        rel="target/${{ matrix.target }}/release"
 
-        worker_bin="target/${{ matrix.target }}/release/luchta-yarn-worker"
-        if [[ "$RUNNER_OS" == "Windows" ]]; then
-          worker_bin="$worker_bin.exe"
-        fi
-        printf '' | "$worker_bin"
-
-        bash_worker_bin="target/${{ matrix.target }}/release/luchta-bash-worker"
-        if [[ "$RUNNER_OS" == "Windows" ]]; then
-          bash_worker_bin="$bash_worker_bin.exe"
-        fi
-        printf '' | "$bash_worker_bin"
+        "$rel/luchta$ext" --help
+        printf '' | "$rel/luchta-yarn-worker$ext"
+        printf '' | "$rel/luchta-bash-worker$ext"
+        printf '' | "$rel/luchta-command-filter$ext" true -- true
+        printf '' | "$rel/luchta-file-exists-filter$ext" '*' -- true
+        printf '' | "$rel/luchta-lazy-worker$ext" -- true
+        printf '' | "$rel/luchta-yarn-filter$ext" -- true
 
     - name: Build archive
       id: package
@@ -164,29 +175,23 @@ jobs:
         staging="$dist_dir/stage"
         mkdir -p "$staging"
 
-        # luchta-cli produces a single binary named `luchta`.
-        bin=luchta
-        executable="target/$target/release/$bin"
+        # Every shipped binary. `luchta` comes from luchta-cli; the rest are
+        # named after their crate. Each is copied into the archive (with the
+        # `.exe` suffix on Windows).
+        ext=""
         if [[ "$RUNNER_OS" == "Windows" ]]; then
-          executable="$executable.exe"
+          ext=".exe"
         fi
-        cp "$executable" "$staging/"
-
-        # luchta-yarn-worker produces a binary named `luchta-yarn-worker`.
-        worker_bin=luchta-yarn-worker
-        worker_executable="target/$target/release/$worker_bin"
-        if [[ "$RUNNER_OS" == "Windows" ]]; then
-          worker_executable="$worker_executable.exe"
-        fi
-        cp "$worker_executable" "$staging/"
-
-        # luchta-bash-worker produces a binary named `luchta-bash-worker`.
-        bash_worker_bin=luchta-bash-worker
-        bash_worker_executable="target/$target/release/$bash_worker_bin"
-        if [[ "$RUNNER_OS" == "Windows" ]]; then
-          bash_worker_executable="$bash_worker_executable.exe"
-        fi
-        cp "$bash_worker_executable" "$staging/"
+        for bin in \
+          luchta \
+          luchta-yarn-worker \
+          luchta-bash-worker \
+          luchta-command-filter \
+          luchta-file-exists-filter \
+          luchta-lazy-worker \
+          luchta-yarn-filter; do
+          cp "target/$target/release/$bin$ext" "$staging/"
+        done
 
         name="luchta-$version-$target"
         if [[ "$RUNNER_OS" == "Windows" ]]; then
