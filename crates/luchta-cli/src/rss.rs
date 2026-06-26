@@ -261,9 +261,72 @@ mod platform {
 
 #[cfg(not(target_os = "linux"))]
 mod platform {
-    #[allow(dead_code)] // Stub compiled on non-Linux; Linux /proc implementation is unavailable there.
-    pub(super) fn process_tree_rss_bytes_for(_root_pid: u32) -> Option<u64> {
-        None
+    use std::collections::{HashMap, HashSet, VecDeque};
+
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+
+    /// Sum the resident-set size (bytes) of `root_pid` plus every descendant.
+    ///
+    /// Linux walks `/proc` directly (see the sibling module). Platforms without
+    /// `/proc` — macOS and Windows — enumerate the process table via `sysinfo`
+    /// and follow parent links instead. Returns `None` when `root_pid` is not a
+    /// live process, matching the Linux implementation's contract.
+    pub(super) fn process_tree_rss_bytes_for(root_pid: u32) -> Option<u64> {
+        let mut sys = System::new();
+        sys.refresh_processes_specifics(
+            ProcessesToUpdate::All,
+            true,
+            ProcessRefreshKind::nothing().with_memory(),
+        );
+        let processes = sys.processes();
+
+        let root = Pid::from_u32(root_pid);
+        // The root must be a live process; otherwise there is nothing to report.
+        let root_proc = processes.get(&root)?;
+
+        // Index children by parent so the descendant walk is linear in table size.
+        let mut children: HashMap<Pid, Vec<Pid>> = HashMap::new();
+        for (pid, process) in processes {
+            if let Some(parent) = process.parent() {
+                children.entry(parent).or_default().push(*pid);
+            }
+        }
+
+        let mut total = root_proc.memory();
+        let mut visited = HashSet::from([root]);
+        let mut queue = VecDeque::from([root]);
+        while let Some(pid) = queue.pop_front() {
+            let Some(child_pids) = children.get(&pid) else {
+                continue;
+            };
+            for &child in child_pids {
+                if !visited.insert(child) {
+                    continue;
+                }
+                if let Some(child_proc) = processes.get(&child) {
+                    total = total.saturating_add(child_proc.memory());
+                }
+                queue.push_back(child);
+            }
+        }
+
+        Some(total)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::process_tree_rss_bytes_for;
+
+        #[test]
+        fn process_tree_rss_is_available_for_current_process() {
+            let rss = process_tree_rss_bytes_for(std::process::id());
+            assert!(rss.is_some_and(|bytes| bytes > 0));
+        }
+
+        #[test]
+        fn invalid_root_pid_returns_none() {
+            assert_eq!(process_tree_rss_bytes_for(u32::MAX), None);
+        }
     }
 }
 
