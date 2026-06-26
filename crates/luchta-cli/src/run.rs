@@ -542,35 +542,10 @@ async fn finalize_run(
     walker_result
 }
 
-/// Emit an informational line for each task the resolution phase pruned, with
-/// the worker-supplied reason (e.g. "script `build` not found in package …").
-/// Pruning is normal, expected behavior — not an error — so this is a notice.
-pub fn report_pruned_tasks(pruned: &[PrunedTask]) {
-    if pruned.is_empty() {
-        return;
-    }
-
-    let mut entries: Vec<&PrunedTask> = pruned.iter().collect();
-    entries.sort_by_key(|entry| entry.task_id.to_string());
-
-    println!(
-        "{} {} task(s) pruned during resolution:",
-        "note:".bold().yellow(),
-        entries.len()
-    );
-    for entry in entries {
-        println!(
-            "  {} {}",
-            entry.task_id.to_string().bold(),
-            format!("({})", entry.outcome.describe()).dimmed()
-        );
-    }
-}
-
 /// Print the tasks in the order they would run, grouped into parallel "waves",
 /// without executing anything. This is a diagnostic view into the task
-/// dependency graph: every task in a wave only depends on tasks in earlier
-/// waves, so all tasks within a wave could run concurrently.
+/// dependency graph: every displayed task in a wave only depends on displayed
+/// tasks in earlier waves, so all tasks within a wave could run concurrently.
 pub async fn dry_run_tasks(workspace_root: &Path, selection: &TaskSelection<'_>) -> Result<()> {
     let PreparedWorkspace {
         packages: package_nodes,
@@ -594,8 +569,6 @@ pub async fn dry_run_tasks(workspace_root: &Path, selection: &TaskSelection<'_>)
         println!("{}", "No packages found in workspace".yellow());
         return Ok(());
     }
-
-    report_pruned_tasks(&pruned);
 
     let since_affected = match resolve_since_selection(selection, workspace_root, &package_graph)? {
         SinceSelection::NoOp => return Ok(()),
@@ -622,20 +595,20 @@ pub async fn dry_run_tasks(workspace_root: &Path, selection: &TaskSelection<'_>)
         Some(&package_graph),
     );
 
-    let waves = compute_execution_waves(&task_graph, &tasks_to_run);
-    let selected_task_total: usize = waves.iter().map(Vec::len).sum();
+    let displayed_waves =
+        compute_displayed_dry_run_waves(&task_graph, &tasks_to_run, &commands, &invalid, selection);
+    let displayed_task_total: usize = displayed_waves.iter().map(Vec::len).sum();
 
     println!(
         "{} {} task(s) across {} wave(s) (tasks within a wave can run in parallel):",
         "dry-run:".bold(),
-        selected_task_total,
-        waves.len()
+        displayed_task_total,
+        displayed_waves.len()
     );
 
-    for (index, wave) in waves.iter().enumerate() {
+    for (index, wave) in displayed_waves.iter().enumerate() {
         println!("\n{}", format!("Wave {}:", index + 1).bold().cyan());
-        for task_id in wave {
-            let action = describe_planned_action(task_id, &commands, &invalid);
+        for (task_id, action) in wave {
             println!("  {} {}", task_id.to_string().bold(), action);
         }
     }
@@ -643,27 +616,67 @@ pub async fn dry_run_tasks(workspace_root: &Path, selection: &TaskSelection<'_>)
     Ok(())
 }
 
-/// Describe what a task would do when executed, for the dry-run output.
+/// Build the dry-run wave plan as it should be *displayed*: each wave keeps only
+/// the tasks worth showing (paired with their description), and waves left empty
+/// by filtering are dropped so wave numbering stays gap-free. The underlying
+/// execution topology in `compute_execution_waves` is unchanged — this only
+/// shapes presentation.
+fn compute_displayed_dry_run_waves(
+    task_graph: &TaskGraph,
+    tasks_to_run: &HashSet<TaskId>,
+    commands: &HashMap<TaskId, ExecutionRequest>,
+    invalid: &HashMap<TaskId, String>,
+    selection: &TaskSelection<'_>,
+) -> Vec<Vec<(TaskId, String)>> {
+    compute_execution_waves(task_graph, tasks_to_run)
+        .into_iter()
+        .map(|wave| {
+            wave.into_iter()
+                .filter_map(|task_id| {
+                    describe_planned_action(&task_id, commands, invalid, selection)
+                        .map(|action| (task_id, action))
+                })
+                .collect()
+        })
+        .filter(|wave: &Vec<(TaskId, String)>| !wave.is_empty())
+        .collect()
+}
+
+/// Describe what a task would do when executed, for dry-run output. Returns
+/// `None` for uninteresting connector-only tasks that would be skipped (no
+/// command, no config error) so they are hidden from the plan — the visibility
+/// rule and the rendered text are derived from a single lookup (issue #133).
 fn describe_planned_action(
     task_id: &TaskId,
     commands: &HashMap<TaskId, ExecutionRequest>,
     invalid: &HashMap<TaskId, String>,
-) -> String {
+    selection: &TaskSelection<'_>,
+) -> Option<String> {
     if let Some(message) = invalid.get(task_id) {
-        return format!("{} ({})", "config error".red(), message);
+        return Some(format!("{} ({})", "config error".red(), message));
     }
 
-    match commands.get(task_id) {
-        Some(request) => {
-            let worker = request
-                .worker
-                .as_deref()
-                .map(|name| format!("worker '{name}'"))
-                .unwrap_or_else(|| "no worker".to_string());
-            format!("{} via {}", request.command.dimmed(), worker.dimmed())
-        }
-        None => "(no command, would be skipped)".dimmed().to_string(),
+    if let Some(request) = commands.get(task_id) {
+        let worker = request
+            .worker
+            .as_deref()
+            .map(|name| format!("worker '{name}'"))
+            .unwrap_or_else(|| "no worker".to_string());
+        return Some(format!(
+            "{} via {}",
+            request.command.dimmed(),
+            worker.dimmed()
+        ));
     }
+
+    // A top-level (`-T`) request explicitly targets workspace-root tasks; keep
+    // such a root ordering task in the plan with a clear label rather than
+    // dropping it as noise or printing a bare id.
+    if selection.top_level && task_id.is_root() {
+        return Some("(ordering task)".dimmed().to_string());
+    }
+
+    None
 }
 
 fn resolve_since_selection(
@@ -1257,6 +1270,72 @@ mod tests {
         assert_eq!(waves[1], vec![TaskId::new("@repo/app", "build")]);
         assert_eq!(waves[2], vec![TaskId::new("@repo/app", "noop-mid")]);
         assert_eq!(waves[3], vec![TaskId::new("@repo/app", "test")]);
+    }
+
+    #[test]
+    fn describe_planned_action_hides_non_root_no_command_task() {
+        let task_id = TaskId::new("@repo/app", "noop");
+        let commands: HashMap<TaskId, ExecutionRequest> = HashMap::new();
+        let invalid: HashMap<TaskId, String> = HashMap::new();
+        let selection = TaskSelection {
+            requested_tasks: &[],
+            packages: &[],
+            top_level: false,
+            since: None,
+        };
+
+        assert_eq!(
+            describe_planned_action(&task_id, &commands, &invalid, &selection),
+            None,
+            "a no-command, non-root task must be hidden from the dry-run plan"
+        );
+    }
+
+    #[test]
+    fn describe_planned_action_labels_top_level_root_ordering_task() {
+        // `-T` explicitly targets workspace-root tasks; a root ordering task
+        // with no command must stay visible with a clear label, not a bare id.
+        let task_id = TaskId::new(luchta_types::ROOT_PACKAGE_NAME, "build");
+        assert!(task_id.is_root(), "root package name denotes a root task");
+        let commands: HashMap<TaskId, ExecutionRequest> = HashMap::new();
+        let invalid: HashMap<TaskId, String> = HashMap::new();
+        let selection = TaskSelection {
+            requested_tasks: &[],
+            packages: &[],
+            top_level: true,
+            since: None,
+        };
+
+        let action = describe_planned_action(&task_id, &commands, &invalid, &selection)
+            .expect("top-level root ordering task should be shown");
+        assert!(
+            action.contains("(ordering task)"),
+            "top-level root ordering task should be labeled, got: {action}"
+        );
+    }
+
+    #[test]
+    fn describe_planned_action_keeps_config_error_visible() {
+        let task_id = TaskId::new("@repo/app", "check");
+        let commands: HashMap<TaskId, ExecutionRequest> = HashMap::new();
+        let mut invalid: HashMap<TaskId, String> = HashMap::new();
+        invalid.insert(
+            task_id.clone(),
+            "defines a command but no worker".to_string(),
+        );
+        let selection = TaskSelection {
+            requested_tasks: &[],
+            packages: &[],
+            top_level: false,
+            since: None,
+        };
+
+        let action = describe_planned_action(&task_id, &commands, &invalid, &selection)
+            .expect("config-error task should stay visible");
+        assert!(
+            action.contains("config error"),
+            "config-error task should be labeled as such, got: {action}"
+        );
     }
 
     #[test]

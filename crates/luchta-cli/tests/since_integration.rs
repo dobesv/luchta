@@ -2,9 +2,11 @@ mod common;
 
 use assert_cmd::Command as AssertCommand;
 use assert_fs::prelude::*;
-use common::{git_commit_all, git_commit_paths, setup_workspace};
+use common::{
+    git_commit_all, git_commit_paths, setup_workspace, write_task_config_with_named_worker,
+};
 use predicates::prelude::*;
-use std::{fs, process::Command};
+use std::process::Command;
 
 fn add_third_package(temp: &assert_fs::TempDir) {
     temp.child("packages/c").create_dir_all().unwrap();
@@ -19,22 +21,29 @@ fn add_third_package(temp: &assert_fs::TempDir) {
         .unwrap();
 }
 
+fn write_selection_inspector_worker(temp: &assert_fs::TempDir) -> std::path::PathBuf {
+    let worker = common::shell_worker(temp);
+    worker.path().to_path_buf()
+}
+
 fn write_default_luchta_config(temp: &assert_fs::TempDir) {
-    fs::write(
-        temp.child("luchta-config.sh").path(),
-        "#!/bin/sh\necho '{\"concurrency\":{\"maxWeight\":4},\"tasks\":{\"build\":{\"dependsOn\":[\"^build\"]},\"a#build\":{},\"b#build\":{\"dependsOn\":[\"^build\"]},\"c#build\":{}}}'\n",
-    )
-    .unwrap();
-    common::set_executable(temp.child("luchta-config.sh").path());
+    let worker = write_selection_inspector_worker(temp);
+    write_task_config_with_named_worker(
+        temp,
+        "sh",
+        &worker,
+        "\"build\":{\"dependsOn\":[\"^build\"],\"worker\":\"sh\"},\"a#build\":{\"worker\":\"sh\"},\"b#build\":{\"dependsOn\":[\"^build\"],\"worker\":\"sh\"},\"c#build\":{\"worker\":\"sh\"}",
+    );
 }
 
 fn write_top_level_luchta_config(temp: &assert_fs::TempDir) {
-    fs::write(
-        temp.child("luchta-config.sh").path(),
-        "#!/bin/sh\necho '{\"concurrency\":{\"maxWeight\":4},\"tasks\":{\"build\":{\"dependsOn\":[\"^build\"]},\"#build\":{},\"a#build\":{},\"b#build\":{\"dependsOn\":[\"^build\"]}}}'\n",
-    )
-    .unwrap();
-    common::set_executable(temp.child("luchta-config.sh").path());
+    let worker = write_selection_inspector_worker(temp);
+    write_task_config_with_named_worker(
+        temp,
+        "sh",
+        &worker,
+        "\"build\":{\"dependsOn\":[\"^build\"],\"worker\":\"sh\"},\"#build\":{\"worker\":\"sh\"},\"a#build\":{\"worker\":\"sh\"},\"b#build\":{\"dependsOn\":[\"^build\"],\"worker\":\"sh\"}",
+    );
 }
 
 fn git_stdout(repo: &assert_fs::TempDir, args: &[&str]) -> String {

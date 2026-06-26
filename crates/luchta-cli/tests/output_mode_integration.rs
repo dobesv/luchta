@@ -462,6 +462,105 @@ echo '{{"concurrency":{{"maxWeight":4}},"workers":{{"yarn":{{"command":"{worker_
     temp.close().expect("cleanup temp dir");
 }
 
+#[test]
+fn dry_run_hides_pruned_connectors_but_keeps_runnable_and_config_errors() {
+    let temp = assert_fs::TempDir::new().expect("create temp dir");
+
+    temp.child("package.json")
+        .write_str(
+            r#"{
+    "name": "root",
+    "private": true,
+    "workspaces": ["packages/*"]
+}"#,
+        )
+        .expect("write root package.json");
+
+    let pkg_a_dir = temp.child("packages/a");
+    fs::create_dir_all(pkg_a_dir.path()).expect("create packages/a dir");
+    temp.child("packages/a/package.json")
+        .write_str(
+            r#"{
+    "name": "a",
+    "scripts": {
+        "build": "echo built-a"
+    }
+}"#,
+        )
+        .expect("write packages/a/package.json");
+
+    let pkg_b_dir = temp.child("packages/b");
+    fs::create_dir_all(pkg_b_dir.path()).expect("create packages/b dir");
+    temp.child("packages/b/package.json")
+        .write_str(
+            r#"{
+    "name": "b"
+}"#,
+        )
+        .expect("write packages/b/package.json");
+
+    let worker_script = make_worker_script(
+        &temp,
+        "selection-worker.sh",
+        &shell_worker_body(
+            r#"{"type":"done","id":"%s","success":true,"exitCode":0}"#,
+            "",
+        ),
+    );
+
+    let config_content = format!(
+        r#"#!/bin/sh
+echo '{{"concurrency":{{"maxWeight":4}},"workers":{{"fake":{{"command":"{}"}}}},"tasks":{{"a#build":{{"worker":"fake"}},"check":{{"command":"echo invalid-without-worker"}}}}}}'
+"#,
+        worker_script.path().display()
+    );
+    temp.child("luchta-config.sh")
+        .write_str(&config_content)
+        .expect("write luchta-config.sh");
+
+    let output = Command::cargo_bin("luchta")
+        .expect("find binary")
+        .arg("run")
+        .arg("check")
+        .arg("build")
+        .arg("--dry-run")
+        .arg("--workspace-root")
+        .arg(temp.path())
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("run command");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        output.status.success(),
+        "dry-run should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !stdout.contains("pruned during resolution"),
+        "dry-run should not print pruned note, got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("(no command, would be skipped)"),
+        "dry-run should hide skipped connector rows, got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("b#build"),
+        "dry-run should hide pruned no-command task rows, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("a#build"),
+        "dry-run should keep runnable tasks visible, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("check") && stdout.contains("config error"),
+        "dry-run should keep config-error tasks visible, got: {stdout}"
+    );
+
+    temp.close().expect("cleanup temp dir");
+}
+
 /// Test 5: Failure dumps captured output, exits 1, no Done line.
 #[test]
 fn failing_task_exits_nonzero_no_done_line() {

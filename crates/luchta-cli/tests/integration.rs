@@ -639,7 +639,18 @@ fn dry_run_global_build_excludes_named_root_tasks() {
 }"#,
         )
         .expect("write root package.json");
-    let config = r#"{"concurrency":{"maxWeight":4},"tasks":{"build":{}}}"#;
+    let worker_script = make_worker_script(
+        &temp,
+        "global-build-worker.sh",
+        &shell_worker_body(
+            r#"{"type":"done","id":"%s","success":true,"exitCode":0}"#,
+            "",
+        ),
+    );
+    let config = format!(
+        r#"{{"concurrency":{{"maxWeight":4}},"workers":{{"fake":{{"command":"{}"}}}},"tasks":{{"build":{{"worker":"fake"}}}}}}"#,
+        worker_script.path().display()
+    );
 
     temp.child("luchta-config.sh")
         .write_str(&format!("#!/bin/sh\necho '{config}'\n"))
