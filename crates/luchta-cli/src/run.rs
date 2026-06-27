@@ -14,12 +14,12 @@ use globset::{Glob, GlobSet, GlobSetBuilder};
 use luchta_cache::shared::SharedCache;
 use luchta_cache::{
     combined_outputs_hash, decide, resolve_cache_dir, resolve_inputs_with_semantics,
-    resolve_outputs, Cache, Decision, TaskRunRecord,
+    resolve_outputs, Cache, CurrentState, Decision, DecisionResult, RunReason, TaskRunRecord,
 };
 use luchta_engine::{
     expand_input_patterns, is_root_task, CompletionSignal, ExecutionLogSink, ExecutionRequest,
-    LogStream, PackageResolveInfo, PrunedTask, ReadyTaskMessage, ResolveMode, TaskGraph, TaskNode,
-    TaskRunOutcome, Walker, WeightedExecutor, WorkerManager,
+    LogStream, PackageResolveInfo, PruneOutcome, PrunedTask, ReadyTaskMessage, ResolveMode,
+    TaskGraph, TaskNode, TaskRunOutcome, Walker, WeightedExecutor, WorkerManager,
 };
 use luchta_types::{EnvSpec, PackageName, TaskDefinition, TaskId, TaskName, WorkerDefinition};
 use luchta_workspace::{PackageGraph, PackageNode, WorkspaceDiscovery, YarnWorkspace};
@@ -35,7 +35,7 @@ use crate::progress::ProgressReporter;
 
 mod dispatch;
 mod pause;
-use dispatch::{build_command_map, CommandMap};
+use dispatch::{build_command_map, CachePackageContext, CommandMap};
 use pause::dispatch_loop;
 
 mod setup;
@@ -446,6 +446,12 @@ struct TaskRunContext {
     shared_cache: Option<Arc<SharedCache>>,
 }
 
+#[derive(Clone)]
+struct CacheDecisionContext {
+    action: Decision,
+    run_reason: RunReason,
+}
+
 struct CacheWriteContext {
     task_id: TaskId,
     task_def: TaskDefinition,
@@ -460,6 +466,37 @@ struct CacheWriteContext {
     package_graph: PackageGraph,
     /// Resolved cache nonce string for this task.
     cache_nonce: Option<String>,
+    decision: CacheDecisionContext,
+}
+
+struct CacheStateContext<'a> {
+    cache_package: CachePackageContext<'a>,
+    dep_outputs: BTreeMap<String, [u8; 32]>,
+    pkg_dep_pairs: Vec<(String, String)>,
+    resolver: PackageDirResolver,
+}
+
+struct CacheCurrentStateInput<'a> {
+    task_def: &'a TaskDefinition,
+    merged_env: &'a BTreeMap<String, EnvSpec>,
+    nonce: Option<&'a str>,
+    cache_context: &'a CacheStateContext<'a>,
+}
+
+struct SharedCacheSkipInput<'a> {
+    task_id: &'a TaskId,
+    task_def: &'a TaskDefinition,
+    cache_context: &'a CacheStateContext<'a>,
+    current: &'a CurrentState<'a>,
+    decision: &'a DecisionResult,
+}
+
+#[derive(Clone)]
+struct BuildRunRecordArgs<'a> {
+    outcome: Option<&'a TaskRunOutcome>,
+    succeeded: bool,
+    end_unix_ms: u64,
+    run_reason: Option<RunReason>,
 }
 
 struct OutputHashRecordContext {
@@ -908,7 +945,33 @@ pub(crate) fn collect_requested_subgraph(
 
     let requested_ids = collect_matching_task_ids(&available_nodes, &criteria);
 
-    validate_literal_task_requests(&requested_ids, selection, pruned, &criteria)?;
+    let requested_task_names: HashSet<&str> = requested_ids
+        .iter()
+        .map(|task_id| task_id.task.as_str())
+        .collect();
+    let selection_prunes: Vec<PrunedTask> = available_nodes
+        .iter()
+        .filter(|node| !requested_ids.contains(&node.id))
+        .filter(|node| package_matches(&node.id, &criteria))
+        .filter(|node| {
+            selection
+                .requested_tasks
+                .iter()
+                .any(|requested| requested == node.id.task.as_str())
+                || requested_task_names.contains(node.id.task.as_str())
+        })
+        .map(|node| PrunedTask {
+            task_id: node.id.clone(),
+            outcome: PruneOutcome::Pruned {
+                reason: Some("not in requested subgraph".to_string()),
+            },
+        })
+        .collect();
+    let mut pruned_with_selection = Vec::with_capacity(pruned.len() + selection_prunes.len());
+    pruned_with_selection.extend_from_slice(pruned);
+    pruned_with_selection.extend(selection_prunes);
+
+    validate_literal_task_requests(&requested_ids, selection, &pruned_with_selection, &criteria)?;
 
     if requested_ids.is_empty() && single_literal_task_request(selection.requested_tasks).is_none()
     {

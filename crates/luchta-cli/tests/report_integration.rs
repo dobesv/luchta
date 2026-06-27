@@ -96,16 +96,56 @@ fn setup_two_package_report_workspace(temp: &assert_fs::TempDir) {
 
 #[test]
 fn cache_write_read_report_byte_exact() {
-    use luchta_cache::{Cache, RunArtifacts, TaskRunRecord, CACHE_DIR_NAME, LUCHTA_DIR_NAME};
-    use std::collections::BTreeMap;
+    use luchta_cache::{Cache, RunArtifacts, CACHE_DIR_NAME, LUCHTA_DIR_NAME};
     use tempfile::tempdir;
 
     let temp_dir = tempdir().unwrap();
-    let cache = Cache::open(&temp_dir.path().join(LUCHTA_DIR_NAME).join(CACHE_DIR_NAME)).unwrap();
+    let cache_dir = temp_dir.path().join(LUCHTA_DIR_NAME).join(CACHE_DIR_NAME);
+    let cache = Cache::open(&cache_dir).unwrap();
+    let record = test_record_with_reports();
+    let sarif_content = "{\"version\":\"2.1.0\"}\n";
+    let txt_content = "Hello\nWorld\n";
+    let reports = vec![
+        report_input("sarif.json", "application/sarif+json", sarif_content),
+        report_input("report.txt", "text/plain", txt_content),
+    ];
 
-    // Create record with reports
-    let record = TaskRunRecord {
-        schema_version: 3,
+    cache
+        .write(
+            "test#task",
+            RunArtifacts {
+                record: &record,
+                stdout: b"stdout",
+                stderr: b"stderr",
+                reports: &reports,
+            },
+        )
+        .unwrap();
+
+    let read_back = cache.read("test#task").expect("record should exist");
+    assert_eq!(read_back.reports.len(), 2);
+    assert_eq!(read_back.reports[0].filename, "sarif.json");
+    assert_eq!(
+        cache
+            .read_report("test#task", "sarif.json")
+            .expect("sarif report"),
+        sarif_content.as_bytes(),
+        "sarif content must be byte-exact"
+    );
+    assert_eq!(
+        cache
+            .read_report("test#task", "report.txt")
+            .expect("txt report"),
+        txt_content.as_bytes(),
+        "txt content must be byte-exact"
+    );
+}
+
+/// Record fixture with two report metadata entries for the byte-exact test.
+fn test_record_with_reports() -> luchta_cache::TaskRunRecord {
+    use std::collections::BTreeMap;
+    luchta_cache::TaskRunRecord {
+        schema_version: 4,
         task_spec_hash: [1u8; 32],
         input_patterns: vec!["src/**/*.ts".to_string()],
         inputs: vec![],
@@ -132,52 +172,8 @@ fn cache_write_read_report_byte_exact() {
             },
         ],
         cache_nonce: None,
-    };
-
-    // Content with specific bytes including trailing newline
-    let sarif_content = "{\"version\":\"2.1.0\"}\n";
-    let txt_content = "Hello\nWorld\n";
-
-    let reports = vec![
-        report_input("sarif.json", "application/sarif+json", sarif_content),
-        report_input("report.txt", "text/plain", txt_content),
-    ];
-
-    cache
-        .write(
-            "test#task",
-            RunArtifacts {
-                record: &record,
-                stdout: b"stdout",
-                stderr: b"stderr",
-                reports: &reports,
-            },
-        )
-        .unwrap();
-
-    // Read back and verify byte-exact
-    let read_back = cache.read("test#task").expect("record should exist");
-    assert_eq!(read_back.reports.len(), 2);
-    assert_eq!(read_back.reports[0].filename, "sarif.json");
-
-    // Byte-exact content verification
-    let sarif_bytes = cache
-        .read_report("test#task", "sarif.json")
-        .expect("sarif report");
-    let txt_bytes = cache
-        .read_report("test#task", "report.txt")
-        .expect("txt report");
-
-    assert_eq!(
-        sarif_bytes,
-        sarif_content.as_bytes(),
-        "sarif content must be byte-exact"
-    );
-    assert_eq!(
-        txt_bytes,
-        txt_content.as_bytes(),
-        "txt content must be byte-exact"
-    );
+        run_reason: None,
+    }
 }
 
 #[test]
@@ -215,7 +211,7 @@ fn cache_duplicate_filename_last_wins() {
     let cache = Cache::open(&temp_dir.path().join(LUCHTA_DIR_NAME).join(CACHE_DIR_NAME)).unwrap();
 
     let record = TaskRunRecord {
-        schema_version: 3,
+        schema_version: 4,
         task_spec_hash: [1u8; 32],
         input_patterns: vec![],
         inputs: vec![],
@@ -236,6 +232,7 @@ fn cache_duplicate_filename_last_wins() {
             mime_type: "application/json".to_string(),
         }],
         cache_nonce: None,
+        run_reason: None,
     };
 
     // Two reports with same filename - last should win
@@ -287,7 +284,7 @@ fn cache_rejects_traversal_filename() {
     let cache = Cache::open(&temp_dir.path().join(LUCHTA_DIR_NAME).join(CACHE_DIR_NAME)).unwrap();
 
     let record = TaskRunRecord {
-        schema_version: 3,
+        schema_version: 4,
         task_spec_hash: [1u8; 32],
         input_patterns: vec![],
         inputs: vec![],
@@ -305,6 +302,7 @@ fn cache_rejects_traversal_filename() {
         end_unix_ms: 0,
         reports: vec![],
         cache_nonce: None,
+        run_reason: None,
     };
 
     // Try to write with path traversal filename
@@ -350,7 +348,7 @@ fn cache_rejects_reserved_filename() {
     let cache = Cache::open(&temp_dir.path().join(LUCHTA_DIR_NAME).join(CACHE_DIR_NAME)).unwrap();
 
     let record = TaskRunRecord {
-        schema_version: 3,
+        schema_version: 4,
         task_spec_hash: [1u8; 32],
         input_patterns: vec![],
         inputs: vec![],
@@ -368,6 +366,7 @@ fn cache_rejects_reserved_filename() {
         end_unix_ms: 0,
         reports: vec![],
         cache_nonce: None,
+        run_reason: None,
     };
 
     // Try to write with reserved filename

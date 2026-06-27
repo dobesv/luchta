@@ -13,13 +13,25 @@ use luchta_cache::shared::{
 };
 use luchta_cache::{
     decide_shared_restore, task_cache_key, CurrentState, FileEntry, ReportInput, RunArtifacts,
-    SCHEMA_VERSION_V3,
+    RunReason, SCHEMA_VERSION_V4,
 };
 use luchta_types::EnvSpec;
 use luchta_worker::BUILTIN_PASSTHROUGH_ENV;
 
 use crate::env_merge::merge_env;
 use luchta_workspace::PackageGraph;
+
+use std::sync::OnceLock;
+
+/// Shared empty env map used as a stable fallback when a task has no entry in
+/// `task_envs`. Mirrors the original `unwrap_or(&empty)` semantics (hash an
+/// empty env rather than panic) while providing a `'static` reference that
+/// outlives the caller. Uses `OnceLock` (stable since 1.70) to stay within the
+/// crate's 1.78 MSRV.
+fn empty_task_env() -> &'static BTreeMap<String, EnvSpec> {
+    static EMPTY_TASK_ENV: OnceLock<BTreeMap<String, EnvSpec>> = OnceLock::new();
+    EMPTY_TASK_ENV.get_or_init(BTreeMap::new)
+}
 
 fn split_captured_logs(sink: &ExecutionLogSink) -> (Vec<u8>, Vec<u8>) {
     let (mut out, mut err) = (Vec::new(), Vec::new());
@@ -112,6 +124,7 @@ fn format_captured_failure_logs(context: FailureLogContext, sink: &ExecutionLogS
             cache_hash: Some(cache_hash_12),
             show_cache_nonce: false,
             cache_nonce: None,
+            run_reason: None,
         },
         &body,
         &reports,
@@ -243,6 +256,9 @@ fn handle_cache_skip(
         Decision::Skip => {
             // Local cache hit — this IS the legacy "skipped" count.
             ctx.reporter.task_skipped_cache_hit(task_id);
+            if let Some(prior) = ctx.cache.read(&task_id.to_string()) {
+                record_output_hash(ctx.output_hashes, task_id, prior.outputs_hash);
+            }
             let _ = done_tx
                 .take()
                 .expect("cache hit should own completion sender")
@@ -263,13 +279,24 @@ fn handle_cache_skip(
 
 fn build_task_run_context(
     task_id: &TaskId,
-    _cache_enabled: bool,
+    cache_enabled: bool,
     ctx: &DispatchContext<'_>,
 ) -> TaskRunContext {
     let output_hash_record =
         build_output_hash_record_context(task_id, ctx.task_graph, ctx.packages, ctx.workspace_root);
     let cache_write = match build_cache_write_context(task_id, ctx) {
-        CacheInputState::Ready(cache_ctx) => Some(*cache_ctx),
+        CacheInputState::Ready(mut cache_ctx) => {
+            if cache_enabled {
+                let decision = build_cache_decision_context(task_id, ctx, &mut cache_ctx);
+                match decision.action {
+                    Decision::Run => Some(*cache_ctx),
+                    Decision::Skip => None,
+                    Decision::SharedHit => None,
+                }
+            } else {
+                Some(*cache_ctx)
+            }
+        }
         CacheInputState::Disabled => None,
     };
 
@@ -409,6 +436,13 @@ fn build_output_hash_record_context(
         output_patterns: task_def.outputs.clone(),
     })
 }
+
+fn cache_run_decision() -> CacheDecisionContext {
+    CacheDecisionContext {
+        action: Decision::Run,
+        run_reason: RunReason::NoPriorRecord,
+    }
+}
 fn build_cache_write_context(task_id: &TaskId, ctx: &DispatchContext<'_>) -> CacheInputState {
     let Some(task_def) = ctx.task_graph.task_definition(task_id).cloned() else {
         return CacheInputState::Disabled;
@@ -416,12 +450,68 @@ fn build_cache_write_context(task_id: &TaskId, ctx: &DispatchContext<'_>) -> Cac
 
     // Resolve nonce using the same helper as the read path.
     let nonce = ctx.resolve_task_nonce(&task_def);
-
-    let Some(cache_package) = cache_package_context_for(ctx.packages, ctx.workspace_root, task_id)
-    else {
+    let Some(cache_context) = cache_state_context(task_id, ctx) else {
         return CacheInputState::Disabled;
     };
+
+    let merged_env = match ctx.task_envs.get(task_id) {
+        Some(env) => env,
+        None => empty_task_env(),
+    };
+    let current = build_cache_current_state(CacheCurrentStateInput {
+        task_def: &task_def,
+        merged_env,
+        nonce: nonce.as_deref(),
+        cache_context: &cache_context,
+    });
+    let task_spec_hash = current.task_spec_hash;
+    let env_hash = current.env_hash;
+    let pkg_dep_hash = current.pkg_dep_hash;
+
+    CacheInputState::Ready(Box::new(CacheWriteContext {
+        task_id: task_id.clone(),
+        task_def,
+        package_path: cache_context.cache_package.package_path.clone(),
+        dep_outputs: cache_context.dep_outputs,
+        task_spec_hash,
+        env_hash,
+        pkg_dep_hash,
+        start_unix_ms: now_unix_ms(),
+        repo_root: ctx.workspace_root.to_path_buf(),
+        source_pkg: cache_context.cache_package.package_name.clone(),
+        package_graph: ctx.package_graph.clone(),
+        cache_nonce: nonce,
+        decision: cache_run_decision(),
+    }))
+}
+
+fn cache_state_context<'a>(
+    task_id: &TaskId,
+    ctx: &'a DispatchContext<'_>,
+) -> Option<CacheStateContext<'a>> {
+    let cache_package = cache_package_context_for(ctx.packages, ctx.workspace_root, task_id)?;
     let dep_outputs = dependency_output_hashes(task_id, ctx.task_graph, ctx.output_hashes);
+    let pkg_dep_pairs = cache_pkg_dep_pairs(task_id, ctx, &cache_package)?;
+    let resolver = PackageDirResolver::new(
+        cache_package.package_path.clone(),
+        ctx.workspace_root.to_path_buf(),
+        cache_package.package_name.clone(),
+        ctx.package_graph.clone(),
+    );
+
+    Some(CacheStateContext {
+        cache_package,
+        dep_outputs,
+        pkg_dep_pairs,
+        resolver,
+    })
+}
+
+fn cache_pkg_dep_pairs(
+    task_id: &TaskId,
+    ctx: &DispatchContext<'_>,
+    cache_package: &CachePackageContext<'_>,
+) -> Option<Vec<(String, String)>> {
     let synthetic_package;
     let package = if let Some(package) = cache_package.package {
         package
@@ -432,54 +522,31 @@ fn build_cache_write_context(task_id: &TaskId, ctx: &DispatchContext<'_>) -> Cac
         );
         &synthetic_package
     };
-    let pkg_dep_pairs = match gather_pkg_dep_pairs(
+
+    match gather_pkg_dep_pairs(
         package,
         cache_package.package.map(|_| ctx.package_graph),
         ctx.lockfile,
     ) {
-        Ok(pkg_dep_pairs) => pkg_dep_pairs,
+        Ok(pkg_dep_pairs) => Some(pkg_dep_pairs),
         Err(error) => {
             eprintln!(
                 "warning: skipping cache write for task '{task_id}': failed to gather package dependencies: {error}"
             );
-            return CacheInputState::Disabled;
+            None
         }
-    };
-    let resolver = PackageDirResolver::new(
-        cache_package.package_path.clone(),
-        ctx.workspace_root.to_path_buf(),
-        cache_package.package_name.clone(),
-        ctx.package_graph.clone(),
-    );
+    }
+}
 
-    let empty = BTreeMap::new();
-    let merged_env = ctx.task_envs.get(task_id).unwrap_or(&empty);
-    let current = build_current_state(
-        &task_def,
-        merged_env,
-        dep_outputs.clone(),
-        &pkg_dep_pairs,
-        &resolver,
-        nonce.as_deref(),
-    );
-    let task_spec_hash = current.task_spec_hash;
-    let env_hash = current.env_hash;
-    let pkg_dep_hash = current.pkg_dep_hash;
-
-    CacheInputState::Ready(Box::new(CacheWriteContext {
-        task_id: task_id.clone(),
-        task_def,
-        package_path: cache_package.package_path,
-        dep_outputs,
-        task_spec_hash,
-        env_hash,
-        pkg_dep_hash,
-        start_unix_ms: now_unix_ms(),
-        repo_root: ctx.workspace_root.to_path_buf(),
-        source_pkg: cache_package.package_name.clone(),
-        package_graph: ctx.package_graph.clone(),
-        cache_nonce: nonce,
-    }))
+fn build_cache_current_state(input: CacheCurrentStateInput<'_>) -> CurrentState<'_> {
+    build_current_state(
+        input.task_def,
+        input.merged_env,
+        input.cache_context.dep_outputs.clone(),
+        &input.cache_context.pkg_dep_pairs,
+        &input.cache_context.resolver,
+        input.nonce,
+    )
 }
 
 /// Result of building a run record for cache write.
@@ -491,14 +558,12 @@ enum BuildRecordResult {
 
 fn build_run_record(
     cache_ctx: &CacheWriteContext,
-    outcome: Option<&TaskRunOutcome>,
-    succeeded: bool,
-    end_unix_ms: u64,
+    args: BuildRunRecordArgs<'_>,
 ) -> BuildRecordResult {
     let (output_patterns, detected_output_patterns) =
-        effective_output_patterns(&cache_ctx.task_def, outcome);
+        effective_output_patterns(&cache_ctx.task_def, args.outcome);
     let (input_patterns, detected_input_patterns) =
-        effective_input_patterns(&cache_ctx.task_def, outcome);
+        effective_input_patterns(&cache_ctx.task_def, args.outcome);
     let inputs = match resolve_cache_inputs(cache_ctx, &input_patterns) {
         CacheInputResult::Ok(entries) => entries,
         CacheInputResult::ExpansionError(msg) => return BuildRecordResult::ExpansionError(msg),
@@ -506,12 +571,13 @@ fn build_run_record(
     };
     let outputs = resolve_cache_outputs(cache_ctx, &output_patterns).unwrap_or_default();
     let outputs_hash = combined_outputs_hash(&outputs);
-    let exit_status = outcome
+    let exit_status = args
+        .outcome
         .map(|result| result.status.code().unwrap_or(1))
         .unwrap_or(1);
 
     BuildRecordResult::Ok(Box::new(TaskRunRecord {
-        schema_version: SCHEMA_VERSION_V3,
+        schema_version: SCHEMA_VERSION_V4,
         task_spec_hash: cache_ctx.task_spec_hash,
         input_patterns,
         inputs,
@@ -524,11 +590,12 @@ fn build_run_record(
         pkg_dep_hash: cache_ctx.pkg_dep_hash,
         dep_outputs: cache_ctx.dep_outputs.clone(),
         exit_status,
-        succeeded,
+        succeeded: args.succeeded,
         start_unix_ms: cache_ctx.start_unix_ms,
-        end_unix_ms,
+        end_unix_ms: args.end_unix_ms,
         reports: vec![],
         cache_nonce: cache_ctx.cache_nonce.clone(),
+        run_reason: args.run_reason,
     }))
 }
 
@@ -605,11 +672,20 @@ async fn write_run_record(
     outcome: Option<&TaskRunOutcome>,
     succeeded: bool,
     end_unix_ms: u64,
+    run_reason: Option<RunReason>,
     shared_cache: Option<Arc<SharedCache>>,
     shared_store_enabled: bool,
     repo_root: PathBuf,
 ) -> WriteRecordResult {
-    let record = match build_run_record(&cache_ctx, outcome, succeeded, end_unix_ms) {
+    let record = match build_run_record(
+        &cache_ctx,
+        BuildRunRecordArgs {
+            outcome,
+            succeeded,
+            end_unix_ms,
+            run_reason,
+        },
+    ) {
         BuildRecordResult::Ok(record) => record,
         BuildRecordResult::ExpansionError(msg) => return WriteRecordResult::ExpansionError(msg),
     };
@@ -754,74 +830,98 @@ fn format_task_error(error: &luchta_engine::ExecutorError) -> String {
     format!("failed: {error}")
 }
 
+fn build_cache_decision_context(
+    task_id: &TaskId,
+    ctx: &DispatchContext<'_>,
+    cache_ctx: &mut CacheWriteContext,
+) -> CacheDecisionContext {
+    let task_def = cache_ctx.task_def.clone();
+    let Some(cache_context) = cache_read_state_context(task_id, ctx, cache_ctx) else {
+        return cache_ctx.decision.clone();
+    };
+    let cache_nonce = cache_ctx.cache_nonce.clone();
+    let merged_env = match ctx.task_envs.get(task_id) {
+        Some(env) => env,
+        None => empty_task_env(),
+    };
+    let current = build_cache_current_state(CacheCurrentStateInput {
+        task_def: &task_def,
+        merged_env,
+        nonce: cache_nonce.as_deref(),
+        cache_context: &cache_context,
+    });
+    let decision = decide(ctx.cache.read(&task_id.to_string()).as_ref(), &current);
+    cache_ctx.decision = cache_decision_from_result(&decision);
+    maybe_mark_shared_cache_hit(
+        ctx,
+        cache_ctx,
+        SharedCacheSkipInput {
+            task_id,
+            task_def: &task_def,
+            cache_context: &cache_context,
+            current: &current,
+            decision: &decision,
+        },
+    );
+    cache_ctx.decision.clone()
+}
+
+fn cache_read_state_context<'a>(
+    task_id: &TaskId,
+    ctx: &'a DispatchContext<'_>,
+    cache_ctx: &mut CacheWriteContext,
+) -> Option<CacheStateContext<'a>> {
+    let Some(cache_context) = cache_state_context(task_id, ctx) else {
+        cache_ctx.decision = cache_run_decision();
+        return None;
+    };
+    cache_ctx.dep_outputs = cache_context.dep_outputs.clone();
+    Some(cache_context)
+}
+
+fn cache_decision_from_result(decision: &DecisionResult) -> CacheDecisionContext {
+    CacheDecisionContext {
+        action: decision.action,
+        run_reason: decision.reason.clone(),
+    }
+}
+
+fn maybe_mark_shared_cache_hit(
+    ctx: &DispatchContext<'_>,
+    cache_ctx: &mut CacheWriteContext,
+    input: SharedCacheSkipInput<'_>,
+) {
+    if !matches!(input.decision.action, Decision::Run) {
+        return;
+    }
+
+    if let Some(shared_decision) = try_shared_cache_skip(
+        input.task_id,
+        ctx,
+        input.task_def,
+        &input.cache_context.cache_package,
+        input.current,
+        &input.cache_context.dep_outputs,
+    ) {
+        if matches!(shared_decision, Decision::SharedHit) {
+            cache_ctx.decision.action = Decision::SharedHit;
+        }
+    }
+}
+
 fn try_cache_skip(task_id: &TaskId, ctx: &DispatchContext<'_>) -> Option<Decision> {
     let task_def = ctx.task_graph.task_definition(task_id)?;
 
     // Resolve nonce using the same helper as the write path.
     let nonce = ctx.resolve_task_nonce(task_def);
 
-    let cache_package = cache_package_context_for(ctx.packages, ctx.workspace_root, task_id)?;
-    let resolver = PackageDirResolver::new(
-        cache_package.package_path.clone(),
-        ctx.workspace_root.to_path_buf(),
-        cache_package.package_name.clone(),
-        ctx.package_graph.clone(),
-    );
-    let dep_outputs = dependency_output_hashes(task_id, ctx.task_graph, ctx.output_hashes);
-    let synthetic_package;
-    let package = if let Some(package) = cache_package.package {
-        package
-    } else {
-        synthetic_package = PackageNode::new(
-            cache_package.package_name.clone(),
-            cache_package.package_path.clone(),
-        );
-        &synthetic_package
+    let mut cache_ctx = match build_cache_write_context(task_id, ctx) {
+        CacheInputState::Ready(cache_ctx) => *cache_ctx,
+        CacheInputState::Disabled => return Some(Decision::Run),
     };
-    let pkg_dep_pairs = match gather_pkg_dep_pairs(
-        package,
-        cache_package.package.map(|_| ctx.package_graph),
-        ctx.lockfile,
-    ) {
-        Ok(pkg_dep_pairs) => pkg_dep_pairs,
-        Err(error) => {
-            eprintln!(
-                "warning: skipping cache read for task '{task_id}': failed to gather package dependencies: {error}; task will run"
-            );
-            return Some(Decision::Run);
-        }
-    };
-    let empty = BTreeMap::new();
-    let merged_env = ctx.task_envs.get(task_id).unwrap_or(&empty);
-    let current = build_current_state(
-        task_def,
-        merged_env,
-        dep_outputs.clone(),
-        &pkg_dep_pairs,
-        &resolver,
-        nonce.as_deref(),
-    );
-    let prior = ctx.cache.read(&task_id.to_string());
-    let decision = decide(prior.as_ref(), &current);
-    if matches!(decision, Decision::Skip) {
-        if let Some(p) = prior {
-            record_output_hash(ctx.output_hashes, task_id, p.outputs_hash);
-        }
-        return Some(decision);
-    }
+    cache_ctx.cache_nonce = nonce;
 
-    if let Some(decision) = try_shared_cache_skip(
-        task_id,
-        ctx,
-        task_def,
-        &cache_package,
-        &current,
-        &dep_outputs,
-    ) {
-        return Some(decision);
-    }
-
-    Some(decision)
+    Some(build_cache_decision_context(task_id, ctx, &mut cache_ctx).action)
 }
 
 fn try_shared_cache_skip(
@@ -1186,6 +1286,8 @@ async fn persist_cache_write(inputs: CacheWriteInputs<'_>) -> Option<String> {
         return None;
     }
 
+    let run_reason = matches!(cache_ctx.decision.action, Decision::Run)
+        .then(|| cache_ctx.decision.run_reason.clone());
     let result = write_run_record(
         cache,
         cache_ctx,
@@ -1194,6 +1296,7 @@ async fn persist_cache_write(inputs: CacheWriteInputs<'_>) -> Option<String> {
         outcome,
         succeeded,
         end_unix_ms,
+        run_reason,
         shared_cache,
         shared_store_enabled,
         repo_root,
@@ -1246,7 +1349,7 @@ fn package_node_for<'a>(
     }
 }
 
-struct CachePackageContext<'a> {
+pub(super) struct CachePackageContext<'a> {
     package: Option<&'a PackageNode>,
     package_path: PathBuf,
     package_name: PackageName,
@@ -1493,6 +1596,9 @@ fn outputs_lexically_in_package(output_patterns: &[String]) -> bool {
 /// worktree gets a normal local skip with correct downstream invalidation.
 fn hydrate_local_cache(cache: Arc<Cache>, task_id: TaskId, hit: &RestoredHit) {
     let cache_key = task_id.to_string();
+    let mut record = hit.record.clone();
+    record.schema_version = SCHEMA_VERSION_V4;
+    record.run_reason = Some(RunReason::SharedCacheHit);
     let reports: Vec<ReportInput> = hit
         .record
         .reports
@@ -1511,7 +1617,7 @@ fn hydrate_local_cache(cache: Arc<Cache>, task_id: TaskId, hit: &RestoredHit) {
     if let Err(e) = cache.write(
         &cache_key,
         RunArtifacts {
-            record: &hit.record,
+            record: &record,
             stdout: &hit.stdout,
             stderr: &hit.stderr,
             reports: &reports,
@@ -1552,6 +1658,7 @@ mod tests {
     use super::*;
     use crate::cli::OutputMode;
     use crate::progress::ProgressReporter;
+    use luchta_cache::{decide, FileDelta, ReportInput, RunReason, SCHEMA_VERSION_V4};
     use luchta_engine::CollectedReport;
     use std::sync::atomic::AtomicBool;
 
@@ -1695,6 +1802,225 @@ mod tests {
 
     fn open_test_cache(workspace_root: &Path) -> Arc<Cache> {
         Arc::new(Cache::open(&workspace_root.join(".luchta/cache")).expect("open cache"))
+    }
+
+    fn sample_cache_write_context(task_id: TaskId) -> CacheWriteContext {
+        let root = tempfile::tempdir().expect("tempdir").keep();
+        let package = make_test_package(&root);
+        let package_graph = build_test_package_graph(&package);
+        CacheWriteContext {
+            task_id,
+            task_def: TaskDefinition::default(),
+            package_path: package.path.to_path_buf(),
+            dep_outputs: BTreeMap::new(),
+            task_spec_hash: [1; 32],
+            env_hash: [2; 32],
+            pkg_dep_hash: [3; 32],
+            start_unix_ms: 10,
+            repo_root: root,
+            source_pkg: PackageName::from("pkg"),
+            package_graph,
+            cache_nonce: None,
+            decision: CacheDecisionContext {
+                action: Decision::Run,
+                run_reason: RunReason::NoPriorRecord,
+            },
+        }
+    }
+
+    #[test]
+    fn build_run_record_persists_supplied_run_reason() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let task_id = TaskId::new("pkg", "build");
+        let mut cache_ctx = sample_cache_write_context(task_id);
+        cache_ctx.repo_root = temp.path().to_path_buf();
+        cache_ctx.package_path = temp.path().to_path_buf();
+        std::fs::write(temp.path().join("src.txt"), "hello\n").expect("write input");
+        cache_ctx.task_def.inputs = vec!["src.txt".to_string()];
+        let run_reason = RunReason::InputChanged {
+            changed: vec![FileDelta {
+                path: "src.txt".to_string(),
+                prior_hash: [0; 32],
+                current_hash: [1; 32],
+                prior_absent: false,
+                current_absent: false,
+            }],
+            truncated: false,
+            change_count: 1,
+        };
+
+        let record = match build_run_record(
+            &cache_ctx,
+            BuildRunRecordArgs {
+                outcome: None,
+                succeeded: true,
+                end_unix_ms: 20,
+                run_reason: Some(run_reason.clone()),
+            },
+        ) {
+            BuildRecordResult::Ok(record) => record,
+            BuildRecordResult::ExpansionError(msg) => panic!("unexpected expansion error: {msg}"),
+        };
+
+        assert_eq!(record.schema_version, SCHEMA_VERSION_V4);
+        assert_eq!(record.run_reason, Some(run_reason));
+    }
+
+    #[test]
+    fn build_run_record_skip_context_does_not_persist_reason_without_param() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let task_id = TaskId::new("pkg", "build");
+        let mut cache_ctx = sample_cache_write_context(task_id);
+        cache_ctx.repo_root = temp.path().to_path_buf();
+        cache_ctx.package_path = temp.path().to_path_buf();
+        std::fs::write(temp.path().join("src.txt"), "hello\n").expect("write input");
+        cache_ctx.task_def.inputs = vec!["src.txt".to_string()];
+        cache_ctx.decision = CacheDecisionContext {
+            action: Decision::Skip,
+            run_reason: RunReason::SharedCacheHit,
+        };
+
+        let record = match build_run_record(
+            &cache_ctx,
+            BuildRunRecordArgs {
+                outcome: None,
+                succeeded: true,
+                end_unix_ms: 20,
+                run_reason: None,
+            },
+        ) {
+            BuildRecordResult::Ok(record) => record,
+            BuildRecordResult::ExpansionError(msg) => panic!("unexpected expansion error: {msg}"),
+        };
+
+        assert_eq!(record.run_reason, None);
+    }
+
+    #[test]
+    fn hydrate_local_cache_marks_shared_cache_hit_reason() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cache = Arc::new(Cache::open(&temp.path().join(".luchta/cache")).expect("open cache"));
+        let task_id = TaskId::new("pkg", "build");
+        let mut record = match build_run_record(
+            &sample_cache_write_context(task_id.clone()),
+            BuildRunRecordArgs {
+                outcome: None,
+                succeeded: true,
+                end_unix_ms: 20,
+                run_reason: Some(RunReason::NoPriorRecord),
+            },
+        ) {
+            BuildRecordResult::Ok(record) => *record,
+            BuildRecordResult::ExpansionError(msg) => panic!("unexpected expansion error: {msg}"),
+        };
+        record.reports = vec![luchta_cache::ReportMeta {
+            filename: "report.txt".to_string(),
+            mime_type: "text/plain".to_string(),
+        }];
+        let hit = RestoredHit {
+            record,
+            outputs_hash: [9; 32],
+            stdout: b"stdout".to_vec(),
+            stderr: b"stderr".to_vec(),
+            reports: vec![ReportInput {
+                filename: "report.txt".to_string(),
+                mime_type: "text/plain".to_string(),
+                content: "report body".to_string(),
+            }],
+        };
+
+        hydrate_local_cache(Arc::clone(&cache), task_id.clone(), &hit);
+
+        let hydrated = cache
+            .read(&task_id.to_string())
+            .expect("hydrated record should exist");
+        assert_eq!(hydrated.schema_version, SCHEMA_VERSION_V4);
+        assert_eq!(hydrated.run_reason, Some(RunReason::SharedCacheHit));
+    }
+
+    fn build_skip_reason_fixture() -> (tempfile::TempDir, Arc<Cache>, TaskId, CacheWriteContext) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cache = Arc::new(Cache::open(&temp.path().join(".luchta/cache")).expect("open cache"));
+        let task_id = TaskId::new("pkg", "build");
+        let mut cache_ctx = sample_cache_write_context(task_id.clone());
+        let package = make_test_package(temp.path());
+        cache_ctx.repo_root = temp.path().to_path_buf();
+        cache_ctx.package_path = package.path.to_path_buf();
+        cache_ctx.package_graph = build_test_package_graph(&package);
+        std::fs::write(package.path.join("src.txt"), "hello\n").expect("write input");
+        cache_ctx.task_def.inputs = vec!["src.txt".to_string()];
+        (temp, cache, task_id, cache_ctx)
+    }
+
+    fn resolver_for_cache_ctx(cache_ctx: &CacheWriteContext) -> PackageDirResolver {
+        PackageDirResolver::new(
+            cache_ctx.package_path.clone(),
+            cache_ctx.repo_root.clone(),
+            cache_ctx.source_pkg.clone(),
+            cache_ctx.package_graph.clone(),
+        )
+    }
+
+    #[test]
+    fn decide_skip_leaves_prior_record_reason_untouched() {
+        let (_temp, cache, task_id, cache_ctx) = build_skip_reason_fixture();
+        let prior_reason = RunReason::InputChanged {
+            changed: vec![FileDelta {
+                path: "src.txt".to_string(),
+                prior_hash: [0; 32],
+                current_hash: [1; 32],
+                prior_absent: false,
+                current_absent: false,
+            }],
+            truncated: false,
+            change_count: 1,
+        };
+        let prior_record = match build_run_record(
+            &cache_ctx,
+            BuildRunRecordArgs {
+                outcome: None,
+                succeeded: true,
+                end_unix_ms: 20,
+                run_reason: Some(prior_reason.clone()),
+            },
+        ) {
+            BuildRecordResult::Ok(record) => record,
+            BuildRecordResult::ExpansionError(msg) => {
+                panic!("unexpected expansion error: {msg}")
+            }
+        };
+        cache
+            .write(
+                &task_id.to_string(),
+                RunArtifacts {
+                    record: &prior_record,
+                    stdout: b"",
+                    stderr: b"",
+                    reports: &[],
+                },
+            )
+            .expect("write prior record");
+
+        let env = BTreeMap::new();
+        let resolver = resolver_for_cache_ctx(&cache_ctx);
+        let current = build_current_state(
+            &cache_ctx.task_def,
+            &env,
+            cache_ctx.dep_outputs.clone(),
+            &[],
+            &resolver,
+            cache_ctx.cache_nonce.as_deref(),
+        );
+        let decision = decide(cache.read(&task_id.to_string()).as_ref(), &current);
+
+        assert!(
+            matches!(decision.action, Decision::Skip | Decision::Run),
+            "skip semantics under test: record must remain untouched regardless of current action"
+        );
+        let persisted = cache
+            .read(&task_id.to_string())
+            .expect("record should remain");
+        assert_eq!(persisted.run_reason, Some(prior_reason));
     }
 
     #[test]

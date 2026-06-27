@@ -188,7 +188,7 @@ pub fn build_current_state<'a>(
     dep_outputs: BTreeMap<String, [u8; 32]>,
     pkg_dep_pairs: &'a [(String, String)],
     resolver: &'a dyn FileStateResolver,
-    nonce: Option<&str>,
+    nonce: Option<&'a str>,
 ) -> CurrentState<'a> {
     CurrentState {
         task_spec_hash: task_spec_hash(task_def, nonce),
@@ -198,6 +198,7 @@ pub fn build_current_state<'a>(
         env_hash: env_hash(merged_env, |name| std::env::var(name).ok()),
         pkg_dep_hash: pkg_dep_hash(pkg_dep_pairs),
         dep_outputs,
+        cache_nonce: nonce,
         declared_input_patterns: &task_def.inputs,
         declared_output_patterns: &task_def.outputs,
         resolver,

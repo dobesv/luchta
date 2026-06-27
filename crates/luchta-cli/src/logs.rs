@@ -242,6 +242,7 @@ fn build_log_block_meta<'a>(
         cache_hash: Some(cache_hash_12),
         show_cache_nonce,
         cache_nonce: record.cache_nonce.as_deref(),
+        run_reason: record.run_reason.as_ref().map(|r| r.summary()),
     }
 }
 
@@ -397,7 +398,7 @@ mod tests {
 
     fn dummy_record(reports: Vec<&str>) -> TaskRunRecord {
         TaskRunRecord {
-            schema_version: 1,
+            schema_version: luchta_cache::SCHEMA_VERSION_V4,
             task_spec_hash: [0; 32],
             input_patterns: vec![],
             inputs: vec![],
@@ -421,6 +422,7 @@ mod tests {
                 })
                 .collect(),
             cache_nonce: None,
+            run_reason: None,
         }
     }
 
@@ -472,6 +474,7 @@ mod tests {
             cache_hash: Some("abcdef123456"),
             show_cache_nonce: false,
             cache_nonce: None,
+            run_reason: None,
         };
         let body = join_output_streams("stdout line".to_string(), "stderr line".to_string());
         let reports = render_reports_pretty(

@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, path::Path};
 
-use crate::{FileEntry, TaskRunRecord};
+use crate::{FileDelta, FileEntry, RunReason, TaskRunRecord};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Decision {
@@ -8,6 +8,14 @@ pub enum Decision {
     SharedHit,
     Run,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecisionResult {
+    pub action: Decision,
+    pub reason: RunReason,
+}
+
+pub const DECIDE_FILES_DIFF_LIMIT: usize = 50;
 
 pub trait FileStateResolver {
     fn resolve_inputs(&self, patterns: &[String]) -> crate::Result<Vec<FileEntry>>;
@@ -20,82 +28,164 @@ pub struct CurrentState<'a> {
     pub env_hash: [u8; 32],
     pub pkg_dep_hash: [u8; 32],
     pub dep_outputs: BTreeMap<String, [u8; 32]>,
+    pub cache_nonce: Option<&'a str>,
     pub declared_input_patterns: &'a [String],
     pub declared_output_patterns: &'a [String],
     pub resolver: &'a dyn FileStateResolver,
 }
 
-pub fn decide(prior: Option<&TaskRunRecord>, current: &CurrentState<'_>) -> Decision {
+/// Decision precedence. First mismatch wins and returns `Decision::Run` with reason:
+/// 1. NoPriorRecord
+/// 2. PriorFailed
+/// 3. NonceChanged
+/// 4. TaskSpecMismatch
+/// 5. DepOutputMismatch
+/// 6. PkgDepMismatch
+/// 7. EnvMismatch
+/// 8. OutputChanged
+/// 9. InputChanged
+/// 10. CacheHit
+pub fn decide(prior: Option<&TaskRunRecord>, current: &CurrentState<'_>) -> DecisionResult {
     let Some(prior) = prior else {
-        return Decision::Run;
+        return DecisionResult {
+            action: Decision::Run,
+            reason: RunReason::NoPriorRecord,
+        };
     };
 
-    if !cacheable_prior(prior, current) {
-        return Decision::Run;
+    if !prior.succeeded {
+        return DecisionResult {
+            action: Decision::Run,
+            reason: RunReason::PriorFailed,
+        };
     }
 
+    if prior.cache_nonce.as_deref() != current.cache_nonce {
+        return DecisionResult {
+            action: Decision::Run,
+            reason: RunReason::NonceChanged,
+        };
+    }
+
+    if prior.task_spec_hash != current.task_spec_hash {
+        return DecisionResult {
+            action: Decision::Run,
+            reason: RunReason::TaskSpecMismatch,
+        };
+    }
+
+    let changed_dep_tasks = changed_dep_tasks(prior, current);
+    if !changed_dep_tasks.is_empty() {
+        return DecisionResult {
+            action: Decision::Run,
+            reason: RunReason::DepOutputMismatch {
+                tasks: changed_dep_tasks,
+            },
+        };
+    }
+
+    if prior.pkg_dep_hash != current.pkg_dep_hash {
+        return DecisionResult {
+            action: Decision::Run,
+            reason: RunReason::PkgDepMismatch,
+        };
+    }
+
+    if prior.env_hash != current.env_hash {
+        return DecisionResult {
+            action: Decision::Run,
+            reason: RunReason::EnvMismatch,
+        };
+    }
+
+    check_patterns_unchanged(prior, current)
+}
+
+/// Check if task definition patterns and inputs/outputs are unchanged.
+fn check_patterns_unchanged(prior: &TaskRunRecord, current: &CurrentState<'_>) -> DecisionResult {
     let input_patterns = effective_input_patterns(prior, current);
     let output_patterns = effective_output_patterns(prior, current);
 
-    if !declared_outputs_match_prior(prior, &output_patterns) {
-        return Decision::Run;
+    if prior.detected_output_patterns && prior.output_patterns != output_patterns {
+        return DecisionResult {
+            action: Decision::Run,
+            reason: output_pattern_mismatch_reason(prior, current),
+        };
     }
-    if !patterns_unchanged(
-        &prior.inputs,
-        &input_patterns,
+
+    if let Some(reason) = change_reason(
         current.resolver,
-        FileEntryKind::Inputs,
-    ) {
-        return Decision::Run;
-    }
-    if !patterns_unchanged(
-        &prior.outputs,
         &output_patterns,
-        current.resolver,
+        &prior.outputs,
         FileEntryKind::Outputs,
     ) {
-        return Decision::Run;
+        return DecisionResult {
+            action: Decision::Run,
+            reason,
+        };
     }
 
-    Decision::Skip
+    if let Some(reason) = change_reason(
+        current.resolver,
+        &input_patterns,
+        &prior.inputs,
+        FileEntryKind::Inputs,
+    ) {
+        return DecisionResult {
+            action: Decision::Run,
+            reason,
+        };
+    }
+
+    DecisionResult {
+        action: Decision::Skip,
+        reason: RunReason::CacheHit,
+    }
 }
 
-/// Validates a shared-cache candidate for RESTORE: like `decide` but does NOT
-/// require the current-tree OUTPUTS to be present/match (the restore will
-/// provide them from the content-addressed blob).
+/// Special decision path for shared cache restore eligibility.
 ///
-/// This is the correct validation for a shared restore because:
-/// - On a shared restore, outputs DON'T EXIST in the work tree yet (we're
-///   ABOUT to restore them from the blob).
+/// Purpose: Determine whether a shared cache candidate can restore outputs into
+/// current tree state. Differs from full `decide()` in one critical way:
+///
+/// - Full `decide()` validates current outputs match prior outputs. That is correct
+///   for local skip decisions, because local cache hit means outputs already exist.
+/// - Shared restore needs opposite behavior: outputs may be absent or stale in tree,
+///   and restore should still be allowed if all *inputs and cacheability facts* match.
+///
+/// Returns `true` iff record is safe to restore from shared cache.
+///
+/// Rules:
+/// 1. Same cacheability checks as normal skip path: prior succeeded, task spec/env/
+///    package deps/dependency outputs unchanged.
+/// 2. Same effective input pattern resolution semantics as normal skip path.
+/// 3. Inputs must still match current tree state.
+/// 4. Outputs are NOT compared at all.
+///
+/// This allows cases like:
 /// - Full `decide()` would return `Run` because outputs are absent → legitimate
-///   shared hits get REJECTED.
-/// - Output integrity is inherent: the blob is content-addressed by
-///   `outputs_hash`, so restored outputs are exactly what was stored.
-///
-/// Returns `true` if the candidate is content-valid to restore.
+///   shared restore candidate.
+/// - Shared snapshot from another clone/commit can hydrate outputs safely when
+///   inputs and dependency outputs still match.
+#[must_use]
 pub fn decide_shared_restore(record: &TaskRunRecord, current: &CurrentState<'_>) -> bool {
-    // 1. Check cacheable_prior (succeeded, task_spec_hash, env_hash, pkg_dep_hash, dep_outputs)
     if !cacheable_prior(record, current) {
         return false;
     }
 
-    // 2. Resolve and check INPUTS only (not outputs)
     let input_patterns = effective_input_patterns(record, current);
-    if !patterns_unchanged(
+
+    patterns_unchanged(
         &record.inputs,
         &input_patterns,
         current.resolver,
         FileEntryKind::Inputs,
-    ) {
-        return false;
-    }
-
-    // 3. Skip output validation — outputs will be restored from content-addressed blob
-    true
+    )
 }
 
 fn cacheable_prior(prior: &TaskRunRecord, current: &CurrentState<'_>) -> bool {
     prior.succeeded
+        && prior.cache_nonce.as_deref() == current.cache_nonce
         && prior.task_spec_hash == current.task_spec_hash
         && prior.env_hash == current.env_hash
         && prior.pkg_dep_hash == current.pkg_dep_hash
@@ -122,12 +212,23 @@ fn dependency_outputs_unchanged(prior: &TaskRunRecord, current: &CurrentState<'_
     prior.dep_outputs == current.dep_outputs
 }
 
-fn declared_outputs_match_prior(prior: &TaskRunRecord, output_patterns: &[String]) -> bool {
-    if prior.detected_output_patterns {
-        prior.output_patterns == output_patterns
-    } else {
-        true
+fn changed_dep_tasks(prior: &TaskRunRecord, current: &CurrentState<'_>) -> Vec<String> {
+    let prior_outputs = &prior.dep_outputs;
+    let current_outputs = &current.dep_outputs;
+
+    let mut changed: Vec<String> = prior_outputs
+        .iter()
+        .filter(|(task, prior_hash)| current_outputs.get(&**task) != Some(prior_hash))
+        .map(|(task, _)| task.clone())
+        .collect();
+
+    for task in current_outputs.keys() {
+        if !prior_outputs.contains_key(task) {
+            changed.push(task.clone());
+        }
     }
+
+    changed
 }
 
 #[derive(Clone, Copy)]
@@ -152,11 +253,87 @@ fn patterns_unchanged(
     !files_changed(prior_entries, &resolved_entries)
 }
 
-fn files_changed(prior_entries: &[FileEntry], current_entries: &[FileEntry]) -> bool {
-    if prior_entries.len() != current_entries.len() {
-        return true;
+fn output_pattern_mismatch_reason(prior: &TaskRunRecord, current: &CurrentState<'_>) -> RunReason {
+    let (changed, truncated, change_count) = files_diff(
+        &prior.outputs,
+        &resolve_or_empty(
+            current.resolver,
+            current.declared_output_patterns,
+            FileEntryKind::Outputs,
+        ),
+        DECIDE_FILES_DIFF_LIMIT,
+    );
+    RunReason::OutputChanged {
+        changed,
+        truncated,
+        change_count,
     }
+}
 
+fn change_reason(
+    resolver: &dyn FileStateResolver,
+    patterns: &[String],
+    prior_entries: &[FileEntry],
+    kind: FileEntryKind,
+) -> Option<RunReason> {
+    let resolved_entries = match kind {
+        FileEntryKind::Inputs => resolver.resolve_inputs(patterns),
+        FileEntryKind::Outputs => resolver.resolve_outputs(patterns),
+    };
+    let Ok(resolved_entries) = resolved_entries else {
+        return Some(match kind {
+            FileEntryKind::Inputs => RunReason::InputChanged {
+                changed: Vec::new(),
+                truncated: false,
+                change_count: 0,
+            },
+            FileEntryKind::Outputs => RunReason::OutputChanged {
+                changed: Vec::new(),
+                truncated: false,
+                change_count: 0,
+            },
+        });
+    };
+    if !files_changed(prior_entries, &resolved_entries) {
+        return None;
+    }
+    let (changed, truncated, change_count) =
+        files_diff(prior_entries, &resolved_entries, DECIDE_FILES_DIFF_LIMIT);
+    Some(match kind {
+        FileEntryKind::Inputs => RunReason::InputChanged {
+            changed,
+            truncated,
+            change_count,
+        },
+        FileEntryKind::Outputs => RunReason::OutputChanged {
+            changed,
+            truncated,
+            change_count,
+        },
+    })
+}
+
+fn resolve_or_empty(
+    resolver: &dyn FileStateResolver,
+    patterns: &[String],
+    kind: FileEntryKind,
+) -> Vec<FileEntry> {
+    let resolved = match kind {
+        FileEntryKind::Inputs => resolver.resolve_inputs(patterns),
+        FileEntryKind::Outputs => resolver.resolve_outputs(patterns),
+    };
+    resolved.unwrap_or_default()
+}
+
+fn files_changed(prior_entries: &[FileEntry], current_entries: &[FileEntry]) -> bool {
+    files_diff(prior_entries, current_entries, 0).2 > 0
+}
+
+pub fn files_diff(
+    prior_entries: &[FileEntry],
+    current_entries: &[FileEntry],
+    limit: usize,
+) -> (Vec<FileDelta>, bool, u32) {
     let prior_by_path = prior_entries
         .iter()
         .map(|entry| (entry.path.as_str(), entry))
@@ -166,21 +343,41 @@ fn files_changed(prior_entries: &[FileEntry], current_entries: &[FileEntry]) -> 
         .map(|entry| (entry.path.as_str(), entry))
         .collect::<BTreeMap<_, _>>();
 
-    if prior_by_path.len() != prior_entries.len() || current_by_path.len() != current_entries.len()
-    {
-        return true;
-    }
+    let mut changed = Vec::new();
+    let mut change_count = 0_u32;
+    let mut seen_paths = std::collections::BTreeSet::new();
 
-    for (path, prior) in &prior_by_path {
-        let Some(current) = current_by_path.get(path) else {
-            return true;
-        };
-        if file_entry_changed(prior, current) {
-            return true;
+    for path in prior_by_path.keys().chain(current_by_path.keys()) {
+        let path = *path;
+        if !seen_paths.insert(path) {
+            continue;
+        }
+        let prior = prior_by_path.get(path).copied();
+        let current = current_by_path.get(path).copied();
+        if !path_changed(prior, current) {
+            continue;
+        }
+        change_count = change_count.saturating_add(1);
+        if changed.len() < limit {
+            changed.push(FileDelta {
+                path: path.to_owned(),
+                prior_hash: prior.map_or([0; 32], |entry| entry.hash),
+                current_hash: current.map_or([0; 32], |entry| entry.hash),
+                prior_absent: prior.map(|entry| entry.absent).unwrap_or(true),
+                current_absent: current.map(|entry| entry.absent).unwrap_or(true),
+            });
         }
     }
 
-    false
+    (changed, change_count as usize > limit, change_count)
+}
+
+fn path_changed(prior: Option<&FileEntry>, current: Option<&FileEntry>) -> bool {
+    match (prior, current) {
+        (Some(prior), Some(current)) => file_entry_changed(prior, current),
+        (Some(_), None) | (None, Some(_)) => true,
+        (None, None) => false,
+    }
 }
 
 fn file_entry_changed(prior: &FileEntry, current: &FileEntry) -> bool {
@@ -201,245 +398,280 @@ fn file_identity_changed(prior: &FileEntry, current: &FileEntry) -> bool {
 mod tests {
     use std::{cell::RefCell, collections::BTreeMap, path::Path};
 
-    use crate::{CacheError, FileEntry, TaskRunRecord, SCHEMA_VERSION_V3};
+    use crate::{CacheError, FileDelta, FileEntry, RunReason, TaskRunRecord, SCHEMA_VERSION_V4};
 
-    use super::{decide, CurrentState, Decision, FileStateResolver};
+    use super::{
+        decide, files_diff, CurrentState, Decision, DecisionResult, FileStateResolver,
+        DECIDE_FILES_DIFF_LIMIT,
+    };
 
     #[test]
-    fn unchanged_everything_skips() {
+    fn unchanged_everything_skips_with_cache_hit_reason() {
+        assert_matching_decision(
+            sample_record(),
+            |_| {},
+            expected_run_decision(RunReason::CacheHit),
+        );
+    }
+
+    #[test]
+    fn missing_prior_runs_with_no_prior_reason() {
         let prior = sample_record();
-        let resolver = FixtureResolver::new(prior.inputs.clone(), prior.outputs.clone());
+        let resolver = matching_resolver(&prior);
         let current = current_state(&prior, &resolver);
 
-        assert_eq!(decide(Some(&prior), &current), Decision::Skip);
+        assert_eq!(
+            decide(None, &current),
+            expected_run_decision(RunReason::NoPriorRecord)
+        );
     }
 
     #[test]
-    fn missing_prior_runs() {
+    fn failed_prior_runs_with_prior_failed_reason() {
+        assert_decision_with_match(
+            sample_record(),
+            |prior| prior.succeeded = false,
+            DecisionResult {
+                action: Decision::Run,
+                reason: RunReason::PriorFailed,
+            },
+        );
+    }
+
+    #[test]
+    fn changed_nonce_runs_with_nonce_changed_reason() {
+        assert_matching_decision(
+            sample_record(),
+            |current| current.cache_nonce = Some("nonce-v2"),
+            expected_run_decision(RunReason::NonceChanged),
+        );
+    }
+
+    #[test]
+    fn changed_task_spec_runs_with_reason() {
+        assert_mutated_state_runs(
+            |state| state.task_spec_hash = [9; 32],
+            RunReason::TaskSpecMismatch,
+        );
+    }
+
+    #[test]
+    fn changed_env_runs_with_reason() {
+        assert_mutated_state_runs(|state| state.env_hash = [9; 32], RunReason::EnvMismatch);
+    }
+
+    #[test]
+    fn changed_pkg_dep_runs_with_reason() {
+        assert_mutated_state_runs(
+            |state| state.pkg_dep_hash = [9; 32],
+            RunReason::PkgDepMismatch,
+        );
+    }
+
+    #[test]
+    fn changed_dep_outputs_runs_with_task_names_reason() {
         let prior = sample_record();
-        let resolver = FixtureResolver::new(prior.inputs.clone(), prior.outputs.clone());
-        let current = current_state(&prior, &resolver);
-
-        assert_eq!(decide(None, &current), Decision::Run);
-    }
-
-    #[test]
-    fn failed_prior_runs() {
-        let mut prior = sample_record();
-        prior.succeeded = false;
-        let resolver = FixtureResolver::new(prior.inputs.clone(), prior.outputs.clone());
-        let current = current_state(&prior, &resolver);
-
-        // A previously-failed task must always rerun, even when every hash and
-        // resolved file set is unchanged (decide rule 1).
-        assert_eq!(decide(Some(&prior), &current), Decision::Run);
-    }
-
-    #[test]
-    fn changed_task_spec_runs() {
-        assert_mutated_state_runs(|state| state.task_spec_hash = [9; 32]);
-    }
-
-    #[test]
-    fn changed_env_runs() {
-        assert_mutated_state_runs(|state| state.env_hash = [9; 32]);
-    }
-
-    #[test]
-    fn changed_pkg_dep_runs() {
-        assert_mutated_state_runs(|state| state.pkg_dep_hash = [9; 32]);
-    }
-
-    #[test]
-    fn changed_dependency_outputs_run() {
-        assert_mutated_state_runs(|state| {
-            state.dep_outputs.insert("dep#build".to_owned(), [8; 32]);
-        });
-    }
-
-    #[test]
-    fn changed_input_patterns_run() {
-        let mut prior = sample_record();
-        prior.detected_input_patterns = true;
-        let resolver = FixtureResolver::new(prior.inputs.clone(), prior.outputs.clone());
-        let changed_patterns = ["src/**/*.tsx".to_owned()];
+        let resolver = matching_resolver(&prior);
         let mut current = current_state(&prior, &resolver);
-        current.declared_input_patterns = &changed_patterns;
+        current.dep_outputs.insert("dep#build".to_owned(), [9; 32]);
+        current.dep_outputs.insert("new#lint".to_owned(), [7; 32]);
 
-        assert_eq!(decide(Some(&prior), &current), Decision::Skip);
         assert_eq!(
-            resolver.input_patterns_calls(),
-            vec![vec!["src/**/*.ts".to_owned()]]
+            decide(Some(&prior), &current),
+            DecisionResult {
+                action: Decision::Run,
+                reason: RunReason::DepOutputMismatch {
+                    tasks: vec!["dep#build".to_owned(), "new#lint".to_owned()],
+                },
+            }
         );
     }
 
     #[test]
-    fn changed_declared_input_patterns_run_when_not_detected() {
+    fn changed_output_pattern_runs_with_output_changed_reason() {
         let prior = sample_record();
-        let changed_patterns = ["src/**/*.tsx".to_owned()];
-        let resolver = FixtureResolver::with_patterns(
-            prior.inputs.clone(),
-            prior.outputs.clone(),
-            BTreeMap::from([(
-                changed_patterns.to_vec(),
-                vec![file_entry("src/main.tsx", 11, 110, [8; 32])],
-            )]),
-            BTreeMap::new(),
-        );
-        let mut current = current_state(&prior, &resolver);
-        current.declared_input_patterns = &changed_patterns;
-
-        assert_eq!(decide(Some(&prior), &current), Decision::Run);
-        assert_eq!(
-            resolver.input_patterns_calls(),
-            vec![changed_patterns.to_vec()]
-        );
-    }
-
-    #[test]
-    fn detected_input_patterns_do_not_fall_back_to_declared_inputs() {
-        let mut prior = sample_record();
-        prior.detected_input_patterns = true;
-        prior.input_patterns = vec!["package.json".to_owned()];
-        prior.inputs = vec![file_entry("package.json", 10, 100, [2; 32])];
-        let resolver = FixtureResolver::with_patterns(
-            prior.inputs.clone(),
-            prior.outputs.clone(),
-            BTreeMap::from([
-                (
-                    vec!["package.json".to_owned()],
-                    vec![file_entry("package.json", 10, 100, [2; 32])],
-                ),
-                (
-                    vec!["src/**/*.tsx".to_owned()],
-                    vec![file_entry("src/main.tsx", 10, 100, [9; 32])],
-                ),
-            ]),
-            BTreeMap::new(),
-        );
-        let changed_patterns = ["src/**/*.tsx".to_owned()];
-        let mut current = current_state(&prior, &resolver);
-        current.declared_input_patterns = &changed_patterns;
-
-        assert_eq!(decide(Some(&prior), &current), Decision::Skip);
-        assert_eq!(
-            resolver.input_patterns_calls(),
-            vec![vec!["package.json".to_owned()]]
-        );
-    }
-
-    #[test]
-    fn changed_output_patterns_run_when_detected() {
-        let mut prior = sample_record();
-        prior.detected_output_patterns = true;
-        // detected_output_patterns == true means the EFFECTIVE output patterns are the
-        // prior detected ones ("dist/**/*.js"). Re-resolving those now yields a
-        // changed output set, which must force a rerun.
+        let current_patterns = vec!["dist/other.js".to_owned()];
+        let current_outputs = vec![sample_present_file("dist/other.js", [2; 32])];
+        let outputs_by_patterns = BTreeMap::from([(current_patterns.clone(), current_outputs)]);
         let resolver = FixtureResolver::with_patterns(
             prior.inputs.clone(),
             prior.outputs.clone(),
             BTreeMap::new(),
-            BTreeMap::from([(
-                vec!["dist/**/*.js".to_owned()],
-                vec![file_entry("dist/app.js", 20, 200, [9; 32])],
-            )]),
+            outputs_by_patterns,
         );
-        let changed_patterns = ["build/out.txt".to_owned()];
         let mut current = current_state(&prior, &resolver);
-        current.declared_output_patterns = &changed_patterns;
+        current.declared_output_patterns = &current_patterns;
 
-        assert_eq!(decide(Some(&prior), &current), Decision::Run);
-        assert_eq!(
-            resolver.output_patterns_calls(),
-            vec![vec!["dist/**/*.js".to_owned()]]
+        assert_changed_reason(
+            decide(Some(&prior), &current),
+            ExpectedChange {
+                changed: vec![
+                    FileDelta {
+                        path: "dist/app.js".to_owned(),
+                        prior_hash: [2; 32],
+                        current_hash: [0; 32],
+                        prior_absent: false,
+                        current_absent: true,
+                    },
+                    FileDelta {
+                        path: "dist/other.js".to_owned(),
+                        prior_hash: [0; 32],
+                        current_hash: [2; 32],
+                        prior_absent: true,
+                        current_absent: false,
+                    },
+                ],
+                truncated: false,
+                change_count: 2,
+                kind: ChangeKind::Output,
+            },
         );
+        assert_eq!(resolver.output_patterns_calls(), vec![current_patterns]);
     }
 
     #[test]
-    fn unchanged_outputs_with_detected_patterns_skip() {
-        let mut prior = sample_record();
-        prior.detected_output_patterns = true;
-        let patterns = prior.output_patterns.clone();
-
-        assert_output_pattern_resolution(
-            prior,
-            BTreeMap::from([(patterns.clone(), sample_record().outputs)]),
-            None,
-            Decision::Skip,
-            vec![patterns],
-        );
-    }
-
-    #[test]
-    fn undetected_output_pattern_changes_still_skip_with_same_resolved_outputs() {
-        let prior = sample_record();
-
-        assert_output_pattern_resolution(
-            prior,
-            BTreeMap::from([(vec!["build/out.txt".to_owned()], sample_record().outputs)]),
-            Some(vec!["build/out.txt".to_owned()]),
-            Decision::Skip,
-            vec![vec!["build/out.txt".to_owned()]],
-        );
-    }
-
-    #[test]
-    fn changed_outputs_with_undetected_patterns_run_when_resolved_set_changes() {
-        let prior = sample_record();
-
-        assert_output_pattern_resolution(
-            prior,
-            BTreeMap::from([(
-                vec!["build/out.txt".to_owned()],
-                vec![file_entry("build/out.txt", 20, 200, [3; 32])],
-            )]),
-            Some(vec!["build/out.txt".to_owned()]),
-            Decision::Run,
-            vec![vec!["build/out.txt".to_owned()]],
-        );
-    }
-
-    #[test]
-    fn missing_output_in_resolved_set_runs() {
-        let prior = sample_record();
-        let missing = vec![FileEntry::absent("dist/app.js")];
-        let resolver = FixtureResolver::new(prior.inputs.clone(), missing);
-        let current = current_state(&prior, &resolver);
-
-        assert_eq!(decide(Some(&prior), &current), Decision::Run);
-    }
-
-    #[test]
-    fn changed_output_metadata_with_same_resolved_hash_skips() {
-        let prior = sample_record();
-        let mut changed_outputs = prior.outputs.clone();
-        changed_outputs[0].mtime_ns += 1;
-        let resolver = FixtureResolver::new(prior.inputs.clone(), changed_outputs);
-        let current = current_state(&prior, &resolver);
-
-        assert_eq!(decide(Some(&prior), &current), Decision::Skip);
-        assert_eq!(resolver.hash_calls(), Vec::<Option<String>>::new());
-    }
-
-    #[test]
-    fn changed_output_hash_with_same_metadata_runs() {
-        let prior = sample_record();
-        let mut changed_outputs = prior.outputs.clone();
-        changed_outputs[0].hash = [9; 32];
-        let resolver = FixtureResolver::new(prior.inputs.clone(), changed_outputs);
-        let current = current_state(&prior, &resolver);
-
-        assert_eq!(decide(Some(&prior), &current), Decision::Run);
-        assert_eq!(resolver.hash_calls(), Vec::<Option<String>>::new());
-    }
-
-    #[test]
-    fn changed_absent_flag_runs() {
+    fn changed_output_contents_runs_with_output_changed_reason() {
         assert_file_change_runs(FileChangeCase {
             target: ChangeTarget::Outputs,
-            mutate: |entry| entry.absent = true,
+            mutate: |entry| entry.size += 1,
             new_hash: [9; 32],
         });
+    }
+
+    #[test]
+    fn changed_input_contents_runs_with_input_changed_reason() {
+        assert_file_change_runs(FileChangeCase {
+            target: ChangeTarget::Inputs,
+            mutate: |entry| entry.mtime_ns += 1,
+            new_hash: [9; 32],
+        });
+    }
+
+    #[test]
+    fn files_diff_truncates_and_detects_hash_absent_and_path_changes() {
+        let prior = vec![
+            sample_present_file("a", [1; 32]),
+            sample_present_file("b", [2; 32]),
+            FileEntry::absent("c"),
+        ];
+        let current = vec![
+            sample_present_file("a", [9; 32]),
+            FileEntry::absent("b"),
+            sample_present_file("d", [4; 32]),
+        ];
+
+        let (changed, truncated, total) = files_diff(&prior, &current, 2);
+
+        assert!(truncated);
+        assert_eq!(total, 4);
+        assert_eq!(
+            changed,
+            vec![
+                FileDelta {
+                    path: "a".to_owned(),
+                    prior_hash: [1; 32],
+                    current_hash: [9; 32],
+                    prior_absent: false,
+                    current_absent: false,
+                },
+                FileDelta {
+                    path: "b".to_owned(),
+                    prior_hash: [2; 32],
+                    current_hash: [0; 32],
+                    prior_absent: false,
+                    current_absent: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn files_diff_with_zero_limit_reports_total_without_payload() {
+        let prior = vec![sample_present_file("a", [1; 32])];
+        let current = vec![sample_present_file("a", [9; 32])];
+
+        let (changed, truncated, total) = files_diff(&prior, &current, 0);
+
+        assert!(changed.is_empty());
+        assert!(truncated);
+        assert_eq!(total, 1);
+    }
+
+    #[test]
+    fn uses_detected_output_patterns_when_present() {
+        let mut prior = sample_record();
+        prior.detected_output_patterns = true;
+        prior.output_patterns = vec!["dist/generated.js".to_owned()];
+        let matched_output = sample_present_file("dist/generated.js", [7; 32]);
+        prior.outputs = vec![matched_output.clone()];
+        let outputs_by_patterns = BTreeMap::from([(
+            vec!["dist/generated.js".to_owned()],
+            vec![matched_output.clone()],
+        )]);
+        let resolver = FixtureResolver::with_patterns(
+            prior.inputs.clone(),
+            vec![matched_output],
+            BTreeMap::new(),
+            outputs_by_patterns,
+        );
+        let current_declared_outputs = vec!["dist/declared.js".to_owned()];
+
+        assert_output_pattern_resolution(
+            prior,
+            Some(current_declared_outputs),
+            resolver,
+            OutputPatternExpectation {
+                decision: Decision::Skip,
+                output_pattern_calls: vec![vec!["dist/generated.js".to_owned()]],
+            },
+        );
+    }
+
+    #[test]
+    fn declared_outputs_ignore_current_pattern_drift_until_worker_detects_outputs() {
+        let prior = sample_record();
+        let outputs_by_patterns =
+            BTreeMap::from([(vec!["dist/declared.js".to_owned()], prior.outputs.clone())]);
+        let resolver = FixtureResolver::with_patterns(
+            prior.inputs.clone(),
+            prior.outputs.clone(),
+            BTreeMap::new(),
+            outputs_by_patterns,
+        );
+        let current_declared_outputs = vec!["dist/declared.js".to_owned()];
+
+        assert_output_pattern_resolution(
+            prior,
+            Some(current_declared_outputs),
+            resolver,
+            OutputPatternExpectation {
+                decision: Decision::Skip,
+                output_pattern_calls: vec![vec!["dist/declared.js".to_owned()]],
+            },
+        );
+    }
+
+    #[test]
+    fn removed_output_path_runs() {
+        let prior = sample_record();
+        let resolver = FixtureResolver::new(prior.inputs.clone(), Vec::new());
+        let current = current_state(&prior, &resolver);
+
+        assert_changed_reason(
+            decide(Some(&prior), &current),
+            ExpectedChange {
+                changed: vec![FileDelta {
+                    path: "dist/app.js".to_owned(),
+                    prior_hash: [2; 32],
+                    current_hash: [0; 32],
+                    prior_absent: false,
+                    current_absent: true,
+                }],
+                truncated: false,
+                change_count: 1,
+                kind: ChangeKind::Output,
+            },
+        );
     }
 
     #[test]
@@ -478,13 +710,82 @@ mod tests {
         });
     }
 
+    enum ChangeKind {
+        Input,
+        Output,
+    }
+
     fn assert_file_change_runs(case: FileChangeCase) {
         let prior = sample_record();
         let resolver = resolver_for_file_change(case);
         let current = current_state(&prior, &resolver);
 
-        assert_eq!(decide(Some(&prior), &current), Decision::Run);
+        let expected = expected_diff(case);
+        let expected_change_count = expected.len() as u32;
+        let result = decide(Some(&prior), &current);
+        assert_eq!(result.action, Decision::Run);
+        match case.target {
+            ChangeTarget::Inputs => {
+                assert_changed_reason(
+                    result,
+                    ExpectedChange {
+                        changed: expected,
+                        truncated: false,
+                        change_count: expected_change_count,
+                        kind: ChangeKind::Input,
+                    },
+                );
+            }
+            ChangeTarget::Outputs => {
+                assert_changed_reason(
+                    result,
+                    ExpectedChange {
+                        changed: expected,
+                        truncated: false,
+                        change_count: expected_change_count,
+                        kind: ChangeKind::Output,
+                    },
+                );
+            }
+        }
         assert_eq!(resolver.hash_calls(), Vec::<Option<String>>::new());
+    }
+
+    fn expected_diff(case: FileChangeCase) -> Vec<FileDelta> {
+        let prior = sample_record();
+        let prior_entry = match case.target {
+            ChangeTarget::Inputs => prior.inputs[0].clone(),
+            ChangeTarget::Outputs => prior.outputs[0].clone(),
+        };
+        let mut current_entry = prior_entry.clone();
+        (case.mutate)(&mut current_entry);
+        current_entry.hash = case.new_hash;
+        if current_entry.path != prior_entry.path {
+            vec![
+                FileDelta {
+                    path: prior_entry.path.clone(),
+                    prior_hash: prior_entry.hash,
+                    current_hash: [0; 32],
+                    prior_absent: prior_entry.absent,
+                    current_absent: true,
+                },
+                FileDelta {
+                    path: current_entry.path,
+                    prior_hash: [0; 32],
+                    current_hash: case.new_hash,
+                    prior_absent: true,
+                    current_absent: current_entry.absent,
+                },
+            ]
+        } else {
+            vec![FileDelta {
+                path: prior_entry.path,
+                prior_hash: prior_entry.hash,
+                current_hash: current_entry.hash,
+                prior_absent: prior_entry.absent,
+                current_absent: current_entry.absent,
+            }]
+        }
     }
 
     fn resolver_for_file_change(case: FileChangeCase) -> FixtureResolver {
@@ -500,50 +801,101 @@ mod tests {
         FixtureResolver::new(changed_inputs, changed_outputs)
     }
 
-    fn assert_mutated_state_runs(mutate: impl FnOnce(&mut CurrentState<'_>)) {
+    fn assert_mutated_state_runs(
+        mutate: impl FnOnce(&mut CurrentState<'_>),
+        expected_reason: RunReason,
+    ) {
         let prior = sample_record();
         let resolver = FixtureResolver::new(prior.inputs.clone(), prior.outputs.clone());
         let mut current = current_state(&prior, &resolver);
         mutate(&mut current);
 
-        assert_eq!(decide(Some(&prior), &current), Decision::Run);
+        assert_eq!(
+            decide(Some(&prior), &current),
+            DecisionResult {
+                action: Decision::Run,
+                reason: expected_reason,
+            }
+        );
+    }
+
+    /// Expected outcomes for output pattern resolution tests.
+    struct OutputPatternExpectation {
+        decision: Decision,
+        output_pattern_calls: Vec<Vec<String>>,
     }
 
     fn assert_output_pattern_resolution(
         prior: TaskRunRecord,
-        outputs_by_patterns: BTreeMap<Vec<String>, Vec<FileEntry>>,
         declared_output_patterns: Option<Vec<String>>,
-        expected_decision: Decision,
-        expected_output_pattern_calls: Vec<Vec<String>>,
+        resolver: FixtureResolver,
+        expected: OutputPatternExpectation,
     ) {
-        let resolver = FixtureResolver::with_patterns(
-            prior.inputs.clone(),
-            prior.outputs.clone(),
-            BTreeMap::new(),
-            outputs_by_patterns,
-        );
-        let changed_patterns = declared_output_patterns;
         let mut current = current_state(&prior, &resolver);
-        if let Some(patterns) = changed_patterns.as_deref() {
+        if let Some(patterns) = declared_output_patterns.as_deref() {
             current.declared_output_patterns = patterns;
         }
 
-        assert_eq!(decide(Some(&prior), &current), expected_decision);
+        assert_eq!(decide(Some(&prior), &current).action, expected.decision);
         assert_eq!(
             resolver.output_patterns_calls(),
-            expected_output_pattern_calls
+            expected.output_pattern_calls
         );
         assert_eq!(resolver.hash_calls(), Vec::<Option<String>>::new());
     }
+
+    fn expected_run_decision(reason: RunReason) -> DecisionResult {
+        let action = match reason {
+            RunReason::CacheHit | RunReason::SharedCacheHit => Decision::Skip,
+            _ => Decision::Run,
+        };
+        DecisionResult { action, reason }
+    }
+
+    struct ExpectedChange {
+        changed: Vec<FileDelta>,
+        truncated: bool,
+        change_count: u32,
+        kind: ChangeKind,
+    }
+
+    fn assert_changed_reason(result: DecisionResult, expected: ExpectedChange) {
+        let ExpectedChange {
+            changed,
+            truncated,
+            change_count,
+            kind,
+        } = expected;
+        let expected_reason = match kind {
+            ChangeKind::Input => RunReason::InputChanged {
+                changed,
+                truncated,
+                change_count,
+            },
+            ChangeKind::Output => RunReason::OutputChanged {
+                changed,
+                truncated,
+                change_count,
+            },
+        };
+        assert_run_reason(result, expected_reason);
+    }
+
+    fn assert_run_reason(result: DecisionResult, expected_reason: RunReason) {
+        assert_eq!(result.action, Decision::Run);
+        assert_eq!(result.reason, expected_reason);
+    }
+
     fn current_state<'a>(
         prior: &'a TaskRunRecord,
-        resolver: &'a FixtureResolver,
+        resolver: &'a dyn FileStateResolver,
     ) -> CurrentState<'a> {
         CurrentState {
             task_spec_hash: prior.task_spec_hash,
             env_hash: prior.env_hash,
             pkg_dep_hash: prior.pkg_dep_hash,
             dep_outputs: prior.dep_outputs.clone(),
+            cache_nonce: prior.cache_nonce.as_deref(),
             declared_input_patterns: &prior.input_patterns,
             declared_output_patterns: &prior.output_patterns,
             resolver,
@@ -552,12 +904,12 @@ mod tests {
 
     fn sample_record() -> TaskRunRecord {
         TaskRunRecord {
-            schema_version: SCHEMA_VERSION_V3,
+            schema_version: SCHEMA_VERSION_V4,
             task_spec_hash: [1; 32],
             input_patterns: vec!["src/**/*.ts".to_owned()],
-            inputs: vec![file_entry("src/main.ts", 10, 100, [2; 32])],
-            output_patterns: vec!["dist/**/*.js".to_owned()],
-            outputs: vec![file_entry("dist/app.js", 20, 200, [3; 32])],
+            inputs: vec![sample_present_file("src/main.ts", [3; 32])],
+            output_patterns: vec!["dist/app.js".to_owned()],
+            outputs: vec![sample_present_file("dist/app.js", [2; 32])],
             detected_input_patterns: false,
             detected_output_patterns: false,
             outputs_hash: [4; 32],
@@ -568,176 +920,219 @@ mod tests {
             succeeded: true,
             start_unix_ms: 1,
             end_unix_ms: 2,
-            reports: vec![],
-            cache_nonce: None,
+            reports: Vec::new(),
+            cache_nonce: Some("nonce-v1".to_owned()),
+            run_reason: None,
         }
     }
 
-    fn file_entry(path: &str, size: u64, mtime_ns: i128, hash: [u8; 32]) -> FileEntry {
+    fn sample_present_file(path: &str, hash: [u8; 32]) -> FileEntry {
         FileEntry {
             path: path.to_owned(),
-            size,
-            mtime_ns,
+            size: 1,
+            mtime_ns: 1,
             hash,
             absent: false,
         }
     }
 
-    #[derive(Clone)]
-    struct FixtureResolver {
-        default_inputs: Vec<FileEntry>,
-        default_outputs: Vec<FileEntry>,
-        inputs_by_patterns: BTreeMap<Vec<String>, Vec<FileEntry>>,
-        outputs_by_patterns: BTreeMap<Vec<String>, Vec<FileEntry>>,
-        hash_overrides: BTreeMap<String, [u8; 32]>,
-        hash_calls: RefCell<Vec<String>>,
-        input_patterns_calls: RefCell<Vec<Vec<String>>>,
-        output_patterns_calls: RefCell<Vec<Vec<String>>>,
-    }
-    impl FixtureResolver {
-        fn new(default_inputs: Vec<FileEntry>, default_outputs: Vec<FileEntry>) -> Self {
-            Self::with_patterns(
-                default_inputs,
-                default_outputs,
-                BTreeMap::new(),
-                BTreeMap::new(),
-            )
-        }
-
-        fn with_patterns(
-            default_inputs: Vec<FileEntry>,
-            default_outputs: Vec<FileEntry>,
-            inputs_by_patterns: BTreeMap<Vec<String>, Vec<FileEntry>>,
-            outputs_by_patterns: BTreeMap<Vec<String>, Vec<FileEntry>>,
-        ) -> Self {
-            Self {
-                default_inputs,
-                default_outputs,
-                inputs_by_patterns,
-                outputs_by_patterns,
-                hash_overrides: BTreeMap::new(),
-                hash_calls: RefCell::new(Vec::new()),
-                input_patterns_calls: RefCell::new(Vec::new()),
-                output_patterns_calls: RefCell::new(Vec::new()),
-            }
-        }
-
-        fn hash_calls(&self) -> Vec<Option<String>> {
-            self.hash_calls.borrow().iter().cloned().map(Some).collect()
-        }
-
-        fn input_patterns_calls(&self) -> Vec<Vec<String>> {
-            self.input_patterns_calls.borrow().clone()
-        }
-
-        fn output_patterns_calls(&self) -> Vec<Vec<String>> {
-            self.output_patterns_calls.borrow().clone()
-        }
-
-        fn resolve_entries(
-            by_patterns: &BTreeMap<Vec<String>, Vec<FileEntry>>,
-            defaults: &[FileEntry],
-            patterns: &[String],
-        ) -> Vec<FileEntry> {
-            by_patterns
-                .get(patterns)
-                .cloned()
-                .unwrap_or_else(|| defaults.to_vec())
-        }
+    #[derive(Clone, Copy)]
+    enum ChangeTarget {
+        Inputs,
+        Outputs,
     }
 
-    impl FileStateResolver for FixtureResolver {
-        fn resolve_inputs(&self, patterns: &[String]) -> crate::Result<Vec<FileEntry>> {
-            self.input_patterns_calls
-                .borrow_mut()
-                .push(patterns.to_vec());
-            Ok(Self::resolve_entries(
-                &self.inputs_by_patterns,
-                &self.default_inputs,
-                patterns,
-            ))
-        }
-
-        fn resolve_outputs(&self, patterns: &[String]) -> crate::Result<Vec<FileEntry>> {
-            self.output_patterns_calls
-                .borrow_mut()
-                .push(patterns.to_vec());
-            Ok(Self::resolve_entries(
-                &self.outputs_by_patterns,
-                &self.default_outputs,
-                patterns,
-            ))
-        }
-
-        fn blake3_file(&self, path: &Path) -> crate::Result<[u8; 32]> {
-            let normalized = path.to_string_lossy().replace('\\', "/");
-            self.hash_calls.borrow_mut().push(normalized.clone());
-            if let Some(hash) = self.hash_overrides.get(&normalized) {
-                return Ok(*hash);
-            }
-            self.default_inputs
-                .iter()
-                .chain(self.default_outputs.iter())
-                .find(|entry| entry.path == normalized)
-                .map(|entry| entry.hash)
-                .ok_or_else(|| {
-                    CacheError::Git(format!("unknown file requested for hash: {normalized}"))
-                })
-        }
-    }
-
+    #[derive(Clone, Copy)]
     struct FileChangeCase {
         target: ChangeTarget,
         mutate: fn(&mut FileEntry),
         new_hash: [u8; 32],
     }
 
-    enum ChangeTarget {
-        Inputs,
-        Outputs,
+    /// Creates a resolver with matching inputs/outputs for cache-hit scenarios.
+    fn matching_resolver(record: &TaskRunRecord) -> FixtureResolver {
+        FixtureResolver::new(record.inputs.clone(), record.outputs.clone())
+    }
+
+    /// Helper for testing decide() results with matching state.
+    fn assert_decision_with_match(
+        prior: TaskRunRecord,
+        prior_mut: impl FnOnce(&mut TaskRunRecord),
+        expected: DecisionResult,
+    ) {
+        let mut prior = prior;
+        prior_mut(&mut prior);
+        let resolver = matching_resolver(&prior);
+        let current = current_state(&prior, &resolver);
+        assert_eq!(decide(Some(&prior), &current), expected);
+    }
+
+    fn assert_matching_decision(
+        prior: TaskRunRecord,
+        mutate_current: impl FnOnce(&mut CurrentState<'_>),
+        expected: DecisionResult,
+    ) {
+        let resolver = matching_resolver(&prior);
+        let mut current = current_state(&prior, &resolver);
+        mutate_current(&mut current);
+        assert_eq!(decide(Some(&prior), &current), expected);
+    }
+
+    struct FixtureResolver {
+        default_inputs: Vec<FileEntry>,
+        default_outputs: Vec<FileEntry>,
+        inputs_by_patterns: BTreeMap<Vec<String>, Vec<FileEntry>>,
+        outputs_by_patterns: BTreeMap<Vec<String>, Vec<FileEntry>>,
+        input_pattern_calls: RefCell<Vec<Vec<String>>>,
+        output_pattern_calls: RefCell<Vec<Vec<String>>>,
+        hash_calls: RefCell<Vec<Option<String>>>,
+    }
+
+    impl FixtureResolver {
+        fn new(inputs: Vec<FileEntry>, outputs: Vec<FileEntry>) -> Self {
+            Self::with_patterns(inputs, outputs, BTreeMap::new(), BTreeMap::new())
+        }
+
+        fn with_patterns(
+            inputs: Vec<FileEntry>,
+            outputs: Vec<FileEntry>,
+            inputs_by_patterns: BTreeMap<Vec<String>, Vec<FileEntry>>,
+            outputs_by_patterns: BTreeMap<Vec<String>, Vec<FileEntry>>,
+        ) -> Self {
+            Self {
+                default_inputs: inputs,
+                default_outputs: outputs,
+                inputs_by_patterns,
+                outputs_by_patterns,
+                input_pattern_calls: RefCell::new(Vec::new()),
+                output_pattern_calls: RefCell::new(Vec::new()),
+                hash_calls: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn output_patterns_calls(&self) -> Vec<Vec<String>> {
+            self.output_pattern_calls.borrow().clone()
+        }
+
+        fn hash_calls(&self) -> Vec<Option<String>> {
+            self.hash_calls.borrow().clone()
+        }
+    }
+
+    impl FileStateResolver for FixtureResolver {
+        fn resolve_inputs(&self, patterns: &[String]) -> crate::Result<Vec<FileEntry>> {
+            self.input_pattern_calls
+                .borrow_mut()
+                .push(patterns.to_vec());
+            Ok(self
+                .inputs_by_patterns
+                .get(patterns)
+                .cloned()
+                .unwrap_or_else(|| self.default_inputs.clone()))
+        }
+
+        fn resolve_outputs(&self, patterns: &[String]) -> crate::Result<Vec<FileEntry>> {
+            self.output_pattern_calls
+                .borrow_mut()
+                .push(patterns.to_vec());
+            Ok(self
+                .outputs_by_patterns
+                .get(patterns)
+                .cloned()
+                .unwrap_or_else(|| self.default_outputs.clone()))
+        }
+
+        fn blake3_file(&self, path: &Path) -> crate::Result<[u8; 32]> {
+            self.hash_calls
+                .borrow_mut()
+                .push(path.to_str().map(str::to_owned));
+            Err(CacheError::InputExpansion(
+                "hashing should not be needed".to_owned(),
+            ))
+        }
+    }
+
+    #[test]
+    fn decide_resolver_error_forces_run() {
+        struct ErrorResolver;
+
+        impl FileStateResolver for ErrorResolver {
+            fn resolve_inputs(&self, _: &[String]) -> crate::Result<Vec<FileEntry>> {
+                Err(CacheError::InputExpansion(
+                    "input resolver failed".to_owned(),
+                ))
+            }
+
+            fn resolve_outputs(&self, _: &[String]) -> crate::Result<Vec<FileEntry>> {
+                Err(CacheError::InputExpansion(
+                    "output resolver failed".to_owned(),
+                ))
+            }
+
+            fn blake3_file(&self, path: &Path) -> crate::Result<[u8; 32]> {
+                Err(CacheError::InputExpansion(format!(
+                    "hashing should not be needed: {}",
+                    path.display()
+                )))
+            }
+        }
+
+        let prior = sample_record();
+        let resolver = ErrorResolver;
+        let current = current_state(&prior, &resolver);
+
+        let result = decide(Some(&prior), &current);
+        assert_eq!(
+            result.action,
+            Decision::Run,
+            "resolver errors must force rerun instead of skip"
+        );
+        assert_eq!(
+            result.reason,
+            RunReason::OutputChanged {
+                changed: Vec::new(),
+                truncated: false,
+                change_count: 0,
+            },
+            "output resolver errors should force rerun via output-changed reason because outputs are checked first"
+        );
     }
 
     // === Tests for decide_shared_restore ===
 
     #[test]
-    fn shared_restore_inputs_match_outputs_absent_returns_true() {
-        // KEY CASE: inputs match, outputs ABSENT in current tree → should return true
-        // This is the case full decide() got wrong (it would return Run because outputs absent)
+    fn shared_restore_allows_absent_outputs_when_inputs_match() {
         let prior = sample_record();
-        // Empty outputs = outputs don't exist in current tree
         let resolver = FixtureResolver::new(prior.inputs.clone(), vec![]);
         let current = current_state(&prior, &resolver);
 
         assert!(
             super::decide_shared_restore(&prior, &current),
-            "should allow restore when inputs match and outputs absent"
+            "should allow shared restore when outputs are absent but inputs match"
         );
-        // Verify: full decide() would return Run because outputs don't match
         assert_eq!(
-            decide(Some(&prior), &current),
+            decide(Some(&prior), &current).action,
             Decision::Run,
             "sanity check: full decide() returns Run when outputs absent"
         );
     }
 
     #[test]
-    fn shared_restore_input_content_differs_returns_false() {
-        // Input content hash differs → should reject restore
+    fn shared_restore_input_mismatch_returns_false() {
         let prior = sample_record();
         let mut changed_inputs = prior.inputs.clone();
-        changed_inputs[0].hash = [9; 32]; // Different content hash
+        changed_inputs[0].hash = [9; 32];
         let resolver = FixtureResolver::new(changed_inputs, vec![]);
         let current = current_state(&prior, &resolver);
 
         assert!(
             !super::decide_shared_restore(&prior, &current),
-            "should reject restore when input content differs"
+            "should reject restore when inputs differ"
         );
     }
 
     #[test]
     fn shared_restore_task_spec_mismatch_returns_false() {
-        // task_spec_hash mismatch → should reject
         let prior = sample_record();
         let resolver = FixtureResolver::new(prior.inputs.clone(), vec![]);
         let mut current = current_state(&prior, &resolver);
@@ -751,7 +1146,6 @@ mod tests {
 
     #[test]
     fn shared_restore_env_mismatch_returns_false() {
-        // env_hash mismatch → should reject
         let prior = sample_record();
         let resolver = FixtureResolver::new(prior.inputs.clone(), vec![]);
         let mut current = current_state(&prior, &resolver);
@@ -765,7 +1159,6 @@ mod tests {
 
     #[test]
     fn shared_restore_pkg_dep_mismatch_returns_false() {
-        // pkg_dep_hash mismatch → should reject
         let prior = sample_record();
         let resolver = FixtureResolver::new(prior.inputs.clone(), vec![]);
         let mut current = current_state(&prior, &resolver);
@@ -779,7 +1172,6 @@ mod tests {
 
     #[test]
     fn shared_restore_dep_outputs_mismatch_returns_false() {
-        // dep_outputs mismatch → should reject
         let prior = sample_record();
         let resolver = FixtureResolver::new(prior.inputs.clone(), vec![]);
         let mut current = current_state(&prior, &resolver);
@@ -793,29 +1185,59 @@ mod tests {
 
     #[test]
     fn shared_restore_failed_prior_returns_false() {
-        // Prior task failed → should reject
-        let mut prior = sample_record();
-        prior.succeeded = false;
-        let resolver = FixtureResolver::new(prior.inputs.clone(), vec![]);
-        let current = current_state(&prior, &resolver);
-
-        assert!(
-            !super::decide_shared_restore(&prior, &current),
-            "should reject restore when prior failed"
+        assert_shared_restore_rejects(
+            sample_record(),
+            |prior| prior.succeeded = false,
+            |_| {},
+            "should reject restore when prior failed",
         );
     }
 
     #[test]
     fn shared_restore_outputs_present_also_returns_true() {
-        // Outputs already present and matching → should also allow restore
-        // (This handles same-commit restore case where outputs exist)
         let prior = sample_record();
-        let resolver = FixtureResolver::new(prior.inputs.clone(), prior.outputs.clone());
+        let resolver = matching_resolver(&prior);
         let current = current_state(&prior, &resolver);
 
         assert!(
             super::decide_shared_restore(&prior, &current),
             "should allow restore when inputs match and outputs present"
         );
+    }
+
+    #[test]
+    fn shared_restore_nonce_mismatch_returns_false() {
+        let mut prior = sample_record();
+        prior.cache_nonce = Some("nonce-v2".to_owned());
+        assert_shared_restore_rejects(
+            prior,
+            |_| {},
+            |current| current.cache_nonce = Some("nonce-v1"),
+            "should reject restore when nonce differs",
+        );
+    }
+
+    /// Helper for testing that decide_shared_restore rejects a condition.
+    fn assert_shared_restore_rejects(
+        prior: TaskRunRecord,
+        prior_mut: impl FnOnce(&mut TaskRunRecord),
+        current_mut: impl FnOnce(&mut CurrentState<'_>),
+        message: &str,
+    ) {
+        let mut prior = prior;
+        prior_mut(&mut prior);
+        let resolver = matching_resolver(&prior);
+        let mut current = current_state(&prior, &resolver);
+        current_mut(&mut current);
+        assert!(
+            !super::decide_shared_restore(&prior, &current),
+            "{}",
+            message
+        );
+    }
+
+    #[test]
+    fn decide_files_diff_limit_constant_is_50() {
+        assert_eq!(DECIDE_FILES_DIFF_LIMIT, 50);
     }
 }

@@ -12,6 +12,7 @@ pub struct LogBlockMeta<'a> {
     pub cache_hash: Option<&'a str>,
     pub show_cache_nonce: bool,
     pub cache_nonce: Option<&'a str>,
+    pub run_reason: Option<String>,
 }
 
 const TIMESTAMP_PRINTER: DateTimePrinter = DateTimePrinter::new().precision(Some(0));
@@ -68,13 +69,18 @@ pub fn format_task_log_block(
     push_cache_nonce_line(&mut out, meta.show_cache_nonce, meta.cache_nonce);
 
     out.push_str(&format!(
-        "{} {} · {} {} · {} {}\n",
+        "{} {}\n",
         FOOTER_MARKER.if_supports_color(stream, |t| t.blue()),
-        duration.if_supports_color(stream, |t| t.dimmed()),
-        "exit".if_supports_color(stream, |t| t.dimmed()),
-        exit.if_supports_color(stream, |t| t.dimmed()),
-        "cache".if_supports_color(stream, |t| t.dimmed()),
-        cache.if_supports_color(stream, |t| t.dimmed())
+        footer_parts(
+            meta,
+            stream,
+            FooterDisplay {
+                duration: &duration,
+                exit: &exit,
+                cache,
+            },
+        )
+        .join(" · ")
     ));
     out
 }
@@ -86,6 +92,41 @@ fn push_cache_nonce_line(out: &mut String, show_cache_nonce: bool, cache_nonce: 
 
     let nonce_str = cache_nonce.unwrap_or("(none)");
     out.push_str(&format!("  Cache nonce: {}\n", nonce_str));
+}
+
+struct FooterDisplay<'a> {
+    duration: &'a str,
+    exit: &'a str,
+    cache: &'a str,
+}
+
+fn footer_parts(meta: &LogBlockMeta, stream: Stream, footer: FooterDisplay<'_>) -> Vec<String> {
+    let mut parts = vec![
+        format!(
+            "{}",
+            footer.duration.if_supports_color(stream, |t| t.dimmed())
+        ),
+        format!(
+            "{} {}",
+            "exit".if_supports_color(stream, |t| t.dimmed()),
+            footer.exit.if_supports_color(stream, |t| t.dimmed())
+        ),
+        format!(
+            "{} {}",
+            "cache".if_supports_color(stream, |t| t.dimmed()),
+            footer.cache.if_supports_color(stream, |t| t.dimmed())
+        ),
+    ];
+
+    if let Some(reason) = &meta.run_reason {
+        parts.push(format!(
+            "{} {}",
+            "ran:".if_supports_color(stream, |t| t.dimmed()),
+            reason.if_supports_color(stream, |t| t.dimmed())
+        ));
+    }
+
+    parts
 }
 
 pub struct ReportRenderInput<'a> {
@@ -614,13 +655,8 @@ mod tests {
     fn test_log_meta(package: &'static str) -> LogBlockMeta<'static> {
         LogBlockMeta {
             package,
-            task: "build",
-            start: None,
-            duration_ms: None,
-            exit_status: None,
-            cache_hash: None,
-            show_cache_nonce: false,
-            cache_nonce: None,
+            run_reason: None,
+            ..base_log_block_meta()
         }
     }
     #[test]
@@ -843,6 +879,7 @@ mod tests {
             cache_hash: None,
             show_cache_nonce: false,
             cache_nonce: None,
+            run_reason: None,
         };
 
         let output = format_task_log_block(&meta, "body line", "report line\n", Stream::Stdout);
@@ -945,6 +982,7 @@ mod tests {
             cache_hash: Some("deadbeefcafe"),
             show_cache_nonce: false,
             cache_nonce: None,
+            run_reason: None,
         };
         let reports = render_reports_pretty(
             [ReportRenderInput {
@@ -1009,6 +1047,7 @@ mod tests {
             cache_hash: None,
             show_cache_nonce: true,
             cache_nonce: Some("env=v1&task=t1"),
+            run_reason: None,
         };
 
         // True + Some
@@ -1024,5 +1063,41 @@ mod tests {
         meta.show_cache_nonce = false;
         let output = format_task_log_block(&meta, "body", "", Stream::Stdout);
         assert!(!output.contains("Cache nonce:"));
+    }
+
+    #[test]
+    fn format_task_log_block_shows_run_reason_when_present() {
+        let mut meta = test_log_meta("app");
+        meta.run_reason = Some("no prior run".to_string());
+        let output = format_task_log_block(&meta, "body", "", Stream::Stdout);
+        assert!(
+            output.contains("ran: no prior run"),
+            "footer should contain 'ran: no prior run' when run_reason is Some: {output}"
+        );
+    }
+
+    #[test]
+    fn format_task_log_block_omits_run_reason_when_absent() {
+        let meta = test_log_meta("app");
+        let output = format_task_log_block(&meta, "body", "", Stream::Stdout);
+        assert!(
+            !output.contains("ran:"),
+            "footer should not contain 'ran:' when run_reason is None: {output}"
+        );
+    }
+
+    /// Base metadata for log block tests.
+    fn base_log_block_meta() -> LogBlockMeta<'static> {
+        LogBlockMeta {
+            package: "app",
+            task: "build",
+            start: None,
+            duration_ms: None,
+            exit_status: None,
+            cache_hash: None,
+            show_cache_nonce: false,
+            cache_nonce: None,
+            run_reason: None,
+        }
     }
 }

@@ -124,5 +124,32 @@ pub enum Commands {
         #[arg(long = "file", value_name = "NAME")]
         files: Vec<String>,
     },
+    /// Explain why a task would run or skip.
+    ///
+    /// For each matched pkg×task, prints three facts:
+    /// (1) if PRUNED, the prune reason;
+    /// (2) the persisted run_reason from the prior record ("last ran");
+    /// (3) a LIVE decide() result ("what would happen now").
+    Why {
+        /// Task names to match; supports glob wildcards.
+        tasks: Vec<String>,
+
+        /// Match package NAMEs (not paths); supports glob wildcards. Repeat to target multiple packages.
+        #[arg(short = 'p', long = "package")]
+        packages: Vec<String>,
+
+        /// Match the given task names as top-level (workspace-root) tasks
+        /// instead of package tasks.
+        #[arg(short = 'T', long = "top-level")]
+        top_level: bool,
+
+        /// Show which input files changed.
+        #[arg(long = "show-inputs")]
+        show_inputs: bool,
+
+        /// Show which output files changed.
+        #[arg(long = "show-outputs")]
+        show_outputs: bool,
+    },
     Check,
 }

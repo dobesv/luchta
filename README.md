@@ -394,6 +394,34 @@ luchta logs build --file sarif.json
 ```
 The `--file` flag uses union task selection: a task is included if it has at least one of the named files. If no tasks match any of the requested files, the command exits with a non-zero error code.
 
+### Explaining Task Execution (`why`)
+
+To understand why a task ran in the past or why it would run/skip now, use the `luchta why` command. This is useful for debugging unexpected cache misses or confirming which files triggered a rebuild.
+
+For each matched task, `luchta why` reports three facts:
+
+1.  **Pruning:** Whether the task was excluded from the current run (e.g., filtered out via `--package` or not in the requested subgraph). Pruned tasks receive no further analysis.
+2.  **Last Run:** Reports `last ran: {reason}` based on the `run_reason` persisted in the task's cache record. This explains why the task last actually executed (e.g., "input changed", "no prior run", "dependency output changed"). If no prior record exists or it was created before schema V4, it shows `not recorded`.
+3.  **Current Decision:** Reports `now: {status}`—a live assessment of what would happen if you ran it now: `would run: {reason}` if it would execute, or `up to date (local cache hit)` / `up to date (shared cache hit)` if it would skip. This is computed fresh without executing the task.
+
+#### Examples
+
+- `luchta why build`: Explain the status of all `build` tasks.
+- `luchta why -p app build`: Explain only the `@repo/app#build` task.
+- `luchta why -p app build --show-inputs`: Show which specific input files changed compared to the last cached run.
+
+#### `why` CLI Options
+
+The `why` command mirrors the selection flags of `luchta logs`.
+
+| Flag | Description |
+|---|---|
+| `tasks` (positional) | Task names to match; supports glob wildcards. |
+| `-p, --package <PKG>` | Match package name globs (not paths). Repeatable. |
+| `-T, --top-level` | Match tasks defined at the workspace root instead of package tasks. |
+| `--show-inputs` | Show indented per-file detail for changed inputs. |
+| `--show-outputs` | Show indented per-file detail for changed outputs. |
+
 ### `dependsOn` Syntax
 
 Luchta supports flexible dependency definitions:
@@ -584,7 +612,7 @@ Nonces are available at four scopes and are **additive**:
 - **Combine:** All nonces combine; changing any single one invalidates the affected scope's cache. Empty/absent everywhere has no effect.
 - **Stale Entries:** Setting a nonce does NOT delete old cache entries; it changes the hash so a fresh entry is written. The local cache keeps only the most recent entry per task, so reverting a nonce is a fresh cache miss (the task re-runs) rather than restoring the old result; the shared cache may still hold a matching prior candidate.
 - **Recovery (GitHub #118):** If a worker under-reports a task's inputs (a worker bug), a cache entry can be "poisoned" with wrong outputs. Fixing the worker does NOT invalidate that entry, because the task spec hash does not include the worker's version/code. To recover, bump the relevant-scope `nonce` (e.g. change `nonce: "v1"` → `"v2"`) or set `LUCHTA_CACHE_NONCE`.
-- **Upgrade Note:** Shipping this feature changed the on-disk cache record layout; the first run after upgrading will re-run all cached tasks once.
+- **Upgrade Note:** Upgrading to the version containing `luchta why` bumps the cache schema to V4. This triggers a one-time cache invalidation and full rebuild on the first run after upgrade, which is expected and harmless.
 
 #### Inspection
 Use `luchta logs --show-cache-nonce` to view the resolved nonce string persisted per task (shows `(none)` when no nonce is applied).

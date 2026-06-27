@@ -4,7 +4,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use crate::record::{TaskRunRecord, SCHEMA_VERSION_V3};
+use crate::record::{TaskRunRecord, SCHEMA_VERSION_V4};
 use crate::shared::atomic_write;
 use crate::{CacheError, Result};
 
@@ -57,8 +57,8 @@ impl Cache {
         let bytes = fs::read(self.task_dir(task_id).join(META_FILE_NAME)).ok()?;
         let (record, _): (TaskRunRecord, usize) =
             bincode::serde::decode_from_slice(&bytes, bincode_config()).ok()?;
-        // Only accept V3 records. Older versions -> clean cache miss.
-        (record.schema_version == SCHEMA_VERSION_V3).then_some(record)
+        // Only accept V4 records. Older versions -> clean cache miss.
+        (record.schema_version == SCHEMA_VERSION_V4).then_some(record)
     }
 
     pub fn write(&self, task_id: &str, artifacts: RunArtifacts<'_>) -> Result<()> {
@@ -236,6 +236,7 @@ mod tests {
     use super::*;
     use crate::record::{
         FileEntry, ReportMeta, SCHEMA_VERSION_V1, SCHEMA_VERSION_V2, SCHEMA_VERSION_V3,
+        SCHEMA_VERSION_V4,
     };
 
     #[test]
@@ -267,6 +268,29 @@ mod tests {
             fs::read(cache.stderr_path("pkg#build")).unwrap(),
             b"stderr bytes"
         );
+    }
+
+    #[test]
+    fn write_then_read_round_trip_preserves_run_reason() {
+        let temp_dir = tempdir().unwrap();
+        let cache =
+            Cache::open(&temp_dir.path().join(LUCHTA_DIR_NAME).join(CACHE_DIR_NAME)).unwrap();
+        let mut record = sample_record();
+        record.run_reason = Some(crate::RunReason::NoPriorRecord);
+
+        cache
+            .write(
+                "pkg#build",
+                RunArtifacts {
+                    record: &record,
+                    stdout: b"stdout bytes",
+                    stderr: b"stderr bytes",
+                    reports: &[],
+                },
+            )
+            .unwrap();
+
+        assert_eq!(cache.read("pkg#build"), Some(record));
     }
 
     #[test]
@@ -356,6 +380,27 @@ mod tests {
     #[test]
     fn v2_meta_returns_none_instead_of_panicking() {
         assert_previous_schema_record_is_cache_miss("pkg#build", sample_v2_record());
+    }
+
+    #[test]
+    fn v3_shape_meta_returns_none_instead_of_panicking() {
+        assert_previous_schema_record_is_cache_miss("pkg#build", sample_v3_record());
+    }
+
+    #[test]
+    fn v3_version_field_is_rejected() {
+        let temp_dir = tempdir().unwrap();
+        let cache =
+            Cache::open(&temp_dir.path().join(LUCHTA_DIR_NAME).join(CACHE_DIR_NAME)).unwrap();
+        let task_dir = cache.task_dir("pkg#build");
+        fs::create_dir_all(&task_dir).unwrap();
+
+        let mut record = sample_record();
+        record.schema_version = SCHEMA_VERSION_V3;
+        let encoded = bincode::serde::encode_to_vec(&record, bincode_config()).unwrap();
+        fs::write(task_dir.join(META_FILE_NAME), encoded).unwrap();
+
+        assert_eq!(cache.read("pkg#build"), None);
     }
 
     #[test]
@@ -602,7 +647,7 @@ mod tests {
 
     fn sample_record() -> TaskRunRecord {
         TaskRunRecord {
-            schema_version: SCHEMA_VERSION_V3,
+            schema_version: SCHEMA_VERSION_V4,
             task_spec_hash: [1; 32],
             input_patterns: vec!["src/**/*.ts".to_string()],
             inputs: vec![FileEntry {
@@ -632,6 +677,7 @@ mod tests {
             end_unix_ms: 2_000,
             reports: vec![],
             cache_nonce: None,
+            run_reason: None,
         }
     }
 
@@ -707,6 +753,28 @@ mod tests {
         reports: Vec<ReportMeta>,
     }
 
+    #[derive(serde::Serialize)]
+    struct V3TaskRunRecord {
+        schema_version: u32,
+        task_spec_hash: [u8; 32],
+        input_patterns: Vec<String>,
+        inputs: Vec<FileEntry>,
+        output_patterns: Vec<String>,
+        outputs: Vec<FileEntry>,
+        detected_input_patterns: bool,
+        detected_output_patterns: bool,
+        outputs_hash: [u8; 32],
+        env_hash: [u8; 32],
+        pkg_dep_hash: [u8; 32],
+        dep_outputs: BTreeMap<String, [u8; 32]>,
+        exit_status: i32,
+        succeeded: bool,
+        start_unix_ms: u64,
+        end_unix_ms: u64,
+        reports: Vec<ReportMeta>,
+        cache_nonce: Option<String>,
+    }
+
     fn sample_inputs() -> Vec<FileEntry> {
         vec![FileEntry {
             path: "src/main.ts".to_string(),
@@ -738,48 +806,84 @@ mod tests {
         }]
     }
 
-    fn sample_v2_record() -> V2TaskRunRecord {
-        V2TaskRunRecord {
-            schema_version: SCHEMA_VERSION_V2,
-            task_spec_hash: [11; 32],
+    /// Shared base builder for legacy schema fixtures.
+    /// Returns data that can be used to construct any legacy record type.
+    fn base_fixture_data() -> BaseFixtureData {
+        BaseFixtureData {
             input_patterns: vec!["src/**/*.ts".to_string()],
             inputs: sample_inputs(),
             output_patterns: vec!["dist/**/*.js".to_string()],
             outputs: sample_outputs(),
+            dep_outputs: sample_dep_outputs(),
+            reports: sample_reports_meta(),
+        }
+    }
+
+    struct BaseFixtureData {
+        input_patterns: Vec<String>,
+        inputs: Vec<FileEntry>,
+        output_patterns: Vec<String>,
+        outputs: Vec<FileEntry>,
+        dep_outputs: BTreeMap<String, [u8; 32]>,
+        reports: Vec<ReportMeta>,
+    }
+
+    fn sample_v2_record() -> V2TaskRunRecord {
+        let base = base_fixture_data();
+        V2TaskRunRecord {
+            schema_version: SCHEMA_VERSION_V2,
+            task_spec_hash: [11; 32],
+            input_patterns: base.input_patterns,
+            inputs: base.inputs,
+            output_patterns: base.output_patterns,
+            outputs: base.outputs,
             detected_input_patterns: true,
             detected_output_patterns: true,
             outputs_hash: [14; 32],
             env_hash: [15; 32],
             pkg_dep_hash: [16; 32],
-            dep_outputs: sample_dep_outputs(),
+            dep_outputs: base.dep_outputs,
             exit_status: 0,
             succeeded: true,
             start_unix_ms: 1_000,
             end_unix_ms: 2_000,
-            reports: sample_reports_meta(),
+            reports: base.reports,
+        }
+    }
+
+    fn sample_v3_record() -> V3TaskRunRecord {
+        let base = base_fixture_data();
+        V3TaskRunRecord {
+            schema_version: SCHEMA_VERSION_V3,
+            task_spec_hash: [11; 32],
+            input_patterns: base.input_patterns,
+            inputs: base.inputs,
+            output_patterns: base.output_patterns,
+            outputs: base.outputs,
+            detected_input_patterns: true,
+            detected_output_patterns: true,
+            outputs_hash: [14; 32],
+            env_hash: [15; 32],
+            pkg_dep_hash: [16; 32],
+            dep_outputs: base.dep_outputs,
+            exit_status: 0,
+            succeeded: true,
+            start_unix_ms: 1_000,
+            end_unix_ms: 2_000,
+            reports: base.reports,
+            cache_nonce: Some("nonce-v1".to_string()),
         }
     }
 
     fn sample_v1_record() -> V1TaskRunRecord {
+        let base = base_fixture_data();
         V1TaskRunRecord {
             schema_version: SCHEMA_VERSION_V1,
             task_spec_hash: [1; 32],
-            input_patterns: vec!["src/**/*.ts".to_string()],
-            inputs: vec![FileEntry {
-                path: "src/main.ts".to_string(),
-                size: 42,
-                mtime_ns: 111,
-                hash: [2; 32],
-                absent: false,
-            }],
-            output_patterns: vec!["dist/**/*.js".to_string()],
-            outputs: vec![FileEntry {
-                path: "dist/main.js".to_string(),
-                size: 84,
-                mtime_ns: 222,
-                hash: [3; 32],
-                absent: false,
-            }],
+            input_patterns: base.input_patterns,
+            inputs: base.inputs,
+            output_patterns: base.output_patterns,
+            outputs: base.outputs,
             detected_input_patterns: true,
             detected_output_patterns: true,
             outputs_hash: [4; 32],
