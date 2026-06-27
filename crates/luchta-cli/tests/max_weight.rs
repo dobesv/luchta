@@ -54,7 +54,7 @@ fn setup_weighted_task_workspace(temp: &assert_fs::TempDir) {
         temp.child("luchta-config.sh").path(),
         &format!(
             r#"#!/bin/sh
-echo '{{"concurrency":{{"maxWeight":1}},"workers":{{"shell":{{"command":"{worker_command}"}}}},"tasks":{{"build":{{"dependsOn":["^build"]}},"a#build":{{"worker":"shell","command":"echo a","weight":2}},"b#build":{{"dependsOn":["^build"],"worker":"shell","command":"echo b","weight":2}}}}}}'
+echo '{{"concurrency":{{"maxWeight":1}},"workers":{{"shell":{{"command":"{worker_command}"}}}},"tasks":{{"build":{{"dependsOn":["^build"]}},"a#build":{{"worker":"shell","command":"true","weight":2}},"b#build":{{"dependsOn":["^build"],"worker":"shell","command":"true","weight":2}}}}}}'
 "#
         ),
     );
@@ -109,14 +109,23 @@ fn zero_max_weight_exits_with_error() {
 }
 
 #[test]
+fn weighted_task_exceeding_config_max_weight_is_clamped_and_runs() {
+    let temp = assert_fs::TempDir::new().expect("create temp dir");
+    setup_weighted_task_workspace(&temp);
+
+    // Config sets maxWeight=1 but tasks declare weight=2. The oversized weight
+    // is clamped to the executor max instead of erroring, so the run succeeds.
+    run_luchta(&temp, "build")
+        .success()
+        .stderr(predicate::str::contains("exceeds executor max weight").not());
+}
+
+#[test]
 fn env_var_overrides_config_max_weight_for_weighted_task() {
     let temp = assert_fs::TempDir::new().expect("create temp dir");
     setup_weighted_task_workspace(&temp);
 
-    run_luchta(&temp, "build")
-        .failure()
-        .stderr(predicate::str::contains("exceeds executor max weight 1"));
-
+    // Raising the max weight above the task weight via env var also succeeds.
     let mut cmd = Command::cargo_bin("luchta").expect("find binary");
     cmd.arg("run")
         .arg("build")
@@ -125,7 +134,8 @@ fn env_var_overrides_config_max_weight_for_weighted_task() {
         .env("NO_COLOR", "1")
         .env("LUCHTA_MAX_WEIGHT", "2");
     cmd.assert()
-        .stderr(predicate::str::contains("exceeds executor max weight 1").not());
+        .success()
+        .stderr(predicate::str::contains("exceeds executor max weight").not());
 }
 
 #[test]
@@ -133,10 +143,8 @@ fn cli_overrides_env_and_config_max_weight_for_weighted_task() {
     let temp = assert_fs::TempDir::new().expect("create temp dir");
     setup_weighted_task_workspace(&temp);
 
-    run_luchta(&temp, "build")
-        .failure()
-        .stderr(predicate::str::contains("exceeds executor max weight 1"));
-
+    // CLI flag (2) overrides both the env var (1) and config (1); the run
+    // succeeds with the task weight no longer exceeding the max.
     let mut cmd = Command::cargo_bin("luchta").expect("find binary");
     cmd.arg("run")
         .arg("build")
@@ -147,5 +155,6 @@ fn cli_overrides_env_and_config_max_weight_for_weighted_task() {
         .env("NO_COLOR", "1")
         .env("LUCHTA_MAX_WEIGHT", "1");
     cmd.assert()
-        .stderr(predicate::str::contains("exceeds executor max weight 1").not());
+        .success()
+        .stderr(predicate::str::contains("exceeds executor max weight").not());
 }
