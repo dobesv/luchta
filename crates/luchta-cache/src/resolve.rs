@@ -40,41 +40,68 @@ pub fn resolve_inputs_with_semantics(requests: &[ResolveRequest]) -> Result<Vec<
     }
 
     let mut candidate_cache = HashMap::<PathBuf, Vec<PathBuf>>::new();
+    let mut base_dir_prefix_cache = HashMap::<PathBuf, PathBuf>::new();
     let mut merged_entries = Vec::new();
-    let mut base_dirs = Vec::new();
+    let mut worktree_roots = Vec::new();
 
     for request in requests {
-        if !base_dirs.contains(&request.base_dir) {
-            base_dirs.push(request.base_dir.clone());
+        let base_dir_prefix =
+            qualified_base_dir_prefix(&request.base_dir, &mut base_dir_prefix_cache)?.clone();
+        // The repo-relative prefix is exactly the tail of `base_dir` below the
+        // worktree root, so stripping it yields the worktree root. Entry paths
+        // are repo-relative, so this root is what they must be joined to when
+        // reconstructing absolute paths for canonical dedup — no path probing.
+        let worktree_root = strip_suffix_components(&request.base_dir, &base_dir_prefix);
+        if !worktree_roots.contains(&worktree_root) {
+            worktree_roots.push(worktree_root);
         }
 
+        let base = ResolvedBase {
+            dir: &request.base_dir,
+            prefix: &base_dir_prefix,
+        };
         merged_entries.extend(resolve_single_request(
             request,
+            base,
             &mut candidate_cache,
             &StdFs,
         )?);
     }
 
-    Ok(dedupe_and_sort_entries(merged_entries, &base_dirs))
+    Ok(dedupe_and_sort_entries(merged_entries, &worktree_roots))
+}
+
+/// A resolved input base directory paired with the repo-relative prefix used to
+/// qualify the paths of files discovered beneath it. Bundling the two keeps the
+/// pair together as a single abstraction wherever inputs are turned into
+/// `FileEntry` values.
+#[derive(Clone, Copy)]
+struct ResolvedBase<'a> {
+    dir: &'a Path,
+    prefix: &'a Path,
 }
 
 fn resolve_single_request(
     request: &ResolveRequest,
+    base: ResolvedBase<'_>,
     candidate_cache: &mut HashMap<PathBuf, Vec<PathBuf>>,
     file_reader: &dyn FileReader,
 ) -> Result<Vec<FileEntry>> {
     match request.semantics {
-        InputSemantics::Literal => resolve_literal_request(request, file_reader),
-        InputSemantics::Wildcard => resolve_wildcard_request(request, candidate_cache, file_reader),
+        InputSemantics::Literal => resolve_literal_request(request, base, file_reader),
+        InputSemantics::Wildcard => {
+            resolve_wildcard_request(request, candidate_cache, base, file_reader)
+        }
     }
 }
 
 fn resolve_literal_request(
     request: &ResolveRequest,
+    base: ResolvedBase<'_>,
     file_reader: &dyn FileReader,
 ) -> Result<Vec<FileEntry>> {
     Ok(vec![file_entry_from_path(
-        &request.base_dir,
+        base,
         PathBuf::from(&request.pattern),
         file_reader,
     )?])
@@ -83,10 +110,11 @@ fn resolve_literal_request(
 fn resolve_wildcard_request(
     request: &ResolveRequest,
     candidate_cache: &mut HashMap<PathBuf, Vec<PathBuf>>,
+    base: ResolvedBase<'_>,
     file_reader: &dyn FileReader,
 ) -> Result<Vec<FileEntry>> {
     let candidates = cached_input_candidates(&request.base_dir, candidate_cache)?;
-    resolve_wildcard_with_candidates(&request.base_dir, &request.pattern, candidates, file_reader)
+    resolve_wildcard_with_candidates(base, &request.pattern, candidates, file_reader)
 }
 
 fn cached_input_candidates(
@@ -103,6 +131,14 @@ fn cached_input_candidates(
     Ok(candidates)
 }
 
+/// Resolve a task's output files.
+///
+/// Output `FileEntry.path` values stay **package-relative** (an empty base-dir
+/// prefix), unlike inputs which are qualified repo-relative. This split is
+/// intentional: outputs are always confined to a single task's own package, so
+/// they cannot collide across packages within one record the way cross-package
+/// inputs can (see issue #138). Keeping outputs package-relative preserves the
+/// existing snapshot/restore path semantics.
 pub fn resolve_outputs(base_dir: &Path, patterns: &[String]) -> Result<Vec<FileEntry>> {
     resolve_with(base_dir, patterns, &FilesystemLister, &StdFs)
 }
@@ -141,14 +177,18 @@ fn resolve_with_candidates(
         }
     }
 
+    let base = ResolvedBase {
+        dir: base_dir,
+        prefix: Path::new(""),
+    };
     resolved_paths
         .into_iter()
-        .map(|path| file_entry_from_path(base_dir, path, file_reader))
+        .map(|path| file_entry_from_path(base, path, file_reader))
         .collect()
 }
 
 fn resolve_wildcard_with_candidates(
-    base_dir: &Path,
+    base: ResolvedBase<'_>,
     pattern: &str,
     candidates: Vec<PathBuf>,
     file_reader: &dyn FileReader,
@@ -157,11 +197,11 @@ fn resolve_wildcard_with_candidates(
     candidates
         .into_iter()
         .filter(|candidate| globset.is_match(candidate.as_path()))
-        .map(|path| file_entry_from_path(base_dir, path, file_reader))
+        .map(|path| file_entry_from_path(base, path, file_reader))
         .collect()
 }
 
-fn dedupe_and_sort_entries(entries: Vec<FileEntry>, base_dirs: &[PathBuf]) -> Vec<FileEntry> {
+fn dedupe_and_sort_entries(entries: Vec<FileEntry>, worktree_roots: &[PathBuf]) -> Vec<FileEntry> {
     let mut seen_present = HashSet::new();
     let mut seen_absent = HashSet::new();
     let mut deduped = Vec::new();
@@ -174,18 +214,49 @@ fn dedupe_and_sort_entries(entries: Vec<FileEntry>, base_dirs: &[PathBuf]) -> Ve
             continue;
         }
 
-        let canonical_path = base_dirs
-            .iter()
-            .map(|base_dir| base_dir.join(&entry.path))
-            .find_map(|path| fs::canonicalize(path).ok())
-            .unwrap_or_else(|| PathBuf::from(&entry.path));
-        if seen_present.insert(normalize_path(&canonical_path)) {
+        let dedupe_key =
+            canonical_dedupe_key(worktree_roots, &entry.path).unwrap_or_else(|| entry.path.clone());
+        if seen_present.insert(dedupe_key) {
             deduped.push(entry);
         }
     }
 
     deduped.sort_by(|left, right| left.path.cmp(&right.path));
     deduped
+}
+
+/// Build a stable dedup key for a present entry by resolving its repo-relative
+/// path against the known worktree root(s) and canonicalizing. Because entry
+/// paths are repo-relative, joining to the worktree root yields the exact
+/// absolute path with no ancestor probing, so two qualified paths pointing at
+/// the same physical file collapse to one key.
+///
+/// In the common single-repo workspace there is exactly one worktree root, so
+/// the join is unambiguous. If a batch ever spans multiple repositories, the
+/// first root whose join canonicalizes wins; that is deterministic for a given
+/// `worktree_roots` ordering and only matters in the unusual case of identical
+/// repo-relative paths existing in more than one repo.
+fn canonical_dedupe_key(worktree_roots: &[PathBuf], entry_path: &str) -> Option<String> {
+    let entry_path = Path::new(entry_path);
+    worktree_roots
+        .iter()
+        .map(|root| root.join(entry_path))
+        .find_map(|path| fs::canonicalize(path).ok())
+        .map(|path| normalize_path(&path))
+}
+
+/// Remove the trailing components of `path` that correspond to `suffix`,
+/// yielding the directory `suffix` was relative to. When `suffix` is empty,
+/// `path` is returned unchanged.
+fn strip_suffix_components(path: &Path, suffix: &Path) -> PathBuf {
+    let suffix_len = suffix.components().count();
+    let mut result = path.to_path_buf();
+    for _ in 0..suffix_len {
+        if !result.pop() {
+            break;
+        }
+    }
+    result
 }
 
 #[must_use]
@@ -227,24 +298,49 @@ fn build_globset(patterns: &[String]) -> Result<GlobSet> {
 }
 
 fn file_entry_from_path(
-    base_dir: &Path,
+    base: ResolvedBase<'_>,
     relative_path: PathBuf,
     file_reader: &dyn FileReader,
 ) -> Result<FileEntry> {
-    let absolute_path = base_dir.join(&relative_path);
+    let absolute_path = base.dir.join(&relative_path);
+    let qualified_path = qualify_relative_path(base.prefix, &relative_path);
     if !absolute_path.exists() {
-        return Ok(FileEntry::absent(normalize_path(&relative_path)));
+        return Ok(FileEntry::absent(qualified_path));
     }
 
     let metadata = fs::metadata(&absolute_path)?;
     let hash = file_reader.blake3_file(&absolute_path)?;
     Ok(FileEntry {
-        path: normalize_path(&relative_path),
+        path: qualified_path,
         size: metadata.len(),
         mtime_ns: modified_time_ns(&metadata)?,
         hash,
         absent: false,
     })
+}
+
+fn qualified_base_dir_prefix<'a>(
+    base_dir: &Path,
+    base_dir_prefix_cache: &'a mut HashMap<PathBuf, PathBuf>,
+) -> Result<&'a PathBuf> {
+    use std::collections::hash_map::Entry;
+
+    match base_dir_prefix_cache.entry(base_dir.to_path_buf()) {
+        Entry::Occupied(entry) => Ok(entry.into_mut()),
+        Entry::Vacant(entry) => {
+            let prefix = worktree_relative_base_dir(base_dir)?;
+            Ok(entry.insert(prefix))
+        }
+    }
+}
+
+fn qualify_relative_path(base_dir_prefix: &Path, relative_path: &Path) -> String {
+    let qualified = if base_dir_prefix.as_os_str().is_empty() {
+        relative_path.to_path_buf()
+    } else {
+        base_dir_prefix.join(relative_path)
+    };
+    normalize_path(&qualified)
 }
 
 fn worktree_relative_base_dir(base_dir: &Path) -> Result<PathBuf> {
@@ -586,7 +682,23 @@ mod tests {
         let resolved = resolve_inputs(&repo.path().join("packages/app"), &patterns).unwrap();
 
         assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved[0].path, "src/seed.txt");
+        assert_eq!(resolved[0].path, "packages/app/src/seed.txt");
+    }
+
+    #[test]
+    fn resolve_outputs_remain_package_relative_in_subdirectory() {
+        // Outputs intentionally stay package-relative (unlike inputs, which are
+        // qualified repo-relative for #138). Resolving from a package subdir
+        // must yield `dist/app.js`, not `pkg-a/dist/app.js`.
+        let repo = TestRepo::new();
+        repo.write_file("pkg-a/dist/app.js", "built\n");
+        repo.git_add_and_commit_all();
+
+        let entries =
+            resolve_outputs(&repo.path().join("pkg-a"), &["dist/app.js".to_string()]).unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, "dist/app.js");
     }
 
     #[test]
@@ -664,7 +776,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].path, "../shared/file.txt");
+        assert_eq!(entries[0].path, "pkg-a/../shared/file.txt");
         assert!(!entries[0].absent);
     }
 
@@ -702,8 +814,58 @@ mod tests {
 
         assert_eq!(
             entries.iter().map(|e| e.path.as_str()).collect::<Vec<_>>(),
-            vec!["src/a.txt", "src/b.txt"]
+            vec!["pkg-a/src/a.txt", "pkg-b/src/b.txt"]
         );
+    }
+
+    #[test]
+    fn resolve_inputs_with_semantics_distinguishes_same_relative_path_across_packages() {
+        let repo = TestRepo::new();
+        repo.write_file("pkg-a/src/schema.graphql", "type Query { a: String }\n");
+        repo.write_file(
+            "pkg-b/src/schema.graphql",
+            "type Query { field: String, other: Int }\n",
+        );
+        repo.git_add_and_commit_all();
+
+        let entries = resolve_inputs_with_semantics(&[
+            repo.request_from("pkg-a", "src/schema.graphql", InputSemantics::Literal),
+            repo.request_from("pkg-b", "src/schema.graphql", InputSemantics::Literal),
+        ])
+        .unwrap();
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["pkg-a/src/schema.graphql", "pkg-b/src/schema.graphql"]
+        );
+        assert_ne!(entries[0].path, entries[1].path);
+    }
+
+    #[test]
+    fn resolve_inputs_with_semantics_dedup_unaffected_by_shadow_directory() {
+        // Guards against a dedup heuristic that reconstructs a file's absolute
+        // path by probing ancestors: a nested directory mirroring the package
+        // name (`pkg-a/pkg-a/...`) must not be mistaken for the real input.
+        // Dedup keys off the worktree root join, so the shadow path is ignored.
+        let repo = TestRepo::new();
+        repo.write_file("pkg-a/src/schema.graphql", "real\n");
+        repo.write_file("pkg-a/pkg-a/src/schema.graphql", "shadow\n");
+        repo.git_add_and_commit_all();
+
+        let entries = resolve_inputs_with_semantics(&[repo.request_from(
+            "pkg-a",
+            "src/schema.graphql",
+            InputSemantics::Literal,
+        )])
+        .unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, "pkg-a/src/schema.graphql");
+        assert!(!entries[0].absent);
     }
 
     struct TestRepo {
