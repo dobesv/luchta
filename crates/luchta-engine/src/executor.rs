@@ -79,12 +79,6 @@ impl ExecutionRequest {
 
 #[derive(Debug, Error)]
 pub enum ExecutorError {
-    #[error("task {task} has weight {weight}, which exceeds executor max weight {max_weight}")]
-    WeightExceedsMax {
-        task: String,
-        weight: u32,
-        max_weight: u32,
-    },
     #[error("failed to spawn task {task}: {source}")]
     Spawn {
         task: String,
@@ -283,12 +277,11 @@ impl WeightedExecutor {
     where
         F: FnOnce(),
     {
-        self.validate_weight(&request.task)?;
-
+        let effective_weight = self.effective_weight(&request.task);
         let permit = self
             .semaphore
             .clone()
-            .acquire_many_owned(request.task.weight)
+            .acquire_many_owned(effective_weight)
             .await
             .expect("executor semaphore closed unexpectedly");
 
@@ -381,20 +374,14 @@ impl WeightedExecutor {
         Ok(status)
     }
 
-    fn validate_weight(&self, task: &TaskNode) -> Result<(), ExecutorError> {
-        if task.weight > self.max_weight {
-            eprintln!(
-                "warning: task {} weight {} exceeds executor max weight {}",
-                task.id, task.weight, self.max_weight
-            );
-            return Err(ExecutorError::WeightExceedsMax {
-                task: task.id.to_string(),
-                weight: task.weight,
-                max_weight: self.max_weight,
-            });
-        }
-
-        Ok(())
+    /// Clamp a task's requested weight to the executor's maximum.
+    ///
+    /// A task may declare a weight larger than `max_weight` (e.g. a very
+    /// heavy task on a small machine). Rather than rejecting it, we treat its
+    /// weight as equal to `max_weight` so it still runs, occupying the whole
+    /// executor while it does.
+    fn effective_weight(&self, task: &TaskNode) -> u32 {
+        task.weight.min(self.max_weight)
     }
 }
 
@@ -585,7 +572,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_enforces_total_weight_and_rejects_oversized_tasks() {
+    async fn run_enforces_total_weight_and_clamps_oversized_tasks() {
         let executor = Arc::new(WeightedExecutor::new(4));
         let active_weight = Arc::new(AtomicU32::new(0));
         let max_observed = Arc::new(AtomicU32::new(0));
@@ -632,18 +619,11 @@ mod tests {
         assert_eq!(executor.semaphore().available_permits(), 4);
 
         let oversized = task_node("pkg", "too-big", 5);
-        let err = executor
-            .run(&ExecutionRequest::new(oversized.clone(), "echo nope"))
+        let result = executor
+            .run(&ExecutionRequest::new(oversized, "echo nope"))
             .await
-            .expect_err("oversized task rejected");
-        assert!(matches!(
-            err,
-            ExecutorError::WeightExceedsMax {
-                task,
-                weight: 5,
-                max_weight: 4
-            } if task == oversized.id.to_string()
-        ));
+            .expect("oversized task clamped and run");
+        assert!(result.status.success());
     }
 
     #[tokio::test]

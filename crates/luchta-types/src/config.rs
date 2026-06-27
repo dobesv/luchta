@@ -82,8 +82,29 @@ pub struct LuchtaConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ConcurrencyConfig {
     /// Global maximum cumulative task weight allowed to run at once.
-    #[serde(rename = "maxWeight", alias = "max_weight")]
+    ///
+    /// Must be greater than 0 — a max weight of 0 would create an executor
+    /// that can never bound concurrency.
+    #[serde(
+        rename = "maxWeight",
+        alias = "max_weight",
+        deserialize_with = "deserialize_nonzero_max_weight"
+    )]
     pub max_weight: u32,
+}
+
+/// Deserialize `maxWeight`, rejecting 0 with a clear error.
+fn deserialize_nonzero_max_weight<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = u32::deserialize(deserializer)?;
+    if value == 0 {
+        return Err(serde::de::Error::custom(
+            "concurrency.maxWeight must be greater than 0",
+        ));
+    }
+    Ok(value)
 }
 
 impl Default for ConcurrencyConfig {
@@ -177,6 +198,21 @@ mod tests {
                 worker: None,
                 ..Default::default()
             })
+        );
+    }
+
+    #[test]
+    fn rejects_zero_max_weight_in_config() {
+        let sample = r#"
+            [concurrency]
+            maxWeight = 0
+        "#;
+
+        let err =
+            toml::from_str::<LuchtaConfig>(sample).expect_err("maxWeight of 0 should be rejected");
+        assert!(
+            err.to_string().contains("must be greater than 0"),
+            "unexpected error: {err}"
         );
     }
 
