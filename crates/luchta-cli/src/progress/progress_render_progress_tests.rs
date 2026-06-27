@@ -109,7 +109,7 @@ fn render_progress_running_segment_uses_grouped_list() {
     );
     assert_progress_line_shape(
         &out,
-        "✔ 0 🏃 6 ({a,b,c}:lint, d:{test,tsc} +1) ⌚ ",
+        "✔ 0 🏃 6 ({a,b,c}#lint, d#{test,tsc}, e#babel) ⌚ ",
         SegmentLabel::new("🐏", "42 MB"),
         SegmentLabel::new("🌊", "0 / 1"),
     );
@@ -145,7 +145,7 @@ fn render_progress_failed_segment_uses_grouped_list_and_appears_after_running() 
     );
 
     assert!(out.contains("🏃 1 (c#lint)"), "output was: {out}");
-    assert!(out.contains("× 2 ({a,b}:lint)"), "output was: {out}");
+    assert!(out.contains("× 2 ({a,b}#lint)"), "output was: {out}");
     assert!(out.find("🏃").unwrap() < out.find("×").unwrap());
 }
 #[test]

@@ -8,25 +8,29 @@ pub(crate) fn render_task_id_list(mut all: Vec<&TaskId>) -> String {
     }
 
     all.sort_by_key(|task_id| task_id.to_string());
-    let total = all.len();
-    let shown_count = total.min(5);
-    let shown = &all[..shown_count];
-    let inner = render_running_task_groups(shown);
-
-    if total > shown_count {
-        format!("{} +{}", inner, total - shown_count)
-    } else {
-        inner
-    }
+    render_running_task_groups(&all)
 }
 
 pub(crate) fn render_running_task_groups(shown: &[&TaskId]) -> String {
-    let (mut rendered, consumed) = group_by_shared_task_name(shown);
-    rendered.extend(group_remaining_by_package(shown, &consumed));
+    let shared_scope = shared_scope_for_tasks(shown);
+    let (mut rendered, consumed) = group_by_shared_task_name(shown, shared_scope);
+    rendered.extend(group_remaining_by_package(shown, &consumed, shared_scope));
     rendered.join(", ")
 }
 
-pub(crate) fn group_by_shared_task_name(shown: &[&TaskId]) -> (Vec<String>, Vec<bool>) {
+fn shared_scope_for_tasks<'a>(shown: &[&'a TaskId]) -> Option<&'a str> {
+    let packages = shown
+        .iter()
+        .filter(|task| !task.package.is_root())
+        .map(|task| task.package.as_str())
+        .collect::<BTreeSet<_>>();
+    common_scope(&packages)
+}
+
+pub(crate) fn group_by_shared_task_name(
+    shown: &[&TaskId],
+    shared_scope: Option<&str>,
+) -> (Vec<String>, Vec<bool>) {
     let mut tasks_by_name: BTreeMap<&str, Vec<(usize, &TaskId)>> = BTreeMap::new();
     for (index, task) in shown.iter().copied().enumerate() {
         tasks_by_name
@@ -43,7 +47,11 @@ pub(crate) fn group_by_shared_task_name(shown: &[&TaskId]) -> (Vec<String>, Vec<
             continue;
         }
 
-        rendered.push(format!("{}:{}", format_package_set(&packages), task_name));
+        rendered.push(format!(
+            "{}#{}",
+            format_package_set(&packages, shared_scope),
+            task_name
+        ));
         mark_consumed(&mut consumed, &tasks);
     }
 
@@ -58,24 +66,96 @@ pub(crate) fn shared_task_name_packages<'a>(tasks: &'a [(usize, &'a TaskId)]) ->
         .collect()
 }
 
-/// Renders set of packages sharing task name. When every package shares a
-/// common npm scope (e.g. `@acme/`), scope is factored out:
-/// `@acme/{web,api}` instead of `{@acme/web,@acme/api}`. Otherwise full
-/// package names are listed: `{a,b}`.
-pub(crate) fn format_package_set(packages: &BTreeSet<&str>) -> String {
-    if let Some(scope) = common_scope(packages) {
-        let inner = packages
+pub(crate) fn format_package_set(packages: &BTreeSet<&str>, shared_scope: Option<&str>) -> String {
+    let display_packages = packages_for_display(packages, shared_scope);
+    let prefix = display_packages
+        .len()
+        .gt(&1)
+        .then(|| longest_shared_boundary_prefix(&display_packages))
+        .flatten();
+
+    if let Some(prefix) = prefix {
+        let suffixes = display_packages
             .iter()
-            .map(|package| package.trim_start_matches(scope).trim_start_matches('/'))
+            .map(|package| package.strip_prefix(prefix).unwrap_or(package))
             .collect::<Vec<_>>()
             .join(",");
-        format!("{scope}/{{{inner}}}", scope = scope, inner = inner)
-    } else {
-        format!(
-            "{{{}}}",
-            packages.iter().copied().collect::<Vec<_>>().join(",")
-        )
+        return format!("{prefix}{{{suffixes}}}");
     }
+
+    format!("{{{}}}", display_packages.join(","))
+}
+
+fn packages_for_display<'a>(
+    packages: &BTreeSet<&'a str>,
+    shared_scope: Option<&str>,
+) -> Vec<&'a str> {
+    if let Some(scope) = shared_scope {
+        return packages
+            .iter()
+            .map(|package| strip_shared_scope(package, scope))
+            .collect();
+    }
+
+    packages.iter().copied().collect()
+}
+
+fn strip_shared_scope<'a>(package: &'a str, scope: &str) -> &'a str {
+    match package.strip_prefix(scope) {
+        Some(rest) => rest.strip_prefix('/').unwrap_or(rest),
+        None => package,
+    }
+}
+
+fn longest_shared_boundary_prefix<'a>(packages: &[&'a str]) -> Option<&'a str> {
+    let first = *packages.first()?;
+    let max_len = shared_prefix_len(packages);
+    separator_boundaries(first, max_len)
+        .rev()
+        .find_map(|index| {
+            let prefix = &first[..index];
+            all_suffixes_non_empty(packages, prefix).then_some(prefix)
+        })
+}
+
+fn shared_prefix_len(packages: &[&str]) -> usize {
+    let first = packages[0].as_bytes();
+    let mut shared = first.len();
+
+    for package in &packages[1..] {
+        shared = shared.min(common_prefix_len(first, package.as_bytes()));
+    }
+
+    shared
+}
+
+fn common_prefix_len(left: &[u8], right: &[u8]) -> usize {
+    left.iter()
+        .zip(right.iter())
+        .take_while(|(left, right)| left == right)
+        .count()
+}
+
+fn separator_boundaries(
+    package: &str,
+    max_len: usize,
+) -> impl DoubleEndedIterator<Item = usize> + '_ {
+    package
+        .char_indices()
+        .filter_map(move |(index, ch)| is_word_separator(ch).then_some(index + ch.len_utf8()))
+        .filter(move |index| *index <= max_len)
+}
+
+fn all_suffixes_non_empty(packages: &[&str], prefix: &str) -> bool {
+    packages.iter().all(|package| {
+        package
+            .strip_prefix(prefix)
+            .is_some_and(|suffix| !suffix.is_empty())
+    })
+}
+
+fn is_word_separator(ch: char) -> bool {
+    matches!(ch, '-' | '/' | '.')
 }
 
 /// Returns npm scope (`@scope`) shared by every package, if any. Package's
@@ -104,7 +184,11 @@ pub(crate) fn mark_consumed(consumed: &mut [bool], tasks: &[(usize, &TaskId)]) {
     }
 }
 
-pub(crate) fn group_remaining_by_package(shown: &[&TaskId], consumed: &[bool]) -> Vec<String> {
+pub(crate) fn group_remaining_by_package(
+    shown: &[&TaskId],
+    consumed: &[bool],
+    shared_scope: Option<&str>,
+) -> Vec<String> {
     let mut tasks_by_package: BTreeMap<&str, Vec<&TaskId>> = BTreeMap::new();
     for (index, task) in shown.iter().copied().enumerate() {
         if consumed[index] {
@@ -118,14 +202,14 @@ pub(crate) fn group_remaining_by_package(shown: &[&TaskId], consumed: &[bool]) -
 
     tasks_by_package
         .into_values()
-        .map(render_package_group)
+        .map(|tasks| render_package_group(tasks, shared_scope))
         .collect()
 }
 
-pub(crate) fn render_package_group(mut tasks: Vec<&TaskId>) -> String {
+pub(crate) fn render_package_group(mut tasks: Vec<&TaskId>, shared_scope: Option<&str>) -> String {
     tasks.sort_by_key(|task| task.task.to_string());
     if tasks.len() == 1 {
-        return tasks[0].to_string();
+        return render_single_task(tasks[0], shared_scope);
     }
 
     let names = tasks
@@ -140,15 +224,33 @@ pub(crate) fn render_package_group(mut tasks: Vec<&TaskId>) -> String {
     if tasks[0].package.is_root() {
         format!("#{{{names}}}")
     } else {
-        format!("{}:{{{names}}}", tasks[0].package.as_str())
+        let package = display_package_name(tasks[0].package.as_str(), shared_scope);
+        format!("{package}#{{{names}}}")
     }
+}
+
+fn render_single_task(task: &TaskId, shared_scope: Option<&str>) -> String {
+    if task.package.is_root() {
+        return task.to_string();
+    }
+
+    let package = display_package_name(task.package.as_str(), shared_scope);
+    format!("{package}#{}", task.task)
+}
+
+fn display_package_name<'a>(package: &'a str, shared_scope: Option<&str>) -> &'a str {
+    shared_scope
+        .map(|scope| strip_shared_scope(package, scope))
+        .unwrap_or(package)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use luchta_types::TaskId;
 
-    use super::render_running_task_groups;
+    use super::{format_package_set, render_running_task_groups};
 
     #[test]
     fn render_running_task_groups_examples() {
@@ -161,15 +263,19 @@ mod tests {
                 task_ref("d", "tsc"),
                 task_ref("e", "babel"),
             ],
-            "{a,b,c}:lint, d:{test,tsc}, e#babel",
+            "{a,b,c}#lint, d#{test,tsc}, e#babel",
         );
+    }
+
+    #[test]
+    fn render_running_task_groups_basic_examples() {
         assert_rendered_groups(
             &[task_ref("a", "lint"), task_ref("b", "lint")],
-            "{a,b}:lint",
+            "{a,b}#lint",
         );
         assert_rendered_groups(
             &[task_ref("pkg", "build"), task_ref("pkg", "test")],
-            "pkg:{build,test}",
+            "pkg#{build,test}",
         );
         assert_rendered_groups(
             &[
@@ -190,7 +296,7 @@ mod tests {
                 task_ref("a", "lint"),
                 task_ref("b", "lint"),
             ],
-            "{a,b}:lint, #lint",
+            "{a,b}#lint, #lint",
         );
         assert_rendered_groups(
             &[task_ref("//root", "build"), task_ref("//root", "test")],
@@ -204,7 +310,7 @@ mod tests {
                 task_ref("c", "test"),
                 task_ref("d", "check"),
             ],
-            "{a,b}:build, c:{lint,test}, d#check",
+            "{a,b}#build, c#{lint,test}, d#check",
         );
         assert_rendered_groups(
             &[
@@ -212,7 +318,7 @@ mod tests {
                 task_ref("a", "build"),
                 task_ref("m", "build"),
             ],
-            "{a,m}:build, z#lint",
+            "{a,m}#build, z#lint",
         );
     }
 
@@ -224,31 +330,121 @@ mod tests {
                 task_ref("@acme/api", "lint"),
                 task_ref("@acme/admin", "lint"),
             ],
-            "@acme/{admin,api,web}:lint",
+            "{admin,api,web}#lint",
         );
         assert_rendered_groups(
             &[
                 task_ref("@acme/web", "lint"),
                 task_ref("@other/api", "lint"),
             ],
-            "{@acme/web,@other/api}:lint",
+            "{@acme/web,@other/api}#lint",
         );
         assert_rendered_groups(
             &[task_ref("@acme/web", "lint"), task_ref("api", "lint")],
-            "{@acme/web,api}:lint",
+            "{@acme/web,api}#lint",
         );
         assert_rendered_groups(
             &[
                 task_ref("@acme/web", "build"),
                 task_ref("@acme/web", "test"),
             ],
-            "@acme/web:{build,test}",
+            "web#{build,test}",
+        );
+    }
+
+    #[test]
+    fn render_running_task_groups_global_scope_handling_examples() {
+        for (tasks, expected) in [
+            (
+                vec![
+                    task_ref("@acme/a", "lint"),
+                    task_ref("@acme/b", "lint"),
+                    task_ref("@acme/c", "build"),
+                    task_ref("@acme/c", "test"),
+                ],
+                "{a,b}#lint, c#{build,test}",
+            ),
+            (
+                vec![
+                    task_ref("@acme/web", "build"),
+                    task_ref("@acme/api", "lint"),
+                    task_ref("@acme/api", "test"),
+                ],
+                "api#{lint,test}, web#build",
+            ),
+            (
+                vec![task_ref("@acme/a", "lint"), task_ref("@other/b", "build")],
+                "@acme/a#lint, @other/b#build",
+            ),
+        ] {
+            assert_rendered_groups(&tasks, expected);
+        }
+    }
+
+    #[test]
+    fn format_package_set_compacts_word_boundary_prefix() {
+        assert_eq!(
+            format_packages(&[
+                "@formative/server-answers",
+                "@formative/server-changes",
+                "@formative/server-enrollments",
+                "@formative/server-export",
+                "@formative/server-folders",
+            ]),
+            "server-{answers,changes,enrollments,export,folders}"
+        );
+    }
+
+    #[test]
+    fn format_package_set_omits_common_scope_without_extra_prefix() {
+        assert_eq!(
+            format_packages(&["@acme/admin", "@acme/api", "@acme/web"]),
+            "{admin,api,web}"
+        );
+    }
+
+    #[test]
+    fn format_package_set_repeated_prefix_keeps_literal_prefix_once() {
+        assert_eq!(
+            format_packages(&["@scope/server-server-a", "@scope/server-server-b"]),
+            "server-server-{a,b}"
+        );
+    }
+
+    #[test]
+    fn format_package_set_rejects_prefix_that_would_leave_empty_suffix() {
+        assert_eq!(format_packages(&["pkga-", "pkga-api"]), "{pkga-,pkga-api}");
+    }
+
+    #[test]
+    fn format_package_set_compacts_utf8_prefix_safely() {
+        assert_eq!(
+            format_packages(&["@scope/café-a", "@scope/café-b"]),
+            "café-{a,b}"
+        );
+    }
+
+    #[test]
+    fn format_package_set_scope_omission_contract_and_mixed_scope_contrast() {
+        assert_eq!(
+            format_packages(&["@acme/admin", "@acme/api", "@acme/web"]),
+            "{admin,api,web}"
+        );
+        assert_eq!(
+            format_packages(&["@acme/admin", "@other/api", "@acme/web"]),
+            "{@acme/admin,@acme/web,@other/api}"
         );
     }
 
     fn assert_rendered_groups(tasks: &[TaskRef<'_>], expected: &str) {
         let tasks = running_tasks(tasks);
         assert_eq!(render_running_task_groups(&tasks), expected);
+    }
+
+    fn format_packages<'a>(packages: &'a [&'a str]) -> String {
+        let packages = packages.iter().copied().collect::<BTreeSet<_>>();
+        let shared_scope = super::common_scope(&packages);
+        format_package_set(&packages, shared_scope)
     }
 
     struct TaskRef<'a> {
