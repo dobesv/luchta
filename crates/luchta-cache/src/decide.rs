@@ -598,6 +598,25 @@ mod tests {
     }
 
     #[test]
+    fn files_diff_same_qualified_cross_package_paths_report_no_change() {
+        let prior = vec![
+            sample_present_file("pkg-a/src/schema.graphql", [1; 32]),
+            sample_present_file("pkg-b/src/schema.graphql", [2; 32]),
+        ];
+        let current = vec![
+            sample_present_file("pkg-b/src/schema.graphql", [2; 32]),
+            sample_present_file("pkg-a/src/schema.graphql", [1; 32]),
+        ];
+
+        let (changed, truncated, total) = files_diff(&prior, &current, 10);
+
+        assert!(changed.is_empty());
+        assert!(!truncated);
+        assert_eq!(total, 0);
+        assert!(!super::files_changed(&prior, &current));
+    }
+
+    #[test]
     fn uses_detected_output_patterns_when_present() {
         let mut prior = sample_record();
         prior.detected_output_patterns = true;
@@ -924,6 +943,30 @@ mod tests {
             cache_nonce: Some("nonce-v1".to_owned()),
             run_reason: None,
         }
+    }
+
+    #[test]
+    fn decide_skip_with_qualified_cross_package_inputs() {
+        let mut prior = sample_record();
+        prior.input_patterns = vec![
+            "pkg-a/src/schema.graphql".to_owned(),
+            "pkg-b/src/schema.graphql".to_owned(),
+        ];
+        prior.inputs = vec![
+            sample_present_file("pkg-a/src/schema.graphql", [1; 32]),
+            sample_present_file("pkg-b/src/schema.graphql", [2; 32]),
+        ];
+
+        let resolver = FixtureResolver::new(prior.inputs.clone(), prior.outputs.clone());
+        let current = current_state(&prior, &resolver);
+
+        assert_eq!(
+            decide(Some(&prior), &current),
+            DecisionResult {
+                action: Decision::Skip,
+                reason: RunReason::CacheHit,
+            }
+        );
     }
 
     fn sample_present_file(path: &str, hash: [u8; 32]) -> FileEntry {
