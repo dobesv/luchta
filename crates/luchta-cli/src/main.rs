@@ -14,6 +14,9 @@ mod reports;
 mod rss;
 mod run;
 mod since;
+mod why;
+
+use std::path::Path;
 
 use clap::Parser;
 use cli::{Cli, Commands, OutputMode};
@@ -81,64 +84,92 @@ async fn run(cli: Cli) -> Result<()> {
             show_cache_nonce,
             files,
         } => {
-            let options = LogsOptions {
-                tasks: &tasks,
-                packages: &packages,
-                top_level,
-                time_taken,
-                failed,
-                show_inputs,
-                show_outputs,
-                show_cache_nonce,
-                files: &files,
-            };
-            logs::execute_logs(&workspace_root, &options).await
+            dispatch_logs(
+                &workspace_root,
+                LogsOptions {
+                    tasks: &tasks,
+                    packages: &packages,
+                    top_level,
+                    time_taken,
+                    failed,
+                    show_inputs,
+                    show_outputs,
+                    show_cache_nonce,
+                    files: &files,
+                },
+            )
+            .await
         }
-        Commands::Check => {
-            // Check mode: a worker `Reject` during resolution is a hard error
-            // (surfaced from prepare_workspace); a `Prune` is informational and
-            // intentionally not reported — the pruned-task list is noise on large
-            // workspaces (see GitHub issue #46).
-            let prepared =
-                run::prepare_workspace(&workspace_root, ResolveMode::Check, None).await?;
-            prepared.worker_manager.shutdown().await;
-
-            let dep_diagnostics = match TaskGraph::validate_tasks_with_pruned(
-                &prepared.package_graph,
-                &prepared.pipeline,
-                &prepared.workers,
-                &prepared.pruned_ids,
-            ) {
-                Ok(()) => Vec::new(),
-                Err(DependencyValidationError::InvalidTasks { diagnostics }) => diagnostics
-                    .into_iter()
-                    .map(task_validation_diagnostic_report)
-                    .collect::<Vec<_>>(),
-            };
-
-            let env_conflicts = env_conflict::detect_env_conflicts(
-                &prepared.env,
-                &prepared.workers,
-                &prepared.pipeline,
-            );
-            let env_diagnostics: Vec<_> = env_conflicts
-                .into_iter()
-                .map(|conflict| conflict.to_diagnostic())
-                .collect();
-
-            let mut all_diagnostics = dep_diagnostics;
-            all_diagnostics.extend(env_diagnostics);
-
-            if all_diagnostics.is_empty() {
-                println!("Configuration valid");
-                Ok(())
-            } else {
-                Err(CheckValidationError {
-                    diagnostics: all_diagnostics,
-                }
-                .into())
-            }
+        Commands::Why {
+            tasks,
+            packages,
+            top_level,
+            show_inputs,
+            show_outputs,
+        } => {
+            dispatch_why(
+                &workspace_root,
+                why::WhyOptions {
+                    tasks: &tasks,
+                    packages: &packages,
+                    top_level,
+                    show_inputs,
+                    show_outputs,
+                },
+            )
+            .await
         }
+        Commands::Check => dispatch_check(&workspace_root).await,
+    }
+}
+
+async fn dispatch_logs(workspace_root: &Path, options: LogsOptions<'_>) -> Result<()> {
+    logs::execute_logs(workspace_root, &options).await
+}
+
+async fn dispatch_why(workspace_root: &Path, options: why::WhyOptions<'_>) -> Result<()> {
+    why::execute_why(workspace_root, &options).await
+}
+
+async fn dispatch_check(workspace_root: &Path) -> Result<()> {
+    // Check mode: a worker `Reject` during resolution is a hard error
+    // (surfaced from prepare_workspace); a `Prune` is informational and
+    // intentionally not reported — the pruned-task list is noise on large
+    // workspaces (see GitHub issue #46).
+    let prepared = run::prepare_workspace(workspace_root, ResolveMode::Check, None).await?;
+    prepared.worker_manager.shutdown().await;
+
+    let dep_diagnostics = match TaskGraph::validate_tasks_with_pruned(
+        &prepared.package_graph,
+        &prepared.pipeline,
+        &prepared.workers,
+        &prepared.pruned_ids,
+    ) {
+        Ok(()) => Vec::new(),
+        Err(DependencyValidationError::InvalidTasks { diagnostics }) => diagnostics
+            .into_iter()
+            .map(task_validation_diagnostic_report)
+            .collect::<Vec<_>>(),
+    };
+
+    let env_conflicts =
+        env_conflict::detect_env_conflicts(&prepared.env, &prepared.workers, &prepared.pipeline);
+    let env_diagnostics: Vec<_> = env_conflicts
+        .into_iter()
+        .map(|conflict| conflict.to_diagnostic())
+        .collect();
+
+    let mut all_diagnostics = dep_diagnostics;
+    all_diagnostics.extend(env_diagnostics);
+
+    if all_diagnostics.is_empty() {
+        println!("Configuration valid");
+        Ok(())
+    } else {
+        Err(CheckValidationError {
+            diagnostics: all_diagnostics,
+        }
+        .into())
     }
 }
 
@@ -217,7 +248,9 @@ fn command_run_args(command: Commands) -> RunArgs {
             max_weight_cli: max_weight,
             since,
         },
-        Commands::Logs { .. } | Commands::Check => unreachable!("checked by caller"),
+        Commands::Logs { .. } | Commands::Why { .. } | Commands::Check => {
+            unreachable!("checked by caller")
+        }
     }
 }
 

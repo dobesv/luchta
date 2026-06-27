@@ -777,7 +777,7 @@ mod tests {
     pub(crate) fn sample_record(succeeded: bool, duration_ms: u64) -> TaskRunRecord {
         let start = 1_000_000_000_000_u64;
         TaskRunRecord {
-            schema_version: crate::record::SCHEMA_VERSION_V3,
+            schema_version: crate::record::SCHEMA_VERSION_V4,
             task_spec_hash: [1; 32],
             input_patterns: vec!["src/**/*.ts".to_string()],
             inputs: vec![],
@@ -801,6 +801,7 @@ mod tests {
             end_unix_ms: start + duration_ms,
             reports: vec![],
             cache_nonce: None,
+            run_reason: None,
         }
     }
 

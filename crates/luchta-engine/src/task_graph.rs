@@ -94,6 +94,7 @@ struct ResolvedPipeline {
     tasks_by_id: HashMap<TaskId, TaskDefinition>,
     task_names_by_package: HashMap<PackageName, HashSet<TaskName>>,
     root_task_names: HashSet<TaskName>,
+    prune_reasons_by_id: HashMap<TaskId, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -676,6 +677,7 @@ impl ResolvedPipeline {
             tasks_by_id,
             task_names_by_package,
             root_task_names,
+            prune_reasons_by_id: HashMap::new(),
         })
     }
 
@@ -768,6 +770,8 @@ impl ResolvedPipeline {
     fn apply_prunes(&mut self, pruned: &[PrunedTask]) -> HashSet<TaskId> {
         let mut removed = HashSet::new();
         for entry in pruned {
+            self.prune_reasons_by_id
+                .insert(entry.task_id.clone(), entry.outcome.describe());
             let task_id = &entry.task_id;
             self.tasks_by_id.remove(task_id);
             if let Some(task_names) = self.task_names_by_package.get_mut(&task_id.package) {
@@ -816,6 +820,11 @@ impl ResolvedPipeline {
                 }
             }
         }
+    }
+
+    #[allow(dead_code)]
+    pub fn prune_reason(&self, task_id: &TaskId) -> Option<&str> {
+        self.prune_reasons_by_id.get(task_id).map(String::as_str)
     }
 
     fn contains_package_task(&self, package_name: &PackageName, task_name: &TaskName) -> bool {
@@ -1079,7 +1088,7 @@ mod tests {
     use luchta_workspace::{PackageGraph, PackageNode};
 
     use super::{
-        root_task_id, DeadDependencyReason, DependencyValidationError, TaskGraph,
+        root_task_id, DeadDependencyReason, DependencyValidationError, ResolvedPipeline, TaskGraph,
         TaskValidationDiagnostic, TaskValidationReason,
     };
     use crate::EngineError;
@@ -2739,6 +2748,33 @@ mod tests {
         // Task was pruned, so graph is empty
         assert_eq!(graph.node_count(), 0);
         assert_eq!(pruned.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn resolve_retains_prune_reason_after_apply_prunes() {
+        let package_graph = package_graph_single("@repo/a");
+        let pipeline = HashMap::from([(TaskName::from("build"), worker_task(vec![]))]);
+        let resolver = StubResolver(|_: &ResolveTask| {
+            ResolveResult::prune(Some("missing script".to_string()))
+        });
+
+        let mut resolved_pipeline =
+            ResolvedPipeline::build(&package_graph, &pipeline).expect("build resolved pipeline");
+        let pruned = resolved_pipeline
+            .resolve(&empty_resolve_info(), &resolver, ResolveMode::Run)
+            .await
+            .expect("resolve pruned tasks");
+        let task_id = TaskId::new("@repo/a", "build");
+
+        assert_eq!(pruned.len(), 1);
+        assert_eq!(resolved_pipeline.prune_reason(&task_id), None);
+
+        resolved_pipeline.apply_prunes(&pruned);
+
+        assert_eq!(
+            resolved_pipeline.prune_reason(&task_id),
+            Some("missing script")
+        );
     }
 
     #[tokio::test]
