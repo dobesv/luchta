@@ -207,7 +207,11 @@ fn fail_invalid_task(
         ctx.continue_on_failure,
         ctx.worker_manager,
     );
-    eprintln!("{} {}", "✖".red(), message.red());
+    eprintln!(
+        "{} {}",
+        "✖".if_supports_color(Stream::Stderr, |text| text.red()),
+        message.if_supports_color(Stream::Stderr, |text| text.red())
+    );
     // Invalid/config-error — counted in totals via wave map, but completion is
     // recorded as failed because it is neither done nor cache-skipped.
     ctx.reporter.task_failed(task_id);
@@ -388,7 +392,11 @@ where
 
     if let Some(expansion_error) = expansion_error {
         if !interrupted.load(Ordering::SeqCst) {
-            eprintln!("{} {}", "✖".red(), expansion_error.red());
+            eprintln!(
+                "{} {}",
+                "✖".if_supports_color(Stream::Stderr, |text| text.red()),
+                expansion_error.if_supports_color(Stream::Stderr, |text| text.red())
+            );
         }
         return SpawnedTaskOutcome {
             outcome_res,
