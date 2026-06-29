@@ -2820,4 +2820,108 @@ mod tests {
         // No worker, so no injection
         assert!(definition.depends_on.is_empty());
     }
+
+    /// Regression guard for lage issue #881
+    /// (<https://github.com/microsoft/lage/issues/881>): "Dependencies not
+    /// calculated properly for subtrees of noop tasks".
+    ///
+    /// In lage, a chain of noop (no-worker) tasks between two real tasks could
+    /// lose the transitive dependency, allowing a downstream script to run
+    /// before its upstream script. Luchta keeps noop tasks as first-class graph
+    /// nodes and never collapses noop chains, so the edge `d -> a` is preserved
+    /// transitively through `d -> c(noop) -> b(noop) -> a`.
+    ///
+    /// Topology (script <- noop <- noop <- script):
+    ///   a = script (has worker), depended on by
+    ///   b = noop, depended on by
+    ///   c = noop, depended on by
+    ///   d = script (has worker)
+    #[test]
+    fn noop_chain_preserves_transitive_dependency_ordering() {
+        let package_graph = package_graph_single("@repo/app");
+
+        let script = |dep: Option<&str>| TaskDefinition {
+            worker: Some("yarn".to_string()),
+            command: Some("echo run".to_string()),
+            depends_on: dep
+                .map(|name| vec![DependsOn::Specific(TaskId::new("@repo/app", name))])
+                .unwrap_or_default(),
+            ..TaskDefinition::default()
+        };
+        let noop = |dep: &str| TaskDefinition {
+            depends_on: vec![DependsOn::Specific(TaskId::new("@repo/app", dep))],
+            ..TaskDefinition::default()
+        };
+
+        let pipeline = HashMap::from([
+            (TaskName::from("a"), script(None)),
+            (TaskName::from("b"), noop("a")),
+            (TaskName::from("c"), noop("b")),
+            (TaskName::from("d"), script(Some("c"))),
+        ]);
+
+        let task_graph = TaskGraph::build(&package_graph, &pipeline).expect("build task graph");
+
+        let a = TaskId::new("@repo/app", "a");
+        let b = TaskId::new("@repo/app", "b");
+        let c = TaskId::new("@repo/app", "c");
+        let d = TaskId::new("@repo/app", "d");
+
+        // All four nodes (including the two noops) survive graph construction.
+        for id in [&a, &b, &c, &d] {
+            assert!(
+                task_graph.task_node(id).is_some(),
+                "expected node {id} to exist in the task graph"
+            );
+        }
+
+        // The chain edges are preserved through the noop tasks.
+        assert!(
+            has_edge(&task_graph, d.clone(), c.clone()),
+            "d should depend on c"
+        );
+        assert!(
+            has_edge(&task_graph, c.clone(), b.clone()),
+            "c should depend on b"
+        );
+        assert!(
+            has_edge(&task_graph, b.clone(), a.clone()),
+            "b should depend on a"
+        );
+
+        // Transitive dependency closure of `d` must reach the upstream script `a`
+        // through the noop chain — this is the exact behaviour lage #881 lost.
+        let mut closure = HashSet::new();
+        let mut stack = vec![d.clone()];
+        while let Some(current) = stack.pop() {
+            for dep in task_graph.dependencies_of(&current) {
+                if closure.insert(dep.id.clone()) {
+                    stack.push(dep.id.clone());
+                }
+            }
+        }
+        assert!(
+            closure.contains(&a),
+            "transitive dependencies of {d} must include upstream script {a}, got {closure:?}"
+        );
+
+        // Topological order must place the upstream script `a` before the
+        // downstream script `d`.
+        let order = task_graph
+            .topological_order()
+            .expect("topological order")
+            .into_iter()
+            .map(|node| node.id.clone())
+            .collect::<Vec<_>>();
+        let pos = |id: &TaskId| {
+            order
+                .iter()
+                .position(|node| node == id)
+                .unwrap_or_else(|| panic!("{id} missing from topological order"))
+        };
+        assert!(
+            pos(&a) < pos(&d),
+            "upstream script {a} must be ordered before downstream script {d}; order was {order:?}"
+        );
+    }
 }
