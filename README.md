@@ -630,7 +630,7 @@ The shared build cache is a cross-worktree, cross-clone cache that restores task
 #### Layout
 By default, the cache is stored at `~/.cache/luchta` (on Linux/macOS):
 - `blobs/<outputs_hash>.tar.zst` — Content-addressed compressed output archives.
-- `snapshots/<commit>/<shard_id>.bincode` — Metadata snapshots, stored as append-only content-addressed shards.
+- `snapshots/<commit>/<shard_id>.bincode` — Metadata snapshots, stored as append-only content-addressed shards (zstd-compressed at rest; the `<shard_id>` is the BLAKE3 hash of the uncompressed bincode bytes).
 
 #### Configuration (Environment Variables)
 The shared cache is **OPT-IN** and is configured exclusively via environment variables:
