@@ -304,7 +304,11 @@ async fn prepare_run_context(
     } = prepare_workspace(workspace_root, ResolveMode::Run, max_weight_override).await?;
 
     if packages.is_empty() {
-        println!("{}", "No packages found in workspace".yellow());
+        println!(
+            "{}",
+            "No packages found in workspace"
+                .if_supports_color(Stream::Stdout, |text| text.yellow())
+        );
         // Resolution may have spawned resident workers; shut them down on this
         // early exit so we do not leak worker processes.
         worker_manager.shutdown().await;
@@ -603,7 +607,11 @@ pub async fn dry_run_tasks(workspace_root: &Path, selection: &TaskSelection<'_>)
     worker_manager.shutdown().await;
 
     if package_nodes.is_empty() {
-        println!("{}", "No packages found in workspace".yellow());
+        println!(
+            "{}",
+            "No packages found in workspace"
+                .if_supports_color(Stream::Stdout, |text| text.yellow())
+        );
         return Ok(());
     }
 
@@ -632,21 +640,37 @@ pub async fn dry_run_tasks(workspace_root: &Path, selection: &TaskSelection<'_>)
         Some(&package_graph),
     );
 
-    let displayed_waves =
-        compute_displayed_dry_run_waves(&task_graph, &tasks_to_run, &commands, &invalid, selection);
+    let displayed_waves = compute_displayed_dry_run_waves(
+        &task_graph,
+        &tasks_to_run,
+        &commands,
+        &invalid,
+        selection,
+        Stream::Stdout,
+    );
     let displayed_task_total: usize = displayed_waves.iter().map(Vec::len).sum();
 
     println!(
         "{} {} task(s) across {} wave(s) (tasks within a wave can run in parallel):",
-        "dry-run:".bold(),
+        "dry-run:".if_supports_color(Stream::Stdout, |text| text.bold()),
         displayed_task_total,
         displayed_waves.len()
     );
 
     for (index, wave) in displayed_waves.iter().enumerate() {
-        println!("\n{}", format!("Wave {}:", index + 1).bold().cyan());
+        let wave_label = format!("Wave {}:", index + 1);
+        println!(
+            "\n{}",
+            wave_label.if_supports_color(Stream::Stdout, |text| text.cyan().bold().to_string())
+        );
         for (task_id, action) in wave {
-            println!("  {} {}", task_id.to_string().bold(), action);
+            println!(
+                "  {} {}",
+                task_id
+                    .to_string()
+                    .if_supports_color(Stream::Stdout, |text| text.bold()),
+                action
+            );
         }
     }
 
@@ -664,13 +688,14 @@ fn compute_displayed_dry_run_waves(
     commands: &HashMap<TaskId, ExecutionRequest>,
     invalid: &HashMap<TaskId, String>,
     selection: &TaskSelection<'_>,
+    stream: Stream,
 ) -> Vec<Vec<(TaskId, String)>> {
     compute_execution_waves(task_graph, tasks_to_run)
         .into_iter()
         .map(|wave| {
             wave.into_iter()
                 .filter_map(|task_id| {
-                    describe_planned_action(&task_id, commands, invalid, selection)
+                    describe_planned_action(&task_id, commands, invalid, selection, stream)
                         .map(|action| (task_id, action))
                 })
                 .collect()
@@ -688,9 +713,14 @@ fn describe_planned_action(
     commands: &HashMap<TaskId, ExecutionRequest>,
     invalid: &HashMap<TaskId, String>,
     selection: &TaskSelection<'_>,
+    stream: Stream,
 ) -> Option<String> {
     if let Some(message) = invalid.get(task_id) {
-        return Some(format!("{} ({})", "config error".red(), message));
+        return Some(format!(
+            "{} ({})",
+            "config error".if_supports_color(stream, |text| text.red()),
+            message
+        ));
     }
 
     if let Some(request) = commands.get(task_id) {
@@ -701,8 +731,10 @@ fn describe_planned_action(
             .unwrap_or_else(|| "no worker".to_string());
         return Some(format!(
             "{} via {}",
-            request.command.dimmed(),
-            worker.dimmed()
+            request
+                .command
+                .if_supports_color(stream, |text| text.dimmed()),
+            worker.if_supports_color(stream, |text| text.dimmed())
         ));
     }
 
@@ -710,7 +742,11 @@ fn describe_planned_action(
     // such a root ordering task in the plan with a clear label rather than
     // dropping it as noise or printing a bare id.
     if selection.top_level && task_id.is_root() {
-        return Some("(ordering task)".dimmed().to_string());
+        return Some(
+            "(ordering task)"
+                .if_supports_color(stream, |text| text.dimmed())
+                .to_string(),
+        );
     }
 
     None
@@ -736,7 +772,8 @@ fn resolve_since_selection(
     if affected.is_empty() && !selection.top_level {
         println!(
             "{}",
-            format!("No packages changed since {since_ref}; nothing to run.").yellow()
+            format!("No packages changed since {since_ref}; nothing to run.")
+                .if_supports_color(Stream::Stdout, |text| text.yellow())
         );
         return Ok(SinceSelection::NoOp);
     }
@@ -1100,10 +1137,11 @@ fn report_unmatched_request(
         entry.task_id.task.as_str() == requested && package_matches(&entry.task_id, criteria)
     });
     if pruned_away {
+        let note_label =
+            "note:".if_supports_color(Stream::Stdout, |text| text.yellow().bold().to_string());
         println!(
             "{} task '{}' was pruned from every package during resolution; nothing to run",
-            "note:".bold().yellow(),
-            requested
+            note_label, requested
         );
         return Ok(());
     }
@@ -1348,7 +1386,7 @@ mod tests {
         };
 
         assert_eq!(
-            describe_planned_action(&task_id, &commands, &invalid, &selection),
+            describe_planned_action(&task_id, &commands, &invalid, &selection, Stream::Stdout),
             None,
             "a no-command, non-root task must be hidden from the dry-run plan"
         );
@@ -1369,8 +1407,9 @@ mod tests {
             since: None,
         };
 
-        let action = describe_planned_action(&task_id, &commands, &invalid, &selection)
-            .expect("top-level root ordering task should be shown");
+        let action =
+            describe_planned_action(&task_id, &commands, &invalid, &selection, Stream::Stdout)
+                .expect("top-level root ordering task should be shown");
         assert!(
             action.contains("(ordering task)"),
             "top-level root ordering task should be labeled, got: {action}"
@@ -1393,8 +1432,9 @@ mod tests {
             since: None,
         };
 
-        let action = describe_planned_action(&task_id, &commands, &invalid, &selection)
-            .expect("config-error task should stay visible");
+        let action =
+            describe_planned_action(&task_id, &commands, &invalid, &selection, Stream::Stdout)
+                .expect("config-error task should stay visible");
         assert!(
             action.contains("config error"),
             "config-error task should be labeled as such, got: {action}"

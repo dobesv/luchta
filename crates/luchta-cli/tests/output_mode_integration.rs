@@ -462,6 +462,105 @@ echo '{{"concurrency":{{"maxWeight":4}},"workers":{{"yarn":{{"command":"{worker_
     temp.close().expect("cleanup temp dir");
 }
 
+/// Regression test for issues #134 and #43: when stdout is not a TTY (as it is
+/// when captured by `Command::output`, or piped through `less`/a file), the
+/// dry-run wave plan must not contain any ANSI escape codes — even when
+/// `NO_COLOR` is NOT set. This guards the `dry-run:` / `Wave N:` / task-id
+/// labels that previously called raw `.bold()`/`.cyan()` and leaked color onto
+/// non-terminal output.
+#[test]
+fn dry_run_emits_no_ansi_on_non_tty() {
+    let temp = assert_fs::TempDir::new().expect("create temp dir");
+    setup_workspace(&temp);
+
+    let worker_script = make_worker_script(
+        &temp,
+        "no-ansi-dry-run-worker.sh",
+        &shell_worker_body(
+            r#"{"type":"done","id":"%s","success":true,"exitCode":0}"#,
+            "",
+        ),
+    );
+
+    let worker_path = worker_script.path().display();
+    let config_content = format!(
+        r#"#!/bin/sh
+echo '{{"concurrency":{{"maxWeight":4}},"workers":{{"yarn":{{"command":"{worker_path}"}}}},"tasks":{{"build":{{"dependsOn":["^build"],"worker":"yarn"}}}}}}'
+"#,
+    );
+    temp.child("luchta-config.sh")
+        .write_str(&config_content)
+        .expect("write luchta-config.sh");
+
+    // Deliberately do NOT set NO_COLOR. `Command::output` captures stdout via a
+    // pipe, so it is not a TTY — color must be suppressed by tty detection alone.
+    let output = Command::cargo_bin("luchta")
+        .expect("find binary")
+        .arg("run")
+        .arg("build")
+        .arg("--dry-run")
+        .arg("--workspace-root")
+        .arg(temp.path())
+        .env_remove("NO_COLOR")
+        .env_remove("CLICOLOR_FORCE")
+        .env_remove("FORCE_COLOR")
+        .output()
+        .expect("run command");
+
+    assert!(
+        output.status.success(),
+        "dry-run should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Sanity: we actually reached the wave-plan output path.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("dry-run:") && stdout.contains("Wave 1:"),
+        "expected dry-run wave plan, got: {stdout}"
+    );
+
+    // The core assertion: no ESC (0x1b) byte anywhere in stdout or stderr.
+    assert!(
+        !output.stdout.contains(&0x1b),
+        "dry-run stdout must not contain ANSI escape (0x1b) on non-tty, got: {stdout:?}"
+    );
+    assert!(
+        !output.stderr.contains(&0x1b),
+        "dry-run stderr must not contain ANSI escape (0x1b) on non-tty, got: {:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Issue #43 also requires honoring NO_COLOR explicitly. Re-run with
+    // NO_COLOR=1 set and confirm output stays ANSI-free (covers the env-var
+    // path even on terminals where tty detection alone would allow color).
+    let no_color_output = Command::cargo_bin("luchta")
+        .expect("find binary")
+        .arg("run")
+        .arg("build")
+        .arg("--dry-run")
+        .arg("--workspace-root")
+        .arg(temp.path())
+        .env("NO_COLOR", "1")
+        .env_remove("CLICOLOR_FORCE")
+        .env_remove("FORCE_COLOR")
+        .output()
+        .expect("run command");
+
+    assert!(
+        no_color_output.status.success(),
+        "NO_COLOR dry-run should succeed, stderr: {}",
+        String::from_utf8_lossy(&no_color_output.stderr)
+    );
+    assert!(
+        !no_color_output.stdout.contains(&0x1b) && !no_color_output.stderr.contains(&0x1b),
+        "dry-run must not contain ANSI escape (0x1b) when NO_COLOR=1, stdout: {:?}",
+        String::from_utf8_lossy(&no_color_output.stdout)
+    );
+
+    temp.close().expect("cleanup temp dir");
+}
+
 #[test]
 fn dry_run_hides_pruned_connectors_but_keeps_runnable_and_config_errors() {
     let temp = assert_fs::TempDir::new().expect("create temp dir");
