@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 use crate::shared::{atomic_write, SharedCachePaths};
 
 pub const SNAPSHOT_SCHEMA_VERSION: u32 = 2;
+const SNAPSHOT_ZSTD_LEVEL: i32 = 3;
+const ZSTD_FRAME_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 const DEP_OUTPUTS_HASH_DOMAIN: &[u8] = b"luchta:dep-outputs:v1";
 const DEP_OUTPUTS_HASH_SEPARATOR: u8 = 0;
 pub(crate) const SNAPSHOT_FILE_EXTENSION: &str = "bincode";
@@ -53,6 +55,13 @@ pub struct MergeEntryOutcome {
     pub result: MergeResult,
     pub new_snapshot_upload: Option<SnapshotUpload>,
     pub subsumed_shard_ids: Vec<String>,
+}
+
+#[derive(Debug)]
+struct ConsolidatedShardWrite {
+    shard_id: String,
+    shard_on_disk: Vec<u8>,
+    merged_sidecar_path: PathBuf,
 }
 
 impl MergeEntryOutcome {
@@ -216,13 +225,32 @@ impl SnapshotStore {
             .expect("snapshot serialization should succeed");
         let shard_id = blake3::hash(&encoded).to_hex().to_string();
         let shard_path = shard_dir.join(format!("{shard_id}.{SNAPSHOT_FILE_EXTENSION}"));
-        let merged_sidecar_path = shard_dir.join(format!("{shard_id}.{SNAPSHOT_MERGED_EXTENSION}"));
+        let write = ConsolidatedShardWrite {
+            merged_sidecar_path: shard_dir.join(format!("{shard_id}.{SNAPSHOT_MERGED_EXTENSION}")),
+            shard_id,
+            shard_on_disk: Vec::new(),
+        };
 
         if shard_path.exists() {
             return MergeEntryOutcome::from_result(MergeResult::IdempotentNoop);
         }
 
-        if let Err(err) = atomic_write(&shard_path, &encoded) {
+        let on_disk = match compress_snapshot_bytes(&encoded) {
+            Ok(on_disk) => on_disk,
+            Err(err) => {
+                eprintln!(
+                    "warning: failed to compress snapshot shard {}: {err}; skipping shared snapshot write",
+                    shard_path.display()
+                );
+                return MergeEntryOutcome::from_result(MergeResult::SkippedLockUnavailable);
+            }
+        };
+        let write = ConsolidatedShardWrite {
+            shard_on_disk: on_disk,
+            ..write
+        };
+
+        if let Err(err) = atomic_write(&shard_path, &write.shard_on_disk) {
             eprintln!(
                 "warning: failed to write snapshot shard {}: {err}; skipping shared snapshot write",
                 shard_path.display()
@@ -230,26 +258,51 @@ impl SnapshotStore {
             return MergeEntryOutcome::from_result(MergeResult::SkippedLockUnavailable);
         }
 
+        self.finalize_sidecar_and_subsumed(commit_key, write, visible_shards)
+    }
+
+    fn finalize_sidecar_and_subsumed(
+        &self,
+        commit_key: &str,
+        write: ConsolidatedShardWrite,
+        visible_shards: &[SnapshotShard],
+    ) -> MergeEntryOutcome {
+        let ConsolidatedShardWrite {
+            shard_id,
+            shard_on_disk,
+            merged_sidecar_path,
+        } = write;
         let subsumed_shard_ids = visible_shards
             .iter()
             .filter_map(SnapshotShard::deletable_shard_id)
             .collect::<Vec<_>>();
+        let inserted_without_cleanup = |shard_id, shard_bytes| MergeEntryOutcome {
+            result: MergeResult::Inserted,
+            new_snapshot_upload: Some(SnapshotUpload {
+                shard_id,
+                shard_bytes,
+                merged_bytes: Vec::new(),
+            }),
+            subsumed_shard_ids: Vec::new(),
+        };
 
         let merged_bytes = encode_merged_sidecar(&subsumed_shard_ids).into_bytes();
-        if let Err(err) = atomic_write(&merged_sidecar_path, &merged_bytes) {
+        let merged_on_disk = match compress_snapshot_bytes(&merged_bytes) {
+            Ok(merged_on_disk) => merged_on_disk,
+            Err(err) => {
+                eprintln!(
+                    "warning: failed to compress snapshot merged sidecar {}: {err}; skipping compaction cleanup",
+                    merged_sidecar_path.display()
+                );
+                return inserted_without_cleanup(shard_id, shard_on_disk);
+            }
+        };
+        if let Err(err) = atomic_write(&merged_sidecar_path, &merged_on_disk) {
             eprintln!(
                 "warning: failed to write snapshot merged sidecar {}: {err}; skipping compaction cleanup",
                 merged_sidecar_path.display()
             );
-            return MergeEntryOutcome {
-                result: MergeResult::Inserted,
-                new_snapshot_upload: Some(SnapshotUpload {
-                    shard_id,
-                    shard_bytes: encoded,
-                    merged_bytes: Vec::new(),
-                }),
-                subsumed_shard_ids: Vec::new(),
-            };
+            return inserted_without_cleanup(shard_id, shard_on_disk);
         }
 
         for subsumed_shard_id in &subsumed_shard_ids {
@@ -260,8 +313,8 @@ impl SnapshotStore {
             result: MergeResult::Inserted,
             new_snapshot_upload: Some(SnapshotUpload {
                 shard_id,
-                shard_bytes: encoded,
-                merged_bytes,
+                shard_bytes: shard_on_disk,
+                merged_bytes: merged_on_disk,
             }),
             subsumed_shard_ids,
         }
@@ -423,6 +476,18 @@ fn encode_merged_sidecar(shard_ids: &[String]) -> String {
     }
 }
 
+fn compress_snapshot_bytes(raw: &[u8]) -> io::Result<Vec<u8>> {
+    zstd::encode_all(raw, SNAPSHOT_ZSTD_LEVEL)
+}
+
+fn decompress_snapshot_bytes(bytes: &[u8]) -> io::Result<Vec<u8>> {
+    if bytes.starts_with(&ZSTD_FRAME_MAGIC) {
+        zstd::decode_all(bytes)
+    } else {
+        Ok(bytes.to_vec())
+    }
+}
+
 fn remove_file_if_exists(path: &Path) -> io::Result<()> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
@@ -473,8 +538,10 @@ fn decode_snapshot(
     bytes: &[u8],
     _commit_key: &str,
 ) -> Result<Snapshot, bincode::error::DecodeError> {
+    let raw = decompress_snapshot_bytes(bytes)
+        .map_err(|err| bincode::error::DecodeError::OtherString(err.to_string()))?;
     let (snapshot, _): (Snapshot, usize) =
-        bincode::serde::decode_from_slice(bytes, bincode_config())?;
+        bincode::serde::decode_from_slice(&raw, bincode_config())?;
     if snapshot.schema_version != SNAPSHOT_SCHEMA_VERSION {
         return Err(bincode::error::DecodeError::OtherString(
             "unsupported snapshot schema version".to_owned(),
@@ -551,6 +618,16 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_compression_round_trip_and_raw_passthrough() {
+        let raw = b"snapshot bytes without zstd header";
+        let compressed = compress_snapshot_bytes(raw).unwrap();
+
+        assert!(compressed.starts_with(&ZSTD_FRAME_MAGIC));
+        assert_eq!(decompress_snapshot_bytes(&compressed).unwrap(), raw);
+        assert_eq!(decompress_snapshot_bytes(raw).unwrap(), raw);
+    }
+
+    #[test]
     fn snapshot_round_trip_serialization() {
         let snapshot = sample_snapshot();
         let encoded = bincode::serde::encode_to_vec(&snapshot, bincode_config()).unwrap();
@@ -570,6 +647,14 @@ mod tests {
     }
 
     #[test]
+    fn decode_snapshot_zstd_magic_with_corrupt_payload_is_cache_miss() {
+        let mut bytes = ZSTD_FRAME_MAGIC.to_vec();
+        bytes.extend_from_slice(b"not-a-valid-zstd-payload");
+
+        assert!(decode_snapshot(&bytes, "some-commit").is_err());
+    }
+
+    #[test]
     fn snapshot_store_writes_and_reads_entry() {
         let temp_dir = tempdir().unwrap();
         let paths = open_shared_paths(temp_dir.path()).unwrap();
@@ -580,8 +665,108 @@ mod tests {
             store.merge_entry("commit-a", entry.clone()),
             MergeResult::Inserted
         );
+
+        let shard_files = collect_bincode_files(&store.shard_dir_path("commit-a"));
+        assert_eq!(shard_files.len(), 1);
+        let shard_bytes = fs::read(&shard_files[0]).unwrap();
+        assert!(shard_bytes.starts_with(&ZSTD_FRAME_MAGIC));
+        let merged_path = store.merged_sidecar_path(
+            "commit-a",
+            shard_files[0]
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap(),
+        );
+        let merged_bytes = fs::read(merged_path).unwrap();
+        assert!(merged_bytes.starts_with(&ZSTD_FRAME_MAGIC));
+
         assert_eq!(store.lookup("commit-a", &entry.input_key), Some(entry));
         assert_eq!(store.lookup("commit-a", &[99; 32]), None);
+    }
+
+    #[test]
+    fn snapshot_store_loads_raw_bincode_shard_via_passthrough() {
+        let temp_dir = tempdir().unwrap();
+        let paths = open_shared_paths(temp_dir.path()).unwrap();
+        let store = SnapshotStore::new(paths);
+        let commit_key = "commit-raw";
+        let entry = sample_entry_with_seed(21, [11; 32]);
+        let snapshot = snapshot_with_entries([entry.clone()]);
+        let raw_bytes = bincode::serde::encode_to_vec(&snapshot, bincode_config()).unwrap();
+        let shard_id = blake3::hash(&raw_bytes).to_hex().to_string();
+        let shard_path = store
+            .shard_dir_path(commit_key)
+            .join(format!("{shard_id}.{SNAPSHOT_FILE_EXTENSION}"));
+        fs::create_dir_all(shard_path.parent().unwrap()).unwrap();
+        fs::write(&shard_path, &raw_bytes).unwrap();
+
+        let loaded = store.load(commit_key).unwrap();
+        assert_eq!(
+            loaded.entries.get(&input_key_hex(entry.input_key)),
+            Some(&entry)
+        );
+    }
+
+    #[test]
+    fn compressed_snapshot_survives_remote_round_trip() {
+        let temp_dir_a = tempdir().unwrap();
+        let paths_a = open_shared_paths(temp_dir_a.path()).unwrap();
+        let store_a = SnapshotStore::new(paths_a);
+        let commit_key = "commit-remote-round-trip";
+        let entries = [
+            sample_entry_with_seed(2, [6; 32]),
+            sample_entry_with_seed(3, [7; 32]),
+        ];
+        let mut last_upload = None;
+
+        for entry in &entries {
+            assert_eq!(
+                store_a.merge_entry(commit_key, entry.clone()),
+                MergeResult::Inserted
+            );
+            let shard_ids = collect_shard_ids(&store_a.shard_dir_path(commit_key));
+            let shard_id = shard_ids.into_iter().next().unwrap();
+            let shard_bytes = fs::read(
+                store_a
+                    .shard_dir_path(commit_key)
+                    .join(format!("{shard_id}.{SNAPSHOT_FILE_EXTENSION}")),
+            )
+            .unwrap();
+            let merged_bytes =
+                fs::read(store_a.merged_sidecar_path(commit_key, &shard_id)).unwrap();
+            last_upload = Some(SnapshotUpload {
+                shard_id,
+                shard_bytes,
+                merged_bytes,
+            });
+        }
+
+        let upload = last_upload.unwrap();
+        assert!(upload.shard_bytes.starts_with(&ZSTD_FRAME_MAGIC));
+        assert!(upload.merged_bytes.starts_with(&ZSTD_FRAME_MAGIC));
+
+        let temp_dir_b = tempdir().unwrap();
+        let paths_b = open_shared_paths(temp_dir_b.path()).unwrap();
+        let store_b = SnapshotStore::new(paths_b);
+        let shard_path = store_b
+            .shard_dir_path(commit_key)
+            .join(format!("{}.{SNAPSHOT_FILE_EXTENSION}", upload.shard_id));
+        fs::create_dir_all(shard_path.parent().unwrap()).unwrap();
+        fs::write(&shard_path, &upload.shard_bytes).unwrap();
+        fs::write(
+            store_b.merged_sidecar_path(commit_key, &upload.shard_id),
+            &upload.merged_bytes,
+        )
+        .unwrap();
+
+        let snapshot = store_b.load(commit_key).unwrap();
+        assert_eq!(snapshot.entries.len(), entries.len());
+        for entry in entries {
+            assert_eq!(
+                snapshot.entries.get(&input_key_hex(entry.input_key)),
+                Some(&entry)
+            );
+        }
     }
 
     #[test]
@@ -679,9 +864,10 @@ mod tests {
         assert_eq!(shard_paths.len(), 1);
 
         let bytes = fs::read(&shard_paths[0]).unwrap();
+        let raw = decompress_snapshot_bytes(&bytes).unwrap();
         let expected_name = format!(
             "{}.{}",
-            blake3::hash(&bytes).to_hex(),
+            blake3::hash(&raw).to_hex(),
             SNAPSHOT_FILE_EXTENSION
         );
         assert_eq!(
@@ -733,7 +919,9 @@ mod tests {
         let shard_ids_after = collect_shard_ids(&store.shard_dir_path(commit_key));
         assert_eq!(shard_ids_after.len(), 1);
         let merged_sidecar =
-            fs::read_to_string(store.merged_sidecar_path(commit_key, &shard_ids_after[0])).unwrap();
+            fs::read(store.merged_sidecar_path(commit_key, &shard_ids_after[0])).unwrap();
+        let merged_sidecar =
+            String::from_utf8(decompress_snapshot_bytes(&merged_sidecar).unwrap()).unwrap();
         assert_eq!(
             merged_sidecar.lines().collect::<Vec<_>>(),
             shard_ids_before
@@ -787,7 +975,8 @@ mod tests {
             .join(format!("{consolidated_id}.{SNAPSHOT_FILE_EXTENSION}"));
         let consolidated_sidecar = store.merged_sidecar_path(commit_key, &consolidated_id);
 
-        atomic_write(&consolidated_path, &consolidated_bytes).unwrap();
+        let consolidated_on_disk = compress_snapshot_bytes(&consolidated_bytes).unwrap();
+        atomic_write(&consolidated_path, &consolidated_on_disk).unwrap();
 
         let unseen_snapshot = snapshot_with_entries([unseen_entry.clone()]);
         let unseen_bytes =
@@ -804,11 +993,9 @@ mod tests {
             .iter()
             .filter_map(SnapshotShard::deletable_shard_id)
             .collect::<Vec<_>>();
-        atomic_write(
-            &consolidated_sidecar,
-            encode_merged_sidecar(&subsumed_shard_ids).as_bytes(),
-        )
-        .unwrap();
+        let consolidated_sidecar_bytes =
+            compress_snapshot_bytes(encode_merged_sidecar(&subsumed_shard_ids).as_bytes()).unwrap();
+        atomic_write(&consolidated_sidecar, &consolidated_sidecar_bytes).unwrap();
         for shard_id in subsumed_shard_ids {
             store.delete_shard_files_by_id(commit_key, &shard_id);
         }
@@ -1074,7 +1261,8 @@ mod tests {
     fn write_snapshot_file(path: &Path, snapshot: Snapshot) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         let bytes = bincode::serde::encode_to_vec(&snapshot, bincode_config()).unwrap();
-        fs::write(path, bytes).unwrap();
+        let on_disk = compress_snapshot_bytes(&bytes).unwrap();
+        fs::write(path, on_disk).unwrap();
     }
 
     fn collect_bincode_files(dir: &Path) -> Vec<PathBuf> {
