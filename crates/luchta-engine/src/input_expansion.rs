@@ -572,6 +572,39 @@ mod tests {
         }
     }
 
+    /// Regression guard for lage issue #869
+    /// (<https://github.com/microsoft/lage/issues/869>): "Patterns in inputs
+    /// that reference files outside the package are silently ignored".
+    ///
+    /// In lage, inputs were matched only against package-local git files, so an
+    /// absolute path simply matched nothing and was silently dropped — meaning a
+    /// task would never re-run when that file changed. Luchta instead rejects
+    /// out-of-package absolute paths up front with a hard `PathEscape` error
+    /// rather than silently ignoring them.
+    #[test]
+    fn absolute_path_inputs_rejected() {
+        // Absolute paths in every input-pattern position must be rejected, not
+        // silently ignored.
+        let cases: &[&str] = &[
+            "/etc/passwd",          // bare absolute, same-package position
+            "#/etc/passwd",         // root-qualified absolute
+            "frontend#/etc/passwd", // package-qualified absolute
+            "/abs/path/*.ts",       // absolute with glob suffix
+        ];
+
+        for pattern in cases {
+            let (graph, repo_root, source_pkg) = test_context("frontend");
+            let result =
+                expand_input_patterns(&[pattern.to_string()], &source_pkg, &graph, &repo_root);
+            assert!(
+                matches!(result, Err(InputExpansionError::PathEscape { .. })),
+                "absolute pattern {:?} should be rejected as a path escape, not silently ignored; got {:?}",
+                pattern,
+                result
+            );
+        }
+    }
+
     #[test]
     fn valid_subdirectory_allowed() {
         let (graph, repo_root, source_pkg) = test_context("frontend");

@@ -207,6 +207,33 @@ mod tests {
         assert_ne!(baseline, task_spec_hash(&task, None));
     }
 
+    /// Regression guard for lage issue #839
+    /// (<https://github.com/microsoft/lage/issues/839>): "Hashes should be
+    /// different (but are the same) when inputs differ by filename" for
+    /// non-existing files.
+    ///
+    /// In lage the target hash was derived only from the *resolved* file set, so
+    /// two targets whose inputs named different but non-existent files
+    /// (`file1.txt` vs `file2.txt`) collided to the same hash and the cache
+    /// served stale results. Luchta folds the declared input *patterns*
+    /// themselves into `task_spec_hash`, so distinct input filenames yield
+    /// distinct hashes regardless of whether the files exist on disk.
+    #[test]
+    fn task_spec_hash_differs_for_distinct_missing_input_filenames() {
+        let mut a = sample_task_definition();
+        a.inputs = vec!["file1.txt".to_owned()];
+
+        let mut b = sample_task_definition();
+        b.inputs = vec!["file2.txt".to_owned()];
+
+        // Neither file exists; the only difference is the input filename.
+        assert_ne!(
+            task_spec_hash(&a, None),
+            task_spec_hash(&b, None),
+            "tasks with different (non-existent) input filenames must hash differently"
+        );
+    }
+
     #[test]
     fn task_spec_hash_changes_when_outputs_change() {
         let mut task = sample_task_definition();
