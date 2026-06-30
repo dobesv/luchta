@@ -42,7 +42,7 @@ pub enum Commands {
         top_level: bool,
 
         /// Print the tasks in the order they would run (grouped into parallel
-        /// waves) without executing anything.
+        /// waves) without executing them.
         #[arg(long)]
         dry_run: bool,
 
@@ -83,6 +83,56 @@ pub enum Commands {
         /// skipped); exit non-zero if any task failed.
         #[arg(long = "continue")]
         continue_on_failure: bool,
+    },
+    Watch {
+        tasks: Vec<String>,
+
+        /// Match package NAMEs (not paths); supports glob wildcards. Repeat to target multiple packages.
+        #[arg(short = 'p', long = "package")]
+        packages: Vec<String>,
+
+        /// Match the given task names as top-level (workspace-root) tasks
+        /// instead of package tasks.
+        #[arg(short = 'T', long = "top-level")]
+        top_level: bool,
+
+        /// Control how much progress output is printed.
+        #[arg(long, value_enum, default_value_t = OutputMode::Default)]
+        output: OutputMode,
+
+        /// Pause NEW task dispatch when process-tree RSS exceeds this threshold.
+        ///
+        /// Accepts percentages like "50%" or absolute values like "4GiB",
+        /// "512MiB", "2GB", or bare bytes. Flag overrides
+        /// `LUCHTA_MEM_USAGE_THRESHOLD`; otherwise defaults to 50% of total
+        /// system memory. In-flight tasks continue until completion.
+        #[arg(long, value_name = "BYTES_OR_PERCENT")]
+        mem_usage_threshold: Option<String>,
+
+        /// Override maximum cumulative task weight allowed to run at once.
+        ///
+        /// Flag overrides `LUCHTA_MAX_WEIGHT`; otherwise uses config
+        /// `concurrency.maxWeight`, falling back to available parallelism.
+        #[arg(long, value_name = "WEIGHT")]
+        max_weight: Option<String>,
+
+        /// Pause NEW task dispatch when system available memory drops below this threshold.
+        ///
+        /// Accepts percentages like "12.5%" or absolute values like "1GiB",
+        /// "512MiB", "500MB", or bare bytes. Flag overrides
+        /// `LUCHTA_MEM_FREE_THRESHOLD`; otherwise defaults to 1/16 of total
+        /// system memory. In-flight tasks continue until completion.
+        #[arg(long, value_name = "BYTES_OR_PERCENT")]
+        mem_free_threshold: Option<String>,
+
+        /// Continue running independent tasks after a task fails (only transitive dependents are
+        /// skipped); exit non-zero if any task failed.
+        #[arg(long = "continue")]
+        continue_on_failure: bool,
+
+        /// Debounce filesystem changes for this many milliseconds before scheduling rebuild.
+        #[arg(long, value_name = "MS", default_value_t = 150)]
+        debounce: u64,
     },
     /// View cached logs and metadata for previously executed tasks.
     Logs {

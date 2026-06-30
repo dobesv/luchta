@@ -14,6 +14,7 @@ mod reports;
 mod rss;
 mod run;
 mod since;
+mod watch;
 mod why;
 
 use std::path::Path;
@@ -25,6 +26,7 @@ use luchta_engine::{
     DependencyValidationError, ResolveMode, TaskGraph, TaskValidationDiagnostic,
     TaskValidationReason,
 };
+use miette::IntoDiagnostic;
 use miette::{Report, Result};
 
 use crate::outcome::TasksFailed;
@@ -73,6 +75,7 @@ async fn run(cli: Cli) -> Result<()> {
 
     match cli.command {
         command @ Commands::Run { .. } => run_command(&workspace_root, command).await,
+        command @ Commands::Watch { .. } => watch_command(&workspace_root, command).await,
         Commands::Logs {
             tasks,
             packages,
@@ -248,7 +251,7 @@ fn command_run_args(command: Commands) -> RunArgs {
             max_weight_cli: max_weight,
             since,
         },
-        Commands::Logs { .. } | Commands::Why { .. } | Commands::Check => {
+        Commands::Watch { .. } | Commands::Logs { .. } | Commands::Why { .. } | Commands::Check => {
             unreachable!("checked by caller")
         }
     }
@@ -286,6 +289,61 @@ async fn run_command(workspace_root: &std::path::Path, command: Commands) -> Res
         })
         .await
     }
+}
+
+async fn watch_command(workspace_root: &std::path::Path, command: Commands) -> Result<()> {
+    let Commands::Watch {
+        tasks,
+        packages,
+        top_level,
+        output,
+        mem_usage_threshold,
+        max_weight,
+        mem_free_threshold,
+        continue_on_failure,
+        debounce,
+    } = command
+    else {
+        unreachable!("checked by caller");
+    };
+
+    if tasks.is_empty() {
+        return Err(miette::miette!("no tasks specified for watch command"));
+    }
+
+    let memory_pressure = resolve_memory_pressure_config(ThresholdInputs {
+        usage_cli: mem_usage_threshold,
+        free_cli: mem_free_threshold,
+    })?;
+    let max_weight_override =
+        resolve_max_weight_override(max_weight.as_deref(), "LUCHTA_MAX_WEIGHT", "max-weight")?;
+
+    let Some(session) =
+        watch::session::WatchSession::new(workspace_root, max_weight_override).await?
+    else {
+        return Ok(());
+    };
+    let (watcher_handle, changes_rx) =
+        watch::watcher::spawn_watcher(workspace_root, debounce).into_diagnostic()?;
+    let selection = watch::driver::OwnedSelection {
+        requested_tasks: tasks,
+        packages,
+        top_level,
+    };
+    let config = watch::driver::WatchRunConfig {
+        output,
+        continue_on_failure,
+        memory_pressure,
+    };
+
+    watch::driver::run_watch(watch::driver::WatchInputs {
+        session,
+        watcher_handle,
+        changes_rx,
+        selection,
+        config,
+    })
+    .await
 }
 
 fn resolve_memory_pressure_config(

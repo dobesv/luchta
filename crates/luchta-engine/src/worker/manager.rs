@@ -240,6 +240,10 @@ impl WorkerManager {
         .await
     }
 
+    pub fn is_shutdown(&self) -> bool {
+        self.is_shutdown.load(Ordering::SeqCst)
+    }
+
     pub async fn shutdown(&self) {
         self.shutdown_all(self.shutdown_timeout).await;
     }

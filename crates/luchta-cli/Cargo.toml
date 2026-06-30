@@ -21,6 +21,10 @@ serde_json.workspace = true
 serde-sarif = "0.8"
 serde_path_to_error = "0.1"
 tokio = { workspace = true }
+ignore = { workspace = true }
+notify = { workspace = true }
+notify-debouncer-full = { workspace = true }
+tokio-util = { workspace = true }
 owo-colors = { version = "4.0", features = ["supports-colors"] }
 jiff = "0.2.28"
 petgraph.workspace = true
