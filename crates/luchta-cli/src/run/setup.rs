@@ -30,6 +30,7 @@ use crate::progress::ProgressReporter;
 ///
 /// `None` for either field means "use the default" (50% of total system memory
 /// for usage, 1/16 of total for free), resolved by the `MemoryMonitor`.
+#[derive(Clone)]
 pub struct MemoryPressureConfig {
     pub usage: Option<crate::memory_pressure::ThresholdSpec>,
     pub free: Option<crate::memory_pressure::ThresholdSpec>,
@@ -38,7 +39,7 @@ pub struct MemoryPressureConfig {
 /// Builds the memory monitor and the shared pressure state from the resolved
 /// threshold config. The monitor drives pause decisions; the `PressureState` is
 /// shared so the status line can render the current warning suffix.
-pub(super) fn build_memory_pressure(
+pub(crate) fn build_memory_pressure(
     config: MemoryPressureConfig,
 ) -> (
     crate::memory_pressure::MemoryMonitor,
@@ -90,27 +91,27 @@ fn select_summary_rss(
 }
 
 /// Inputs for [`build_execution_resources`].
-pub(super) struct BuildResourcesInputs<'a> {
-    pub(super) task_graph: &'a TaskGraph,
-    pub(super) packages: &'a [PackageNode],
-    pub(super) workspace_root: &'a Path,
-    pub(super) workers: &'a HashMap<String, WorkerDefinition>,
-    pub(super) env: &'a BTreeMap<String, EnvSpec>,
-    pub(super) worker_manager: &'a Arc<WorkerManager>,
-    pub(super) max_weight: u32,
-    pub(super) prefix_width: usize,
-    pub(super) package_graph: Option<&'a PackageGraph>,
+pub(crate) struct BuildResourcesInputs<'a> {
+    pub(crate) task_graph: &'a TaskGraph,
+    pub(crate) packages: &'a [PackageNode],
+    pub(crate) workspace_root: &'a Path,
+    pub(crate) workers: &'a HashMap<String, WorkerDefinition>,
+    pub(crate) env: &'a BTreeMap<String, EnvSpec>,
+    pub(crate) worker_manager: &'a Arc<WorkerManager>,
+    pub(crate) max_weight: u32,
+    pub(crate) prefix_width: usize,
+    pub(crate) package_graph: Option<&'a PackageGraph>,
 }
 
 /// Execution resources shared across the dispatch loop and task runners.
-pub(super) struct ExecutionResources {
-    pub(super) executor: Arc<WeightedExecutor>,
-    pub(super) cache: Arc<Cache>,
-    pub(super) output_hashes: Arc<Mutex<HashMap<TaskId, [u8; 32]>>>,
-    pub(super) commands: HashMap<TaskId, ExecutionRequest>,
-    pub(super) invalid: HashMap<TaskId, String>,
-    pub(super) task_envs: HashMap<TaskId, BTreeMap<String, EnvSpec>>,
-    pub(super) shared_cache: Option<Arc<SharedCache>>,
+pub(crate) struct ExecutionResources {
+    pub(crate) executor: Arc<WeightedExecutor>,
+    pub(crate) cache: Arc<Cache>,
+    pub(crate) output_hashes: Arc<Mutex<HashMap<TaskId, [u8; 32]>>>,
+    pub(crate) commands: HashMap<TaskId, ExecutionRequest>,
+    pub(crate) invalid: HashMap<TaskId, String>,
+    pub(crate) task_envs: HashMap<TaskId, BTreeMap<String, EnvSpec>>,
+    pub(crate) shared_cache: Option<Arc<SharedCache>>,
 }
 
 /// Environment variable enabling shared cache.
@@ -228,7 +229,7 @@ fn shared_cache_history_len() -> usize {
 
 /// Builds the executor (with all task commands registered), the build cache,
 /// the output-hash map, and the command map for a run.
-pub(super) fn build_execution_resources(
+pub(crate) fn build_execution_resources(
     inputs: BuildResourcesInputs<'_>,
 ) -> Result<ExecutionResources> {
     let executor = Arc::new(

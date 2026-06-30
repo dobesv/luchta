@@ -49,13 +49,17 @@ pub fn changed_paths_since(
     Ok(changed_paths)
 }
 
-pub fn affected_packages(
-    workspace_root: &Path,
+/// Maps changed paths to directly changed packages, then includes their transitive
+/// dependents.
+///
+/// Accepts repo-relative paths from git and absolute paths from file watchers.
+/// `repo_root.join(path)` is used for normalization; Rust preserves absolute
+/// `path` unchanged when joined onto another path.
+pub fn affected_packages_from_paths(
+    changed_paths: &HashSet<PathBuf>,
     repo_root: &Path,
-    since_ref: &str,
     package_graph: &PackageGraph,
 ) -> Result<HashSet<PackageName>, SinceError> {
-    let changed_paths = changed_paths_since(workspace_root, since_ref)?;
     let mut changed_packages = HashSet::new();
     let root_package = package_graph.root_package();
 
@@ -76,6 +80,16 @@ pub fn affected_packages(
     package_graph
         .transitive_dependents_of(changed_packages)
         .map_err(SinceError::from)
+}
+
+pub fn affected_packages(
+    workspace_root: &Path,
+    repo_root: &Path,
+    since_ref: &str,
+    package_graph: &PackageGraph,
+) -> Result<HashSet<PackageName>, SinceError> {
+    let changed_paths = changed_paths_since(workspace_root, since_ref)?;
+    affected_packages_from_paths(&changed_paths, repo_root, package_graph)
 }
 
 fn discover_repo(workspace_root: &Path) -> Result<gix::Repository, SinceError> {
@@ -175,7 +189,7 @@ fn map_head_error(_err: impl std::fmt::Display) -> SinceError {
 
 #[cfg(test)]
 mod tests {
-    use super::{affected_packages, changed_paths_since, SinceError};
+    use super::{affected_packages, affected_packages_from_paths, changed_paths_since, SinceError};
     use std::collections::HashSet;
     use std::fs;
     use std::path::Path;
@@ -360,6 +374,28 @@ mod tests {
         let affected = affected_packages(repo.path(), repo.path(), &base_ref, &graph).unwrap();
 
         assert_eq!(affected, package_name_set(["@repo/nested"]));
+    }
+
+    #[test]
+    fn affected_packages_from_paths_accepts_absolute_paths() {
+        let repo = TestRepo::new();
+        repo.write_file("packages/a/package.json", &package_json("@repo/a", &[]));
+        repo.write_file("packages/a/src/index.ts", "export const value = 1;\n");
+        repo.write_file(
+            "packages/b/package.json",
+            &package_json("@repo/b", &["@repo/a"]),
+        );
+        repo.write_file("packages/b/src/index.ts", "export const value = 1;\n");
+
+        let graph = package_graph(
+            repo.path(),
+            [("@repo/a", "packages/a"), ("@repo/b", "packages/b")],
+        );
+        let changed_paths = HashSet::from([repo.path().join("packages/a/src/index.ts")]);
+
+        let affected = affected_packages_from_paths(&changed_paths, repo.path(), &graph).unwrap();
+
+        assert_eq!(affected, package_name_set(["@repo/a", "@repo/b"]));
     }
 
     fn package_graph<const N: usize>(

@@ -32,6 +32,7 @@ use crate::cache_ctx::{
 };
 use crate::cli::OutputMode;
 use crate::progress::ProgressReporter;
+use tokio_util::sync::CancellationToken;
 
 mod dispatch;
 mod pause;
@@ -169,18 +170,43 @@ pub async fn prepare_workspace(
     })
 }
 
-struct RunContext {
-    package_nodes: Vec<PackageNode>,
-    package_graph: PackageGraph,
-    env: BTreeMap<String, EnvSpec>,
-    task_graph: TaskGraph,
-    workers: HashMap<String, WorkerDefinition>,
-    max_weight: u32,
-    pruned: Vec<PrunedTask>,
-    worker_manager: Arc<WorkerManager>,
-    since_affected: Option<HashSet<PackageName>>,
+pub(crate) struct RunContext {
+    pub(crate) package_nodes: Vec<PackageNode>,
+    pub(crate) package_graph: PackageGraph,
+    pub(crate) env: BTreeMap<String, EnvSpec>,
+    pub(crate) task_graph: TaskGraph,
+    pub(crate) workers: HashMap<String, WorkerDefinition>,
+    pub(crate) max_weight: u32,
+    pub(crate) pruned: Vec<PrunedTask>,
+    pub(crate) worker_manager: Arc<WorkerManager>,
+    pub(crate) since_affected: Option<HashSet<PackageName>>,
     /// Global cache nonce from LuchtaConfig.cache.
-    global_cache_nonce: Option<String>,
+    pub(crate) global_cache_nonce: Option<String>,
+    /// Workspace root path.
+    pub(crate) workspace_root: PathBuf,
+}
+
+/// Outcome of a single execution cycle.
+///
+/// Returned by `run_cycle` so callers can determine whether the cycle
+/// completed successfully, failed, or was cancelled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CycleOutcome {
+    /// All tasks completed successfully.
+    Success,
+    /// One or more tasks failed.
+    Failed,
+    /// Cycle was cancelled before completion.
+    Cancelled,
+}
+
+/// Parameters for a single run cycle.
+pub(crate) struct RunCycleParams<'a> {
+    pub selection: &'a TaskSelection<'a>,
+    pub since_affected: Option<&'a HashSet<PackageName>>,
+    pub output: OutputMode,
+    pub continue_on_failure: bool,
+    pub memory_pressure: MemoryPressureConfig,
 }
 
 pub struct RunTasksRequest<'a> {
@@ -201,92 +227,77 @@ pub async fn run_tasks(request: RunTasksRequest<'_>) -> Result<()> {
         memory_pressure,
         max_weight_override,
     } = request;
-    let (mut memory_monitor, pressure_state) = build_memory_pressure(memory_pressure);
+
+    // Prepare the run context (handles empty packages / NoOp since early returns)
     let Some(run) = prepare_run_context(workspace_root, selection, max_weight_override).await?
     else {
         return Ok(());
     };
-    let tasks_to_run = collect_requested_subgraph(CollectSubgraphRequest {
-        task_graph: &run.task_graph,
-        selection,
-        pruned: &run.pruned,
-        since_affected: run_since_affected(&run),
-        expand_dependencies: true,
-    })?;
-    let (wave_of, total_waves) = compute_wave_indices(&run.task_graph, &tasks_to_run);
-    let reporter = Arc::new(ProgressReporter::new(output, wave_of, total_waves));
 
-    let ExecutionResources {
-        executor,
-        cache,
-        output_hashes,
-        commands,
-        invalid,
-        task_envs,
-        shared_cache,
-    } = build_execution_resources(BuildResourcesInputs {
-        task_graph: &run.task_graph,
-        packages: &run.package_nodes,
-        workspace_root,
-        workers: &run.workers,
-        env: &run.env,
-        worker_manager: &run.worker_manager,
-        max_weight: run.max_weight,
-        prefix_width: compute_prefix_width(&run.task_graph, &tasks_to_run),
-        package_graph: Some(&run.package_graph),
-    })?;
+    // Execute one cycle using the shared run_cycle function
+    let cancel_token = CancellationToken::new();
+    let (outcome, was_interrupted) = run_cycle(
+        &run,
+        RunCycleParams {
+            selection,
+            since_affected: run.since_affected.as_ref(),
+            output,
+            continue_on_failure,
+            memory_pressure,
+        },
+        cancel_token,
+    )
+    .await?;
 
-    run_dispatch_loop(RunDispatch {
-        task_graph: &run.task_graph,
-        tasks_to_run: &tasks_to_run,
-        package_nodes: &run.package_nodes,
-        package_graph: &run.package_graph,
-        workspace_root,
-        continue_on_failure,
-        worker_manager: &run.worker_manager,
-        reporter: &reporter,
-        commands: &commands,
-        invalid: &invalid,
-        task_envs: &task_envs,
-        executor: &executor,
-        cache: &cache,
-        output_hashes: &output_hashes,
-        memory_monitor: &mut memory_monitor,
-        pressure_state: &pressure_state,
-        shared_cache,
-        workers: &run.workers,
-        global_cache_nonce: run.global_cache_nonce,
-    })
-    .await
-}
+    // Shut down workers (the ONE place for one-shot `luchta run`)
+    if was_interrupted {
+        run.worker_manager.shutdown_immediate().await;
+    } else {
+        run.worker_manager.shutdown().await;
+    }
 
-/// Bundles the borrowed state needed to drive the dispatch loop, so
-/// `run_tasks` stays small and the many shared references travel as one unit.
-struct RunDispatch<'a> {
-    task_graph: &'a TaskGraph,
-    tasks_to_run: &'a HashSet<TaskId>,
-    package_nodes: &'a [PackageNode],
-    package_graph: &'a PackageGraph,
-    workspace_root: &'a Path,
-    continue_on_failure: bool,
-    worker_manager: &'a Arc<WorkerManager>,
-    reporter: &'a Arc<ProgressReporter>,
-    commands: &'a HashMap<TaskId, ExecutionRequest>,
-    invalid: &'a HashMap<TaskId, String>,
-    task_envs: &'a HashMap<TaskId, BTreeMap<String, EnvSpec>>,
-    executor: &'a Arc<WeightedExecutor>,
-    cache: &'a Arc<Cache>,
-    output_hashes: &'a Arc<Mutex<HashMap<TaskId, [u8; 32]>>>,
-    memory_monitor: &'a mut crate::memory_pressure::MemoryMonitor,
-    pressure_state: &'a Arc<crate::memory_pressure::PressureState>,
-    shared_cache: Option<Arc<SharedCache>>,
-    workers: &'a HashMap<String, WorkerDefinition>,
-    global_cache_nonce: Option<String>,
+    // Return error if failed
+    if outcome == CycleOutcome::Failed {
+        return Err(miette::Report::new(crate::outcome::TasksFailed));
+    }
+
+    Ok(())
 }
 
 async fn prepare_run_context(
     workspace_root: &Path,
     selection: &TaskSelection<'_>,
+    max_weight_override: Option<u32>,
+) -> Result<Option<RunContext>> {
+    // Build session context (without since resolution)
+    let mut run = match prepare_session_context(workspace_root, max_weight_override).await? {
+        Some(r) => r,
+        None => return Ok(None),
+    };
+
+    // Layer since resolution on top
+    let since_affected =
+        match resolve_since_selection(selection, workspace_root, &run.package_graph)? {
+            SinceSelection::NoOp => {
+                // No-op: shut down workers (session-owned) to avoid leak
+                run.worker_manager.shutdown().await;
+                return Ok(None);
+            }
+            SinceSelection::Proceed(set) => set,
+        };
+
+    // Set since_affected for one-shot run
+    run.since_affected = since_affected;
+
+    Ok(Some(run))
+}
+
+/// Prepare a session context without `--since` resolution.
+///
+/// Builds package graph, task graph, workers; handles empty-packages early return.
+/// Used by `WatchSession::new` and layered on by `prepare_run_context` for one-shot `luchta run`.
+pub(crate) async fn prepare_session_context(
+    workspace_root: &Path,
     max_weight_override: Option<u32>,
 ) -> Result<Option<RunContext>> {
     let PreparedWorkspace {
@@ -315,16 +326,6 @@ async fn prepare_run_context(
         return Ok(None);
     }
 
-    let since_affected = match resolve_since_selection(selection, workspace_root, &package_graph)? {
-        SinceSelection::NoOp => {
-            // Same reasoning as above: tear down any resident workers before
-            // the no-op early return.
-            worker_manager.shutdown().await;
-            return Ok(None);
-        }
-        SinceSelection::Proceed(set) => set,
-    };
-
     Ok(Some(RunContext {
         package_nodes: packages,
         package_graph,
@@ -334,57 +335,10 @@ async fn prepare_run_context(
         max_weight,
         pruned,
         worker_manager,
-        since_affected,
+        since_affected: None,
         global_cache_nonce,
+        workspace_root: workspace_root.to_owned(),
     }))
-}
-
-fn run_since_affected(run: &RunContext) -> Option<&HashSet<PackageName>> {
-    run.since_affected.as_ref()
-}
-
-/// Constructs the dispatch context, runs the dispatch loop to completion, and
-/// finalizes the run (worker shutdown + outcome reporting).
-async fn run_dispatch_loop(d: RunDispatch<'_>) -> Result<()> {
-    let (walker, mut receiver) = Walker::new(d.task_graph);
-    let any_failed = Arc::new(AtomicBool::new(false));
-    // Set once a shutdown signal arrives. Spawned task runners consult this so
-    // that jobs killed by the interrupt don't each print a crash/failure error
-    // (which would flood the terminal with one line per in-flight task).
-    let interrupted = Arc::new(AtomicBool::new(false));
-    let lockfile_state = load_lockfile_state(d.workspace_root);
-
-    // Read LUCHTA_CACHE_NONCE exactly once at startup.
-    let env_cache_nonce = std::env::var("LUCHTA_CACHE_NONCE").ok();
-
-    let ctx = DispatchContext {
-        tasks_to_run: d.tasks_to_run,
-        commands: d.commands,
-        invalid: d.invalid,
-        task_envs: d.task_envs,
-        executor: d.executor,
-        any_failed: &any_failed,
-        interrupted: &interrupted,
-        continue_on_failure: d.continue_on_failure,
-        worker_manager: d.worker_manager,
-        workspace_root: d.workspace_root,
-        package_graph: d.package_graph,
-        packages: d.package_nodes,
-        task_graph: d.task_graph,
-        cache: d.cache,
-        output_hashes: d.output_hashes,
-        reporter: d.reporter,
-        lockfile: &lockfile_state,
-        shared_cache: d.shared_cache.clone(),
-        workers: d.workers,
-        global_cache_nonce: d.global_cache_nonce,
-        env_cache_nonce,
-    };
-    let run_result = dispatch_loop(&mut receiver, &ctx, d.memory_monitor, d.pressure_state).await;
-
-    finalize_run(d.worker_manager, walker, receiver, run_result.is_err()).await?;
-
-    report_run_outcome(run_result, &any_failed, d.reporter, d.pressure_state)
 }
 
 /// Shared, read-only context the dispatch loop hands to each ready task.
@@ -546,41 +500,26 @@ fn progress_interval_duration() -> Duration {
     Duration::from_millis(ms)
 }
 
-/// Tears down workers and drains the walker after the dispatch loop ends.
+/// Per-cycle finalization: wait on walker, NO worker shutdown.
 ///
-/// On interruption the dispatch loop stops draining the walker's ready channel
-/// while a task is still executing. The walker cannot finish until that
-/// in-flight task reports completion, and the task cannot complete until its
-/// worker subprocess is stopped. So on interrupt we shut workers down FIRST
-/// (immediately, killing their process groups), which makes the executor
-/// resolve the pending job as a failure and lets the walker drain. On the
-/// normal path the walker has already finished, so workers are shut down
-/// gracefully afterwards.
-async fn finalize_run(
-    worker_manager: &Arc<WorkerManager>,
+/// Used by `run_cycle` to wait for the dispatch loop to complete without
+/// shutting down the worker manager. The caller is responsible for shutdown.
+async fn finalize_cycle(
     walker: Walker,
-    receiver: tokio::sync::mpsc::Receiver<ReadyTaskMessage>,
+    receiver: Option<tokio::sync::mpsc::Receiver<ReadyTaskMessage>>,
     interrupted: bool,
 ) -> Result<()> {
-    if interrupted {
+    if interrupted || receiver.is_none() {
         // Dropping the receiver makes the walker's channel sends fail, so it
-        // stops enqueueing new work and can wind down once the in-flight job is
-        // resolved by the worker shutdown.
+        // stops enqueueing new work and can wind down.
         drop(receiver);
-        worker_manager.shutdown_immediate().await;
     }
 
-    let walker_result = walker
+    walker
         .wait()
         .await
         .into_diagnostic()
-        .wrap_err("walker task panicked");
-
-    if !interrupted {
-        worker_manager.shutdown().await;
-    }
-
-    walker_result
+        .wrap_err("walker task panicked")
 }
 
 /// Print the tasks in the order they would run, grouped into parallel "waves",
@@ -2104,5 +2043,544 @@ mod tests {
 
         // Verify call count.
         assert_eq!(pause_count.load(Ordering::SeqCst), 3);
+    }
+}
+
+fn compute_cycle_outcome(was_cancelled: bool, any_failed: &AtomicBool) -> CycleOutcome {
+    if was_cancelled {
+        CycleOutcome::Cancelled
+    } else if any_failed.load(Ordering::SeqCst) {
+        CycleOutcome::Failed
+    } else {
+        CycleOutcome::Success
+    }
+}
+
+#[allow(clippy::manual_async_fn)]
+/// Executes one cycle of task dispatch.
+///
+/// This function builds fresh per-cycle resources (Walker, executor, output_hashes)
+/// and runs the dispatch loop to completion. It does NOT shut down the worker
+/// manager — the caller is responsible for that.
+///
+/// The `since_affected` parameter filters tasks to affected packages:
+/// - `None` = run all matching tasks (full build)
+/// - `Some(&set)` = run only tasks for packages in the set
+///
+/// The `cancel_token` allows cancelling in-flight work. Full cancel wiring is
+/// task 923e6b06 — for now we pass it through for future use.
+pub(crate) fn run_cycle<'a>(
+    run: &'a RunContext,
+    params: RunCycleParams<'a>,
+    cancel_token: CancellationToken,
+) -> impl std::future::Future<Output = Result<(CycleOutcome, bool)>> + Send + 'a {
+    async move {
+        let RunCycleParams {
+            selection,
+            since_affected,
+            output,
+            continue_on_failure,
+            memory_pressure,
+        } = params;
+        let (mut memory_monitor, pressure_state) = build_memory_pressure(memory_pressure);
+
+        let Some((tasks_to_run, reporter, resources)) =
+            prepare_cycle_resources(run, selection, since_affected, output)?
+        else {
+            // Nothing to run: success.
+            return Ok((CycleOutcome::Success, false));
+        };
+        let (walker, receiver) = Walker::new(&run.task_graph);
+        let any_failed = Arc::new(AtomicBool::new(false));
+        let interrupted = Arc::new(AtomicBool::new(false));
+        let lockfile_state = load_lockfile_state(&run.workspace_root);
+
+        let ctx = build_dispatch_context(BuildDispatchContext {
+            run,
+            tasks_to_run: &tasks_to_run,
+            resources: &resources,
+            reporter: &reporter,
+            any_failed: &any_failed,
+            interrupted: &interrupted,
+            lockfile_state: &lockfile_state,
+            continue_on_failure,
+        });
+
+        let (run_result, was_cancelled, receiver_option) = run_dispatch_with_cancel(
+            DispatchWithCancel {
+                ctx: &ctx,
+                receiver,
+                interrupted: &interrupted,
+                memory_monitor: &mut memory_monitor,
+                pressure_state: &pressure_state,
+            },
+            cancel_token,
+        )
+        .await;
+
+        finalize_and_report(FinalizeCycle {
+            run,
+            walker,
+            receiver_option,
+            interrupted: &interrupted,
+            was_cancelled,
+            run_result,
+            any_failed: &any_failed,
+            reporter: &reporter,
+            pressure_state: &pressure_state,
+        })
+        .await
+    }
+}
+
+/// Borrowed inputs for constructing a per-cycle [`DispatchContext`].
+struct BuildDispatchContext<'a> {
+    run: &'a RunContext,
+    tasks_to_run: &'a HashSet<TaskId>,
+    resources: &'a ExecutionResources,
+    reporter: &'a Arc<ProgressReporter>,
+    any_failed: &'a Arc<AtomicBool>,
+    interrupted: &'a Arc<AtomicBool>,
+    lockfile_state: &'a LockfileState,
+    continue_on_failure: bool,
+}
+
+/// Assembles the read-only [`DispatchContext`] handed to each ready task from the
+/// run context and the per-cycle execution resources.
+fn build_dispatch_context<'a>(inputs: BuildDispatchContext<'a>) -> DispatchContext<'a> {
+    let BuildDispatchContext {
+        run,
+        tasks_to_run,
+        resources,
+        reporter,
+        any_failed,
+        interrupted,
+        lockfile_state,
+        continue_on_failure,
+    } = inputs;
+    DispatchContext {
+        tasks_to_run,
+        commands: &resources.commands,
+        invalid: &resources.invalid,
+        task_envs: &resources.task_envs,
+        executor: &resources.executor,
+        any_failed,
+        interrupted,
+        continue_on_failure,
+        worker_manager: &run.worker_manager,
+        workspace_root: &run.workspace_root,
+        package_graph: &run.package_graph,
+        packages: &run.package_nodes,
+        task_graph: &run.task_graph,
+        cache: &resources.cache,
+        output_hashes: &resources.output_hashes,
+        reporter,
+        lockfile: lockfile_state,
+        shared_cache: resources.shared_cache.clone(),
+        workers: &run.workers,
+        global_cache_nonce: run.global_cache_nonce.clone(),
+        env_cache_nonce: std::env::var("LUCHTA_CACHE_NONCE").ok(),
+    }
+}
+
+/// Collects the requested subgraph and builds the per-cycle execution resources
+/// (executor, cache, commands, etc.) plus the progress reporter. Returns `None`
+/// when there is nothing to run (the cycle should report success immediately).
+#[allow(clippy::type_complexity)]
+fn prepare_cycle_resources(
+    run: &RunContext,
+    selection: &TaskSelection<'_>,
+    since_affected: Option<&HashSet<PackageName>>,
+    output: OutputMode,
+) -> Result<Option<(HashSet<TaskId>, Arc<ProgressReporter>, ExecutionResources)>> {
+    let tasks_to_run = collect_requested_subgraph(CollectSubgraphRequest {
+        task_graph: &run.task_graph,
+        selection,
+        pruned: &run.pruned,
+        since_affected,
+        expand_dependencies: true,
+    })?;
+
+    if tasks_to_run.is_empty() {
+        return Ok(None);
+    }
+
+    let (wave_of, total_waves) = compute_wave_indices(&run.task_graph, &tasks_to_run);
+    let reporter = Arc::new(ProgressReporter::new(output, wave_of, total_waves));
+
+    let resources = build_execution_resources(BuildResourcesInputs {
+        task_graph: &run.task_graph,
+        packages: &run.package_nodes,
+        workspace_root: &run.workspace_root,
+        workers: &run.workers,
+        env: &run.env,
+        worker_manager: &run.worker_manager,
+        max_weight: run.max_weight,
+        prefix_width: compute_prefix_width(&run.task_graph, &tasks_to_run),
+        package_graph: Some(&run.package_graph),
+    })?;
+
+    Ok(Some((tasks_to_run, reporter, resources)))
+}
+
+/// Borrowed inputs for the cancellable dispatch phase of a cycle.
+struct DispatchWithCancel<'a> {
+    ctx: &'a DispatchContext<'a>,
+    receiver: tokio::sync::mpsc::Receiver<ReadyTaskMessage>,
+    interrupted: &'a Arc<AtomicBool>,
+    memory_monitor: &'a mut crate::memory_pressure::MemoryMonitor,
+    pressure_state: &'a Arc<crate::memory_pressure::PressureState>,
+}
+
+/// Runs the dispatch loop, racing it against the cancellation token. On cancel,
+/// drops the receiver so the walker stops enqueueing work and can drain. Returns
+/// the dispatch result, whether it was cancelled, and the (possibly dropped)
+/// receiver so the caller can finalize the walker.
+async fn run_dispatch_with_cancel(
+    inputs: DispatchWithCancel<'_>,
+    cancel_token: CancellationToken,
+) -> (
+    Result<()>,
+    bool,
+    Option<tokio::sync::mpsc::Receiver<ReadyTaskMessage>>,
+) {
+    let DispatchWithCancel {
+        ctx,
+        receiver,
+        interrupted,
+        memory_monitor,
+        pressure_state,
+    } = inputs;
+
+    let mut was_cancelled = false;
+    let mut receiver_option = if interrupted.load(Ordering::SeqCst) {
+        // Already interrupted, no need to run dispatch loop.
+        None
+    } else {
+        Some(receiver)
+    };
+
+    let run_result = if let Some(ref mut rx) = receiver_option {
+        tokio::select! {
+            result = dispatch_loop(rx, ctx, memory_monitor, pressure_state) => result,
+            _ = cancel_token.cancelled() => {
+                was_cancelled = true;
+                // Drop the receiver to stop walker from sending more work.
+                drop(receiver_option.take());
+                Ok(())
+            }
+        }
+    } else {
+        Ok(())
+    };
+
+    (run_result, was_cancelled, receiver_option)
+}
+
+/// Borrowed inputs for finalizing a cycle: draining the walker, shutting workers
+/// down on interrupt, and reporting the outcome.
+struct FinalizeCycle<'a> {
+    run: &'a RunContext,
+    walker: Walker,
+    receiver_option: Option<tokio::sync::mpsc::Receiver<ReadyTaskMessage>>,
+    interrupted: &'a Arc<AtomicBool>,
+    was_cancelled: bool,
+    run_result: Result<()>,
+    any_failed: &'a Arc<AtomicBool>,
+    reporter: &'a Arc<ProgressReporter>,
+    pressure_state: &'a Arc<crate::memory_pressure::PressureState>,
+}
+
+/// Finalizes a cycle: kills workers immediately on interrupt (so the walker can
+/// drain), waits on the walker, computes the outcome, and reports it.
+async fn finalize_and_report(inputs: FinalizeCycle<'_>) -> Result<(CycleOutcome, bool)> {
+    let FinalizeCycle {
+        run,
+        walker,
+        receiver_option,
+        interrupted,
+        was_cancelled,
+        run_result,
+        any_failed,
+        reporter,
+        pressure_state,
+    } = inputs;
+
+    let was_interrupted = interrupted.load(Ordering::SeqCst);
+
+    // On interrupt, must kill workers immediately so the walker can drain. The
+    // caller also calls shutdown for cleanup, but the immediate kill is needed
+    // here to unblock walker.wait().
+    if was_interrupted {
+        run.worker_manager.shutdown_immediate().await;
+    }
+
+    // For cancellation (watch mode) the receiver was already dropped, so the
+    // walker can drain.
+    finalize_cycle(walker, receiver_option, was_interrupted || was_cancelled).await?;
+
+    let outcome = compute_cycle_outcome(was_cancelled, any_failed);
+
+    report_run_outcome(run_result, any_failed, reporter, pressure_state)?;
+
+    Ok((outcome, was_interrupted))
+}
+
+#[cfg(test)]
+mod watch_tests {
+    use super::*;
+    use std::fs;
+
+    use crate::cli::OutputMode;
+    use crate::watch::session::WatchSession;
+    use tokio_util::sync::CancellationToken;
+
+    fn write_watch_test_workspace(workspace_root: &std::path::Path, worker_script_body: &str) {
+        fs::create_dir_all(workspace_root.join("packages/app")).expect("create package dir");
+        fs::write(
+            workspace_root.join("package.json"),
+            r#"{
+                "name": "root",
+                "private": true,
+                "workspaces": ["packages/*"]
+            }"#,
+        )
+        .expect("write root package.json");
+        fs::write(
+            workspace_root.join("packages/app/package.json"),
+            r#"{
+                "name": "app",
+                "version": "1.0.0",
+                "scripts": {
+                    "build": "echo build"
+                }
+            }"#,
+        )
+        .expect("write app package.json");
+
+        let worker_script = workspace_root.join("fake-worker.sh");
+        fs::write(&worker_script, worker_script_body).expect("write worker script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&worker_script, fs::Permissions::from_mode(0o755))
+                .expect("chmod worker script");
+        }
+
+        fs::write(
+            workspace_root.join("luchta-config.sh"),
+            format!(
+                "#!/bin/sh\necho '{{\"concurrency\":{{\"maxWeight\":4}},\"workers\":{{\"fake\":{{\"command\":\"{}\"}}}},\"tasks\":{{\"build\":{{\"worker\":\"fake\"}}}}}}'\n",
+                worker_script.display()
+            ),
+        )
+        .expect("write config");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                workspace_root.join("luchta-config.sh"),
+                fs::Permissions::from_mode(0o755),
+            )
+            .expect("chmod config");
+        }
+    }
+
+    fn watch_selection<'a>(requested_tasks: &'a [String]) -> TaskSelection<'a> {
+        TaskSelection {
+            requested_tasks,
+            packages: &[],
+            top_level: false,
+            since: None,
+        }
+    }
+
+    struct WatchTestHarness {
+        _temp_dir: tempfile::TempDir,
+        session: WatchSession,
+        started: std::path::PathBuf,
+    }
+
+    impl WatchTestHarness {
+        async fn with_workspace<F>(write_workspace: F) -> Self
+        where
+            F: FnOnce(&std::path::Path, &std::path::Path),
+        {
+            let temp_dir = tempfile::tempdir().expect("create temp dir");
+            let workspace_root = temp_dir.path();
+            let started = workspace_root.join("job-started");
+            write_workspace(workspace_root, &started);
+
+            let session = WatchSession::new(workspace_root, None)
+                .await
+                .expect("create watch session")
+                .expect("session should not be None");
+
+            Self {
+                _temp_dir: temp_dir,
+                session,
+                started,
+            }
+        }
+
+        fn worker_manager_handle(&self) -> Arc<luchta_engine::WorkerManager> {
+            self.session.worker_manager_handle()
+        }
+
+        fn selection(&self) -> TaskSelection<'static> {
+            watch_selection(Box::leak(Box::new(vec!["build".to_string()])))
+        }
+
+        async fn run_cycle(
+            &self,
+            selection: &TaskSelection<'_>,
+            token: CancellationToken,
+        ) -> CycleOutcome {
+            self.session
+                .run_cycle(default_watch_cycle_params(selection), token)
+                .await
+                .expect("watch cycle result")
+        }
+    }
+
+    fn default_watch_cycle_params<'a>(selection: &'a TaskSelection<'a>) -> RunCycleParams<'a> {
+        RunCycleParams {
+            selection,
+            since_affected: None,
+            output: OutputMode::Default,
+            continue_on_failure: false,
+            memory_pressure: MemoryPressureConfig {
+                usage: None,
+                free: None,
+            },
+        }
+    }
+
+    fn cancellation_worker_script(
+        started: &std::path::Path,
+        workspace_root: &std::path::Path,
+    ) -> String {
+        format!(
+            "#!/bin/sh\nwhile IFS= read -r line; do\n  case \"$line\" in\n    *'\"type\":\"resolveTask\"'*)\n      id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\"\\([^\"]*\\)\".*/\\1/p')\n      printf '{{\"type\":\"resolved\",\"id\":\"%s\",\"result\":{{\"decision\":\"accept\"}}}}\\n' \"$id\"\n      ;;\n    *'\"type\":\"run\"'*)\n      echo saw-run >> '{}'
+      id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\"\\([^\"]*\\)\".*/\\1/p')\n      : > '{}'\n      sleep 1\n      printf '{{\"type\":\"done\",\"id\":\"%s\",\"success\":true,\"exitCode\":0}}\\n' \"$id\"\n      ;;
+    *)
+      echo saw-other >> '{}'
+      ;;
+  esac\ndone\n",
+            workspace_root.join("worker-trace").display(),
+            started.display(),
+            workspace_root.join("worker-trace").display()
+        )
+    }
+
+    #[tokio::test]
+    async fn watch_session_reuses_worker_manager_across_two_real_cycles() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let workspace_root = temp_dir.path();
+        write_watch_test_workspace(
+            workspace_root,
+            "#!/bin/sh\nwhile IFS= read -r line; do\n  case \"$line\" in\n    *'\"type\":\"resolveTask\"'*)\n      id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\"\\([^\"]*\\)\".*/\\1/p')\n      printf '{\"type\":\"resolved\",\"id\":\"%s\",\"result\":{\"decision\":\"accept\"}}\\n' \"$id\"\n      ;;\n    *'\"type\":\"run\"'*)\n      id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\"\\([^\"]*\\)\".*/\\1/p')\n      printf '{\"type\":\"done\",\"id\":\"%s\",\"success\":true,\"exitCode\":0}\\n' \"$id\"\n      ;;\n  esac\ndone\n",
+        );
+
+        let session = WatchSession::new(workspace_root, None)
+            .await
+            .expect("create watch session")
+            .expect("session should not be None");
+        let h1 = session.worker_manager_handle();
+
+        let requested_tasks = vec!["build".to_string()];
+        let selection = watch_selection(&requested_tasks);
+
+        let outcome1 = session
+            .run_cycle(
+                RunCycleParams {
+                    selection: &selection,
+                    since_affected: None,
+                    output: OutputMode::Default,
+                    continue_on_failure: false,
+                    memory_pressure: MemoryPressureConfig {
+                        usage: None,
+                        free: None,
+                    },
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .expect("first cycle succeeds");
+        assert_eq!(outcome1, CycleOutcome::Success);
+
+        let outcome2 = session
+            .run_cycle(
+                RunCycleParams {
+                    selection: &selection,
+                    since_affected: None,
+                    output: OutputMode::Default,
+                    continue_on_failure: false,
+                    memory_pressure: MemoryPressureConfig {
+                        usage: None,
+                        free: None,
+                    },
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .expect("second cycle succeeds");
+        assert_eq!(outcome2, CycleOutcome::Success);
+
+        let h2 = session.worker_manager_handle();
+        assert!(
+            Arc::ptr_eq(&h1, &h2),
+            "worker manager Arc should be reused across cycles"
+        );
+
+        session.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn watch_session_cancellation_drains_in_flight_job_and_keeps_workers_alive() {
+        let harness = WatchTestHarness::with_workspace(|workspace_root, started| {
+            write_watch_test_workspace(
+                workspace_root,
+                &cancellation_worker_script(started, workspace_root),
+            );
+        })
+        .await;
+        let h1 = harness.worker_manager_handle();
+        let selection = harness.selection();
+
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let outcome = harness.run_cycle(&selection, cancel).await;
+        assert_eq!(outcome, CycleOutcome::Cancelled);
+        assert!(
+            !harness.started.exists(),
+            "cancel before dispatch must not start worker job"
+        );
+        assert_eq!(outcome, CycleOutcome::Cancelled);
+        assert!(
+            !harness.session.worker_manager_is_shutdown(),
+            "cancel path must not shut down worker manager"
+        );
+
+        let h2 = harness.worker_manager_handle();
+        assert!(
+            Arc::ptr_eq(&h1, &h2),
+            "worker manager Arc should survive cancelled cycle"
+        );
+
+        let outcome2 = harness
+            .run_cycle(&selection, CancellationToken::new())
+            .await;
+        assert_eq!(outcome2, CycleOutcome::Success);
+        assert!(
+            Arc::ptr_eq(&h1, &harness.worker_manager_handle()),
+            "worker manager Arc should be reused after cancellation"
+        );
+        assert!(
+            !harness.session.worker_manager_is_shutdown(),
+            "worker manager should stay alive after successful reuse"
+        );
+
+        harness.session.shutdown().await;
     }
 }
