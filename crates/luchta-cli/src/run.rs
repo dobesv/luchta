@@ -2067,8 +2067,8 @@ fn compute_cycle_outcome(was_cancelled: bool, any_failed: &AtomicBool) -> CycleO
 /// - `None` = run all matching tasks (full build)
 /// - `Some(&set)` = run only tasks for packages in the set
 ///
-/// The `cancel_token` allows cancelling in-flight work. Full cancel wiring is
-/// task 923e6b06 — for now we pass it through for future use.
+/// The `cancel_token` is active: dispatch races against cancellation so watch-mode
+/// rebuilds can stop in-flight work without shutting down resident workers.
 pub(crate) fn run_cycle<'a>(
     run: &'a RunContext,
     params: RunCycleParams<'a>,

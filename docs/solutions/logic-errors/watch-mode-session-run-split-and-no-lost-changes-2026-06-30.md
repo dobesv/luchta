@@ -67,7 +67,7 @@ When cycle 2 started, the Notify permit from the cancel path was still unconsume
 
 ### 1. Session/run split (Path B, not Path A)
 
-```
+```text
 WatchSession (long-lived):
   - owns Arc<WorkerManager>
   - owns PackageGraph, TaskGraph (static config)

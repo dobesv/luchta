@@ -32,8 +32,11 @@ const IGNORED_DIR_NAMES: &[&str] = &["target", "node_modules", ".git", ".luchta"
 
 type SharedDebouncer = Arc<Mutex<Debouncer<RecommendedWatcher, FileIdMap>>>;
 
-/// Keeps debouncer and bridge task alive. Dropping handle stops watching and releases OS watches.
+/// Keeps debouncer and bridge task alive. Dropping handle aborts bridge task and
+/// releases this handle's debouncer reference; OS-watch teardown happens when last
+/// debouncer reference is dropped, not necessarily synchronously with `drop`.
 pub struct WatcherHandle {
+    #[allow(dead_code)]
     debouncer: Option<SharedDebouncer>,
     bridge_task: JoinHandle<()>,
 }
@@ -41,9 +44,6 @@ pub struct WatcherHandle {
 impl Drop for WatcherHandle {
     fn drop(&mut self) {
         self.bridge_task.abort();
-        if let Some(debouncer) = &self.debouncer {
-            drop(debouncer.lock());
-        }
     }
 }
 
@@ -208,11 +208,14 @@ fn normalize_absolute_path(path: PathBuf) -> Option<PathBuf> {
     std::fs::canonicalize(&path).ok()
 }
 
-fn is_ignored_by_name(path: &Path) -> bool {
-    path.components().any(|component| {
-        let name = component.as_os_str().to_string_lossy();
-        IGNORED_DIR_NAMES.iter().any(|ignored| name == *ignored)
-    })
+fn is_ignored_by_name(workspace_root: &Path, path: &Path) -> bool {
+    path.strip_prefix(workspace_root)
+        .unwrap_or(path)
+        .components()
+        .any(|component| {
+            let name = component.as_os_str().to_string_lossy();
+            IGNORED_DIR_NAMES.iter().any(|ignored| name == *ignored)
+        })
 }
 
 struct IgnoreFilter {
@@ -261,7 +264,7 @@ impl IgnoreFilter {
     }
 
     fn should_ignore(&self, absolute_path: &Path) -> bool {
-        if is_ignored_by_name(absolute_path) {
+        if is_ignored_by_name(&self.workspace_root, absolute_path) {
             return true;
         }
 
@@ -290,7 +293,7 @@ fn discover_watch_dirs(
                 .path()
                 .strip_prefix(&root)
                 .ok()
-                .map(|relative| !is_ignored_by_name(relative))
+                .map(|relative| !is_ignored_by_name(Path::new(""), relative))
                 .unwrap_or(true)
         }
     });
@@ -428,6 +431,22 @@ mod tests {
         let created = created_directories(&ignore_filter, events.iter());
         let expected: HashSet<_> = [watched_dir].into_iter().collect();
         assert_eq!(created, expected);
+    }
+
+    #[test]
+    fn workspace_ancestor_named_like_ignored_dir_does_not_hide_workspace_paths() {
+        let temp = tempdir().expect("create tempdir");
+        let root = canonical(temp.path());
+        let workspace_root = root.join("target/workspace");
+        let source_dir = workspace_root.join("src");
+        let source_file = source_dir.join("main.ts");
+        fs::create_dir_all(&source_dir).expect("create source dir");
+        fs::write(&source_file, "export const value = 1;\n").expect("write source file");
+        let ignore_filter = IgnoreFilter::new(&workspace_root).expect("build ignore filter");
+
+        assert!(!ignore_filter.should_ignore(&source_file));
+        assert!(ignore_filter.should_watch_dir(&workspace_root));
+        assert!(ignore_filter.should_watch_dir(&source_dir));
     }
 
     #[test]

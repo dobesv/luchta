@@ -274,41 +274,45 @@ where
 
     ui.started();
 
-    if should_stop(
-        run_initial_watch_cycle(
-            &session,
-            &selection,
-            &config,
-            &active_cycle,
-            &ui,
-            &mut signals,
-        )
-        .await?,
-    ) {
-        finish_shutdown(session, watcher_handle, drain_task).await;
-        return Ok(());
-    }
-
-    loop {
+    let result: Result<()> = async {
         if should_stop(
-            run_one_iteration(
-                WatchIterationContext {
-                    session: &session,
-                    selection: &selection,
-                    config: &config,
-                    pending: &pending,
-                    wake: &wake,
-                    active_cycle: &active_cycle,
-                    ui: &ui,
-                },
+            run_initial_watch_cycle(
+                &session,
+                &selection,
+                &config,
+                &active_cycle,
+                &ui,
                 &mut signals,
             )
             .await?,
         ) {
-            finish_shutdown(session, watcher_handle, drain_task).await;
             return Ok(());
         }
+
+        loop {
+            if should_stop(
+                run_one_iteration(
+                    WatchIterationContext {
+                        session: &session,
+                        selection: &selection,
+                        config: &config,
+                        pending: &pending,
+                        wake: &wake,
+                        active_cycle: &active_cycle,
+                        ui: &ui,
+                    },
+                    &mut signals,
+                )
+                .await?,
+            ) {
+                return Ok(());
+            }
+        }
     }
+    .await;
+
+    finish_shutdown(session, watcher_handle, drain_task).await;
+    result
 }
 
 fn should_stop(control: WatchControl) -> bool {
