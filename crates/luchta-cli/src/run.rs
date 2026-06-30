@@ -2046,10 +2046,14 @@ mod tests {
     }
 }
 
-fn compute_cycle_outcome(was_cancelled: bool, any_failed: &AtomicBool) -> CycleOutcome {
+fn compute_cycle_outcome(
+    was_cancelled: bool,
+    was_interrupted: bool,
+    any_failed: &AtomicBool,
+) -> CycleOutcome {
     if was_cancelled {
         CycleOutcome::Cancelled
-    } else if any_failed.load(Ordering::SeqCst) {
+    } else if was_interrupted || any_failed.load(Ordering::SeqCst) {
         CycleOutcome::Failed
     } else {
         CycleOutcome::Success
@@ -2319,9 +2323,19 @@ async fn finalize_and_report(inputs: FinalizeCycle<'_>) -> Result<(CycleOutcome,
     // walker can drain.
     finalize_cycle(walker, receiver_option, was_interrupted || was_cancelled).await?;
 
-    let outcome = compute_cycle_outcome(was_cancelled, any_failed);
+    let outcome = compute_cycle_outcome(was_cancelled, was_interrupted, any_failed);
 
-    report_run_outcome(run_result, any_failed, reporter, pressure_state)?;
+    // `outcome` already encodes task failure for the caller. `report_run_outcome`
+    // returns `Err(TasksFailed)` when `any_failed` is set; we must NOT let that
+    // short-circuit here, or callers never get to shut down workers (one-shot
+    // `luchta run`) or keep watching after a failed build (`luchta watch`).
+    // A non-`any_failed` error is a genuine failure (e.g. walker panic) and is
+    // still propagated.
+    if let Err(err) = report_run_outcome(run_result, any_failed, reporter, pressure_state) {
+        if !any_failed.load(Ordering::SeqCst) {
+            return Err(err);
+        }
+    }
 
     Ok((outcome, was_interrupted))
 }
@@ -2473,6 +2487,10 @@ mod watch_tests {
         )
     }
 
+    fn failing_worker_script() -> &'static str {
+        "#!/bin/sh\nwhile IFS= read -r line; do\n  case \"$line\" in\n    *'\"type\":\"resolveTask\"'*)\n      id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\"\\([^\"]*\\)\".*/\\1/p')\n      printf '{\"type\":\"resolved\",\"id\":\"%s\",\"result\":{\"decision\":\"accept\"}}\\n' \"$id\"\n      ;;\n    *'\"type\":\"run\"'*)\n      id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\"\\([^\"]*\\)\".*/\\1/p')\n      printf '{\"type\":\"done\",\"id\":\"%s\",\"success\":false,\"exitCode\":1}\\n' \"$id\"\n      ;;\n  esac\ndone\n"
+    }
+
     #[tokio::test]
     async fn watch_session_reuses_worker_manager_across_two_real_cycles() {
         let temp_dir = tempfile::tempdir().expect("create temp dir");
@@ -2534,6 +2552,41 @@ mod watch_tests {
         );
 
         session.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn watch_session_run_cycle_reports_failed_outcome_without_poisoning_session() {
+        let harness = WatchTestHarness::with_workspace(|workspace_root, _started| {
+            write_watch_test_workspace(workspace_root, failing_worker_script());
+        })
+        .await;
+        let h1 = harness.worker_manager_handle();
+        let selection = harness.selection();
+
+        let outcome1 = harness
+            .run_cycle(&selection, CancellationToken::new())
+            .await;
+        assert_eq!(outcome1, CycleOutcome::Failed);
+
+        let outcome2 = harness
+            .run_cycle(&selection, CancellationToken::new())
+            .await;
+        assert_eq!(outcome2, CycleOutcome::Failed);
+        assert!(
+            Arc::ptr_eq(&h1, &harness.worker_manager_handle()),
+            "worker manager Arc should survive failed cycle for watch reuse"
+        );
+
+        harness.session.shutdown().await;
+    }
+
+    #[test]
+    fn compute_cycle_outcome_maps_interrupted_cycles_to_failed() {
+        let any_failed = AtomicBool::new(false);
+        assert_eq!(
+            compute_cycle_outcome(false, true, &any_failed),
+            CycleOutcome::Failed
+        );
     }
 
     #[tokio::test]
