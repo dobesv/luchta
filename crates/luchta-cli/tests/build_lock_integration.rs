@@ -215,7 +215,11 @@ fn concurrent_runs_wait_for_build_lock_across_processes() {
 
     wait_for_waiting_message(second_stderr.path());
     assert!(
-        second.child_mut().try_wait().expect("poll second process").is_none(),
+        second
+            .child_mut()
+            .try_wait()
+            .expect("poll second process")
+            .is_none(),
         "second process should still be blocked after waiting message"
     );
 
