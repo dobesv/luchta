@@ -38,7 +38,7 @@ use tokio_util::sync::CancellationToken;
 
 mod dispatch;
 mod pause;
-use dispatch::{build_command_map, CachePackageContext, CommandMap};
+use dispatch::{build_command_map, CommandMap};
 use pause::dispatch_loop;
 
 mod setup;
@@ -349,50 +349,40 @@ pub(crate) async fn prepare_session_context(
     }))
 }
 
-/// Shared, read-only context the dispatch loop hands to each ready task.
-struct DispatchContext<'a> {
-    tasks_to_run: &'a HashSet<TaskId>,
-    commands: &'a HashMap<TaskId, ExecutionRequest>,
-    invalid: &'a HashMap<TaskId, String>,
-    task_envs: &'a HashMap<TaskId, BTreeMap<String, EnvSpec>>,
-    executor: &'a Arc<WeightedExecutor>,
-    any_failed: &'a Arc<AtomicBool>,
-    interrupted: &'a Arc<AtomicBool>,
-    continue_on_failure: bool,
-    worker_manager: &'a Arc<WorkerManager>,
-    workspace_root: &'a Path,
-    package_graph: &'a PackageGraph,
-    packages: &'a [PackageNode],
-    task_graph: &'a TaskGraph,
-    cache: &'a Arc<Cache>,
-    output_hashes: &'a Arc<Mutex<HashMap<TaskId, [u8; 32]>>>,
-    reporter: &'a Arc<ProgressReporter>,
-    lockfile: &'a LockfileState,
+#[derive(Clone)]
+struct DecisionContext {
+    task_envs: Arc<HashMap<TaskId, BTreeMap<String, EnvSpec>>>,
+    workspace_root: PathBuf,
+    package_graph: Arc<PackageGraph>,
+    packages: Arc<Vec<PackageNode>>,
+    task_graph: Arc<TaskGraph>,
+    cache: Arc<Cache>,
+    output_hashes: Arc<Mutex<HashMap<TaskId, [u8; 32]>>>,
+    lockfile: Arc<LockfileState>,
     /// Shared cache for cross-worktree cache hits. `None` if shared cache disabled.
     shared_cache: Option<Arc<SharedCache>>,
     /// Run-scoped directory listing cache shared across all task resolvers.
-    listing_cache: &'a Arc<ListingCache>,
+    listing_cache: Arc<ListingCache>,
     /// Workers map for nonce resolution.
-    workers: &'a HashMap<String, WorkerDefinition>,
+    workers: Arc<HashMap<String, WorkerDefinition>>,
     /// Global cache nonce from LuchtaConfig.cache.
     global_cache_nonce: Option<String>,
     /// Environment nonce from LUCHTA_CACHE_NONCE (read once at startup).
     env_cache_nonce: Option<String>,
+    /// Progress reporter, used to replay captured logs on shared-cache hits.
+    reporter: Arc<ProgressReporter>,
 }
 
-impl<'a> DispatchContext<'a> {
-    /// Resolves the cache nonce for a task, combining all four sources.
+impl DecisionContext {
     fn resolve_task_nonce(&self, task_def: &TaskDefinition) -> Option<String> {
         let env_nonce = self.env_cache_nonce.as_deref();
         let global_nonce = self.global_cache_nonce.as_deref();
-        // Worker nonce: sparse lookup — missing worker or dangling ref yields None
         let worker_nonce = task_def
             .worker
             .as_deref()
             .and_then(|w| self.workers.get(w))
             .and_then(|wd| wd.cache.as_ref())
             .and_then(|c| c.cache_nonce.as_deref());
-        // Task nonce
         let task_nonce = task_def
             .cache
             .as_ref()
@@ -400,6 +390,27 @@ impl<'a> DispatchContext<'a> {
 
         crate::cache_nonce::resolve_cache_nonce(env_nonce, global_nonce, worker_nonce, task_nonce)
     }
+}
+
+/// Shared, read-only context the dispatch loop hands to each ready task.
+struct DispatchContext<'a> {
+    tasks_to_run: &'a HashSet<TaskId>,
+    commands: &'a HashMap<TaskId, ExecutionRequest>,
+    invalid: &'a HashMap<TaskId, String>,
+    executor: &'a Arc<WeightedExecutor>,
+    any_failed: &'a Arc<AtomicBool>,
+    interrupted: &'a Arc<AtomicBool>,
+    continue_on_failure: bool,
+    worker_manager: &'a Arc<WorkerManager>,
+    workspace_root: &'a Path,
+    packages: &'a [PackageNode],
+    task_graph: &'a TaskGraph,
+    cache: &'a Arc<Cache>,
+    output_hashes: &'a Arc<Mutex<HashMap<TaskId, [u8; 32]>>>,
+    reporter: &'a Arc<ProgressReporter>,
+    /// Shared cache for cross-worktree cache hits. `None` if shared cache disabled.
+    shared_cache: Option<Arc<SharedCache>>,
+    decision_ctx: DecisionContext,
 }
 
 struct TaskRunContext {
@@ -437,24 +448,28 @@ struct CacheWriteContext {
     decision: CacheDecisionContext,
 }
 
-struct CacheStateContext<'a> {
-    cache_package: CachePackageContext<'a>,
+struct CacheStateContext {
+    cache_package: CachePackageContextOwned,
     dep_outputs: BTreeMap<String, [u8; 32]>,
     pkg_dep_pairs: Vec<(String, String)>,
     resolver: PackageDirResolver,
+}
+
+struct CachePackageContextOwned {
+    package_path: PathBuf,
+    package_name: PackageName,
 }
 
 struct CacheCurrentStateInput<'a> {
     task_def: &'a TaskDefinition,
     merged_env: &'a BTreeMap<String, EnvSpec>,
     nonce: Option<&'a str>,
-    cache_context: &'a CacheStateContext<'a>,
+    cache_context: &'a CacheStateContext,
 }
 
 struct SharedCacheSkipInput<'a> {
     task_id: &'a TaskId,
     task_def: &'a TaskDefinition,
-    cache_context: &'a CacheStateContext<'a>,
     current: &'a CurrentState<'a>,
     decision: &'a DecisionResult,
 }
@@ -2176,25 +2191,34 @@ fn build_dispatch_context<'a>(inputs: BuildDispatchContext<'a>) -> DispatchConte
         tasks_to_run,
         commands: &resources.commands,
         invalid: &resources.invalid,
-        task_envs: &resources.task_envs,
         executor: &resources.executor,
         any_failed,
         interrupted,
         continue_on_failure,
         worker_manager: &run.worker_manager,
         workspace_root: &run.workspace_root,
-        package_graph: &run.package_graph,
         packages: &run.package_nodes,
         task_graph: &run.task_graph,
         cache: &resources.cache,
         output_hashes: &resources.output_hashes,
         reporter,
-        lockfile: lockfile_state,
         shared_cache: resources.shared_cache.clone(),
-        listing_cache: &resources.listing_cache,
-        workers: &run.workers,
-        global_cache_nonce: run.global_cache_nonce.clone(),
-        env_cache_nonce: std::env::var("LUCHTA_CACHE_NONCE").ok(),
+        decision_ctx: DecisionContext {
+            task_envs: Arc::new(resources.task_envs.clone()),
+            workspace_root: run.workspace_root.clone(),
+            package_graph: Arc::new(run.package_graph.clone()),
+            packages: Arc::new(run.package_nodes.clone()),
+            task_graph: Arc::new(run.task_graph.clone()),
+            cache: Arc::clone(&resources.cache),
+            output_hashes: Arc::clone(&resources.output_hashes),
+            lockfile: Arc::new(lockfile_state.clone()),
+            shared_cache: resources.shared_cache.clone(),
+            listing_cache: Arc::clone(&resources.listing_cache),
+            workers: Arc::new(run.workers.clone()),
+            global_cache_nonce: run.global_cache_nonce.clone(),
+            env_cache_nonce: std::env::var("LUCHTA_CACHE_NONCE").ok(),
+            reporter: Arc::clone(reporter),
+        },
     }
 }
 

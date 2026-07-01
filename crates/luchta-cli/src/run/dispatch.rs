@@ -252,7 +252,7 @@ fn handle_cache_skip(
         return false;
     }
 
-    let Some(decision) = try_cache_skip(task_id, ctx) else {
+    let Some(decision) = try_cache_skip(task_id, &ctx.decision_ctx) else {
         return false;
     };
 
@@ -288,10 +288,11 @@ fn build_task_run_context(
 ) -> TaskRunContext {
     let output_hash_record =
         build_output_hash_record_context(task_id, ctx.task_graph, ctx.packages, ctx.workspace_root);
-    let cache_write = match build_cache_write_context(task_id, ctx) {
+    let cache_write = match build_cache_write_context(task_id, &ctx.decision_ctx) {
         CacheInputState::Ready(mut cache_ctx) => {
             if cache_enabled {
-                let decision = build_cache_decision_context(task_id, ctx, &mut cache_ctx);
+                let decision =
+                    build_cache_decision_context(task_id, &ctx.decision_ctx, &mut cache_ctx);
                 match decision.action {
                     Decision::Run => Some(*cache_ctx),
                     Decision::Skip => None,
@@ -451,7 +452,7 @@ fn cache_run_decision() -> CacheDecisionContext {
         run_reason: RunReason::NoPriorRecord,
     }
 }
-fn build_cache_write_context(task_id: &TaskId, ctx: &DispatchContext<'_>) -> CacheInputState {
+fn build_cache_write_context(task_id: &TaskId, ctx: &DecisionContext) -> CacheInputState {
     let Some(task_def) = ctx.task_graph.task_definition(task_id).cloned() else {
         return CacheInputState::Disabled;
     };
@@ -485,31 +486,31 @@ fn build_cache_write_context(task_id: &TaskId, ctx: &DispatchContext<'_>) -> Cac
         env_hash,
         pkg_dep_hash,
         start_unix_ms: now_unix_ms(),
-        repo_root: ctx.workspace_root.to_path_buf(),
+        repo_root: ctx.workspace_root.clone(),
         source_pkg: cache_context.cache_package.package_name.clone(),
-        package_graph: ctx.package_graph.clone(),
+        package_graph: (*ctx.package_graph).clone(),
         cache_nonce: nonce,
         decision: cache_run_decision(),
     }))
 }
 
-fn cache_state_context<'a>(
-    task_id: &TaskId,
-    ctx: &'a DispatchContext<'_>,
-) -> Option<CacheStateContext<'a>> {
-    let cache_package = cache_package_context_for(ctx.packages, ctx.workspace_root, task_id)?;
-    let dep_outputs = dependency_output_hashes(task_id, ctx.task_graph, ctx.output_hashes);
+fn cache_state_context(task_id: &TaskId, ctx: &DecisionContext) -> Option<CacheStateContext> {
+    let cache_package = cache_package_context_for(&ctx.packages, &ctx.workspace_root, task_id)?;
+    let dep_outputs = dependency_output_hashes(task_id, &ctx.task_graph, &ctx.output_hashes);
     let pkg_dep_pairs = cache_pkg_dep_pairs(task_id, ctx, &cache_package)?;
     let resolver = PackageDirResolver::new(
         cache_package.package_path.clone(),
-        ctx.workspace_root.to_path_buf(),
+        ctx.workspace_root.clone(),
         cache_package.package_name.clone(),
-        ctx.package_graph.clone(),
-        Arc::clone(ctx.listing_cache),
+        (*ctx.package_graph).clone(),
+        Arc::clone(&ctx.listing_cache),
     );
 
     Some(CacheStateContext {
-        cache_package,
+        cache_package: CachePackageContextOwned {
+            package_path: cache_package.package_path.clone(),
+            package_name: cache_package.package_name.clone(),
+        },
         dep_outputs,
         pkg_dep_pairs,
         resolver,
@@ -518,7 +519,7 @@ fn cache_state_context<'a>(
 
 fn cache_pkg_dep_pairs(
     task_id: &TaskId,
-    ctx: &DispatchContext<'_>,
+    ctx: &DecisionContext,
     cache_package: &CachePackageContext<'_>,
 ) -> Option<Vec<(String, String)>> {
     let synthetic_package;
@@ -534,8 +535,8 @@ fn cache_pkg_dep_pairs(
 
     match gather_pkg_dep_pairs(
         package,
-        cache_package.package.map(|_| ctx.package_graph),
-        ctx.lockfile,
+        cache_package.package.map(|_| ctx.package_graph.as_ref()),
+        ctx.lockfile.as_ref(),
     ) {
         Ok(pkg_dep_pairs) => Some(pkg_dep_pairs),
         Err(error) => {
@@ -841,7 +842,7 @@ fn format_task_error(error: &luchta_engine::ExecutorError) -> String {
 
 fn build_cache_decision_context(
     task_id: &TaskId,
-    ctx: &DispatchContext<'_>,
+    ctx: &DecisionContext,
     cache_ctx: &mut CacheWriteContext,
 ) -> CacheDecisionContext {
     let task_def = cache_ctx.task_def.clone();
@@ -867,19 +868,19 @@ fn build_cache_decision_context(
         SharedCacheSkipInput {
             task_id,
             task_def: &task_def,
-            cache_context: &cache_context,
             current: &current,
             decision: &decision,
         },
+        &cache_context.dep_outputs,
     );
     cache_ctx.decision.clone()
 }
 
-fn cache_read_state_context<'a>(
+fn cache_read_state_context(
     task_id: &TaskId,
-    ctx: &'a DispatchContext<'_>,
+    ctx: &DecisionContext,
     cache_ctx: &mut CacheWriteContext,
-) -> Option<CacheStateContext<'a>> {
+) -> Option<CacheStateContext> {
     let Some(cache_context) = cache_state_context(task_id, ctx) else {
         cache_ctx.decision = cache_run_decision();
         return None;
@@ -896,9 +897,10 @@ fn cache_decision_from_result(decision: &DecisionResult) -> CacheDecisionContext
 }
 
 fn maybe_mark_shared_cache_hit(
-    ctx: &DispatchContext<'_>,
+    ctx: &DecisionContext,
     cache_ctx: &mut CacheWriteContext,
     input: SharedCacheSkipInput<'_>,
+    dep_outputs: &BTreeMap<String, [u8; 32]>,
 ) {
     if !matches!(input.decision.action, Decision::Run) {
         return;
@@ -908,9 +910,9 @@ fn maybe_mark_shared_cache_hit(
         input.task_id,
         ctx,
         input.task_def,
-        &input.cache_context.cache_package,
+        &cache_ctx.package_path,
         input.current,
-        &input.cache_context.dep_outputs,
+        dep_outputs,
     ) {
         if matches!(shared_decision, Decision::SharedHit) {
             cache_ctx.decision.action = Decision::SharedHit;
@@ -918,7 +920,7 @@ fn maybe_mark_shared_cache_hit(
     }
 }
 
-fn try_cache_skip(task_id: &TaskId, ctx: &DispatchContext<'_>) -> Option<Decision> {
+pub(super) fn try_cache_skip(task_id: &TaskId, ctx: &DecisionContext) -> Option<Decision> {
     let task_def = ctx.task_graph.task_definition(task_id)?;
 
     // Resolve nonce using the same helper as the write path.
@@ -935,9 +937,9 @@ fn try_cache_skip(task_id: &TaskId, ctx: &DispatchContext<'_>) -> Option<Decisio
 
 fn try_shared_cache_skip(
     task_id: &TaskId,
-    ctx: &DispatchContext<'_>,
+    ctx: &DecisionContext,
     task_def: &TaskDefinition,
-    cache_package: &CachePackageContext<'_>,
+    package_path: &Path,
     current: &CurrentState<'_>,
     dep_outputs: &BTreeMap<String, [u8; 32]>,
 ) -> Option<Decision> {
@@ -960,11 +962,9 @@ fn try_shared_cache_skip(
 
     // Try restore from shared cache with validation.
     // Iterate candidates newest-first; validate each before committing.
-    for candidate in shared_cache.try_restore_candidates(
-        &task_id.to_string(),
-        &input_key,
-        &cache_package.package_path,
-    ) {
+    for candidate in
+        shared_cache.try_restore_candidates(&task_id.to_string(), &input_key, package_path)
+    {
         // VALIDATE: Use decide_shared_restore to check if this candidate matches current tree state.
         // Unlike full decide(), this does NOT require outputs to exist in the tree —
         // we're ABOUT to restore outputs from the blob.
@@ -977,10 +977,11 @@ fn try_shared_cache_skip(
                     // (a) Outputs now restored to package dir.
                     // (b) Hydrate local cache for next build.
                     hydrate_local_cache(ctx.cache.clone(), task_id.clone(), &hit);
-                    // (c) Replay logs via reporter (so output appears as if task ran).
-                    replay_logs(&hit, ctx.reporter);
+                    // (c) Replay the restored task's captured stdout/stderr so a
+                    // shared-cache hit produces the same visible output as on main.
+                    replay_logs(&hit, &ctx.reporter);
                     // (d) Record output hash for downstream invalidation.
-                    record_output_hash(ctx.output_hashes, task_id, hit.outputs_hash);
+                    record_output_hash(&ctx.output_hashes, task_id, hit.outputs_hash);
                     // (e) Return dedicated shared-hit decision so dispatcher can count it.
                     return Some(Decision::SharedHit);
                 }
@@ -1643,7 +1644,7 @@ fn hydrate_local_cache(cache: Arc<Cache>, task_id: TaskId, hit: &RestoredHit) {
 ///
 /// This mirrors how the normal run path emits logs so output appears
 /// as if the task actually ran.
-fn replay_logs(hit: &RestoredHit, _reporter: &Arc<ProgressReporter>) {
+pub(super) fn replay_logs(hit: &RestoredHit, _reporter: &Arc<ProgressReporter>) {
     // Replay stdout
     if !hit.stdout.is_empty() {
         if let Ok(stdout_str) = std::str::from_utf8(&hit.stdout) {
@@ -1719,6 +1720,8 @@ mod tests {
                 1,
             ))));
 
+            let cache = Box::leak(Box::new(open_test_cache(temp_dir.path())));
+            let output_hashes = Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
             let ctx = DispatchContext {
                 tasks_to_run: Box::leak(Box::new(HashSet::from([task_id.clone()]))),
                 commands: Box::leak(Box::new(HashMap::new())),
@@ -1726,25 +1729,34 @@ mod tests {
                     task_id.clone(),
                     "task missing worker".to_string(),
                 )]))),
-                task_envs: Box::leak(Box::new(HashMap::new())),
                 executor: Box::leak(Box::new(Arc::new(WeightedExecutor::new(1)))),
                 any_failed: Box::leak(Box::new(Arc::new(AtomicBool::new(true)))),
                 interrupted: Box::leak(Box::new(Arc::new(AtomicBool::new(false)))),
                 continue_on_failure: false,
                 worker_manager: Box::leak(Box::new(Arc::new(WorkerManager::new(HashMap::new())))),
                 workspace_root: temp_dir.path(),
-                package_graph,
-                packages: Box::leak(Box::new(vec![package])),
+                packages: Box::leak(Box::new(vec![package.clone()])),
                 task_graph,
-                cache: Box::leak(Box::new(open_test_cache(temp_dir.path()))),
-                output_hashes: Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new())))),
+                cache,
+                output_hashes,
                 reporter,
-                lockfile: Box::leak(Box::new(LockfileState::Absent)),
                 shared_cache: None,
-                listing_cache: Box::leak(Box::new(Arc::new(ListingCache::default()))),
-                workers: Box::leak(Box::new(HashMap::new())),
-                global_cache_nonce: None,
-                env_cache_nonce: None,
+                decision_ctx: DecisionContext {
+                    task_envs: Arc::new(HashMap::new()),
+                    workspace_root: temp_dir.path().to_path_buf(),
+                    package_graph: Arc::new(package_graph.clone()),
+                    packages: Arc::new(vec![package.clone()]),
+                    task_graph: Arc::new(task_graph.clone()),
+                    cache: Arc::clone(cache),
+                    output_hashes: Arc::clone(output_hashes),
+                    lockfile: Arc::new(LockfileState::Absent),
+                    shared_cache: None,
+                    listing_cache: Arc::new(ListingCache::default()),
+                    workers: Arc::new(HashMap::new()),
+                    global_cache_nonce: None,
+                    env_cache_nonce: None,
+                    reporter: Arc::clone(reporter),
+                },
             };
 
             Self { task_id, ctx }
@@ -1904,6 +1916,40 @@ mod tests {
         };
 
         assert_eq!(record.run_reason, None);
+    }
+
+    #[test]
+    fn replay_logs_accepts_restored_hit_output() {
+        let reporter = Arc::new(ProgressReporter::new(
+            OutputMode::Default,
+            HashMap::new(),
+            0,
+        ));
+        let task_id = TaskId::new("pkg", "build");
+        let record = match build_run_record(
+            &sample_cache_write_context(task_id),
+            BuildRunRecordArgs {
+                outcome: None,
+                succeeded: true,
+                end_unix_ms: 20,
+                run_reason: Some(RunReason::NoPriorRecord),
+            },
+        ) {
+            BuildRecordResult::Ok(record) => *record,
+            BuildRecordResult::ExpansionError(msg) => panic!("unexpected expansion error: {msg}"),
+        };
+        let hit = RestoredHit {
+            record,
+            outputs_hash: [9; 32],
+            stdout: b"restored stdout\n".to_vec(),
+            stderr: b"restored stderr\n".to_vec(),
+            reports: Vec::new(),
+        };
+
+        // Restored stdout/stderr replay for a shared-cache hit must not panic and
+        // is wired back into the shared-cache-hit path (regression guard: this
+        // call was dropped during the owned-decision-context refactor).
+        replay_logs(&hit, &reporter);
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use std::{
+    cmp::Ordering,
     collections::{BTreeSet, HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
@@ -40,13 +41,33 @@ const COMBINED_OUTPUTS_HASH_DOMAIN: &[u8] = b"luchta-cache:combined-outputs:v1";
 #[derive(Debug, Clone, Default)]
 pub struct ListingCache {
     input_candidates: Arc<Mutex<HashMap<PathBuf, Arc<Vec<PathBuf>>>>>,
-    output_candidates: Arc<Mutex<HashMap<PathBuf, Arc<Vec<PathBuf>>>>>,
+    output_candidates: Arc<Mutex<HashMap<OutputCandidateCacheKey, Arc<Vec<PathBuf>>>>>,
     /// Maps a resolved `base_dir` to its discovered git worktree root, so
     /// `gix::discover` (which walks up the filesystem to find `.git`) runs once
     /// per distinct base_dir per run instead of once per task. Keyed by exact
     /// base_dir — NOT by prefix — so a nested repository/submodule inside a
     /// parent worktree is never served the parent's root.
     worktree_roots: Arc<Mutex<HashMap<PathBuf, PathBuf>>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct OutputCandidateCacheKey {
+    base_dir: PathBuf,
+    /// `None` means "full package walk" (no extractable static prefix);
+    /// `Some([])` means "walk nothing" (task declares no outputs). These are
+    /// distinct listing modes and MUST hash to distinct keys — collapsing them
+    /// would let an empty-output resolve poison the cache for a later full walk
+    /// and skip all of that package's outputs.
+    prefixes: Option<Vec<PathBuf>>,
+}
+
+impl OutputCandidateCacheKey {
+    fn new(base_dir: &Path, prefixes: Option<&[PathBuf]>) -> Self {
+        Self {
+            base_dir: base_dir.to_path_buf(),
+            prefixes: prefixes.map(<[PathBuf]>::to_vec),
+        }
+    }
 }
 
 impl ListingCache {
@@ -60,13 +81,24 @@ impl ListingCache {
         }
     }
 
-    fn get_output_candidates(&self, base_dir: &Path) -> Option<Arc<Vec<PathBuf>>> {
-        self.output_candidates.lock().ok()?.get(base_dir).cloned()
+    fn get_output_candidates(
+        &self,
+        base_dir: &Path,
+        prefixes: Option<&[PathBuf]>,
+    ) -> Option<Arc<Vec<PathBuf>>> {
+        let key = OutputCandidateCacheKey::new(base_dir, prefixes);
+        self.output_candidates.lock().ok()?.get(&key).cloned()
     }
 
-    fn insert_output_candidates(&self, base_dir: &Path, candidates: Arc<Vec<PathBuf>>) {
+    fn insert_output_candidates(
+        &self,
+        base_dir: &Path,
+        prefixes: Option<&[PathBuf]>,
+        candidates: Arc<Vec<PathBuf>>,
+    ) {
         if let Ok(mut cache) = self.output_candidates.lock() {
-            cache.insert(base_dir.to_path_buf(), candidates);
+            let key = OutputCandidateCacheKey::new(base_dir, prefixes);
+            cache.insert(key, candidates);
         }
     }
 
@@ -276,7 +308,7 @@ fn cached_input_candidates(
         &mut worktree_root_cache,
         listing_cache,
     )?
-    .list(base_dir)?;
+    .list(base_dir, None)?;
     if let Some(cache) = listing_cache {
         cache.insert_input_candidates(base_dir, Arc::new(candidates.clone()));
     }
@@ -303,7 +335,15 @@ pub fn resolve_outputs_with_options(
     patterns: &[String],
     options: ResolveOptions<'_>,
 ) -> Result<Vec<FileEntry>> {
-    resolve_with(base_dir, patterns, &FilesystemLister, &StdFs, options)
+    let prefixes = prefix_union(patterns);
+    resolve_with(
+        base_dir,
+        patterns,
+        prefixes,
+        &FilesystemLister,
+        &StdFs,
+        options,
+    )
 }
 
 fn resolve_with_candidates(
@@ -462,27 +502,35 @@ pub fn combined_outputs_hash(entries: &[FileEntry]) -> [u8; 32] {
 fn resolve_with(
     base_dir: &Path,
     patterns: &[String],
+    prefixes: Option<Vec<PathBuf>>,
     candidate_lister: &dyn CandidateLister,
     file_reader: &dyn FileReader,
     options: ResolveOptions<'_>,
 ) -> Result<Vec<FileEntry>> {
-    let candidates = cached_output_candidates(base_dir, candidate_lister, options.listing_cache)?;
+    let candidates = cached_output_candidates(
+        base_dir,
+        prefixes.as_deref(),
+        candidate_lister,
+        options.listing_cache,
+    )?;
     resolve_with_candidates(base_dir, patterns, candidates, file_reader, options)
 }
 
 fn cached_output_candidates(
     base_dir: &Path,
+    prefixes: Option<&[PathBuf]>,
     candidate_lister: &dyn CandidateLister,
     listing_cache: Option<&ListingCache>,
 ) -> Result<Vec<PathBuf>> {
-    if let Some(candidates) = listing_cache.and_then(|cache| cache.get_output_candidates(base_dir))
+    if let Some(candidates) =
+        listing_cache.and_then(|cache| cache.get_output_candidates(base_dir, prefixes))
     {
         return Ok((*candidates).clone());
     }
 
-    let candidates = candidate_lister.list(base_dir)?;
+    let candidates = candidate_lister.list(base_dir, prefixes)?;
     if let Some(cache) = listing_cache {
-        cache.insert_output_candidates(base_dir, Arc::new(candidates.clone()));
+        cache.insert_output_candidates(base_dir, prefixes, Arc::new(candidates.clone()));
     }
     Ok(candidates)
 }
@@ -622,7 +670,7 @@ fn normalize_path(path: &Path) -> String {
 }
 
 trait CandidateLister {
-    fn list(&self, base_dir: &Path) -> Result<Vec<PathBuf>>;
+    fn list(&self, base_dir: &Path, prefixes: Option<&[PathBuf]>) -> Result<Vec<PathBuf>>;
 }
 
 /// Lists candidate input files under a package directory, honoring git's
@@ -660,7 +708,7 @@ impl GitTrackedInputLister {
 }
 
 impl CandidateLister for GitTrackedInputLister {
-    fn list(&self, base_dir: &Path) -> Result<Vec<PathBuf>> {
+    fn list(&self, base_dir: &Path, _prefixes: Option<&[PathBuf]>) -> Result<Vec<PathBuf>> {
         // Open the repo from the already-resolved worktree root (no discovery
         // walk) and build the ignore stack once for this walk. gix's repository
         // and attribute stack are neither `Send` nor `'static`, so they cannot
@@ -745,22 +793,97 @@ fn git_tracked_input_lister(
 struct FilesystemLister;
 
 impl CandidateLister for FilesystemLister {
-    fn list(&self, base_dir: &Path) -> Result<Vec<PathBuf>> {
-        let mut paths = Vec::new();
-        for entry in WalkDir::new(base_dir) {
-            let entry = entry?;
-            if !entry.file_type().is_file() {
+    fn list(&self, base_dir: &Path, prefixes: Option<&[PathBuf]>) -> Result<Vec<PathBuf>> {
+        let Some(prefixes) = prefixes else {
+            return walk_output_candidates(base_dir);
+        };
+        if prefixes.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut paths = BTreeSet::new();
+        for prefix in prefixes {
+            let walk_root = base_dir.join(prefix);
+            if !walk_root.exists() {
                 continue;
             }
-            let relative = entry
-                .path()
-                .strip_prefix(base_dir)
-                .map_err(|err| CacheError::StripBaseDir(err.to_string()))?;
-            paths.push(relative.to_path_buf());
+            for entry in WalkDir::new(&walk_root) {
+                let entry = entry?;
+                if !entry.file_type().is_file() {
+                    continue;
+                }
+                let relative = entry
+                    .path()
+                    .strip_prefix(base_dir)
+                    .map_err(|err| CacheError::StripBaseDir(err.to_string()))?;
+                paths.insert(relative.to_path_buf());
+            }
         }
-        paths.sort();
-        Ok(paths)
+        Ok(paths.into_iter().collect())
     }
+}
+
+fn walk_output_candidates(base_dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for entry in WalkDir::new(base_dir) {
+        let entry = entry?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let relative = entry
+            .path()
+            .strip_prefix(base_dir)
+            .map_err(|err| CacheError::StripBaseDir(err.to_string()))?;
+        paths.push(relative.to_path_buf());
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+fn prefix_union(patterns: &[String]) -> Option<Vec<PathBuf>> {
+    if patterns.is_empty() {
+        return Some(Vec::new());
+    }
+
+    let mut prefixes = Vec::new();
+    for pattern in patterns {
+        let prefix = static_prefix(pattern)?;
+        prefixes.push(prefix);
+    }
+    prefixes.sort_by(|left, right| compare_paths(left, right));
+    prefixes.dedup();
+    Some(prefixes)
+}
+
+fn static_prefix(pattern: &str) -> Option<PathBuf> {
+    let mut prefix = PathBuf::new();
+
+    for segment in pattern.split(['/', '\\']) {
+        if segment.is_empty() || segment == "." {
+            continue;
+        }
+        if segment == ".." {
+            return None;
+        }
+        if segment.chars().any(is_glob_metachar) {
+            return if prefix.as_os_str().is_empty() {
+                None
+            } else {
+                Some(prefix)
+            };
+        }
+        prefix.push(segment);
+    }
+
+    Some(prefix)
+}
+
+fn is_glob_metachar(ch: char) -> bool {
+    matches!(ch, '*' | '?' | '[' | '{' | ']' | '}')
+}
+
+fn compare_paths(left: &Path, right: &Path) -> Ordering {
+    left.as_os_str().cmp(right.as_os_str())
 }
 
 trait FileReader {
@@ -783,7 +906,7 @@ mod tests {
         path::{Path, PathBuf},
         sync::{
             atomic::{AtomicU64, Ordering},
-            Arc,
+            Arc, Mutex,
         },
         time::{SystemTime, UNIX_EPOCH},
     };
@@ -794,11 +917,12 @@ mod tests {
 
     use super::{
         cached_worktree_root, combined_outputs_hash, dedupe_and_sort_entries, file_entry_from_path,
-        prior_entries_by_path, qualified_base_dir_prefix, resolve_file_entries, resolve_inputs,
-        resolve_inputs_with_options, resolve_inputs_with_semantics, resolve_literal_request,
-        resolve_outputs, resolve_outputs_with_options, resolve_wildcard_with_candidates,
-        strip_suffix_components, CandidateLister, FileReader, ListingCache, ResolveOptions,
-        ResolveRequest, ResolvedBase, StdFs,
+        prefix_union, prior_entries_by_path, qualified_base_dir_prefix, resolve_file_entries,
+        resolve_inputs, resolve_inputs_with_options, resolve_inputs_with_semantics,
+        resolve_literal_request, resolve_outputs, resolve_outputs_with_options,
+        resolve_wildcard_with_candidates, resolve_with, resolve_with_candidates,
+        strip_suffix_components, walk_output_candidates, CandidateLister, FileReader,
+        FilesystemLister, ListingCache, ResolveOptions, ResolveRequest, ResolvedBase, StdFs,
     };
     use crate::FileEntry;
     use crate::Result;
@@ -1086,7 +1210,7 @@ mod tests {
 
         let cache = ListingCache::default();
 
-        // Two output resolves against the same base dir share one walk.
+        // Two output resolves against the same base dir and prefix union share one walk.
         let first = resolve_outputs_with_options(
             repo.path(),
             &["dist/**/*.js".to_string()],
@@ -1109,15 +1233,260 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(first.len(), 2, "both dist files resolved");
 
-        // The output cache is populated for this base dir; the input cache is not
-        // (input and output listings are stored in separate maps).
+        // The output cache is populated for this base dir + prefix key; the input
+        // cache is not (input and output listings are stored in separate maps).
         assert!(
-            cache.get_output_candidates(repo.path()).is_some(),
+            cache
+                .get_output_candidates(repo.path(), Some(&[PathBuf::from("dist")]))
+                .is_some(),
             "output listing cached after resolve_outputs"
         );
         assert!(
             cache.get_input_candidates(repo.path()).is_none(),
             "resolve_outputs must not populate the input-listing cache"
+        );
+    }
+
+    #[test]
+    fn outputs_empty_walks_nothing() {
+        let repo = TestRepo::new();
+        repo.write_file("dist/a.js", "a\n");
+        let lister = CountingCandidateLister::new(vec![PathBuf::from("dist/a.js")]);
+
+        let entries = resolve_with(
+            repo.path(),
+            &[],
+            Some(Vec::new()),
+            &lister,
+            &StdFs,
+            ResolveOptions::default(),
+        )
+        .unwrap();
+
+        assert!(entries.is_empty());
+        assert_eq!(lister.calls(), 1);
+        assert_eq!(lister.recorded_prefixes(), vec![Some(Vec::new())]);
+    }
+
+    #[test]
+    fn empty_outputs_listing_does_not_poison_full_walk_for_same_base_dir() {
+        // Regression: `Some([])` (task declares no outputs → walk nothing) and
+        // `None` (leading-glob pattern → full walk) share a base_dir but are
+        // DIFFERENT listing modes. They must not collide in the run-scoped
+        // ListingCache; otherwise an empty-output resolve would cache an empty
+        // candidate list that a later full walk reuses, silently dropping every
+        // output for that package (false cache hit).
+        let repo = TestRepo::new();
+        repo.write_file("dist/a.js", "a\n");
+        let cache = ListingCache::default();
+
+        // Task A: no declared outputs → Some([]) → walk nothing.
+        let empty_lister = CountingCandidateLister::new(vec![PathBuf::from("dist/a.js")]);
+        let empty = resolve_with(
+            repo.path(),
+            &[],
+            Some(Vec::new()),
+            &empty_lister,
+            &StdFs,
+            ResolveOptions {
+                prior_entries: &[],
+                listing_cache: Some(&cache),
+            },
+        )
+        .unwrap();
+        assert!(empty.is_empty());
+
+        // Task B: leading-glob output → None → full walk. Must perform a real
+        // walk (not reuse Task A's empty cached list) and find dist/a.js.
+        let glob_lister = CountingCandidateLister::new(vec![PathBuf::from("dist/a.js")]);
+        let patterns = vec!["**/*.js".to_string()];
+        let resolved = resolve_with(
+            repo.path(),
+            &patterns,
+            prefix_union(&patterns),
+            &glob_lister,
+            &StdFs,
+            ResolveOptions {
+                prior_entries: &[],
+                listing_cache: Some(&cache),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(glob_lister.calls(), 1, "full walk must not reuse empty cache");
+        assert_eq!(glob_lister.recorded_prefixes(), vec![None]);
+        assert_eq!(resolved.len(), 1, "full walk finds dist/a.js");
+    }
+
+    #[test]
+    fn output_resolve_scopes_walk_to_single_prefix() {
+        let repo = TestRepo::new();
+        let lister = CountingCandidateLister::new(vec![PathBuf::from("dist/a.js")]);
+        let patterns = vec!["dist/**".to_string()];
+
+        let _ = resolve_with(
+            repo.path(),
+            &patterns,
+            prefix_union(&patterns),
+            &lister,
+            &StdFs,
+            ResolveOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            lister.recorded_prefixes(),
+            vec![Some(vec![PathBuf::from("dist")])]
+        );
+    }
+
+    #[test]
+    fn output_resolve_uses_multi_prefix_union() {
+        let repo = TestRepo::new();
+        let lister = CountingCandidateLister::new(vec![
+            PathBuf::from("dist/types/a.d.ts"),
+            PathBuf::from("dist/schema.json"),
+        ]);
+        let patterns = vec!["dist/types/**".to_string(), "dist/schema.json".to_string()];
+
+        let _ = resolve_with(
+            repo.path(),
+            &patterns,
+            prefix_union(&patterns),
+            &lister,
+            &StdFs,
+            ResolveOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            lister.recorded_prefixes(),
+            vec![Some(vec![
+                PathBuf::from("dist/schema.json"),
+                PathBuf::from("dist/types"),
+            ])]
+        );
+    }
+
+    #[test]
+    fn output_resolve_falls_back_to_full_walk_for_leading_glob() {
+        let repo = TestRepo::new();
+        let lister = CountingCandidateLister::new(vec![PathBuf::from("dist/types/a.d.ts")]);
+        let patterns = vec!["**/*.d.ts".to_string()];
+
+        let _ = resolve_with(
+            repo.path(),
+            &patterns,
+            prefix_union(&patterns),
+            &lister,
+            &StdFs,
+            ResolveOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(lister.recorded_prefixes(), vec![None]);
+    }
+
+    #[test]
+    fn output_listing_cache_keeps_distinct_prefix_keys() {
+        let repo = TestRepo::new();
+        repo.write_file("dist/a.js", "a\n");
+        repo.write_file("coverage/out.txt", "cov\n");
+        let cache = ListingCache::default();
+        let dist_lister = CountingCandidateLister::new(vec![PathBuf::from("dist/a.js")]);
+        let coverage_lister = CountingCandidateLister::new(vec![PathBuf::from("coverage/out.txt")]);
+        let dist_patterns = vec!["dist/**".to_string()];
+        let coverage_patterns = vec!["coverage/**".to_string()];
+
+        let dist_entries = resolve_with(
+            repo.path(),
+            &dist_patterns,
+            prefix_union(&dist_patterns),
+            &dist_lister,
+            &StdFs,
+            ResolveOptions {
+                prior_entries: &[],
+                listing_cache: Some(&cache),
+            },
+        )
+        .unwrap();
+        let coverage_entries = resolve_with(
+            repo.path(),
+            &coverage_patterns,
+            prefix_union(&coverage_patterns),
+            &coverage_lister,
+            &StdFs,
+            ResolveOptions {
+                prior_entries: &[],
+                listing_cache: Some(&cache),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(dist_lister.calls(), 1);
+        assert_eq!(coverage_lister.calls(), 1);
+        assert_eq!(
+            dist_entries
+                .iter()
+                .map(|entry| entry.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["dist/a.js"]
+        );
+        assert_eq!(
+            coverage_entries
+                .iter()
+                .map(|entry| entry.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["coverage/out.txt"]
+        );
+    }
+
+    #[test]
+    fn output_resolve_matches_full_walk_for_prefixed_patterns() {
+        let repo = TestRepo::new();
+        repo.write_file("dist/types/a.d.ts", "a\n");
+        repo.write_file("dist/schema.json", "{}\n");
+        repo.write_file("dist/other.js", "other\n");
+        repo.write_file("src/ignore.ts", "ignore\n");
+        let patterns = vec!["dist/types/**".to_string(), "dist/schema.json".to_string()];
+
+        let prefixed = resolve_outputs(repo.path(), &patterns).unwrap();
+        let full_candidates = walk_output_candidates(repo.path()).unwrap();
+        let full = resolve_with_candidates(
+            repo.path(),
+            &patterns,
+            full_candidates,
+            &StdFs,
+            ResolveOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(prefixed, full);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_symlinked_dir_behaves_like_before() {
+        use std::os::unix::fs::symlink;
+
+        let repo = TestRepo::new();
+        fs::create_dir_all(repo.path().join("real-dist")).unwrap();
+        fs::write(repo.path().join("real-dist/out.js"), "out\n").unwrap();
+        symlink("real-dist", repo.path().join("dist")).unwrap();
+
+        let patterns = vec!["dist/**".to_string()];
+        let prefixed = resolve_outputs(repo.path(), &patterns).unwrap();
+        let prefixed_candidates = FilesystemLister
+            .list(repo.path(), Some(&[PathBuf::from("dist")]))
+            .unwrap();
+
+        assert_eq!(prefixed_candidates, vec![PathBuf::from("dist/out.js")]);
+        assert_eq!(
+            prefixed
+                .iter()
+                .map(|entry| entry.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["dist/out.js"]
         );
     }
 
@@ -1215,7 +1584,7 @@ mod tests {
             candidate_cache.insert(base_dir.to_path_buf(), candidates.clone());
             return Ok(candidates);
         }
-        let candidates = candidate_lister.list(base_dir)?;
+        let candidates = candidate_lister.list(base_dir, None)?;
         if let Some(cache) = listing_cache {
             cache.insert_input_candidates(base_dir, Arc::new(candidates.clone()));
         }
@@ -1225,6 +1594,7 @@ mod tests {
 
     struct CountingCandidateLister {
         calls: Arc<AtomicU64>,
+        calls_by_prefixes: Arc<Mutex<Vec<Option<Vec<PathBuf>>>>>,
         candidates: Vec<PathBuf>,
     }
 
@@ -1232,6 +1602,7 @@ mod tests {
         fn new(candidates: Vec<PathBuf>) -> Self {
             Self {
                 calls: Arc::new(AtomicU64::new(0)),
+                calls_by_prefixes: Arc::new(Mutex::new(Vec::new())),
                 candidates,
             }
         }
@@ -1239,11 +1610,19 @@ mod tests {
         fn calls(&self) -> u64 {
             self.calls.load(Ordering::Relaxed)
         }
+
+        fn recorded_prefixes(&self) -> Vec<Option<Vec<PathBuf>>> {
+            self.calls_by_prefixes.lock().unwrap().clone()
+        }
     }
 
     impl CandidateLister for CountingCandidateLister {
-        fn list(&self, _base_dir: &Path) -> Result<Vec<PathBuf>> {
+        fn list(&self, _base_dir: &Path, prefixes: Option<&[PathBuf]>) -> Result<Vec<PathBuf>> {
             self.calls.fetch_add(1, Ordering::Relaxed);
+            self.calls_by_prefixes
+                .lock()
+                .unwrap()
+                .push(prefixes.map(|values| values.to_vec()));
             Ok(self.candidates.clone())
         }
     }
@@ -1692,5 +2071,53 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success());
+    }
+}
+
+#[cfg(test)]
+mod output_prefix_tests {
+    use super::{prefix_union, static_prefix};
+    use std::path::PathBuf;
+
+    #[test]
+    fn static_prefix_extracts_longest_non_glob_prefix() {
+        assert_eq!(static_prefix("dist/**"), Some(PathBuf::from("dist")));
+        assert_eq!(
+            static_prefix("dist/types/**/*.d.ts"),
+            Some(PathBuf::from("dist/types"))
+        );
+        assert_eq!(
+            static_prefix("dist/schema.json"),
+            Some(PathBuf::from("dist/schema.json"))
+        );
+        assert_eq!(static_prefix("**/*.d.ts"), None);
+        assert_eq!(static_prefix("{dist,build}/**"), None);
+        assert_eq!(static_prefix("dist/../foo"), None);
+        assert_eq!(static_prefix("./dist/**"), Some(PathBuf::from("dist")));
+        assert_eq!(static_prefix("../dist/**"), None);
+    }
+
+    #[test]
+    fn prefix_union_dedupes_and_sorts_prefixes() {
+        let patterns = vec![
+            "dist/types/**".to_string(),
+            "dist/schema.json".to_string(),
+            "dist/types/*.d.ts".to_string(),
+        ];
+
+        assert_eq!(
+            prefix_union(&patterns),
+            Some(vec![
+                PathBuf::from("dist/schema.json"),
+                PathBuf::from("dist/types"),
+            ])
+        );
+    }
+
+    #[test]
+    fn prefix_union_falls_back_when_any_pattern_needs_full_walk() {
+        let patterns = vec!["dist/**".to_string(), "**/*.d.ts".to_string()];
+
+        assert_eq!(prefix_union(&patterns), None);
     }
 }
