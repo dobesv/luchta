@@ -505,6 +505,7 @@ fn cache_state_context<'a>(
         ctx.workspace_root.to_path_buf(),
         cache_package.package_name.clone(),
         ctx.package_graph.clone(),
+        Arc::clone(ctx.listing_cache),
     );
 
     Some(CacheStateContext {
@@ -1740,6 +1741,7 @@ mod tests {
                 reporter,
                 lockfile: Box::leak(Box::new(LockfileState::Absent)),
                 shared_cache: None,
+                listing_cache: Box::leak(Box::new(Arc::new(ListingCache::default()))),
                 workers: Box::leak(Box::new(HashMap::new())),
                 global_cache_nonce: None,
                 env_cache_nonce: None,
@@ -1966,6 +1968,7 @@ mod tests {
             cache_ctx.repo_root.clone(),
             cache_ctx.source_pkg.clone(),
             cache_ctx.package_graph.clone(),
+            std::sync::Arc::new(luchta_cache::ListingCache::default()),
         )
     }
 

@@ -14,7 +14,8 @@ use globset::{Glob, GlobSet, GlobSetBuilder};
 use luchta_cache::shared::SharedCache;
 use luchta_cache::{
     combined_outputs_hash, decide, resolve_cache_dir, resolve_inputs_with_semantics,
-    resolve_outputs, Cache, CurrentState, Decision, DecisionResult, RunReason, TaskRunRecord,
+    resolve_outputs, Cache, CurrentState, Decision, DecisionResult, ListingCache, RunReason,
+    TaskRunRecord,
 };
 use luchta_engine::{
     expand_input_patterns, is_root_task, CompletionSignal, ExecutionLogSink, ExecutionRequest,
@@ -369,6 +370,8 @@ struct DispatchContext<'a> {
     lockfile: &'a LockfileState,
     /// Shared cache for cross-worktree cache hits. `None` if shared cache disabled.
     shared_cache: Option<Arc<SharedCache>>,
+    /// Run-scoped directory listing cache shared across all task resolvers.
+    listing_cache: &'a Arc<ListingCache>,
     /// Workers map for nonce resolution.
     workers: &'a HashMap<String, WorkerDefinition>,
     /// Global cache nonce from LuchtaConfig.cache.
@@ -2188,6 +2191,7 @@ fn build_dispatch_context<'a>(inputs: BuildDispatchContext<'a>) -> DispatchConte
         reporter,
         lockfile: lockfile_state,
         shared_cache: resources.shared_cache.clone(),
+        listing_cache: &resources.listing_cache,
         workers: &run.workers,
         global_cache_nonce: run.global_cache_nonce.clone(),
         env_cache_nonce: std::env::var("LUCHTA_CACHE_NONCE").ok(),

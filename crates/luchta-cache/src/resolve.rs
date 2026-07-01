@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeSet, HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
     time::UNIX_EPOCH,
 };
 
@@ -14,6 +15,68 @@ use crate::{CacheError, FileEntry, Result};
 
 const COMBINED_OUTPUTS_HASH_DOMAIN: &[u8] = b"luchta-cache:combined-outputs:v1";
 
+/// Run-scoped memo of directory listings, shared across every task in a single
+/// `luchta run` so each package directory is walked once rather than once per
+/// task.
+///
+/// # Snapshot semantics
+///
+/// Entries are keyed by `base_dir` and are deliberately **not** invalidated for
+/// the lifetime of the cache. This encodes an intentional model: change
+/// detection resolves a task's inputs against the state of the git-tracked
+/// (non-ignored) files as observed at the start of the build. A build's own
+/// task outputs are captured via the separate cache-record write path — which
+/// re-resolves freshly, bypassing this cache (see `resolve_cache_inputs` /
+/// `resolve_cache_outputs` in the CLI) — so producer/consumer output flow is
+/// driven by dependency output hashes, not by re-listing a directory mid-run.
+///
+/// Because of this, a `ListingCache` MUST be created fresh per run and dropped
+/// when the run ends. It must never be a process-lifetime `static`: reusing a
+/// listing across separate runs (or across `watch` rebuild cycles) would hide
+/// files created or removed between runs.
+///
+/// Cloning shares the underlying maps (`Arc`), so a single logical cache can be
+/// handed to every per-task resolver.
+#[derive(Debug, Clone, Default)]
+pub struct ListingCache {
+    input_candidates: Arc<Mutex<HashMap<PathBuf, Arc<Vec<PathBuf>>>>>,
+    output_candidates: Arc<Mutex<HashMap<PathBuf, Arc<Vec<PathBuf>>>>>,
+}
+
+impl ListingCache {
+    fn get_input_candidates(&self, base_dir: &Path) -> Option<Arc<Vec<PathBuf>>> {
+        self.input_candidates.lock().ok()?.get(base_dir).cloned()
+    }
+
+    fn insert_input_candidates(&self, base_dir: &Path, candidates: Arc<Vec<PathBuf>>) {
+        if let Ok(mut cache) = self.input_candidates.lock() {
+            cache.insert(base_dir.to_path_buf(), candidates);
+        }
+    }
+
+    fn get_output_candidates(&self, base_dir: &Path) -> Option<Arc<Vec<PathBuf>>> {
+        self.output_candidates.lock().ok()?.get(base_dir).cloned()
+    }
+
+    fn insert_output_candidates(&self, base_dir: &Path, candidates: Arc<Vec<PathBuf>>) {
+        if let Ok(mut cache) = self.output_candidates.lock() {
+            cache.insert(base_dir.to_path_buf(), candidates);
+        }
+    }
+}
+
+/// Optional inputs that let resolution skip redundant work.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ResolveOptions<'a> {
+    /// The matching entries from the task's prior run record. When a resolved
+    /// file's path, size, and `mtime_ns` match its prior entry, the prior
+    /// content hash is reused instead of re-hashing the file.
+    pub prior_entries: &'a [FileEntry],
+    /// Run-scoped directory-listing cache shared across tasks. `None` resolves
+    /// against a fresh walk (used by one-shot callers such as `luchta why`).
+    pub listing_cache: Option<&'a ListingCache>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolveRequest {
     pub base_dir: PathBuf,
@@ -22,6 +85,16 @@ pub struct ResolveRequest {
 }
 
 pub fn resolve_inputs(base_dir: &Path, patterns: &[String]) -> Result<Vec<FileEntry>> {
+    resolve_inputs_with_options(base_dir, patterns, ResolveOptions::default())
+}
+
+/// Resolve input `patterns` under `base_dir`, honoring [`ResolveOptions`] for
+/// prior-hash reuse and the run-scoped listing cache.
+pub fn resolve_inputs_with_options(
+    base_dir: &Path,
+    patterns: &[String],
+    options: ResolveOptions<'_>,
+) -> Result<Vec<FileEntry>> {
     let requests = patterns
         .iter()
         .cloned()
@@ -31,18 +104,30 @@ pub fn resolve_inputs(base_dir: &Path, patterns: &[String]) -> Result<Vec<FileEn
             pattern,
         })
         .collect::<Vec<_>>();
-    resolve_inputs_with_semantics(&requests)
+    resolve_inputs_with_semantics_and_options(&requests, options)
 }
 
 pub fn resolve_inputs_with_semantics(requests: &[ResolveRequest]) -> Result<Vec<FileEntry>> {
+    resolve_inputs_with_semantics_and_options(requests, ResolveOptions::default())
+}
+
+/// Resolve pre-classified input [`ResolveRequest`]s, honoring [`ResolveOptions`].
+///
+/// Deduplicates candidate listings per `base_dir` within the call (and across
+/// the run when a `listing_cache` is supplied), then merges and dedupes the
+/// resulting entries.
+pub fn resolve_inputs_with_semantics_and_options(
+    requests: &[ResolveRequest],
+    options: ResolveOptions<'_>,
+) -> Result<Vec<FileEntry>> {
     if requests.is_empty() {
         return Ok(Vec::new());
     }
-
     let mut candidate_cache = HashMap::<PathBuf, Vec<PathBuf>>::new();
     let mut base_dir_prefix_cache = HashMap::<PathBuf, PathBuf>::new();
     let mut merged_entries = Vec::new();
     let mut worktree_roots = Vec::new();
+    let prior_by_path = prior_entries_by_path(options.prior_entries);
 
     for request in requests {
         let base_dir_prefix =
@@ -65,6 +150,8 @@ pub fn resolve_inputs_with_semantics(requests: &[ResolveRequest]) -> Result<Vec<
             base,
             &mut candidate_cache,
             &StdFs,
+            &prior_by_path,
+            options,
         )?);
     }
 
@@ -81,17 +168,33 @@ struct ResolvedBase<'a> {
     prefix: &'a Path,
 }
 
+fn prior_entries_by_path(prior_entries: &[FileEntry]) -> HashMap<&str, &FileEntry> {
+    prior_entries
+        .iter()
+        .map(|entry| (entry.path.as_str(), entry))
+        .collect()
+}
+
 fn resolve_single_request(
     request: &ResolveRequest,
     base: ResolvedBase<'_>,
     candidate_cache: &mut HashMap<PathBuf, Vec<PathBuf>>,
     file_reader: &dyn FileReader,
+    prior_by_path: &HashMap<&str, &FileEntry>,
+    options: ResolveOptions<'_>,
 ) -> Result<Vec<FileEntry>> {
     match request.semantics {
-        InputSemantics::Literal => resolve_literal_request(request, base, file_reader),
-        InputSemantics::Wildcard => {
-            resolve_wildcard_request(request, candidate_cache, base, file_reader)
+        InputSemantics::Literal => {
+            resolve_literal_request(request, base, file_reader, prior_by_path)
         }
+        InputSemantics::Wildcard => resolve_wildcard_request(
+            request,
+            candidate_cache,
+            base,
+            file_reader,
+            prior_by_path,
+            options.listing_cache,
+        ),
     }
 }
 
@@ -99,11 +202,13 @@ fn resolve_literal_request(
     request: &ResolveRequest,
     base: ResolvedBase<'_>,
     file_reader: &dyn FileReader,
+    prior_by_path: &HashMap<&str, &FileEntry>,
 ) -> Result<Vec<FileEntry>> {
     Ok(vec![file_entry_from_path(
         base,
         PathBuf::from(&request.pattern),
         file_reader,
+        prior_by_path,
     )?])
 }
 
@@ -112,21 +217,39 @@ fn resolve_wildcard_request(
     candidate_cache: &mut HashMap<PathBuf, Vec<PathBuf>>,
     base: ResolvedBase<'_>,
     file_reader: &dyn FileReader,
+    prior_by_path: &HashMap<&str, &FileEntry>,
+    listing_cache: Option<&ListingCache>,
 ) -> Result<Vec<FileEntry>> {
-    let candidates = cached_input_candidates(&request.base_dir, candidate_cache)?;
-    resolve_wildcard_with_candidates(base, &request.pattern, candidates, file_reader)
+    let candidates = cached_input_candidates(&request.base_dir, candidate_cache, listing_cache)?;
+    resolve_wildcard_with_candidates(
+        base,
+        &request.pattern,
+        candidates,
+        file_reader,
+        prior_by_path,
+    )
 }
 
 fn cached_input_candidates(
     base_dir: &Path,
     candidate_cache: &mut HashMap<PathBuf, Vec<PathBuf>>,
+    listing_cache: Option<&ListingCache>,
 ) -> Result<Vec<PathBuf>> {
     if let Some(candidates) = candidate_cache.get(base_dir) {
         return Ok(candidates.clone());
     }
 
+    if let Some(candidates) = listing_cache.and_then(|cache| cache.get_input_candidates(base_dir)) {
+        let candidates = (*candidates).clone();
+        candidate_cache.insert(base_dir.to_path_buf(), candidates.clone());
+        return Ok(candidates);
+    }
+
     let base_prefix = worktree_relative_base_dir(base_dir)?;
     let candidates = GitTrackedInputLister::new(base_prefix).list(base_dir)?;
+    if let Some(cache) = listing_cache {
+        cache.insert_input_candidates(base_dir, Arc::new(candidates.clone()));
+    }
     candidate_cache.insert(base_dir.to_path_buf(), candidates.clone());
     Ok(candidates)
 }
@@ -140,7 +263,17 @@ fn cached_input_candidates(
 /// inputs can (see issue #138). Keeping outputs package-relative preserves the
 /// existing snapshot/restore path semantics.
 pub fn resolve_outputs(base_dir: &Path, patterns: &[String]) -> Result<Vec<FileEntry>> {
-    resolve_with(base_dir, patterns, &FilesystemLister, &StdFs)
+    resolve_outputs_with_options(base_dir, patterns, ResolveOptions::default())
+}
+
+/// [`resolve_outputs`] variant honoring [`ResolveOptions`] for prior-hash reuse
+/// and the run-scoped listing cache.
+pub fn resolve_outputs_with_options(
+    base_dir: &Path,
+    patterns: &[String],
+    options: ResolveOptions<'_>,
+) -> Result<Vec<FileEntry>> {
+    resolve_with(base_dir, patterns, &FilesystemLister, &StdFs, options)
 }
 
 fn resolve_with_candidates(
@@ -148,6 +281,7 @@ fn resolve_with_candidates(
     patterns: &[String],
     candidates: Vec<PathBuf>,
     file_reader: &dyn FileReader,
+    options: ResolveOptions<'_>,
 ) -> Result<Vec<FileEntry>> {
     if patterns.is_empty() {
         return Ok(Vec::new());
@@ -181,10 +315,13 @@ fn resolve_with_candidates(
         dir: base_dir,
         prefix: Path::new(""),
     };
-    resolved_paths
-        .into_iter()
-        .map(|path| file_entry_from_path(base, path, file_reader))
-        .collect()
+    let prior_by_path = prior_entries_by_path(options.prior_entries);
+    resolve_file_entries(
+        base,
+        resolved_paths.into_iter().collect(),
+        file_reader,
+        &prior_by_path,
+    )
 }
 
 fn resolve_wildcard_with_candidates(
@@ -192,12 +329,25 @@ fn resolve_wildcard_with_candidates(
     pattern: &str,
     candidates: Vec<PathBuf>,
     file_reader: &dyn FileReader,
+    prior_by_path: &HashMap<&str, &FileEntry>,
 ) -> Result<Vec<FileEntry>> {
     let globset = build_globset(&[pattern.to_string()])?;
-    candidates
+    let matched = candidates
         .into_iter()
         .filter(|candidate| globset.is_match(candidate.as_path()))
-        .map(|path| file_entry_from_path(base, path, file_reader))
+        .collect::<Vec<_>>();
+    resolve_file_entries(base, matched, file_reader, prior_by_path)
+}
+
+fn resolve_file_entries(
+    base: ResolvedBase<'_>,
+    paths: Vec<PathBuf>,
+    file_reader: &dyn FileReader,
+    prior_by_path: &HashMap<&str, &FileEntry>,
+) -> Result<Vec<FileEntry>> {
+    paths
+        .into_iter()
+        .map(|path| file_entry_from_path(base, path, file_reader, prior_by_path))
         .collect()
 }
 
@@ -284,9 +434,27 @@ fn resolve_with(
     patterns: &[String],
     candidate_lister: &dyn CandidateLister,
     file_reader: &dyn FileReader,
+    options: ResolveOptions<'_>,
 ) -> Result<Vec<FileEntry>> {
+    let candidates = cached_output_candidates(base_dir, candidate_lister, options.listing_cache)?;
+    resolve_with_candidates(base_dir, patterns, candidates, file_reader, options)
+}
+
+fn cached_output_candidates(
+    base_dir: &Path,
+    candidate_lister: &dyn CandidateLister,
+    listing_cache: Option<&ListingCache>,
+) -> Result<Vec<PathBuf>> {
+    if let Some(candidates) = listing_cache.and_then(|cache| cache.get_output_candidates(base_dir))
+    {
+        return Ok((*candidates).clone());
+    }
+
     let candidates = candidate_lister.list(base_dir)?;
-    resolve_with_candidates(base_dir, patterns, candidates, file_reader)
+    if let Some(cache) = listing_cache {
+        cache.insert_output_candidates(base_dir, Arc::new(candidates.clone()));
+    }
+    Ok(candidates)
 }
 
 fn build_globset(patterns: &[String]) -> Result<GlobSet> {
@@ -301,19 +469,34 @@ fn file_entry_from_path(
     base: ResolvedBase<'_>,
     relative_path: PathBuf,
     file_reader: &dyn FileReader,
+    prior_by_path: &HashMap<&str, &FileEntry>,
 ) -> Result<FileEntry> {
     let absolute_path = base.dir.join(&relative_path);
     let qualified_path = qualify_relative_path(base.prefix, &relative_path);
-    if !absolute_path.exists() {
-        return Ok(FileEntry::absent(qualified_path));
-    }
-
-    let metadata = fs::metadata(&absolute_path)?;
-    let hash = file_reader.blake3_file(&absolute_path)?;
+    // Single stat: a missing path (including a broken symlink) yields NotFound,
+    // which we treat as absent. Other IO errors propagate. This replaces the
+    // former `exists()` + `metadata()` pair, which stat'd every present file twice.
+    let metadata = match fs::metadata(&absolute_path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(FileEntry::absent(qualified_path));
+        }
+        Err(err) => return Err(err.into()),
+    };
+    let size = metadata.len();
+    let mtime_ns = modified_time_ns(&metadata)?;
+    let reused = prior_by_path
+        .get(qualified_path.as_str())
+        .filter(|entry| !entry.absent && entry.size == size && entry.mtime_ns == mtime_ns)
+        .map(|entry| entry.hash);
+    let hash = match reused {
+        Some(h) => h,
+        None => file_reader.blake3_file(&absolute_path)?,
+    };
     Ok(FileEntry {
         path: qualified_path,
-        size: metadata.len(),
-        mtime_ns: modified_time_ns(&metadata)?,
+        size,
+        mtime_ns,
         hash,
         absent: false,
     })
@@ -506,9 +689,13 @@ impl FileReader for StdFs {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::HashMap,
         fs,
-        path::Path,
-        sync::atomic::{AtomicU64, Ordering},
+        path::{Path, PathBuf},
+        sync::{
+            atomic::{AtomicU64, Ordering},
+            Arc,
+        },
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -517,10 +704,351 @@ mod tests {
     use luchta_types::{classify_pattern, InputSemantics};
 
     use super::{
-        combined_outputs_hash, resolve_inputs, resolve_inputs_with_semantics, resolve_outputs,
-        ResolveRequest,
+        combined_outputs_hash, dedupe_and_sort_entries, file_entry_from_path,
+        prior_entries_by_path, qualified_base_dir_prefix, resolve_file_entries, resolve_inputs,
+        resolve_inputs_with_options, resolve_inputs_with_semantics, resolve_literal_request,
+        resolve_outputs, resolve_outputs_with_options, resolve_wildcard_with_candidates,
+        strip_suffix_components, CandidateLister, FileReader, ListingCache, ResolveOptions,
+        ResolveRequest, ResolvedBase, StdFs,
     };
     use crate::FileEntry;
+    use crate::Result;
+
+    #[test]
+    fn listing_cache_reuses_walks_within_run_and_fresh_cache_rewalks() {
+        let repo = TestRepo::new();
+        repo.write_file("src/one.ts", "one\n");
+        repo.write_file("src/two.ts", "two\n");
+        repo.git_add_and_commit_all();
+
+        let requests = [repo.request("src/**/*.ts", InputSemantics::Wildcard)];
+        let first_cache = ListingCache::default();
+        let counting = CountingCandidateLister::new(vec![
+            Path::new("src/one.ts").to_path_buf(),
+            Path::new("src/two.ts").to_path_buf(),
+        ]);
+        let options = ResolveOptions {
+            prior_entries: &[],
+            listing_cache: Some(&first_cache),
+        };
+
+        let first =
+            resolve_inputs_with_semantics_with_lister(&requests, &counting, options).unwrap();
+        let second =
+            resolve_inputs_with_semantics_with_lister(&requests, &counting, options).unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(counting.calls(), 1);
+
+        let second_cache = ListingCache::default();
+        let second_lister = CountingCandidateLister::new(vec![
+            Path::new("src/one.ts").to_path_buf(),
+            Path::new("src/two.ts").to_path_buf(),
+        ]);
+        let second_options = ResolveOptions {
+            prior_entries: &[],
+            listing_cache: Some(&second_cache),
+        };
+        let _ =
+            resolve_inputs_with_semantics_with_lister(&requests, &second_lister, second_options)
+                .unwrap();
+        assert_eq!(second_lister.calls(), 1);
+    }
+
+    #[test]
+    fn resolve_input_hashes_reuse_prior_hash_when_metadata_matches() {
+        let repo = TestRepo::new();
+        repo.write_file("src/app.ts", "console.log('same');\n");
+        repo.git_add_and_commit_all();
+
+        let initial = resolve_inputs(repo.path(), &["src/app.ts".to_string()]).unwrap();
+        let prior = vec![FileEntry {
+            path: "src/app.ts".to_string(),
+            hash: [9; 32],
+            ..initial[0].clone()
+        }];
+        let resolved = resolve_inputs_with_options(
+            repo.path(),
+            &["src/app.ts".to_string()],
+            ResolveOptions {
+                prior_entries: &prior,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(resolved[0].hash, [9; 32]);
+        assert_eq!(resolved[0].size, prior[0].size);
+        assert_eq!(resolved[0].mtime_ns, prior[0].mtime_ns);
+    }
+
+    #[test]
+    fn resolve_input_hashes_rehash_when_metadata_changes() {
+        let repo = TestRepo::new();
+        repo.write_file("src/app.ts", "console.log('same');\n");
+        repo.git_add_and_commit_all();
+
+        let initial = resolve_inputs(repo.path(), &["src/app.ts".to_string()]).unwrap();
+        let mut prior = initial[0].clone();
+        prior.hash = [9; 32];
+        prior.size = prior.size.saturating_add(1);
+
+        let resolved = resolve_inputs_with_options(
+            repo.path(),
+            &["src/app.ts".to_string()],
+            ResolveOptions {
+                prior_entries: &[prior],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_ne!(resolved[0].hash, [9; 32]);
+    }
+
+    #[test]
+    fn resolve_file_entries_matches_direct_order_and_values() {
+        let repo = TestRepo::new();
+        repo.write_file("dist/a.js", "a\n");
+        repo.write_file("dist/c.js", "c\n");
+        repo.write_file("dist/nested/b.js", "b\n");
+        let reader = CountingReader::new();
+        let base = ResolvedBase {
+            dir: repo.path(),
+            prefix: Path::new(""),
+        };
+        let paths = vec![
+            Path::new("dist/a.js").to_path_buf(),
+            Path::new("dist/c.js").to_path_buf(),
+            Path::new("dist/nested/b.js").to_path_buf(),
+        ];
+        let prior = Vec::new();
+        let prior_by_path = prior_entries_by_path(&prior);
+
+        let batched = resolve_file_entries(base, paths.clone(), &reader, &prior_by_path).unwrap();
+        let direct = paths
+            .into_iter()
+            .map(|path| file_entry_from_path(base, path, &reader, &prior_by_path).unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(batched, direct);
+    }
+
+    #[test]
+    fn resolve_input_hashes_rehash_when_only_mtime_changes() {
+        // A file whose size is unchanged but mtime_ns differs from the prior
+        // record MUST be re-hashed, not served from the prior hash. Guards the
+        // stat fast-path against a same-size in-place edit.
+        let repo = TestRepo::new();
+        repo.write_file("src/app.ts", "console.log('same');\n");
+        repo.git_add_and_commit_all();
+
+        let initial = resolve_inputs(repo.path(), &["src/app.ts".to_string()]).unwrap();
+        let mut prior = initial[0].clone();
+        prior.hash = [9; 32];
+        // Same size, different mtime: only the timestamp diverges from disk.
+        prior.mtime_ns = prior.mtime_ns.wrapping_add(1);
+
+        let resolved = resolve_inputs_with_options(
+            repo.path(),
+            &["src/app.ts".to_string()],
+            ResolveOptions {
+                prior_entries: &[prior.clone()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(resolved[0].size, prior.size, "size unchanged on disk");
+        assert_ne!(
+            resolved[0].hash, [9; 32],
+            "mtime mismatch must force a real re-hash, not reuse the prior hash"
+        );
+    }
+
+    #[test]
+    fn listing_cache_reuses_output_walks_within_run_and_isolates_from_inputs() {
+        // The output-listing cache must (a) walk each base dir only once per run
+        // and (b) not collide with the input-listing cache keyed by the same dir.
+        let repo = TestRepo::new();
+        repo.write_file("dist/a.js", "a\n");
+        repo.write_file("dist/b.js", "b\n");
+
+        let cache = ListingCache::default();
+
+        // Two output resolves against the same base dir share one walk.
+        let first = resolve_outputs_with_options(
+            repo.path(),
+            &["dist/**/*.js".to_string()],
+            ResolveOptions {
+                prior_entries: &[],
+                listing_cache: Some(&cache),
+            },
+        )
+        .unwrap();
+        let second = resolve_outputs_with_options(
+            repo.path(),
+            &["dist/**/*.js".to_string()],
+            ResolveOptions {
+                prior_entries: &[],
+                listing_cache: Some(&cache),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 2, "both dist files resolved");
+
+        // The output cache is populated for this base dir; the input cache is not
+        // (input and output listings are stored in separate maps).
+        assert!(
+            cache.get_output_candidates(repo.path()).is_some(),
+            "output listing cached after resolve_outputs"
+        );
+        assert!(
+            cache.get_input_candidates(repo.path()).is_none(),
+            "resolve_outputs must not populate the input-listing cache"
+        );
+    }
+
+    fn resolve_inputs_with_semantics_with_lister(
+        requests: &[ResolveRequest],
+        candidate_lister: &dyn CandidateLister,
+        options: ResolveOptions<'_>,
+    ) -> Result<Vec<FileEntry>> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut candidate_cache = HashMap::<PathBuf, Vec<PathBuf>>::new();
+        let mut base_dir_prefix_cache = HashMap::<PathBuf, PathBuf>::new();
+        let mut merged_entries = Vec::new();
+        let mut worktree_roots = Vec::new();
+        let prior_by_path = prior_entries_by_path(options.prior_entries);
+
+        for request in requests {
+            let base_dir_prefix =
+                qualified_base_dir_prefix(&request.base_dir, &mut base_dir_prefix_cache)?.clone();
+            let worktree_root = strip_suffix_components(&request.base_dir, &base_dir_prefix);
+            if !worktree_roots.contains(&worktree_root) {
+                worktree_roots.push(worktree_root);
+            }
+
+            let base = ResolvedBase {
+                dir: &request.base_dir,
+                prefix: &base_dir_prefix,
+            };
+            merged_entries.extend(resolve_single_request_for_tests(
+                request,
+                base,
+                &mut candidate_cache,
+                &StdFs,
+                &prior_by_path,
+                options,
+                candidate_lister,
+            )?);
+        }
+
+        Ok(dedupe_and_sort_entries(merged_entries, &worktree_roots))
+    }
+
+    fn resolve_single_request_for_tests(
+        request: &ResolveRequest,
+        base: ResolvedBase<'_>,
+        candidate_cache: &mut HashMap<PathBuf, Vec<PathBuf>>,
+        file_reader: &dyn FileReader,
+        prior_by_path: &HashMap<&str, &FileEntry>,
+        options: ResolveOptions<'_>,
+        candidate_lister: &dyn CandidateLister,
+    ) -> Result<Vec<FileEntry>> {
+        match request.semantics {
+            InputSemantics::Literal => {
+                resolve_literal_request(request, base, file_reader, prior_by_path)
+            }
+            InputSemantics::Wildcard => {
+                let candidates = cached_input_candidates_for_tests(
+                    &request.base_dir,
+                    candidate_cache,
+                    options.listing_cache,
+                    candidate_lister,
+                )?;
+                resolve_wildcard_with_candidates(
+                    base,
+                    &request.pattern,
+                    candidates,
+                    file_reader,
+                    prior_by_path,
+                )
+            }
+        }
+    }
+
+    fn cached_input_candidates_for_tests(
+        base_dir: &Path,
+        candidate_cache: &mut HashMap<PathBuf, Vec<PathBuf>>,
+        listing_cache: Option<&ListingCache>,
+        candidate_lister: &dyn CandidateLister,
+    ) -> Result<Vec<PathBuf>> {
+        if let Some(candidates) = candidate_cache.get(base_dir) {
+            return Ok(candidates.clone());
+        }
+        if let Some(candidates) =
+            listing_cache.and_then(|cache| cache.get_input_candidates(base_dir))
+        {
+            let candidates = (*candidates).clone();
+            candidate_cache.insert(base_dir.to_path_buf(), candidates.clone());
+            return Ok(candidates);
+        }
+        let candidates = candidate_lister.list(base_dir)?;
+        if let Some(cache) = listing_cache {
+            cache.insert_input_candidates(base_dir, Arc::new(candidates.clone()));
+        }
+        candidate_cache.insert(base_dir.to_path_buf(), candidates.clone());
+        Ok(candidates)
+    }
+
+    struct CountingCandidateLister {
+        calls: Arc<AtomicU64>,
+        candidates: Vec<PathBuf>,
+    }
+
+    impl CountingCandidateLister {
+        fn new(candidates: Vec<PathBuf>) -> Self {
+            Self {
+                calls: Arc::new(AtomicU64::new(0)),
+                candidates,
+            }
+        }
+
+        fn calls(&self) -> u64 {
+            self.calls.load(Ordering::Relaxed)
+        }
+    }
+
+    impl CandidateLister for CountingCandidateLister {
+        fn list(&self, _base_dir: &Path) -> Result<Vec<PathBuf>> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok(self.candidates.clone())
+        }
+    }
+
+    #[derive(Default)]
+    struct CountingReader {
+        calls: Arc<AtomicU64>,
+    }
+
+    impl CountingReader {
+        fn new() -> Self {
+            Self::default()
+        }
+    }
+
+    impl FileReader for CountingReader {
+        fn blake3_file(&self, path: &Path) -> crate::Result<[u8; 32]> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            crate::blake3_file(path)
+        }
+    }
 
     #[test]
     fn literal_missing_vs_literal_present_produce_different_entries_and_hashes() {

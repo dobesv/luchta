@@ -6,8 +6,9 @@ use std::{
 };
 
 use luchta_cache::{
-    env_hash, pkg_dep_hash, resolve_inputs_with_semantics, resolve_outputs, task_spec_hash,
-    CurrentState, FileEntry, FileStateResolver,
+    env_hash, pkg_dep_hash, resolve_inputs_with_semantics_and_options,
+    resolve_outputs_with_options, task_spec_hash, CurrentState, FileEntry, FileStateResolver,
+    ListingCache, ResolveOptions,
 };
 use luchta_engine::{expand_input_patterns, InputExpansionError};
 use luchta_lockfiles::{parse_lockfile, Lockfile};
@@ -45,6 +46,7 @@ pub struct PackageDirResolver {
     repo_root: PathBuf,
     source_pkg: PackageName,
     package_graph: PackageGraph,
+    listing_cache: Arc<ListingCache>,
 }
 
 impl PackageDirResolver {
@@ -54,12 +56,14 @@ impl PackageDirResolver {
         repo_root: PathBuf,
         source_pkg: PackageName,
         package_graph: PackageGraph,
+        listing_cache: Arc<ListingCache>,
     ) -> Self {
         Self {
             package_dir,
             repo_root,
             source_pkg,
             package_graph,
+            listing_cache,
         }
     }
 }
@@ -69,7 +73,11 @@ fn format_expansion_error(error: &InputExpansionError) -> String {
 }
 
 impl FileStateResolver for PackageDirResolver {
-    fn resolve_inputs(&self, patterns: &[String]) -> luchta_cache::Result<Vec<FileEntry>> {
+    fn resolve_inputs(
+        &self,
+        patterns: &[String],
+        prior_entries: &[FileEntry],
+    ) -> luchta_cache::Result<Vec<FileEntry>> {
         let requests = expand_input_patterns(
             patterns,
             &self.source_pkg,
@@ -77,11 +85,28 @@ impl FileStateResolver for PackageDirResolver {
             &self.repo_root,
         )
         .map_err(|e| luchta_cache::CacheError::InputExpansion(format_expansion_error(&e)))?;
-        resolve_inputs_with_semantics(&requests)
+        resolve_inputs_with_semantics_and_options(
+            &requests,
+            ResolveOptions {
+                prior_entries,
+                listing_cache: Some(self.listing_cache.as_ref()),
+            },
+        )
     }
 
-    fn resolve_outputs(&self, patterns: &[String]) -> luchta_cache::Result<Vec<FileEntry>> {
-        resolve_outputs(&self.package_dir, patterns)
+    fn resolve_outputs(
+        &self,
+        patterns: &[String],
+        prior_entries: &[FileEntry],
+    ) -> luchta_cache::Result<Vec<FileEntry>> {
+        resolve_outputs_with_options(
+            &self.package_dir,
+            patterns,
+            ResolveOptions {
+                prior_entries,
+                listing_cache: Some(self.listing_cache.as_ref()),
+            },
+        )
     }
 
     fn blake3_file(&self, path: &Path) -> luchta_cache::Result<[u8; 32]> {
