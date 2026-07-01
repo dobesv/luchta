@@ -54,6 +54,7 @@ sysinfo = { version = "0.36.1", default-features = false, features = ["system"] 
 zstd = "0.13.2"
 tar = "0.4.44"
 dirs = "6.0.0"
+fd-lock = "4"
 fs2 = "0.4.3"
 ignore = "0.4"
 notify = "6"

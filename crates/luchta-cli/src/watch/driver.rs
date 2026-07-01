@@ -23,6 +23,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use luchta_cache::resolve_cache_dir;
 use luchta_types::PackageName;
 use miette::{IntoDiagnostic, Result};
 use owo_colors::{OwoColorize, Stream};
@@ -32,6 +33,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::session::WatchSession;
 use super::watcher::WatcherHandle;
+use crate::build_lock;
 use crate::cli::OutputMode;
 use crate::run::{CycleOutcome, MemoryPressureConfig, RunCycleParams, TaskSelection};
 use crate::since::affected_packages_from_paths;
@@ -331,6 +333,20 @@ where
     F: Future<Output = std::result::Result<(), std::io::Error>> + Send,
     G: Future<Output = std::result::Result<(), std::io::Error>> + Send,
 {
+    let cache_dir = resolve_cache_dir(session.repo_root());
+    let acquire_lock = build_lock::acquire(&cache_dir);
+    tokio::pin!(acquire_lock);
+    let _build_lock = tokio::select! {
+        lock = &mut acquire_lock => match lock? {
+            Some(lock) => lock,
+            None => return Ok(WatchControl::Stop), // Ctrl+C while waiting
+        },
+        _ = &mut signals.shutdown => {
+            ui.shutting_down();
+            shutdown_watch(session, ui, signals).await;
+            return Ok(WatchControl::Stop);
+        }
+    };
     let initial_selection = selection.as_task_selection();
     run_cycle_with_status(
         session,
@@ -378,6 +394,20 @@ where
 
     context.ui.change_detected(&affected);
     let cycle_selection = context.selection.as_task_selection();
+    let cache_dir = resolve_cache_dir(context.session.repo_root());
+    let acquire_lock = build_lock::acquire(&cache_dir);
+    tokio::pin!(acquire_lock);
+    let _build_lock = tokio::select! {
+        lock = &mut acquire_lock => match lock? {
+            Some(lock) => lock,
+            None => return Ok(WatchControl::Stop), // Ctrl+C while waiting
+        },
+        _ = &mut signals.shutdown => {
+            context.ui.shutting_down();
+            shutdown_watch(context.session, context.ui, signals).await;
+            return Ok(WatchControl::Stop);
+        }
+    };
     run_cycle_with_status(
         context.session,
         cycle_request(&cycle_selection, Some(&affected), context.config),

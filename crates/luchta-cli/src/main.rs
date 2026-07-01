@@ -1,3 +1,4 @@
+mod build_lock;
 mod cache_ctx;
 mod cache_nonce;
 mod cli;
