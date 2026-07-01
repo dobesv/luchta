@@ -8,7 +8,7 @@ use petgraph::{
 };
 use thiserror::Error;
 
-use crate::worker::protocol::{ResolveDecision, ResolveMode, ResolveTask};
+use crate::worker::protocol::{ResolveDecision, ResolveMode, ResolveResult, ResolveTask};
 use crate::EngineError;
 
 /// Per-package context the resolution phase passes to a worker so it can decide
@@ -227,6 +227,18 @@ pub enum ResolveError {
     Worker { task: TaskId, message: String },
     #[error("task '{task}' rejected by worker: {message}")]
     Rejected { task: TaskId, message: String },
+}
+
+/// Resolves a single task via its worker, tagging the result with the task id
+/// so concurrent, out-of-order completions can be reassembled by the caller.
+async fn resolve_one<R: TaskResolver>(
+    resolver: &R,
+    task_id: TaskId,
+    worker: String,
+    request: ResolveTask,
+) -> (TaskId, Result<ResolveResult, String>) {
+    let outcome = resolver.resolve(&worker, request).await;
+    (task_id, outcome)
 }
 
 /// Abstraction over the worker round-trip used to resolve a task. The engine
@@ -699,18 +711,30 @@ impl ResolvedPipeline {
         resolver: &R,
         mode: ResolveMode,
     ) -> Result<Vec<PrunedTask>, ResolveError> {
+        use futures::stream::{FuturesUnordered, StreamExt};
+
+        // Each task with a worker is resolved via an independent worker
+        // round-trip (Accept / Modify / Prune / Reject). These round-trips are
+        // IPC-bound and mutually independent, so they run concurrently (bounded)
+        // rather than one-at-a-time. Task-graph mutations and prune collection
+        // are then applied serially in a deterministic order, so diagnostics and
+        // the resulting graph are identical to a sequential resolve.
+        let max_in_flight = std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(4)
+            .max(1);
+
         // Deterministic iteration order so prune diagnostics are stable.
         let mut task_ids: Vec<TaskId> = self.tasks_by_id.keys().cloned().collect();
-        task_ids.sort_by_key(|task_id| task_id.to_string());
+        task_ids.sort_by_key(TaskId::to_string);
 
-        let mut pruned = Vec::new();
-
+        // Phase 1: build owned resolve requests for every task that has a worker.
+        let mut requests: Vec<(TaskId, String, ResolveTask)> = Vec::new();
         for task_id in task_ids {
             let definition = &self.tasks_by_id[&task_id];
             let Some(worker) = definition.worker.clone() else {
                 continue;
             };
-
             let info = packages.get(&task_id.package);
             let request = ResolveTask {
                 id: task_id.to_string(),
@@ -725,15 +749,45 @@ impl ResolvedPipeline {
                 scripts: info.map(|info| info.scripts.clone()).unwrap_or_default(),
                 mode,
             };
+            requests.push((task_id, worker, request));
+        }
 
-            let result = resolver
-                .resolve(&worker, request)
-                .await
-                .map_err(|message| ResolveError::Worker {
-                    task: task_id.clone(),
-                    message,
-                })?;
+        // Phase 2: run the worker round-trips concurrently, bounded by
+        // `max_in_flight`, collecting each task's outcome. Completion order does
+        // not matter — outcomes are keyed by TaskId and applied deterministically
+        // in phase 3. A worker/IPC error is stored (not returned) here so that
+        // which error surfaces stays deterministic (sorted), matching the old
+        // sequential resolve rather than depending on completion order.
+        let mut in_flight = FuturesUnordered::new();
+        let mut outcomes: HashMap<TaskId, Result<ResolveResult, String>> =
+            HashMap::with_capacity(requests.len());
+        let mut requests = requests.into_iter();
 
+        for (task_id, worker, request) in requests.by_ref().take(max_in_flight) {
+            in_flight.push(resolve_one(resolver, task_id, worker, request));
+        }
+        while let Some((task_id, outcome)) = in_flight.next().await {
+            outcomes.insert(task_id, outcome);
+            if let Some((task_id, worker, request)) = requests.next() {
+                in_flight.push(resolve_one(resolver, task_id, worker, request));
+            }
+        }
+
+        // Phase 3: apply outcomes serially in deterministic (sorted) order so
+        // graph mutations, prune diagnostics, and any surfaced worker/reject
+        // error match a sequential resolve regardless of completion order.
+        let mut resolved_ids: Vec<TaskId> = outcomes.keys().cloned().collect();
+        resolved_ids.sort_by_key(TaskId::to_string);
+
+        let mut pruned = Vec::new();
+        for task_id in resolved_ids {
+            let Some(outcome) = outcomes.remove(&task_id) else {
+                continue;
+            };
+            let result = outcome.map_err(|message| ResolveError::Worker {
+                task: task_id.clone(),
+                message,
+            })?;
             match result.decision {
                 ResolveDecision::Accept => {}
                 ResolveDecision::Modify(modification) => {
@@ -2280,6 +2334,103 @@ mod tests {
         assert_in_graph(&graph, "@repo/a", "build");
         assert_not_in_graph(&graph, "@repo/b", "build");
         assert_single_prune(&pruned, "@repo/b", "build");
+    }
+
+    /// Resolver that awaits an async delay for a chosen package before
+    /// returning `decision`, so worker round-trips complete out of order
+    /// without blocking the executor thread.
+    struct DelayingResolver {
+        slow_package: &'static str,
+        delay: std::time::Duration,
+        decision: fn(&ResolveTask) -> ResolveResult,
+    }
+
+    impl TaskResolver for DelayingResolver {
+        async fn resolve(
+            &self,
+            _worker: &str,
+            request: ResolveTask,
+        ) -> Result<ResolveResult, String> {
+            if request.package == self.slow_package {
+                tokio::time::sleep(self.delay).await;
+            }
+            Ok((self.decision)(&request))
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_resolution_prunes_are_deterministically_ordered() {
+        // Resolution runs worker round-trips concurrently. A resolver that
+        // completes out of order (the lexicographically-first task finishes
+        // last) must still yield a `pruned` list in stable sorted-by-task-id
+        // order, and a graph identical to a sequential resolve.
+        let package_graph = package_graph_pair();
+        let pipeline = HashMap::from([(TaskName::from("build"), worker_task(vec![]))]);
+
+        let resolver = DelayingResolver {
+            slow_package: "@repo/a",
+            delay: std::time::Duration::from_millis(50),
+            decision: |request| ResolveResult::prune(Some(format!("drop {}", request.package))),
+        };
+
+        let (graph, pruned) = TaskGraph::build_resolved(
+            &package_graph,
+            &pipeline,
+            &empty_resolve_info(),
+            &HashMap::new(),
+            &resolver,
+            ResolveMode::Run,
+        )
+        .await
+        .expect("build resolved graph");
+
+        assert_not_in_graph(&graph, "@repo/a", "build");
+        assert_not_in_graph(&graph, "@repo/b", "build");
+        // Both pruned, ordered deterministically by task id (a before b) even
+        // though b's round-trip completes first.
+        let ordered: Vec<String> = pruned
+            .iter()
+            .map(|entry| entry.task_id.to_string())
+            .collect();
+        let mut expected = ordered.clone();
+        expected.sort();
+        assert_eq!(ordered, expected, "pruned list must be sorted by task id");
+        assert_eq!(pruned.len(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_check_mode_reject_surfaces_first_task_in_sorted_order() {
+        // In check mode a `Reject` is fatal. When multiple tasks reject and
+        // complete out of order, the surfaced error must be the
+        // lexicographically-first task's, matching the old sequential resolve.
+        let package_graph = package_graph_pair();
+        let pipeline = HashMap::from([(TaskName::from("build"), worker_task(vec![]))]);
+
+        // `@repo/a` (sorts first) is slow, so `@repo/b` rejects first in wall
+        // time; the surfaced error must still be `@repo/a`.
+        let resolver = DelayingResolver {
+            slow_package: "@repo/a",
+            delay: std::time::Duration::from_millis(50),
+            decision: |request| ResolveResult::reject(format!("rejected {}", request.package)),
+        };
+
+        let error = TaskGraph::build_resolved(
+            &package_graph,
+            &pipeline,
+            &empty_resolve_info(),
+            &HashMap::new(),
+            &resolver,
+            ResolveMode::Check,
+        )
+        .await
+        .expect_err("check-mode reject must fail");
+
+        match error {
+            EngineError::Resolve(ResolveError::Rejected { task, .. }) => {
+                assert_eq!(task.to_string(), "@repo/a#build");
+            }
+            other => panic!("expected Rejected error, got {other:?}"),
+        }
     }
 
     #[tokio::test]
