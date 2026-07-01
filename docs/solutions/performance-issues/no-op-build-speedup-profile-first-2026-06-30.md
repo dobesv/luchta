@@ -17,7 +17,7 @@ tags:
   - gix
   - worktree-discovery
 plan_ref: "luchta-perf-154"
-last_updated: 2026-06-30
+last_updated: 2026-07-01
 ---
 
 ## Problem
@@ -27,34 +27,30 @@ A fully-cached build (`luchta run build`, 928 tasks all cache-hits) took ~37s, e
 ## Symptoms
 
 ```
-- Behavior: ~37s wall time for fully-cached build (all 928 tasks cache-hits)
-- CPU: Nearly all single-threaded during cache-skip path
-- Scale: 928 tasks × ~2.5 walks/task = 2305 directory traversals
-- Each walk: gix::discover + full WalkDir + gitignore filtering for inputs, separate walk for outputs
+luchta run build (all cache hits)
+Before: ~37s wall time
+Impact: Developer wait time on no-op builds
 ```
 
-The issue report suggested parallelizing hashing with rayon. This was the wrong hypothesis.
+Profiling showed:
+- File hashing: negligible
+- RESOLVE_INPUTS: ~18.6s (majority of runtime)
+- RESOLVE_OUTPUTS: not measured separately (rolled into resolve phase)
 
 ## Investigation Steps
 
-1. **Hypothesis**: Hashing is slow → parallelize with rayon.
-2. **Profiling approach**: Added temporary atomic counters gated by an env var, dumped at process exit. This cheap approach worked where `perf`/`gdb` were blocked by sandbox `perf_event_paranoid`/`ptrace_scope`.
-3. **Finding**: Blake3 hashing was a tiny fraction of total time. Real hotspot: repeated `gix::discover` + `WalkDir` traversals per-task.
-4. **Root cause confirmed**: Each of 928 tasks independently walked its package dir (inputs) and often a second walk (outputs) — 2305 total walks over the same ~26 package directories.
+1. **Assumption testing**: The issue suggested parallel hashing. Profiled actual runtime — hashing was negligible.
+2. **Poor-man's profiler**: System `perf record` blocked by `perf_event_paranoid=4`, so used env-gated `Instant` timers around suspected phases.
+3. **Directory walk counting**: Added counters to track how many times each package dir was walked.
+4. **Discovery**: 2305 directory walks across ~26 packages. Each task walked its package dir for inputs and again for outputs.
 
 ## Root Cause
 
-Two distinct problems:
+Two sources of redundant work:
 
-1. **No stat fast-path**: Resolver always re-read + hash file contents, even when (size, mtime_ns) unchanged and prior hash available in cache record. `FileEntry` already persisted size+mtime+hash; resolver just wasn't given prior entries.
+### (a) Eager hashing after stat
 
-2. **No directory listing cache**: Each task traversed its package dir independently with `gix::discover` + `WalkDir` + gitignore filtering. No sharing across tasks in the same run.
-
-## Solution
-
-### (a) Stat-based content-hash fast-path
-
-When a file's (size, mtime_ns) match the prior `FileEntry` from cache, reuse the stored hash instead of re-reading + hashing:
+The cache-hit fast-path fetched prior file entries but then called `blake3_file()` unconditionally due to `unwrap_or()` eager argument evaluation, discarding the prior hash.
 
 ```rust
 // BEFORE (eager evaluation bug — hashes unconditionally):
@@ -133,7 +129,7 @@ Discovery runs ~once per distinct `base_dir` instead of per task.
 
 ### Pitfalls
 
-1. **Over-eager "optimization" regressed performance**: A first attempt pre-collected ALL gitignored paths by doing a full `WalkDir` of the ENTIRE worktree root for every package's listing (343×). Result: RESOLVE_INPUTS 6.2s→17s, wall 30s — slower than before. Lesson: an "optimization" that adds a whole-repo walk per package is worse than the per-package walk it replaced. The correct fix kept the per-package subtree walk and only memoized repo discovery.
+1. **Over-eager "optimization" regressed performance**: A first attempt pre-collected ALL gitignored paths by doing a full `WalkDir` of the ENTIRE worktree root for every package's listing (343×). Result: RESOLVE_INPUTS 6.2s→17s, wall 30s — slower than before. Lesson: an "optimimization" that adds a whole-repo walk per package is worse than the per-package walk it replaced. The correct fix kept the per-package subtree walk and only memoized repo discovery.
 
 2. **Prefix-matching is WRONG for nested repos/submodules**: Keying by prefix (`base_dir.starts_with(root)`) means a directory inside a nested repo under a parent worktree gets served the PARENT's root. Fix: key by EXACT `base_dir` — `HashMap<base_dir, root>`. Each distinct `base_dir` keeps its own `gix::discover` result. A nested-repo test locked this in.
 
@@ -166,24 +162,161 @@ Wall:  Reduced further from ~18.6s baseline
 - [ ] Are cached values `Send` + `'static`, or is derived data cached instead?
 - [ ] Was the "optimized" path measured against the baseline?
 
+---
+
+## Round 3: Output Candidate Walk Scoping (prefix_union)
+
+After round 2, ~11s no-op time remained. Prior assumption: "build preparation" overhead. Profile-first overturned this.
+
+### Problem
+
+Env-gated `Instant` timers revealed the real split: prep ~3.6s vs **decide/skip loop ~7s**. Within decide, output candidate directory listing walked **1.44M files vs 27k for inputs**.
+
+Root cause: the output lister did a raw `WalkDir` over the ENTIRE package dir just to glob-match patterns like `dist/**` — walking `node_modules`, `.git`, build artifacts, everything.
+
+### Solution
+
+Scope the output-candidate walk to each output pattern's **static (metachar-free) leading path prefix** — e.g., for `dist/**/*.js`, only walk `dist/`.
+
+Key the run-scoped `ListingCache` by `(base_dir, prefix_union)` instead of `base_dir` alone, where `prefix_union` is the union of all output patterns' static prefixes for that task.
+
+**Implementation anchors:**
+- `crates/luchta-cache/src/resolve.rs` — `static_prefix()`, `prefix_union()`, `FilesystemLister`
+
+### Edge Cases
+
+1. **Leading `**`/brace/glob patterns**: No extractable prefix → fallback to full walk.
+2. **`..` segment in pattern**: Return `None` → full walk. Do NOT "stop at prior prefix" — that under-walks and misses outputs outside the package dir.
+3. **Multiple patterns**: Compute union of all prefixes. Precise narrow set is the optimization.
+
+### Result
+
+```
+Candidates walked: 1.44M → 59k
+Warm no-op: ~11s → ~9s
+Peak memory: 307MB → 167MB
+Cache skips preserved: 928/928 ✓
+```
+
+### Counterintuitive Pitfall
+
+A reviewer-suggested "optimization" to prune descendant prefixes in the union (collapse `[dist/types, dist/schema.json]` to `[dist]`) **regressed perf by ~3-4s**. Why? Broader walk to shared ancestor.
+
+**Lesson:** The precise narrow prefix set IS the optimization. Broader roots walk more. Always A/B benchmark perf "cleanups" interleaved under identical machine load — load average matters (observed 9s vs 12s purely from system load variation).
+
+### Round 3 Prevention Strategies
+
+**Prefix union specifics:**
+- Static prefix extraction MUST be metachar-free. `*`, `?`, `[` break the guarantee.
+- `..` segments cannot be safely resolved without canonicalization, which may not exist yet — fallback to full walk.
+- Pruning to shared ancestor is an **anti-pattern** — it broadens the walk.
+
+**Benchmark hygiene:**
+- Interleave A/B runs to cancel load noise.
+- Same machine, same thermal state, same background processes.
+- Report min/median of multiple runs.
+
+**Code Review Checklist (Round 3):**
+- [ ] Does the prefix extraction handle all glob metacharacters correctly?
+- [ ] Does `..` in pattern fall back to full walk rather than incorrect partial?
+- [ ] Was any "cleanup" measured against baseline?
+- [ ] Are A/B runs interleaved to cancel load noise?
+
+---
+
+## Round 4: Parallel Decide Loop — Deferred
+
+### Why Not Parallelized Yet
+
+The decision path reads `current.dep_outputs` from a per-cycle mutable `output_hashes` map populated topologically **during** the loop. Naive parallel fan-out causes **false cache hits**: a downstream task reads a stale/absent upstream hash and wrongly skips.
+
+### Safe Design (Deferred)
+
+**Wave-based (topological-layer) parallelism with barrier per wave:**
+
+1. Precompute decision map without reporting completion.
+2. Have `dispatch_ready_task` consume precomputed decisions.
+3. Each wave waits at barrier before next layer proceeds.
+
+**Key constraint:** The decision stage is entangled with Walker's completion-signaling protocol (each task expects exactly one `done_tx` completion). Wave-preapply must NOT report/complete early.
+
+### Architectural Blocker
+
+Implementation hit deeper blocker: `dispatch_ready_task` expects to call decide and immediately emit completions. Wave-based approach requires separating decision from dispatch — a larger engine refactor.
+
+### What Was Landed
+
+**Owned `DecisionContext` (prerequisite for `spawn_blocking`):**
+
+- Refactored decision context to be `Arc`-backed and `'static`.
+- Enables `tokio::spawn_blocking` for CPU-bound cache decision work.
+- Preserves AGENTS.md constraint: no Rayon, all concurrency via tokio.
+
+**File anchors:**
+- `crates/luchta-cli/src/run/dispatch.rs` — decide path, `dependency_output_hashes`, `output_hashes`
+- `crates/luchta-engine/src/...` — `compute_execution_waves` (future wave-based dispatch)
+
+### Why Pre-seeding output_hashes is Unsafe
+
+Persisted records diverge in mixed hit/run builds. A task with a cache hit reuses the persisted output hash, but a task that runs produces a new output hash. Downstream decisions must see the NEW hash, not the persisted one. Only topological populate-then-read within the same cycle is correct.
+
+### Round 4 Status
+
+**LANDED:** Owned `DecisionContext` refactor — reusable for future wave-parallel decide.
+
+**DEFERRED:** Wave-based parallel decide loop. Requires dispatch-core refactor to separate decision from completion reporting.
+
+### Round 4 Prevention Strategies
+
+**Concurrency safety:**
+- Topological dependents read from map populated during the SAME cycle.
+- Parallel reads require wave barriers or snapshot-and-seal approach.
+- Pre-seeding from persisted state breaks mixed hit/run builds.
+
+**Process hygiene:**
+- Land independently-valuable pieces as separate commits (perf win, refactor prerequisite).
+- Don't block verified wins on riskier changes.
+- Respect repo constraints: AGENTS.md forbids Rayon.
+
+**Code Review Checklist (Round 4):**
+- [ ] Does parallelizing a loop preserve topological dependency order?
+- [ ] Are reads fenced behind writes from topologically-prior tasks?
+- [ ] Was a prerequisite refactor landed separately?
+- [ ] Does the design respect AGENTS.md constraints (no Rayon)?
+
+---
+
 ## Prevention Strategies
 
 **Profiling before optimizing:**
 - Profile the real workload before assuming the bottleneck. The issue reporter's suggested fix and the "obvious" hotspot (hashing) were both wrong.
 - Cheap poor-man's profiling (env-gated atomic counters around suspected hot functions) beats guessing when system profilers are unavailable.
+- **PROFILE-FIRST OVERTURNS ASSUMPTIONS (repeatedly):** Round 1 (hashing negligible), Round 3 ("build prep" was actually decide loop). Each round's assumption was wrong.
 
 **Code patterns:**
 - Use `match` or `unwrap_or_else` for lazy evaluation, not `unwrap_or(expensive_call())`.
 - Prefer run-scoped caches over process-lifetime statics for data that may change between invocations.
+- Scope directory walks to the minimal prefix set. Broader roots walk more.
 
 **Repo constraints:**
 - `AGENTS.md` explicitly forbids `rayon` ("Rayon is explicitly excluded"). The stat fast-path made hashing negligible, so rayon addition was unnecessary. Respect architectural constraints; profile to confirm a dependency actually pays for itself before adding it.
+- All concurrency via tokio. Use `spawn_blocking` for CPU-bound work with `'static` contexts.
+
+**Benchmark discipline:**
+- Interleave A/B runs under identical load. System load variation can obscure 3s differences.
+- Measure "cleanups" — they may be regressions.
+
+**Process:**
+- Land independently-valuable, verified pieces as separate commits.
+- Don't block wins on riskier refactors.
 
 **Code Review Checklist:**
 - [ ] Does `unwrap_or` contain an expensive call that should be lazy?
 - [ ] Is the cache scope correct (run vs process lifetime)?
 - [ ] Was profiling done before proposing parallelism?
 - [ ] Does the fix respect repo-wide dependency constraints (e.g., no rayon)?
+- [ ] Was any "optimization" measured against the baseline?
+- [ ] Are A/B benchmarks interleaved to cancel load noise?
 
 ## Related Issues
 

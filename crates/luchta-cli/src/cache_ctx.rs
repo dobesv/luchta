@@ -17,6 +17,7 @@ use luchta_workspace::{PackageGraph, PackageNode};
 use miette::{IntoDiagnostic, Result};
 use serde::Deserialize;
 
+#[derive(Clone)]
 pub(crate) enum LockfileState {
     Absent,
     Parsed(Arc<dyn Lockfile>),
