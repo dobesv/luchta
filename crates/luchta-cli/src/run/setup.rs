@@ -12,7 +12,7 @@ use std::time::Duration;
 use luchta_cache::shared::{maybe_run_gc, SharedCache, DEFAULT_GC_RETENTION, DEFAULT_GC_THROTTLE};
 #[cfg(unix)]
 use luchta_cache::shared::{OpenExtras, RemoteConfig};
-use luchta_cache::Cache;
+use luchta_cache::{Cache, ListingCache};
 use luchta_engine::{ExecutionRequest, TaskGraph, WeightedExecutor, WorkerManager};
 use luchta_types::{EnvSpec, TaskId, WorkerDefinition};
 use luchta_workspace::{PackageGraph, PackageNode};
@@ -112,6 +112,7 @@ pub(crate) struct ExecutionResources {
     pub(crate) invalid: HashMap<TaskId, String>,
     pub(crate) task_envs: HashMap<TaskId, BTreeMap<String, EnvSpec>>,
     pub(crate) shared_cache: Option<Arc<SharedCache>>,
+    pub(crate) listing_cache: Arc<ListingCache>,
 }
 
 /// Environment variable enabling shared cache.
@@ -316,6 +317,7 @@ pub(crate) fn build_execution_resources(
         invalid,
         task_envs,
         shared_cache,
+        listing_cache: Arc::new(ListingCache::default()),
     })
 }
 

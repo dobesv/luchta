@@ -18,8 +18,16 @@ pub struct DecisionResult {
 pub const DECIDE_FILES_DIFF_LIMIT: usize = 50;
 
 pub trait FileStateResolver {
-    fn resolve_inputs(&self, patterns: &[String]) -> crate::Result<Vec<FileEntry>>;
-    fn resolve_outputs(&self, patterns: &[String]) -> crate::Result<Vec<FileEntry>>;
+    fn resolve_inputs(
+        &self,
+        patterns: &[String],
+        prior_entries: &[FileEntry],
+    ) -> crate::Result<Vec<FileEntry>>;
+    fn resolve_outputs(
+        &self,
+        patterns: &[String],
+        prior_entries: &[FileEntry],
+    ) -> crate::Result<Vec<FileEntry>>;
     fn blake3_file(&self, path: &Path) -> crate::Result<[u8; 32]>;
 }
 
@@ -244,8 +252,8 @@ fn patterns_unchanged(
     kind: FileEntryKind,
 ) -> bool {
     let resolved_entries = match kind {
-        FileEntryKind::Inputs => resolver.resolve_inputs(patterns),
-        FileEntryKind::Outputs => resolver.resolve_outputs(patterns),
+        FileEntryKind::Inputs => resolver.resolve_inputs(patterns, prior_entries),
+        FileEntryKind::Outputs => resolver.resolve_outputs(patterns, prior_entries),
     };
     let Ok(resolved_entries) = resolved_entries else {
         return false;
@@ -277,8 +285,8 @@ fn change_reason(
     kind: FileEntryKind,
 ) -> Option<RunReason> {
     let resolved_entries = match kind {
-        FileEntryKind::Inputs => resolver.resolve_inputs(patterns),
-        FileEntryKind::Outputs => resolver.resolve_outputs(patterns),
+        FileEntryKind::Inputs => resolver.resolve_inputs(patterns, prior_entries),
+        FileEntryKind::Outputs => resolver.resolve_outputs(patterns, prior_entries),
     };
     let Ok(resolved_entries) = resolved_entries else {
         return Some(match kind {
@@ -319,8 +327,8 @@ fn resolve_or_empty(
     kind: FileEntryKind,
 ) -> Vec<FileEntry> {
     let resolved = match kind {
-        FileEntryKind::Inputs => resolver.resolve_inputs(patterns),
-        FileEntryKind::Outputs => resolver.resolve_outputs(patterns),
+        FileEntryKind::Inputs => resolver.resolve_inputs(patterns, &[]),
+        FileEntryKind::Outputs => resolver.resolve_outputs(patterns, &[]),
     };
     resolved.unwrap_or_default()
 }
@@ -1063,7 +1071,11 @@ mod tests {
     }
 
     impl FileStateResolver for FixtureResolver {
-        fn resolve_inputs(&self, patterns: &[String]) -> crate::Result<Vec<FileEntry>> {
+        fn resolve_inputs(
+            &self,
+            patterns: &[String],
+            _: &[FileEntry],
+        ) -> crate::Result<Vec<FileEntry>> {
             self.input_pattern_calls
                 .borrow_mut()
                 .push(patterns.to_vec());
@@ -1074,7 +1086,11 @@ mod tests {
                 .unwrap_or_else(|| self.default_inputs.clone()))
         }
 
-        fn resolve_outputs(&self, patterns: &[String]) -> crate::Result<Vec<FileEntry>> {
+        fn resolve_outputs(
+            &self,
+            patterns: &[String],
+            _: &[FileEntry],
+        ) -> crate::Result<Vec<FileEntry>> {
             self.output_pattern_calls
                 .borrow_mut()
                 .push(patterns.to_vec());
@@ -1100,13 +1116,21 @@ mod tests {
         struct ErrorResolver;
 
         impl FileStateResolver for ErrorResolver {
-            fn resolve_inputs(&self, _: &[String]) -> crate::Result<Vec<FileEntry>> {
+            fn resolve_inputs(
+                &self,
+                _: &[String],
+                _: &[FileEntry],
+            ) -> crate::Result<Vec<FileEntry>> {
                 Err(CacheError::InputExpansion(
                     "input resolver failed".to_owned(),
                 ))
             }
 
-            fn resolve_outputs(&self, _: &[String]) -> crate::Result<Vec<FileEntry>> {
+            fn resolve_outputs(
+                &self,
+                _: &[String],
+                _: &[FileEntry],
+            ) -> crate::Result<Vec<FileEntry>> {
                 Err(CacheError::InputExpansion(
                     "output resolver failed".to_owned(),
                 ))

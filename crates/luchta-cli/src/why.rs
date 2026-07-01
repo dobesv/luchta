@@ -8,10 +8,11 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
 
 use luchta_cache::{
     decide, files_diff, resolve_cache_dir, Cache, CurrentState, Decision, FileEntry,
-    FileStateResolver, DECIDE_FILES_DIFF_LIMIT,
+    FileStateResolver, ListingCache, DECIDE_FILES_DIFF_LIMIT,
 };
 use luchta_engine::ResolveMode;
 use luchta_types::{EnvSpec, PackageName, TaskDefinition, TaskId};
@@ -376,6 +377,7 @@ fn print_live_decision(
         ctx.workspace_root.to_path_buf(),
         package_name.clone(),
         ctx.prepared.package_graph.clone(),
+        Arc::new(ListingCache::default()),
     );
 
     let dep_outputs = build_dep_outputs_from_cache(task_id, ctx.prepared, ctx.cache);
@@ -562,11 +564,11 @@ fn resolve_current_entries(
 ) -> Vec<FileEntry> {
     if is_inputs {
         resolver
-            .resolve_inputs(current.declared_input_patterns)
+            .resolve_inputs(current.declared_input_patterns, &[])
             .unwrap_or_default()
     } else {
         resolver
-            .resolve_outputs(current.declared_output_patterns)
+            .resolve_outputs(current.declared_output_patterns, &[])
             .unwrap_or_default()
     }
 }
