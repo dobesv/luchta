@@ -1,7 +1,7 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Child, Command},
     sync::OnceLock,
     thread,
     time::{Duration, Instant},
@@ -9,6 +9,31 @@ use std::{
 
 use assert_cmd::cargo::cargo_bin;
 use assert_fs::{prelude::*, TempDir};
+
+struct KillOnDrop(Option<Child>);
+
+impl KillOnDrop {
+    fn new(child: Child) -> Self {
+        Self(Some(child))
+    }
+
+    fn child_mut(&mut self) -> &mut Child {
+        self.0.as_mut().expect("child already taken")
+    }
+
+    fn into_inner(mut self) -> Child {
+        self.0.take().expect("child already taken")
+    }
+}
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        if let Some(child) = self.0.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
 
 fn make_script(temp: &TempDir, name: &str, body: &str) -> assert_fs::fixture::ChildPath {
     let script = temp.child(name);
@@ -157,15 +182,17 @@ fn concurrent_runs_wait_for_build_lock_across_processes() {
     fs::create_dir_all(cache_dir.path()).expect("create cache dir");
     let second_stderr = temp.child("second.stderr");
 
-    let first = Command::new(binary_path())
-        .arg("run")
-        .arg("build")
-        .arg("--workspace-root")
-        .arg(temp.path())
-        .env("LUCHTA_CACHE_DIR", cache_dir.path())
-        .env("NO_COLOR", "1")
-        .spawn()
-        .expect("spawn first luchta process");
+    let first = KillOnDrop::new(
+        Command::new(binary_path())
+            .arg("run")
+            .arg("build")
+            .arg("--workspace-root")
+            .arg(temp.path())
+            .env("LUCHTA_CACHE_DIR", cache_dir.path())
+            .env("NO_COLOR", "1")
+            .spawn()
+            .expect("spawn first luchta process"),
+    );
 
     wait_for(
         Duration::from_secs(30),
@@ -173,26 +200,29 @@ fn concurrent_runs_wait_for_build_lock_across_processes() {
         "first process to signal lock hold",
     );
 
-    let mut second = Command::new(binary_path())
-        .arg("run")
-        .arg("build")
-        .arg("--workspace-root")
-        .arg(temp.path())
-        .env("LUCHTA_CACHE_DIR", cache_dir.path())
-        .env("NO_COLOR", "1")
-        .stderr(fs::File::create(second_stderr.path()).expect("create second stderr log"))
-        .spawn()
-        .expect("spawn second luchta process");
+    let mut second = KillOnDrop::new(
+        Command::new(binary_path())
+            .arg("run")
+            .arg("build")
+            .arg("--workspace-root")
+            .arg(temp.path())
+            .env("LUCHTA_CACHE_DIR", cache_dir.path())
+            .env("NO_COLOR", "1")
+            .stderr(fs::File::create(second_stderr.path()).expect("create second stderr log"))
+            .spawn()
+            .expect("spawn second luchta process"),
+    );
 
     wait_for_waiting_message(second_stderr.path());
     assert!(
-        second.try_wait().expect("poll second process").is_none(),
+        second.child_mut().try_wait().expect("poll second process").is_none(),
         "second process should still be blocked after waiting message"
     );
 
     fs::write(&release_path, "release").expect("release first worker");
 
     let first_output = first
+        .into_inner()
         .wait_with_output()
         .expect("collect first process output");
     assert!(
@@ -201,7 +231,7 @@ fn concurrent_runs_wait_for_build_lock_across_processes() {
         String::from_utf8_lossy(&first_output.stderr)
     );
 
-    let second_status = second.wait().expect("wait for second process");
+    let second_status = second.into_inner().wait().expect("wait for second process");
     assert!(second_status.success(), "second process should succeed");
     assert_eq!(
         read_file(&finished_path),

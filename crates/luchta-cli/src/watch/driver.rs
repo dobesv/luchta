@@ -334,9 +334,18 @@ where
     G: Future<Output = std::result::Result<(), std::io::Error>> + Send,
 {
     let cache_dir = resolve_cache_dir(session.repo_root());
-    let _build_lock = match build_lock::acquire(&cache_dir).await? {
-        Some(lock) => lock,
-        None => return Ok(WatchControl::Stop), // Ctrl+C while waiting
+    let acquire_lock = build_lock::acquire(&cache_dir);
+    tokio::pin!(acquire_lock);
+    let _build_lock = tokio::select! {
+        lock = &mut acquire_lock => match lock? {
+            Some(lock) => lock,
+            None => return Ok(WatchControl::Stop), // Ctrl+C while waiting
+        },
+        _ = &mut signals.shutdown => {
+            ui.shutting_down();
+            shutdown_watch(session, ui, signals).await;
+            return Ok(WatchControl::Stop);
+        }
     };
     let initial_selection = selection.as_task_selection();
     run_cycle_with_status(
@@ -386,9 +395,18 @@ where
     context.ui.change_detected(&affected);
     let cycle_selection = context.selection.as_task_selection();
     let cache_dir = resolve_cache_dir(context.session.repo_root());
-    let _build_lock = match build_lock::acquire(&cache_dir).await? {
-        Some(lock) => lock,
-        None => return Ok(WatchControl::Stop), // Ctrl+C while waiting
+    let acquire_lock = build_lock::acquire(&cache_dir);
+    tokio::pin!(acquire_lock);
+    let _build_lock = tokio::select! {
+        lock = &mut acquire_lock => match lock? {
+            Some(lock) => lock,
+            None => return Ok(WatchControl::Stop), // Ctrl+C while waiting
+        },
+        _ = &mut signals.shutdown => {
+            context.ui.shutting_down();
+            shutdown_watch(context.session, context.ui, signals).await;
+            return Ok(WatchControl::Stop);
+        }
     };
     run_cycle_with_status(
         context.session,
