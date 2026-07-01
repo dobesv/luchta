@@ -1989,7 +1989,7 @@ checksum = "953f07c43838f8e6f9758cab68bf5bed85465e7587ebe0b823f1bcd81978ad3a"
 
 [[package]]
 name = "luchta-bash-worker"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "assert_cmd",
  "luchta-engine",
@@ -2000,7 +2000,7 @@ dependencies = [
 
 [[package]]
 name = "luchta-cache"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "bincode",
  "blake3",
@@ -2026,7 +2026,7 @@ dependencies = [
 
 [[package]]
 name = "luchta-cli"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "assert_cmd",
  "assert_fs",
@@ -2065,7 +2065,7 @@ dependencies = [
 
 [[package]]
 name = "luchta-command-filter"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "assert_cmd",
  "luchta-worker",
@@ -2076,7 +2076,7 @@ dependencies = [
 
 [[package]]
 name = "luchta-engine"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "libc",
  "luchta-cache",
@@ -2095,7 +2095,7 @@ dependencies = [
 
 [[package]]
 name = "luchta-file-exists-filter"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "assert_cmd",
  "globset",
@@ -2108,7 +2108,7 @@ dependencies = [
 
 [[package]]
 name = "luchta-lazy-worker"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "assert_cmd",
  "luchta-worker",
@@ -2119,7 +2119,7 @@ dependencies = [
 
 [[package]]
 name = "luchta-lockfiles"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "serde",
  "serde_norway",
@@ -2129,7 +2129,7 @@ dependencies = [
 
 [[package]]
 name = "luchta-types"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "serde",
  "serde_json",
@@ -2138,7 +2138,7 @@ dependencies = [
 
 [[package]]
 name = "luchta-worker"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "libc",
  "luchta-types",
@@ -2150,7 +2150,7 @@ dependencies = [
 
 [[package]]
 name = "luchta-workspace"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "globset",
  "luchta-types",
@@ -2164,7 +2164,7 @@ dependencies = [
 
 [[package]]
 name = "luchta-yarn-filter"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "assert_cmd",
  "luchta-worker",
@@ -2175,7 +2175,7 @@ dependencies = [
 
 [[package]]
 name = "luchta-yarn-worker"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "assert_cmd",
  "luchta-engine",
@@ -3906,7 +3906,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "clap",
  "serde",
