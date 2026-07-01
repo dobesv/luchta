@@ -14,7 +14,10 @@ tags:
   - profiling
   - directory-traversal
   - blake3
+  - gix
+  - worktree-discovery
 plan_ref: "luchta-perf-154"
+last_updated: 2026-06-30
 ---
 
 ## Problem
@@ -98,12 +101,70 @@ let listing_cache = Rc<RefCell<HashMap<PathBuf, Arc<Vec<FileEntry>>>>>;
 ## Result
 
 ```
-Before: ~37s for fully-cached build
-After:  ~19s for fully-cached build
-Speedup: ~2x
+Round 1 Before: ~37s for fully-cached build
+Round 1 After:  ~19s for fully-cached build
+Round 1 Speedup: ~2x
 ```
 
 Also collapsed double `stat` into single `fs::metadata()` call.
+
+---
+
+## Round 2: Memoizing Git Worktree Discovery
+
+After round 1 eliminated hashing and directory-walk redundancy, re-profiling revealed a new hotspot: `gix::discover` called ~3039 times despite all ~26 workspace packages living in ONE git repo. Each call walks UP the filesystem to find `.git` — cheap per-call but expensive at scale.
+
+### Problem
+
+`gix::discover(base_dir)` walks up the directory tree to find the git worktree root. Called per-task for input resolution, this accumulated to ~10s of the remaining ~18.6s runtime.
+
+### Solution
+
+Memoize the discovered worktree root per `base_dir` in the run-scoped `ListingCache`:
+
+```rust
+struct ListingCache {
+    dir_listings: HashMap<PathBuf, Arc<Vec<FileEntry>>>,
+    worktree_roots: HashMap<PathBuf, PathBuf>,  // base_dir → worktree root
+}
+```
+
+Discovery runs ~once per distinct `base_dir` instead of per task.
+
+### Pitfalls
+
+1. **Over-eager "optimization" regressed performance**: A first attempt pre-collected ALL gitignored paths by doing a full `WalkDir` of the ENTIRE worktree root for every package's listing (343×). Result: RESOLVE_INPUTS 6.2s→17s, wall 30s — slower than before. Lesson: an "optimization" that adds a whole-repo walk per package is worse than the per-package walk it replaced. The correct fix kept the per-package subtree walk and only memoized repo discovery.
+
+2. **Prefix-matching is WRONG for nested repos/submodules**: Keying by prefix (`base_dir.starts_with(root)`) means a directory inside a nested repo under a parent worktree gets served the PARENT's root. Fix: key by EXACT `base_dir` — `HashMap<base_dir, root>`. Each distinct `base_dir` keeps its own `gix::discover` result. A nested-repo test locked this in.
+
+3. **`gix::Repository`/`AttributeStack` are not `Send`/`'static`**: They can't live in an `Arc<Mutex<...>>` run cache. Fix: cache the cheap, ownable derived data (worktree root `PathBuf`), and open the repo + build the ignore stack locally per listing call. Since discovery is memoized, opening the repo by path is cheap.
+
+### Round 2 Result
+
+```
+Before: ~18.6s (after round 1)
+After:  ~7s internal time for RESOLVE_INPUTS phase
+Wall:  Reduced further from ~18.6s baseline
+```
+
+### Round 2 Prevention Strategies
+
+**Re-profile after each win:**
+- The bottleneck moves. After eliminating the top hotspot, the next-largest becomes visible.
+- Round 1's fix (listing cache) made directory walks cheap, exposing `gix::discover`.
+
+**Always measure "optimizations":**
+- An optimization that adds work can regress. The whole-repo-walk-per-package attempt made things worse.
+- Only profiling caught the regression before merge.
+
+**Cache ownable data, not live handles:**
+- `gix` types often aren't `Send`/`'static`. Cache derived data (`PathBuf`), re-open repo locally.
+
+**Code Review Checklist (Round 2):**
+- [ ] After a perf fix, was the workload re-profiled to find the next hotspot?
+- [ ] Does the cache key correctly handle nested repos (exact match, not prefix)?
+- [ ] Are cached values `Send` + `'static`, or is derived data cached instead?
+- [ ] Was the "optimized" path measured against the baseline?
 
 ## Prevention Strategies
 
