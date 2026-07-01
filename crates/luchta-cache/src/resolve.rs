@@ -41,6 +41,12 @@ const COMBINED_OUTPUTS_HASH_DOMAIN: &[u8] = b"luchta-cache:combined-outputs:v1";
 pub struct ListingCache {
     input_candidates: Arc<Mutex<HashMap<PathBuf, Arc<Vec<PathBuf>>>>>,
     output_candidates: Arc<Mutex<HashMap<PathBuf, Arc<Vec<PathBuf>>>>>,
+    /// Maps a resolved `base_dir` to its discovered git worktree root, so
+    /// `gix::discover` (which walks up the filesystem to find `.git`) runs once
+    /// per distinct base_dir per run instead of once per task. Keyed by exact
+    /// base_dir — NOT by prefix — so a nested repository/submodule inside a
+    /// parent worktree is never served the parent's root.
+    worktree_roots: Arc<Mutex<HashMap<PathBuf, PathBuf>>>,
 }
 
 impl ListingCache {
@@ -61,6 +67,16 @@ impl ListingCache {
     fn insert_output_candidates(&self, base_dir: &Path, candidates: Arc<Vec<PathBuf>>) {
         if let Ok(mut cache) = self.output_candidates.lock() {
             cache.insert(base_dir.to_path_buf(), candidates);
+        }
+    }
+
+    fn get_worktree_root(&self, base_dir: &Path) -> Option<PathBuf> {
+        self.worktree_roots.lock().ok()?.get(base_dir).cloned()
+    }
+
+    fn insert_worktree_root(&self, base_dir: PathBuf, worktree_root: PathBuf) {
+        if let Ok(mut roots) = self.worktree_roots.lock() {
+            roots.entry(base_dir).or_insert(worktree_root);
         }
     }
 }
@@ -125,13 +141,19 @@ pub fn resolve_inputs_with_semantics_and_options(
     }
     let mut candidate_cache = HashMap::<PathBuf, Vec<PathBuf>>::new();
     let mut base_dir_prefix_cache = HashMap::<PathBuf, PathBuf>::new();
+    let mut worktree_root_cache = HashMap::<PathBuf, PathBuf>::new();
     let mut merged_entries = Vec::new();
     let mut worktree_roots = Vec::new();
     let prior_by_path = prior_entries_by_path(options.prior_entries);
 
     for request in requests {
-        let base_dir_prefix =
-            qualified_base_dir_prefix(&request.base_dir, &mut base_dir_prefix_cache)?.clone();
+        let base_dir_prefix = qualified_base_dir_prefix(
+            &request.base_dir,
+            &mut base_dir_prefix_cache,
+            &mut worktree_root_cache,
+            options.listing_cache,
+        )?
+        .clone();
         // The repo-relative prefix is exactly the tail of `base_dir` below the
         // worktree root, so stripping it yields the worktree root. Entry paths
         // are repo-relative, so this root is what they must be joined to when
@@ -245,8 +267,16 @@ fn cached_input_candidates(
         return Ok(candidates);
     }
 
-    let base_prefix = worktree_relative_base_dir(base_dir)?;
-    let candidates = GitTrackedInputLister::new(base_prefix).list(base_dir)?;
+    let mut worktree_root_cache = HashMap::new();
+    let base_prefix =
+        worktree_relative_base_dir(base_dir, &mut worktree_root_cache, listing_cache)?;
+    let candidates = git_tracked_input_lister(
+        base_dir,
+        base_prefix,
+        &mut worktree_root_cache,
+        listing_cache,
+    )?
+    .list(base_dir)?;
     if let Some(cache) = listing_cache {
         cache.insert_input_candidates(base_dir, Arc::new(candidates.clone()));
     }
@@ -505,13 +535,15 @@ fn file_entry_from_path(
 fn qualified_base_dir_prefix<'a>(
     base_dir: &Path,
     base_dir_prefix_cache: &'a mut HashMap<PathBuf, PathBuf>,
+    worktree_root_cache: &mut HashMap<PathBuf, PathBuf>,
+    listing_cache: Option<&ListingCache>,
 ) -> Result<&'a PathBuf> {
     use std::collections::hash_map::Entry;
 
     match base_dir_prefix_cache.entry(base_dir.to_path_buf()) {
         Entry::Occupied(entry) => Ok(entry.into_mut()),
         Entry::Vacant(entry) => {
-            let prefix = worktree_relative_base_dir(base_dir)?;
+            let prefix = worktree_relative_base_dir(base_dir, worktree_root_cache, listing_cache)?;
             Ok(entry.insert(prefix))
         }
     }
@@ -526,23 +558,55 @@ fn qualify_relative_path(base_dir_prefix: &Path, relative_path: &Path) -> String
     normalize_path(&qualified)
 }
 
-fn worktree_relative_base_dir(base_dir: &Path) -> Result<PathBuf> {
-    let repo = gix::discover(base_dir).map_err(|err| {
-        CacheError::Git(format!(
-            "failed to open git repo at {}: {err}",
-            base_dir.display()
-        ))
-    })?;
-    let work_dir = repo.workdir().ok_or_else(|| {
+fn worktree_relative_base_dir(
+    base_dir: &Path,
+    worktree_root_cache: &mut HashMap<PathBuf, PathBuf>,
+    listing_cache: Option<&ListingCache>,
+) -> Result<PathBuf> {
+    let work_dir = cached_worktree_root(base_dir, worktree_root_cache, listing_cache)?;
+    let relative = base_dir
+        .strip_prefix(&work_dir)
+        .map_err(|err| CacheError::StripBaseDir(err.to_string()))?;
+    Ok(relative.to_path_buf())
+}
+
+fn cached_worktree_root(
+    base_dir: &Path,
+    worktree_root_cache: &mut HashMap<PathBuf, PathBuf>,
+    listing_cache: Option<&ListingCache>,
+) -> Result<PathBuf> {
+    // Exact base_dir match only. Prefix sharing would be wrong across a nested
+    // repository/submodule boundary (a descendant dir belongs to the inner
+    // worktree, not the cached parent), so each distinct base_dir keeps its own
+    // discovered root.
+    if let Some(root) = worktree_root_cache.get(base_dir) {
+        return Ok(root.clone());
+    }
+    if let Some(root) = listing_cache.and_then(|cache| cache.get_worktree_root(base_dir)) {
+        worktree_root_cache.insert(base_dir.to_path_buf(), root.clone());
+        return Ok(root);
+    }
+
+    let repo = {
+        gix::discover(base_dir).map_err(|err| {
+            CacheError::Git(format!(
+                "failed to open git repo at {}: {err}",
+                base_dir.display()
+            ))
+        })?
+    };
+    let worktree_root = repo.workdir().ok_or_else(|| {
         CacheError::Git(format!(
             "repository at {} has no worktree for input resolution",
             base_dir.display()
         ))
     })?;
-    let relative = base_dir
-        .strip_prefix(work_dir)
-        .map_err(|err| CacheError::StripBaseDir(err.to_string()))?;
-    Ok(relative.to_path_buf())
+    let worktree_root = worktree_root.to_path_buf();
+    worktree_root_cache.insert(base_dir.to_path_buf(), worktree_root.clone());
+    if let Some(cache) = listing_cache {
+        cache.insert_worktree_root(base_dir.to_path_buf(), worktree_root.clone());
+    }
+    Ok(worktree_root)
 }
 
 fn modified_time_ns(metadata: &fs::Metadata) -> Result<i128> {
@@ -561,13 +625,22 @@ trait CandidateLister {
     fn list(&self, base_dir: &Path) -> Result<Vec<PathBuf>>;
 }
 
+/// Lists candidate input files under a package directory, honoring git's
+/// ignore rules. The worktree root is resolved once per run (memoized in the
+/// `ListingCache`) so `list` never re-runs `gix::discover`; it opens the repo
+/// directly from that root and applies the ignore stack lazily while walking
+/// only the package subtree (not the whole worktree).
 struct GitTrackedInputLister {
     base_prefix: PathBuf,
+    worktree_root: PathBuf,
 }
 
 impl GitTrackedInputLister {
-    fn new(base_prefix: PathBuf) -> Self {
-        Self { base_prefix }
+    fn new(base_prefix: PathBuf, worktree_root: PathBuf) -> Self {
+        Self {
+            base_prefix,
+            worktree_root,
+        }
     }
 
     fn to_package_relative_path(&self, repo_relative_path: &Path) -> Option<PathBuf> {
@@ -580,34 +653,40 @@ impl GitTrackedInputLister {
             .map(Path::to_path_buf)
     }
 
-    fn worktree_relative_path<'a>(&self, worktree_root: &Path, path: &'a Path) -> Result<&'a Path> {
-        path.strip_prefix(worktree_root)
+    fn worktree_relative_path<'a>(&self, path: &'a Path) -> Result<&'a Path> {
+        path.strip_prefix(&self.worktree_root)
             .map_err(|err| CacheError::StripBaseDir(err.to_string()))
     }
 }
 
 impl CandidateLister for GitTrackedInputLister {
     fn list(&self, base_dir: &Path) -> Result<Vec<PathBuf>> {
-        let repo = gix::discover(base_dir).map_err(|err| {
+        // Open the repo from the already-resolved worktree root (no discovery
+        // walk) and build the ignore stack once for this walk. gix's repository
+        // and attribute stack are neither `Send` nor `'static`, so they cannot
+        // live in the shared run cache; keeping them local to the walk is the
+        // cheap, correct choice now that root discovery is memoized.
+        let repo = gix::open(&self.worktree_root).map_err(|err| {
             CacheError::Git(format!(
                 "failed to open git repo at {}: {err}",
-                base_dir.display()
+                self.worktree_root.display()
             ))
         })?;
         let worktree = repo.worktree().ok_or_else(|| {
             CacheError::Git(format!(
                 "repository at {} has no worktree for input resolution",
-                base_dir.display()
+                self.worktree_root.display()
             ))
         })?;
-        let worktree_root = worktree.base().to_path_buf();
-        let git_dir = repo.git_dir().to_path_buf();
-        let mut excludes = worktree.excludes(None).map_err(|err| {
-            CacheError::Git(format!(
-                "failed to initialize git ignore stack at {}: {err}",
-                base_dir.display()
-            ))
-        })?;
+        let git_dir = repo.git_dir();
+        let mut excludes = {
+            worktree.excludes(None).map_err(|err| {
+                CacheError::Git(format!(
+                    "failed to initialize git ignore stack at {}: {err}",
+                    self.worktree_root.display()
+                ))
+            })?
+        };
 
         let mut paths = BTreeSet::new();
         let mut walker = WalkDir::new(base_dir).into_iter();
@@ -615,7 +694,7 @@ impl CandidateLister for GitTrackedInputLister {
             let entry = entry?;
             let path = entry.path();
 
-            if path == git_dir || path.starts_with(&git_dir) {
+            if path == git_dir || path.starts_with(git_dir) {
                 if entry.file_type().is_dir() {
                     walker.skip_current_dir();
                 }
@@ -623,7 +702,7 @@ impl CandidateLister for GitTrackedInputLister {
             }
 
             if path != base_dir {
-                let worktree_relative_path = self.worktree_relative_path(&worktree_root, path)?;
+                let worktree_relative_path = self.worktree_relative_path(path)?;
                 let repo_relative_path = normalize_path(worktree_relative_path);
                 let is_excluded = excludes
                     .at_entry(repo_relative_path.as_bytes().as_bstr(), None)
@@ -641,7 +720,7 @@ impl CandidateLister for GitTrackedInputLister {
                 continue;
             }
 
-            let worktree_relative_path = self.worktree_relative_path(&worktree_root, path)?;
+            let worktree_relative_path = self.worktree_relative_path(path)?;
             let Some(package_relative_path) = self.to_package_relative_path(worktree_relative_path)
             else {
                 continue;
@@ -651,6 +730,16 @@ impl CandidateLister for GitTrackedInputLister {
 
         Ok(paths.into_iter().collect())
     }
+}
+
+fn git_tracked_input_lister(
+    base_dir: &Path,
+    base_prefix: PathBuf,
+    worktree_root_cache: &mut HashMap<PathBuf, PathBuf>,
+    listing_cache: Option<&ListingCache>,
+) -> Result<GitTrackedInputLister> {
+    let worktree_root = cached_worktree_root(base_dir, worktree_root_cache, listing_cache)?;
+    Ok(GitTrackedInputLister::new(base_prefix, worktree_root))
 }
 
 struct FilesystemLister;
@@ -704,7 +793,7 @@ mod tests {
     use luchta_types::{classify_pattern, InputSemantics};
 
     use super::{
-        combined_outputs_hash, dedupe_and_sort_entries, file_entry_from_path,
+        cached_worktree_root, combined_outputs_hash, dedupe_and_sort_entries, file_entry_from_path,
         prior_entries_by_path, qualified_base_dir_prefix, resolve_file_entries, resolve_inputs,
         resolve_inputs_with_options, resolve_inputs_with_semantics, resolve_literal_request,
         resolve_outputs, resolve_outputs_with_options, resolve_wildcard_with_candidates,
@@ -753,6 +842,127 @@ mod tests {
             resolve_inputs_with_semantics_with_lister(&requests, &second_lister, second_options)
                 .unwrap();
         assert_eq!(second_lister.calls(), 1);
+    }
+
+    #[test]
+    fn listing_cache_reuses_worktree_root_across_base_dirs_in_same_repo() {
+        let repo = TestRepo::new();
+        repo.write_file(
+            "pkg-a/src/a.ts",
+            "a
+",
+        );
+        repo.write_file(
+            "pkg-b/src/b.ts",
+            "b
+",
+        );
+        repo.git_add_and_commit_all();
+
+        let cache = ListingCache::default();
+        let mut worktree_root_cache = HashMap::new();
+
+        let pkg_a_root = cached_worktree_root(
+            &repo.path().join("pkg-a"),
+            &mut worktree_root_cache,
+            Some(&cache),
+        )
+        .unwrap();
+        let pkg_b_root = cached_worktree_root(
+            &repo.path().join("pkg-b"),
+            &mut worktree_root_cache,
+            Some(&cache),
+        )
+        .unwrap();
+
+        assert_eq!(pkg_a_root, repo.path());
+        assert_eq!(pkg_b_root, repo.path());
+        // Two distinct base_dirs, both mapping to the one repo's worktree root.
+        let roots = cache.worktree_roots.lock().unwrap();
+        assert_eq!(roots.len(), 2);
+        assert!(roots.values().all(|root| root == repo.path()));
+    }
+
+    #[test]
+    fn listing_cache_keeps_distinct_worktree_roots_for_distinct_repos() {
+        let repo_a = TestRepo::new();
+        repo_a.write_file(
+            "pkg-a/src/a.ts",
+            "a
+",
+        );
+        repo_a.git_add_and_commit_all();
+
+        let repo_b = TestRepo::new();
+        repo_b.write_file(
+            "pkg-b/src/b.ts",
+            "b
+",
+        );
+        repo_b.git_add_and_commit_all();
+
+        let cache = ListingCache::default();
+        let mut worktree_root_cache = HashMap::new();
+
+        let root_a = cached_worktree_root(
+            &repo_a.path().join("pkg-a"),
+            &mut worktree_root_cache,
+            Some(&cache),
+        )
+        .unwrap();
+        let root_b = cached_worktree_root(
+            &repo_b.path().join("pkg-b"),
+            &mut worktree_root_cache,
+            Some(&cache),
+        )
+        .unwrap();
+
+        assert_eq!(root_a, repo_a.path());
+        assert_eq!(root_b, repo_b.path());
+        assert_ne!(root_a, root_b);
+        assert_eq!(cache.worktree_roots.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn cached_worktree_root_prefers_nested_repo_over_parent() {
+        // A nested repository (e.g. a submodule) inside a parent worktree must
+        // resolve to its OWN worktree root, even when the parent's root was
+        // cached first. Guards the deepest-ancestor selection against a
+        // shallower prefix match shadowing the inner worktree.
+        let parent = TestRepo::new();
+        parent.write_file("pkg/src/a.ts", "a\n");
+        parent.git_add_and_commit_all();
+
+        // Initialize an independent repo nested under the parent worktree.
+        let nested_root = parent.path().join("vendor/nested");
+        fs::create_dir_all(&nested_root).unwrap();
+        git(&nested_root, ["init"]);
+        git(&nested_root, ["config", "user.name", "Luchta Tests"]);
+        git(&nested_root, ["config", "user.email", "luchta@example.com"]);
+
+        let cache = ListingCache::default();
+        let mut worktree_root_cache = HashMap::new();
+
+        // Look up a parent-repo package first so the parent root is cached.
+        let parent_pkg_root = cached_worktree_root(
+            &parent.path().join("pkg"),
+            &mut worktree_root_cache,
+            Some(&cache),
+        )
+        .unwrap();
+        assert_eq!(parent_pkg_root, parent.path());
+
+        // A directory inside the nested repo must resolve to the nested root,
+        // not the (shallower, already-cached) parent root.
+        let nested_pkg = nested_root.join("pkg");
+        fs::create_dir_all(&nested_pkg).unwrap();
+        let nested_pkg_root =
+            cached_worktree_root(&nested_pkg, &mut worktree_root_cache, Some(&cache)).unwrap();
+        assert_eq!(
+            nested_pkg_root, nested_root,
+            "nested repo dir must resolve to the nested worktree root"
+        );
+        assert_ne!(nested_pkg_root, parent.path());
     }
 
     #[test]
@@ -922,13 +1132,19 @@ mod tests {
 
         let mut candidate_cache = HashMap::<PathBuf, Vec<PathBuf>>::new();
         let mut base_dir_prefix_cache = HashMap::<PathBuf, PathBuf>::new();
+        let mut worktree_root_cache = HashMap::<PathBuf, PathBuf>::new();
         let mut merged_entries = Vec::new();
         let mut worktree_roots = Vec::new();
         let prior_by_path = prior_entries_by_path(options.prior_entries);
 
         for request in requests {
-            let base_dir_prefix =
-                qualified_base_dir_prefix(&request.base_dir, &mut base_dir_prefix_cache)?.clone();
+            let base_dir_prefix = qualified_base_dir_prefix(
+                &request.base_dir,
+                &mut base_dir_prefix_cache,
+                &mut worktree_root_cache,
+                options.listing_cache,
+            )?
+            .clone();
             let worktree_root = strip_suffix_components(&request.base_dir, &base_dir_prefix);
             if !worktree_roots.contains(&worktree_root) {
                 worktree_roots.push(worktree_root);
