@@ -129,7 +129,7 @@ Discovery runs ~once per distinct `base_dir` instead of per task.
 
 ### Pitfalls
 
-1. **Over-eager "optimization" regressed performance**: A first attempt pre-collected ALL gitignored paths by doing a full `WalkDir` of the ENTIRE worktree root for every package's listing (343×). Result: RESOLVE_INPUTS 6.2s→17s, wall 30s — slower than before. Lesson: an "optimimization" that adds a whole-repo walk per package is worse than the per-package walk it replaced. The correct fix kept the per-package subtree walk and only memoized repo discovery.
+1. **Over-eager "optimization" regressed performance**: A first attempt pre-collected ALL gitignored paths by doing a full `WalkDir` of the ENTIRE worktree root for every package's listing (343×). Result: RESOLVE_INPUTS 6.2s→17s, wall 30s — slower than before. Lesson: an "optimization" that adds a whole-repo walk per package is worse than the per-package walk it replaced. The correct fix kept the per-package subtree walk and only memoized repo discovery.
 
 2. **Prefix-matching is WRONG for nested repos/submodules**: Keying by prefix (`base_dir.starts_with(root)`) means a directory inside a nested repo under a parent worktree gets served the PARENT's root. Fix: key by EXACT `base_dir` — `HashMap<base_dir, root>`. Each distinct `base_dir` keeps its own `gix::discover` result. A nested-repo test locked this in.
 
@@ -191,7 +191,7 @@ Key the run-scoped `ListingCache` by `(base_dir, prefix_union)` instead of `base
 
 ### Result
 
-```
+```text
 Candidates walked: 1.44M → 59k
 Warm no-op: ~11s → ~9s
 Peak memory: 307MB → 167MB

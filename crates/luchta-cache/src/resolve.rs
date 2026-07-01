@@ -53,14 +53,19 @@ pub struct ListingCache {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct OutputCandidateCacheKey {
     base_dir: PathBuf,
-    prefixes: Vec<PathBuf>,
+    /// `None` means "full package walk" (no extractable static prefix);
+    /// `Some([])` means "walk nothing" (task declares no outputs). These are
+    /// distinct listing modes and MUST hash to distinct keys — collapsing them
+    /// would let an empty-output resolve poison the cache for a later full walk
+    /// and skip all of that package's outputs.
+    prefixes: Option<Vec<PathBuf>>,
 }
 
 impl OutputCandidateCacheKey {
-    fn new(base_dir: &Path, prefixes: &[PathBuf]) -> Self {
+    fn new(base_dir: &Path, prefixes: Option<&[PathBuf]>) -> Self {
         Self {
             base_dir: base_dir.to_path_buf(),
-            prefixes: prefixes.to_vec(),
+            prefixes: prefixes.map(<[PathBuf]>::to_vec),
         }
     }
 }
@@ -79,7 +84,7 @@ impl ListingCache {
     fn get_output_candidates(
         &self,
         base_dir: &Path,
-        prefixes: &[PathBuf],
+        prefixes: Option<&[PathBuf]>,
     ) -> Option<Arc<Vec<PathBuf>>> {
         let key = OutputCandidateCacheKey::new(base_dir, prefixes);
         self.output_candidates.lock().ok()?.get(&key).cloned()
@@ -88,7 +93,7 @@ impl ListingCache {
     fn insert_output_candidates(
         &self,
         base_dir: &Path,
-        prefixes: &[PathBuf],
+        prefixes: Option<&[PathBuf]>,
         candidates: Arc<Vec<PathBuf>>,
     ) {
         if let Ok(mut cache) = self.output_candidates.lock() {
@@ -517,16 +522,15 @@ fn cached_output_candidates(
     candidate_lister: &dyn CandidateLister,
     listing_cache: Option<&ListingCache>,
 ) -> Result<Vec<PathBuf>> {
-    let cache_prefixes = prefixes.unwrap_or(&[]);
     if let Some(candidates) =
-        listing_cache.and_then(|cache| cache.get_output_candidates(base_dir, cache_prefixes))
+        listing_cache.and_then(|cache| cache.get_output_candidates(base_dir, prefixes))
     {
         return Ok((*candidates).clone());
     }
 
     let candidates = candidate_lister.list(base_dir, prefixes)?;
     if let Some(cache) = listing_cache {
-        cache.insert_output_candidates(base_dir, cache_prefixes, Arc::new(candidates.clone()));
+        cache.insert_output_candidates(base_dir, prefixes, Arc::new(candidates.clone()));
     }
     Ok(candidates)
 }
@@ -1233,7 +1237,7 @@ mod tests {
         // cache is not (input and output listings are stored in separate maps).
         assert!(
             cache
-                .get_output_candidates(repo.path(), &[PathBuf::from("dist")])
+                .get_output_candidates(repo.path(), Some(&[PathBuf::from("dist")]))
                 .is_some(),
             "output listing cached after resolve_outputs"
         );
@@ -1262,6 +1266,56 @@ mod tests {
         assert!(entries.is_empty());
         assert_eq!(lister.calls(), 1);
         assert_eq!(lister.recorded_prefixes(), vec![Some(Vec::new())]);
+    }
+
+    #[test]
+    fn empty_outputs_listing_does_not_poison_full_walk_for_same_base_dir() {
+        // Regression: `Some([])` (task declares no outputs → walk nothing) and
+        // `None` (leading-glob pattern → full walk) share a base_dir but are
+        // DIFFERENT listing modes. They must not collide in the run-scoped
+        // ListingCache; otherwise an empty-output resolve would cache an empty
+        // candidate list that a later full walk reuses, silently dropping every
+        // output for that package (false cache hit).
+        let repo = TestRepo::new();
+        repo.write_file("dist/a.js", "a\n");
+        let cache = ListingCache::default();
+
+        // Task A: no declared outputs → Some([]) → walk nothing.
+        let empty_lister = CountingCandidateLister::new(vec![PathBuf::from("dist/a.js")]);
+        let empty = resolve_with(
+            repo.path(),
+            &[],
+            Some(Vec::new()),
+            &empty_lister,
+            &StdFs,
+            ResolveOptions {
+                prior_entries: &[],
+                listing_cache: Some(&cache),
+            },
+        )
+        .unwrap();
+        assert!(empty.is_empty());
+
+        // Task B: leading-glob output → None → full walk. Must perform a real
+        // walk (not reuse Task A's empty cached list) and find dist/a.js.
+        let glob_lister = CountingCandidateLister::new(vec![PathBuf::from("dist/a.js")]);
+        let patterns = vec!["**/*.js".to_string()];
+        let resolved = resolve_with(
+            repo.path(),
+            &patterns,
+            prefix_union(&patterns),
+            &glob_lister,
+            &StdFs,
+            ResolveOptions {
+                prior_entries: &[],
+                listing_cache: Some(&cache),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(glob_lister.calls(), 1, "full walk must not reuse empty cache");
+        assert_eq!(glob_lister.recorded_prefixes(), vec![None]);
+        assert_eq!(resolved.len(), 1, "full walk finds dist/a.js");
     }
 
     #[test]
