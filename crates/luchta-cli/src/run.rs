@@ -26,6 +26,7 @@ use luchta_workspace::{PackageGraph, PackageNode, WorkspaceDiscovery, YarnWorksp
 use miette::{bail, Context, IntoDiagnostic, Result};
 use owo_colors::{OwoColorize, Stream};
 
+use crate::build_lock;
 use crate::cache_ctx::{
     build_current_state, gather_pkg_dep_pairs, load_lockfile_state, LockfileState,
     PackageDirResolver,
@@ -227,6 +228,12 @@ pub async fn run_tasks(request: RunTasksRequest<'_>) -> Result<()> {
         memory_pressure,
         max_weight_override,
     } = request;
+
+    let cache_dir = resolve_cache_dir(workspace_root);
+    let _build_lock = match build_lock::acquire(&cache_dir).await? {
+        Some(lock) => lock,
+        None => return Ok(()),
+    };
 
     // Prepare the run context (handles empty packages / NoOp since early returns)
     let Some(run) = prepare_run_context(workspace_root, selection, max_weight_override).await?

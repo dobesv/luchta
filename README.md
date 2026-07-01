@@ -679,9 +679,17 @@ Luchta automatically performs throttled garbage collection of old local cache en
 #### Stats
 Shared cache hits are shown in the build summary: `📥 <n>`.
 
+### Build Lock
+
+Luchta uses a repo-wide exclusive build lock to ensure only one build runs per repository at a time. This prevents concurrent builds from corrupting the local cache or interfering with each other's outputs.
+
+- **Wait Behavior:** If a second `luchta` process starts while a build is already in progress, it logs `Waiting for concurrent build ...` to stderr and waits indefinitely. You can press `Ctrl+C` to cleanly abort the wait.
+- **Watch Mode:** `luchta watch` only holds the lock during an active build pass. It releases the lock while idle (waiting for file changes), allowing other `luchta run` invocations to proceed immediately.
+- **Lock File:** The lock is managed via a dedicated 0-byte file at `<cache-dir>/build.lock` (by default `.luchta/cache/build.lock` or `$LUCHTA_CACHE_DIR/build.lock`).
+- **Resilience:** The lock is an OS-level advisory file lock. If the process crashes, the OS automatically releases the lock. The lock file itself is intentionally never deleted, as the lock guards the file's identity (inode), not its presence on disk.
+
 ## Roadmap
 
 - **Phase 1 (Current):** Multi-crate workspace skeleton, CI, and release tooling (nextest, knope changesets, GitHub release workflows).
 - **Phase 2:** Foundation libraries (workspace discovery, lockfile parsing, graph construction, weighted parallel execution).
-- **Phase 3 (Current):** Opt-in build change-detection cache (blake3 hashing, local and shared) — see "Build cache" and "Shared Build Cache" above.
-- **Future:** Cross-process build locking.
+- **Phase 3 (Current):** Opt-in build change-detection cache (blake3 hashing, local and shared) and cross-process build locking — see "Build cache", "Shared Build Cache", and "Build Lock" above.
