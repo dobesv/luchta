@@ -181,7 +181,12 @@ impl ProgressReporter {
         line
     }
 
-    pub fn render_summary(&self, rss_formatted: &str, stream: Stream) -> String {
+    pub fn render_summary(
+        &self,
+        rss_formatted: &str,
+        was_cancelled: bool,
+        stream: Stream,
+    ) -> String {
         let elapsed_total = self.start.elapsed().as_secs();
         let done = self.done.load(Ordering::SeqCst);
         let skipped = self.skipped.load(Ordering::SeqCst);
@@ -218,7 +223,15 @@ impl ProgressReporter {
             .if_supports_color(stream, |t| t.dimmed())
             .to_string();
 
-        format!("{done_str} {skipped_str}{failed_segment}{shared_segment} {elapsed_str} {rss_str} {waves_str}")
+        let cancelled_segment = if was_cancelled {
+            " ❗ new changes detected"
+                .if_supports_color(stream, |t| t.yellow())
+                .to_string()
+        } else {
+            String::new()
+        };
+
+        format!("{done_str} {skipped_str}{failed_segment}{shared_segment} {elapsed_str} {rss_str} {waves_str}{cancelled_segment}")
     }
 
     fn finish_task(&self, id: &TaskId, kind: TaskOutcome) {
