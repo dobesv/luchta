@@ -886,11 +886,15 @@ pub struct StagedRestore {
 
 impl StagedRestore {
     /// Move all non-meta files from staging into the package directory.
+    /// Returns absolute destination paths written into the package directory.
     /// After this call, the staging directory is cleaned up.
-    pub fn commit(self) -> io::Result<()> {
-        move_non_meta_files(self.staging_dir.path(), &self.package_dir)?;
+    pub fn commit(self) -> io::Result<Vec<PathBuf>> {
+        let written_paths = match move_non_meta_files(self.staging_dir.path(), &self.package_dir) {
+            Ok(written_paths) => written_paths,
+            Err(error) => return Err(io::Error::new(error.source.kind(), error.source)),
+        };
         self.staging_dir.close()?;
-        Ok(())
+        Ok(written_paths)
     }
 
     /// Discard this restore without modifying the package directory.
@@ -1018,9 +1022,34 @@ fn extract_blob_with_meta_to_staging(
     }))
 }
 
-fn move_non_meta_files(from_dir: &Path, to_dir: &Path) -> io::Result<()> {
-    for entry in fs::read_dir(from_dir)? {
-        let entry = entry?;
+struct MoveOutputsError {
+    source: io::Error,
+    written_paths: Vec<PathBuf>,
+}
+
+impl std::fmt::Debug for MoveOutputsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MoveOutputsError")
+            .field("kind", &self.source.kind())
+            .field("written_paths", &self.written_paths)
+            .finish()
+    }
+}
+
+impl From<io::Error> for MoveOutputsError {
+    fn from(source: io::Error) -> Self {
+        Self {
+            source,
+            written_paths: Vec::new(),
+        }
+    }
+}
+
+fn move_non_meta_files(from_dir: &Path, to_dir: &Path) -> Result<Vec<PathBuf>, MoveOutputsError> {
+    let mut written_paths = Vec::new();
+
+    for entry in fs::read_dir(from_dir).map_err(MoveOutputsError::from)? {
+        let entry = entry.map_err(MoveOutputsError::from)?;
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
 
@@ -1031,21 +1060,116 @@ fn move_non_meta_files(from_dir: &Path, to_dir: &Path) -> io::Result<()> {
 
         let source_path = entry.path();
         let target_path = to_dir.join(&name);
-        let file_type = entry.file_type()?;
+        let file_type = entry.file_type().map_err(MoveOutputsError::from)?;
 
         if file_type.is_dir() {
-            fs::create_dir_all(&target_path)?;
-            move_non_meta_files(&source_path, &target_path)?;
-            fs::remove_dir(&source_path)?;
+            fs::create_dir_all(&target_path).map_err(|source| MoveOutputsError {
+                source,
+                written_paths: written_paths.clone(),
+            })?;
+            match move_non_meta_files(&source_path, &target_path) {
+                Ok(child_paths) => written_paths.extend(child_paths),
+                Err(mut error) => {
+                    written_paths.append(&mut error.written_paths);
+                    return Err(MoveOutputsError {
+                        source: error.source,
+                        written_paths,
+                    });
+                }
+            }
+            fs::remove_dir(&source_path).map_err(|source| MoveOutputsError {
+                source,
+                written_paths: written_paths.clone(),
+            })?;
             continue;
         }
 
         if let Some(parent) = target_path.parent() {
-            fs::create_dir_all(parent)?;
+            fs::create_dir_all(parent).map_err(|source| MoveOutputsError {
+                source,
+                written_paths: written_paths.clone(),
+            })?;
         }
 
-        fs::rename(&source_path, &target_path)?;
+        fs::rename(&source_path, &target_path).map_err(|source| MoveOutputsError {
+            source,
+            written_paths: written_paths.clone(),
+        })?;
+        written_paths.push(target_path);
     }
 
-    Ok(())
+    Ok(written_paths)
+}
+
+#[cfg(test)]
+mod restore_tests {
+    use std::fs;
+
+    use tempfile::tempdir;
+
+    use super::*;
+
+    #[test]
+    fn move_non_meta_files_returns_written_destination_paths() {
+        let temp_dir = tempdir().expect("create temp dir");
+        let staging_dir = temp_dir.path().join("staging");
+        let package_dir = temp_dir.path().join("package");
+        fs::create_dir_all(staging_dir.join("dist/nested")).expect("create staging dirs");
+        fs::create_dir_all(staging_dir.join(META_DIR_NAME)).expect("create meta dir");
+        fs::create_dir_all(&package_dir).expect("create package dir");
+        fs::write(staging_dir.join("dist/app.js"), "app").expect("write app output");
+        fs::write(staging_dir.join("dist/nested/chunk.js"), "chunk").expect("write chunk output");
+        fs::write(staging_dir.join(META_DIR_NAME).join("stdout.log"), "meta")
+            .expect("write meta file");
+
+        let mut written_paths =
+            move_non_meta_files(&staging_dir, &package_dir).expect("move outputs");
+        written_paths.sort();
+
+        let mut expected = vec![
+            package_dir.join("dist/app.js"),
+            package_dir.join("dist/nested/chunk.js"),
+        ];
+        expected.sort();
+
+        assert_eq!(written_paths, expected);
+        assert!(package_dir.join("dist/app.js").exists());
+        assert!(package_dir.join("dist/nested/chunk.js").exists());
+        assert!(staging_dir.join(META_DIR_NAME).join("stdout.log").exists());
+    }
+
+    #[test]
+    fn move_non_meta_files_error_preserves_already_written_paths() {
+        let temp_dir = tempdir().expect("create temp dir");
+        let staging_dir = temp_dir.path().join("staging");
+        let package_dir = temp_dir.path().join("package");
+        fs::create_dir_all(staging_dir.join("a-dir")).expect("create staging dirs");
+        fs::create_dir_all(staging_dir.join(META_DIR_NAME)).expect("create meta dir");
+        fs::create_dir_all(&package_dir).expect("create package dir");
+        fs::write(package_dir.join("a-dir"), "conflict").expect("create conflicting file");
+        fs::write(staging_dir.join("a-file.js"), "app").expect("write app output");
+        fs::write(staging_dir.join("a-dir/conflict.js"), "bad").expect("write conflicting output");
+
+        let error = move_non_meta_files(&staging_dir, &package_dir).expect_err("move should fail");
+
+        assert_eq!(error.source.kind(), io::ErrorKind::AlreadyExists);
+
+        // `fs::read_dir` traversal order is unspecified, so `a-file.js` may or may
+        // not have been moved before the conflicting `a-dir` entry failed. Assert
+        // order-independently: the only file that can ever be reported is
+        // `a-file.js`, and its presence in `written_paths` must exactly match its
+        // presence on disk (only successfully-moved files are recorded).
+        let a_file = package_dir.join("a-file.js");
+        for written in &error.written_paths {
+            assert_eq!(
+                written, &a_file,
+                "unexpected written path recorded: {written:?}"
+            );
+        }
+        assert_eq!(
+            error.written_paths.contains(&a_file),
+            a_file.exists(),
+            "written_paths must record exactly the files moved into the package dir"
+        );
+    }
 }

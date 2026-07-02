@@ -2,11 +2,11 @@
 
 use std::path::Path;
 
-use luchta_workspace::PackageGraph;
 use miette::Result;
 use tokio_util::sync::CancellationToken;
 
 use crate::run::{run_cycle, CycleOutcome, RunContext, RunCycleParams};
+use crate::watch::registry::TaskWatchRegistry;
 
 /// Long-lived session for watch mode.
 ///
@@ -44,9 +44,8 @@ impl WatchSession {
         &self.run.workspace_root
     }
 
-    /// Package graph reused across watch cycles.
-    pub(crate) fn package_graph(&self) -> &PackageGraph {
-        &self.run.package_graph
+    pub(crate) fn task_watch_registry(&self) -> &TaskWatchRegistry {
+        &self.run.task_watch_registry
     }
 
     /// Test-only hook for checking whether the manager was shut down.

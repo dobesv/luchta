@@ -303,6 +303,7 @@ async fn watch_command(workspace_root: &std::path::Path, command: Commands) -> R
         mem_free_threshold,
         continue_on_failure,
         debounce,
+        show_changed_files,
     } = command
     else {
         unreachable!("checked by caller");
@@ -335,6 +336,7 @@ async fn watch_command(workspace_root: &std::path::Path, command: Commands) -> R
         output,
         continue_on_failure,
         memory_pressure,
+        show_changed_files,
     };
 
     watch::driver::run_watch(watch::driver::WatchInputs {

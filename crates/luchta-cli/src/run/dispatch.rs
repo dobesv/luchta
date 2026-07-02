@@ -23,6 +23,8 @@ use luchta_workspace::PackageGraph;
 
 use std::sync::OnceLock;
 
+use crate::watch::registry::{register_task_watch_state, register_task_watch_state_from_packages};
+
 /// Shared empty env map used as a stable fallback when a task has no entry in
 /// `task_envs`. Mirrors the original `unwrap_or(&empty)` semantics (hash an
 /// empty env rather than panic) while providing a `'static` reference that
@@ -262,6 +264,13 @@ fn handle_cache_skip(
             ctx.reporter.task_skipped_cache_hit(task_id);
             if let Some(prior) = ctx.cache.read(&task_id.to_string()) {
                 record_output_hash(ctx.output_hashes, task_id, prior.outputs_hash);
+                register_task_watch_state_from_packages(
+                    &ctx.decision_ctx.task_watch_registry,
+                    task_id,
+                    ctx.packages,
+                    &prior,
+                )
+                .expect("cache skip task watch registration should compile globs");
             }
             let _ = done_tx
                 .take()
@@ -491,6 +500,7 @@ fn build_cache_write_context(task_id: &TaskId, ctx: &DecisionContext) -> CacheIn
         package_graph: (*ctx.package_graph).clone(),
         cache_nonce: nonce,
         decision: cache_run_decision(),
+        task_watch_registry: Arc::clone(&ctx.task_watch_registry),
     }))
 }
 
@@ -586,7 +596,7 @@ fn build_run_record(
         .map(|result| result.status.code().unwrap_or(1))
         .unwrap_or(1);
 
-    BuildRecordResult::Ok(Box::new(TaskRunRecord {
+    let record = Box::new(TaskRunRecord {
         schema_version: SCHEMA_VERSION_V4,
         task_spec_hash: cache_ctx.task_spec_hash,
         input_patterns,
@@ -606,7 +616,18 @@ fn build_run_record(
         reports: vec![],
         cache_nonce: cache_ctx.cache_nonce.clone(),
         run_reason: args.run_reason,
-    }))
+    });
+
+    register_task_watch_state(
+        &cache_ctx.task_watch_registry,
+        &cache_ctx.task_id,
+        cache_ctx.source_pkg.clone(),
+        cache_ctx.package_path.clone(),
+        &record,
+    )
+    .expect("run task watch registration should compile globs");
+
+    BuildRecordResult::Ok(record)
 }
 
 /// Result of cache input resolution for the write path.
@@ -972,7 +993,15 @@ fn try_shared_cache_skip(
             // Candidate is VALID - inputs match current tree.
             // Commit the staged restore.
             match candidate.commit() {
-                Ok(hit) => {
+                Ok((hit, _written_paths)) => {
+                    register_task_watch_state(
+                        &ctx.task_watch_registry,
+                        task_id,
+                        task_id.package.clone(),
+                        package_path.to_path_buf(),
+                        &hit.record,
+                    )
+                    .expect("shared hit task watch registration should compile globs");
                     // Shared cache HIT (validated):
                     // (a) Outputs now restored to package dir.
                     // (b) Hydrate local cache for next build.
@@ -1756,6 +1785,7 @@ mod tests {
                     global_cache_nonce: None,
                     env_cache_nonce: None,
                     reporter: Arc::clone(reporter),
+                    task_watch_registry: crate::watch::registry::empty_task_watch_registry(),
                 },
             };
 
@@ -1847,6 +1877,7 @@ mod tests {
                 action: Decision::Run,
                 run_reason: RunReason::NoPriorRecord,
             },
+            task_watch_registry: crate::watch::registry::empty_task_watch_registry(),
         }
     }
 
