@@ -2373,7 +2373,13 @@ async fn finalize_and_report(inputs: FinalizeCycle<'_>) -> Result<(CycleOutcome,
     // `luchta run`) or keep watching after a failed build (`luchta watch`).
     // A non-`any_failed` error is a genuine failure (e.g. walker panic) and is
     // still propagated.
-    if let Err(err) = report_run_outcome(run_result, any_failed, reporter, pressure_state) {
+    if let Err(err) = report_run_outcome(
+        run_result,
+        any_failed,
+        reporter,
+        pressure_state,
+        outcome == CycleOutcome::Cancelled,
+    ) {
         if !any_failed.load(Ordering::SeqCst) {
             return Err(err);
         }

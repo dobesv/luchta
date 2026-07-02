@@ -35,7 +35,7 @@ fn render_summary_emits_no_ansi_when_color_unsupported() {
     reporter.task_ran(&task);
 
     let summary = owo_colors::with_override(false, || {
-        reporter.render_summary("10 MB", owo_colors::Stream::Stdout)
+        reporter.render_summary("10 MB", false, owo_colors::Stream::Stdout)
     });
 
     assert!(
@@ -97,7 +97,7 @@ fn render_summary_emits_ansi_when_color_forced() {
     reporter.task_ran(&task);
 
     let summary = owo_colors::with_override(true, || {
-        reporter.render_summary("10 MB", owo_colors::Stream::Stdout)
+        reporter.render_summary("10 MB", false, owo_colors::Stream::Stdout)
     });
 
     assert!(
