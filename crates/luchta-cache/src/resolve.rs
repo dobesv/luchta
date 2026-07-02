@@ -1313,7 +1313,11 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(glob_lister.calls(), 1, "full walk must not reuse empty cache");
+        assert_eq!(
+            glob_lister.calls(),
+            1,
+            "full walk must not reuse empty cache"
+        );
         assert_eq!(glob_lister.recorded_prefixes(), vec![None]);
         assert_eq!(resolved.len(), 1, "full walk finds dist/a.js");
     }

@@ -934,7 +934,8 @@ mod tests {
             .try_restore_candidates("pkg#build", &seed.input_key, &restore_dir)
             .collect();
         assert_eq!(candidates.len(), 1);
-        let hit = candidates.remove(0).commit().unwrap();
+        let (hit, written_paths) = candidates.remove(0).commit().unwrap();
+        assert_eq!(written_paths, vec![restore_dir.join("dist/main.js")]);
         assert_remote_restore_result(
             &restore_dir,
             &hit,
@@ -1088,12 +1089,13 @@ mod tests {
         let restore_dir = seed.harness.temp_repo.path().join("restore-machine-b");
         fs::create_dir_all(&restore_dir).unwrap();
 
-        let hit = cache_b
+        let (hit, written_paths) = cache_b
             .try_restore_candidates("pkg#build", &seed.input_key, &restore_dir)
             .next()
             .expect("fresh machine should pull from remote")
             .commit()
             .expect("remote restore should succeed");
+        assert_eq!(written_paths, vec![restore_dir.join("dist/main.js")]);
         assert_remote_restore_result(
             &restore_dir,
             &hit,
@@ -1244,7 +1246,7 @@ mod tests {
             .build()
             .unwrap();
         let restore_dir_for_async = restore_dir.clone();
-        let hit = runtime.block_on(async move {
+        let (hit, written_paths) = runtime.block_on(async move {
             pull_cache
                 .try_restore_candidates("pkg#build", &seed.input_key, &restore_dir_for_async)
                 .next()
@@ -1252,6 +1254,7 @@ mod tests {
                 .commit()
                 .expect("async remote restore should succeed")
         });
+        assert_eq!(written_paths, vec![restore_dir.join("dist/main.js")]);
 
         assert_remote_restore_result(
             &restore_dir,

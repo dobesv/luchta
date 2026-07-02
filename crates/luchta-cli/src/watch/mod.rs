@@ -4,5 +4,6 @@
 //! build cycles without restarting workers.
 
 pub mod driver;
+pub mod registry;
 pub mod session;
 pub mod watcher;

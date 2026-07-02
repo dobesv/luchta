@@ -251,6 +251,15 @@ impl IgnoreFilter {
                 path: workspace_root.to_path_buf(),
                 source,
             })?;
+        // Shared-cache restore stages outputs in tempdirs created inside package
+        // dirs via `tempfile::Builder::prefix("blob-restore-")` and
+        // `prefix("blob-restore-meta-")` (see luchta-cache blob.rs). Match both.
+        builder
+            .add_line(None, "blob-restore-*/")
+            .map_err(|source| WatcherError::BuildIgnoreMatcher {
+                path: workspace_root.to_path_buf(),
+                source,
+            })?;
         let gitignore = builder
             .build()
             .map_err(|source| WatcherError::BuildIgnoreMatcher {

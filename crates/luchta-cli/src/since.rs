@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use gix::bstr::BStr;
 use luchta_types::PackageName;
-use luchta_workspace::{PackageGraph, WorkspaceError};
+use luchta_workspace::{PackageGraph, PackageNode, WorkspaceError};
 use miette::Diagnostic;
 use thiserror::Error;
 
@@ -55,24 +55,31 @@ pub fn changed_paths_since(
 /// Accepts repo-relative paths from git and absolute paths from file watchers.
 /// `repo_root.join(path)` is used for normalization; Rust preserves absolute
 /// `path` unchanged when joined onto another path.
+pub fn deepest_package_for_path<'a>(
+    changed_path: &Path,
+    repo_root: &Path,
+    package_graph: &'a PackageGraph,
+) -> Option<&'a PackageNode> {
+    let absolute_changed_path = repo_root.join(changed_path);
+    let root_package = package_graph.root_package();
+
+    package_graph
+        .as_graph()
+        .node_weights()
+        .filter(|node| Some(&node.name) != root_package)
+        .filter(|node| absolute_changed_path.strip_prefix(&node.path).is_ok())
+        .max_by_key(|node| node.path.components().count())
+}
+
 pub fn affected_packages_from_paths(
     changed_paths: &HashSet<PathBuf>,
     repo_root: &Path,
     package_graph: &PackageGraph,
 ) -> Result<HashSet<PackageName>, SinceError> {
     let mut changed_packages = HashSet::new();
-    let root_package = package_graph.root_package();
 
     for changed_path in changed_paths {
-        let absolute_changed_path = repo_root.join(changed_path);
-        let matched_package = package_graph
-            .as_graph()
-            .node_weights()
-            .filter(|node| Some(&node.name) != root_package)
-            .filter(|node| absolute_changed_path.strip_prefix(&node.path).is_ok())
-            .max_by_key(|node| node.path.components().count());
-
-        if let Some(package) = matched_package {
+        if let Some(package) = deepest_package_for_path(changed_path, repo_root, package_graph) {
             changed_packages.insert(package.name.clone());
         }
     }

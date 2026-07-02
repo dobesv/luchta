@@ -18,27 +18,28 @@
 
 use std::collections::HashSet;
 use std::future::Future;
-use std::io::{self, IsTerminal, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use luchta_cache::resolve_cache_dir;
 use luchta_types::PackageName;
-use miette::{IntoDiagnostic, Result};
+use miette::Result;
 use owo_colors::{OwoColorize, Stream};
 use tokio::sync::{mpsc, Notify};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use super::registry::dirty_packages_for_changes;
 use super::session::WatchSession;
 use super::watcher::WatcherHandle;
 use crate::build_lock;
 use crate::cli::OutputMode;
 use crate::run::{CycleOutcome, MemoryPressureConfig, RunCycleParams, TaskSelection};
-use crate::since::affected_packages_from_paths;
 
-const CLEAR_SCREEN_ESCAPE: &str = "\x1Bc";
+/// Maximum number of changed file paths to list under `--show-changed-files`
+/// before collapsing the remainder into a count.
+const MAX_LISTED_CHANGED_FILES: usize = 10;
 
 #[derive(Debug, Clone, Default)]
 pub struct OwnedSelection {
@@ -113,6 +114,8 @@ pub struct WatchRunConfig {
     pub output: OutputMode,
     pub continue_on_failure: bool,
     pub memory_pressure: MemoryPressureConfig,
+    /// When true, list the changed files that triggered each rebuild.
+    pub show_changed_files: bool,
 }
 
 /// Inputs for running watch mode.
@@ -149,22 +152,30 @@ where
 }
 
 struct WatchUi {
-    is_terminal: bool,
+    show_changed_files: bool,
 }
 
 impl WatchUi {
-    fn new() -> Self {
-        Self {
-            is_terminal: io::stdout().is_terminal(),
-        }
+    fn new(show_changed_files: bool) -> Self {
+        Self { show_changed_files }
     }
 
     fn started(&self) {
         print_status(&format_watch_started_line());
     }
 
-    fn change_detected(&self, affected: &HashSet<PackageName>) {
+    fn change_detected(
+        &self,
+        affected: &HashSet<PackageName>,
+        changed: &HashSet<PathBuf>,
+        repo_root: &Path,
+    ) {
         print_status(&format_change_detected_line(affected));
+        if self.show_changed_files {
+            for line in format_changed_files_lines(changed, repo_root) {
+                print_status(&line);
+            }
+        }
     }
 
     fn up_to_date(&self) {
@@ -172,7 +183,9 @@ impl WatchUi {
     }
 
     fn cycle_started(&self) -> Result<()> {
-        clear_screen_if_tty(self.is_terminal)?;
+        // Note: watch mode intentionally does NOT clear the screen here.
+        // Preserving scrollback keeps prior build output and change history
+        // visible (see GitHub issue #160).
         print_status(&format_cycle_start_line());
         Ok(())
     }
@@ -271,7 +284,7 @@ where
         Arc::clone(&wake),
         Arc::clone(&active_cycle),
     );
-    let ui = WatchUi::new();
+    let ui = WatchUi::new(config.show_changed_files);
     let mut signals = WatchSignals::new(shutdown, force_shutdown);
 
     ui.started();
@@ -382,17 +395,19 @@ where
         Some(changed) => changed,
         None => return Ok(WatchControl::Continue),
     };
-    let affected = affected_packages_from_paths(
-        &changed,
-        context.session.repo_root(),
-        context.session.package_graph(),
-    )?;
+    // Only real changes to a task's declared inputs (verified by size/mtime, then
+    // content hash) — or new files matching a task's input globs — dirty a package.
+    // Cache outputs, restore staging dirs, and touch-only events are ignored, which
+    // is what breaks the watch rebuild loop (#161).
+    let affected = dirty_packages_for_changes(context.session.task_watch_registry(), &changed);
     if affected.is_empty() {
         context.ui.up_to_date();
         return Ok(WatchControl::Continue);
     }
 
-    context.ui.change_detected(&affected);
+    context
+        .ui
+        .change_detected(&affected, &changed, context.session.repo_root());
     let cycle_selection = context.selection.as_task_selection();
     let cache_dir = resolve_cache_dir(context.session.repo_root());
     let acquire_lock = build_lock::acquire(&cache_dir);
@@ -583,18 +598,6 @@ async fn finish_shutdown(
     session.shutdown().await;
 }
 
-fn clear_screen_if_tty(is_terminal: bool) -> Result<()> {
-    if let Some(clear) = clear_screen_escape(is_terminal) {
-        print!("{clear}");
-        io::stdout().flush().into_diagnostic()?;
-    }
-    Ok(())
-}
-
-fn clear_screen_escape(is_terminal: bool) -> Option<&'static str> {
-    is_terminal.then_some(CLEAR_SCREEN_ESCAPE)
-}
-
 fn print_status(line: &str) {
     println!("{line}");
 }
@@ -609,6 +612,40 @@ fn format_change_detected_line(affected: &HashSet<PackageName>) -> String {
     let mut names = affected.iter().map(ToString::to_string).collect::<Vec<_>>();
     names.sort();
     format!("[watch] change detected: {}", names.join(", "))
+}
+
+/// Render the changed files that triggered a rebuild: the first
+/// `MAX_LISTED_CHANGED_FILES` paths (sorted, relative to the repo root when
+/// possible) followed by a summary count of any remainder.
+fn format_changed_files_lines(changed: &HashSet<PathBuf>, repo_root: &Path) -> Vec<String> {
+    let mut paths = changed
+        .iter()
+        .map(|path| display_changed_path(path, repo_root))
+        .collect::<Vec<_>>();
+    paths.sort();
+
+    let total = paths.len();
+    let mut lines = paths
+        .iter()
+        .take(MAX_LISTED_CHANGED_FILES)
+        .map(|path| format!("[watch]   {path}"))
+        .collect::<Vec<_>>();
+
+    if total > MAX_LISTED_CHANGED_FILES {
+        let remaining = total - MAX_LISTED_CHANGED_FILES;
+        lines.push(format!("[watch]   … and {remaining} more"));
+    }
+
+    lines
+}
+
+/// Present a changed path relative to `repo_root` when possible; otherwise fall
+/// back to the full path.
+fn display_changed_path(path: &Path, repo_root: &Path) -> String {
+    path.strip_prefix(repo_root)
+        .unwrap_or(path)
+        .display()
+        .to_string()
 }
 
 fn format_up_to_date_line() -> String {
@@ -694,9 +731,46 @@ mod tests {
     }
 
     #[test]
-    fn clear_screen_escape_only_for_terminal() {
-        assert_eq!(clear_screen_escape(true), Some("\x1Bc"));
-        assert_eq!(clear_screen_escape(false), None);
+    fn changed_files_lines_relative_and_sorted() {
+        let repo_root = PathBuf::from("/repo");
+        let changed = HashSet::from([
+            PathBuf::from("/repo/pkg-b/src/lib.rs"),
+            PathBuf::from("/repo/pkg-a/src/main.rs"),
+        ]);
+
+        let lines = format_changed_files_lines(&changed, &repo_root);
+        assert_eq!(
+            lines,
+            vec![
+                "[watch]   pkg-a/src/main.rs".to_string(),
+                "[watch]   pkg-b/src/lib.rs".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn changed_files_lines_truncate_with_count() {
+        let repo_root = PathBuf::from("/repo");
+        let changed: HashSet<PathBuf> = (0..15)
+            .map(|i| PathBuf::from(format!("/repo/pkg/src/file{i:02}.rs")))
+            .collect();
+
+        let lines = format_changed_files_lines(&changed, &repo_root);
+        assert_eq!(lines.len(), MAX_LISTED_CHANGED_FILES + 1);
+        assert_eq!(lines[0], "[watch]   pkg/src/file00.rs");
+        assert_eq!(
+            lines.last().expect("summary line present"),
+            "[watch]   … and 5 more"
+        );
+    }
+
+    #[test]
+    fn changed_files_path_outside_repo_falls_back_to_full_path() {
+        let repo_root = PathBuf::from("/repo");
+        let changed = HashSet::from([PathBuf::from("/elsewhere/file.rs")]);
+
+        let lines = format_changed_files_lines(&changed, &repo_root);
+        assert_eq!(lines, vec!["[watch]   /elsewhere/file.rs".to_string()]);
     }
 
     #[test]
@@ -910,6 +984,7 @@ echo '{{"concurrency":{{"maxWeight":4}},"workers":{{"fake":{{"command":"{}"}}}},
                                 usage: None,
                                 free: None,
                             },
+                            show_changed_files: false,
                         },
                     },
                     shutdown_future,

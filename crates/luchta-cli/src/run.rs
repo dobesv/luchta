@@ -34,6 +34,7 @@ use crate::cache_ctx::{
 };
 use crate::cli::OutputMode;
 use crate::progress::ProgressReporter;
+use crate::watch::registry::TaskWatchRegistry;
 use tokio_util::sync::CancellationToken;
 
 mod dispatch;
@@ -186,6 +187,7 @@ pub(crate) struct RunContext {
     pub(crate) global_cache_nonce: Option<String>,
     /// Workspace root path.
     pub(crate) workspace_root: PathBuf,
+    pub(crate) task_watch_registry: TaskWatchRegistry,
 }
 
 /// Outcome of a single execution cycle.
@@ -346,6 +348,7 @@ pub(crate) async fn prepare_session_context(
         since_affected: None,
         global_cache_nonce,
         workspace_root: workspace_root.to_owned(),
+        task_watch_registry: crate::watch::registry::empty_task_watch_registry(),
     }))
 }
 
@@ -371,6 +374,7 @@ struct DecisionContext {
     env_cache_nonce: Option<String>,
     /// Progress reporter, used to replay captured logs on shared-cache hits.
     reporter: Arc<ProgressReporter>,
+    task_watch_registry: TaskWatchRegistry,
 }
 
 impl DecisionContext {
@@ -446,6 +450,8 @@ struct CacheWriteContext {
     /// Resolved cache nonce string for this task.
     cache_nonce: Option<String>,
     decision: CacheDecisionContext,
+    /// Registry of watched task inputs, updated when this task's record is built.
+    task_watch_registry: TaskWatchRegistry,
 }
 
 struct CacheStateContext {
@@ -2218,6 +2224,7 @@ fn build_dispatch_context<'a>(inputs: BuildDispatchContext<'a>) -> DispatchConte
             global_cache_nonce: run.global_cache_nonce.clone(),
             env_cache_nonce: std::env::var("LUCHTA_CACHE_NONCE").ok(),
             reporter: Arc::clone(reporter),
+            task_watch_registry: Arc::clone(&run.task_watch_registry),
         },
     }
 }

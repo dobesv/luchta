@@ -77,15 +77,18 @@ pub struct StagedCandidate {
 
 impl StagedCandidate {
     /// Commit this restore by moving staged files into the package directory.
-    pub fn commit(self) -> std::io::Result<RestoredHit> {
-        self.staged.commit()?;
-        Ok(RestoredHit {
-            outputs_hash: self.outputs_hash,
-            record: self.record,
-            stdout: self.stdout,
-            stderr: self.stderr,
-            reports: self.reports,
-        })
+    pub fn commit(self) -> std::io::Result<(RestoredHit, Vec<std::path::PathBuf>)> {
+        let written_paths = self.staged.commit()?;
+        Ok((
+            RestoredHit {
+                outputs_hash: self.outputs_hash,
+                record: self.record,
+                stdout: self.stdout,
+                stderr: self.stderr,
+                reports: self.reports,
+            },
+            written_paths,
+        ))
     }
 
     /// Discard this restore without modifying the package directory.
@@ -849,7 +852,7 @@ mod tests {
         fs::create_dir_all(&restore_dir).unwrap();
 
         // Use new try_restore_candidates API - commit first valid candidate
-        let hit = cache
+        let (hit, written_paths) = cache
             .try_restore_candidates("pkg#build", &input_key, &restore_dir)
             .next()
             .expect("expected at least one candidate")
@@ -859,6 +862,7 @@ mod tests {
         assert_eq!(hit.stdout, b"stdout output");
         assert_eq!(hit.stderr, b"stderr output");
         assert!(hit.record.succeeded);
+        assert_eq!(written_paths, vec![restore_dir.join("dist/main.js")]);
 
         // Check file content.
         let restored_content = fs::read(restore_dir.join("dist/main.js")).unwrap();
@@ -1296,11 +1300,12 @@ mod tests {
         assert!(!candidates.is_empty(), "expected at least one candidate");
 
         // The first valid candidate should be from commit1 (commit2's blob is missing)
-        let hit = candidates
+        let (hit, written_paths) = candidates
             .remove(0)
             .commit()
             .expect("commit should succeed");
         assert_eq!(hit.stdout, b"stdout v1");
+        assert_eq!(written_paths, vec![restore_dir.join("dist/main.js")]);
     }
 
     #[test]

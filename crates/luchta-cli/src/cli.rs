@@ -133,6 +133,12 @@ pub enum Commands {
         /// Debounce filesystem changes for this many milliseconds before scheduling rebuild.
         #[arg(long, value_name = "MS", default_value_t = 150)]
         debounce: u64,
+
+        /// On each rebuild, list the changed files that triggered it (first 10 plus a count).
+        ///
+        /// Useful for diagnosing unexpected or repeated rebuilds.
+        #[arg(long)]
+        show_changed_files: bool,
     },
     /// View cached logs and metadata for previously executed tasks.
     Logs {
