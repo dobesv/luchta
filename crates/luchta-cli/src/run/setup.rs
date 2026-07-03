@@ -64,6 +64,7 @@ pub(super) fn report_run_outcome(
     any_failed: &AtomicBool,
     reporter: &ProgressReporter,
     pressure_state: &crate::memory_pressure::PressureState,
+    was_cancelled: bool,
 ) -> Result<()> {
     run_result?;
 
@@ -73,7 +74,11 @@ pub(super) fn report_run_outcome(
     );
     println!(
         "{}",
-        reporter.render_summary(&crate::rss::format_rss(rss), owo_colors::Stream::Stdout)
+        reporter.render_summary(
+            &crate::rss::format_rss(rss),
+            was_cancelled,
+            owo_colors::Stream::Stdout
+        )
     );
 
     if any_failed.load(Ordering::SeqCst) {
