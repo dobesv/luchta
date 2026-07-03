@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 pub use proxy::{
     split_current_process_argv, split_delegate_argv, DelegateArgvSplit, DelegateHandle, ProxyError,
+    RawDelegate, SharedWriter,
 };
 pub use runtime::{run_worker, run_worker_main, shell_single_quote, Worker, WorkerError};
 

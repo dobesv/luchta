@@ -10,6 +10,7 @@ members = [
     "crates/luchta-yarn-worker",
     "crates/luchta-bash-worker",
     "crates/luchta-lazy-worker",
+    "crates/luchta-worker-watcher",
     "crates/luchta-file-exists-filter",
     "crates/luchta-yarn-filter",
   "crates/luchta-command-filter",

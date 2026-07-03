@@ -1,0 +1,28 @@
+[package]
+name = "luchta-worker-watcher"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description.workspace = true
+
+[dependencies]
+luchta-worker = { path = "../luchta-worker" }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+notify = { workspace = true }
+notify-debouncer-full = { workspace = true }
+globset = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+assert_cmd = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+
+[[bin]]
+name = "mock-worker-delegate"
+path = "tests/support/mock_worker_delegate.rs"
