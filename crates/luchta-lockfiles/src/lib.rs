@@ -7,7 +7,7 @@
 mod yarn1;
 mod yarn_berry;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 
 use thiserror::Error;
 
@@ -45,6 +45,37 @@ pub trait Lockfile: Send + Sync + std::fmt::Debug {
 
     /// Returns all direct dependencies for package identified by lockfile key.
     fn all_dependencies(&self, key: &str) -> Result<BTreeMap<String, String>, LockfileError>;
+
+    /// Returns full transitive dependency closure for package identified by lockfile key.
+    ///
+    /// Result contains external dependency `(name, version)` pairs reachable from
+    /// `key` through its dependency closure. In cyclic graphs this may conservatively
+    /// include the seed package if a cycle points back to it.
+    fn transitive_dependencies(
+        &self,
+        key: &str,
+    ) -> Result<BTreeSet<(String, String)>, LockfileError> {
+        let mut dependencies = BTreeSet::new();
+        let mut visited = HashSet::new();
+        let mut pending = VecDeque::new();
+
+        pending.extend(self.all_dependencies(key)?);
+
+        while let Some((dependency_name, dependency_range)) = pending.pop_front() {
+            let Some(package) = self.resolve_package("", &dependency_name, &dependency_range)?
+            else {
+                continue;
+            };
+
+            dependencies.insert((dependency_name, package.version.clone()));
+
+            if visited.insert(package.key.clone()) {
+                pending.extend(self.all_dependencies(&package.key)?);
+            }
+        }
+
+        Ok(dependencies)
+    }
 }
 
 /// Parses supported Yarn lockfile content and returns matching backend.

@@ -165,6 +165,12 @@ impl PackageGraph {
             .collect())
     }
 
+    /// Returns node for package name.
+    pub fn node(&self, name: &PackageName) -> Result<&PackageNode, WorkspaceError> {
+        let index = self.node_index(name)?;
+        Ok(&self.graph[index])
+    }
+
     /// Returns packages that directly depend on `name`.
     pub fn dependents_of(&self, name: &PackageName) -> Result<Vec<&PackageNode>, WorkspaceError> {
         let index = self.node_index(name)?;
@@ -180,6 +186,22 @@ impl PackageGraph {
         &self,
         seeds: impl IntoIterator<Item = PackageName>,
     ) -> Result<HashSet<PackageName>, WorkspaceError> {
+        self.transitive_neighbors(seeds, Direction::Incoming)
+    }
+
+    /// Returns `name` plus all packages it transitively depends on.
+    pub fn transitive_dependencies_of(
+        &self,
+        name: &PackageName,
+    ) -> Result<HashSet<PackageName>, WorkspaceError> {
+        self.transitive_neighbors([name.clone()], Direction::Outgoing)
+    }
+
+    fn transitive_neighbors(
+        &self,
+        seeds: impl IntoIterator<Item = PackageName>,
+        direction: Direction,
+    ) -> Result<HashSet<PackageName>, WorkspaceError> {
         let mut visited = HashSet::new();
         let mut pending = Vec::new();
 
@@ -193,9 +215,9 @@ impl PackageGraph {
         }
 
         while let Some(index) = pending.pop() {
-            for dependent_index in self.graph.neighbors_directed(index, Direction::Incoming) {
-                if visited.insert(dependent_index) {
-                    pending.push(dependent_index);
+            for neighbor_index in self.graph.neighbors_directed(index, direction) {
+                if visited.insert(neighbor_index) {
+                    pending.push(neighbor_index);
                 }
             }
         }

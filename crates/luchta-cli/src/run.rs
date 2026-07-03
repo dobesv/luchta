@@ -29,8 +29,7 @@ use owo_colors::{OwoColorize, Stream};
 
 use crate::build_lock;
 use crate::cache_ctx::{
-    build_current_state, gather_pkg_dep_pairs, load_lockfile_state, LockfileState,
-    PackageDirResolver,
+    build_current_state, load_lockfile_state, LockfileState, PackageDirResolver,
 };
 use crate::cli::OutputMode;
 use crate::progress::ProgressReporter;

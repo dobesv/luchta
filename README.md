@@ -136,8 +136,18 @@ interface CacheConfig {
 interface TaskDefinition {
   /** Tasks that must finish before this one runs. */
   dependsOn?: DependsOn[];
+  /**
+   * Optional filter for external package dependencies (yarn.lock).
+   * Reuses the Input Pattern grammar (^, ^^, pkg#, #, globs).
+   * Default: ["**/*"] (conservative).
+   */
+  dependencies?: string[];
   /** Opt-in build cache configuration. */
   cache?: CacheConfig;
+  /** Relative input paths/globs. */
+  inputs?: string[];
+  /** Relative output paths/globs. */
+  outputs?: string[];
   /** Relative cost for the weighted scheduler. Defaults to 1. */
   weight?: number;
   /**
@@ -234,6 +244,10 @@ The top-level `tasks` map defines the pipeline. Each task may set:
 - `cache`: opt-in build cache. Provide an object (e.g. `cache: {}`) to enable change-detection skips for successful prior runs; omit the field to disable. Set the `nonce` field (e.g. `cache: { nonce: "v1" }`) to force-bust this task's cache. See [Cache Nonce](#cache-nonce-force-busting-stale-cache) for details.
 - `inputs`: relative input paths/globs. Literal paths and glob matches are hashed from git-tracked files, so `.gitignore` is respected. See [Input Pattern Prefixes](#input-pattern-prefixes).
 - `outputs`: relative output paths/globs. These are checked on disk, so missing/deleted outputs invalidate cache entries even if ignored by git.
+- `dependencies`: optional filter for external package dependencies (from `yarn.lock`). Reuses the [Input Pattern Prefixes](#input-pattern-prefixes) grammar (`^`, `^^`, `pkg#`, `#`, globs).
+    - **Default:** `["**/*"]` (conservative; includes all package dependencies).
+    - **Semantic difference:** Patterns select which package dependencies' **resolved versions** (and their full transitive closures) feed the task's cache hash — they do NOT select files.
+    - **Interpretation:** The filter selects "roots" from the package's immediate dependencies; each matched root contributes its FULL transitive closure to the hash. Narrowing the filter reduces cache invalidation (fewer roots → fewer version changes bust the cache).
 - `env`: environment variables for the task. See [Environment Variables](#environment-variables) for details on scopes and resolution modes.
 
 ### Input Pattern Prefixes
@@ -488,7 +502,7 @@ workers: {
 Then point a task at a worker with its `worker` field. Luchta ships several
 standard worker binaries and a set of composable filters.
 
-#### Worker `dependsOn`
+#### Worker `dependsOn` and `dependencies`
 Workers can declare their own dependencies in the configuration.
 `workers.<name>.dependsOn` uses the same syntax as task `dependsOn` (see below).
 These dependencies are automatically appended (engine-side) to every task that
@@ -499,6 +513,8 @@ Injected worker dependencies are:
 - Persistent even if the worker's `resolve` protocol message tries to modify
   task dependencies.
 - Tolerant of pointing at pruned or missing tasks.
+
+**Worker Overrides:** A worker's `Modify` decision (during the `resolve` protocol phase) may include `dependsOn` or `dependencies` (raw pattern strings) which **fully replaces** the task's static definition for that run. This mirrors how workers can override other task fields like `command` or `weight`. Omitting a field in the `Modify` decision leaves the static filter unchanged.
 
 #### Worker reports
 
@@ -572,6 +588,7 @@ workers: {
 ### Build Cache
 Luchta build cache is **opt-in** per task via `cache: {}`. Cached task skips only when prior run succeeded and all cache inputs still match: task spec, significant env, package dependency versions from `yarn.lock`, dependency-task output hashes, declared or worker-detected inputs, and outputs.
 
+- **Transitive Lockfile Detection (#89):** Cache hashing and watch-mode invalidation both track the **full transitive closure** of external package dependencies from `yarn.lock`. Any transitive dependency's resolved-version change now busts the cache, even when the direct specifier is unchanged. Lockfile cycles are handled silently. `gather_pkg_dep_pairs` serves as the single source of truth for both cache and watch.
 - Default cache dir: `<workspace>/.luchta/cache`
 - Override: `LUCHTA_CACHE_DIR=/abs/path`
 - Inputs use git-tracked listing, so `.gitignore` is honored for globs and literals.

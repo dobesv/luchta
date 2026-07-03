@@ -20,7 +20,7 @@ use luchta_workspace::PackageNode;
 use miette::Result;
 
 use crate::cache_ctx::{
-    build_current_state, gather_pkg_dep_pairs, load_lockfile_state, PackageDirResolver,
+    build_current_state, gather_pkg_dep_pairs_filtered, load_lockfile_state, PackageDirResolver,
 };
 use crate::cache_nonce::resolve_cache_nonce;
 use crate::env_merge::merge_env;
@@ -383,10 +383,12 @@ fn print_live_decision(
     let dep_outputs = build_dep_outputs_from_cache(task_id, ctx.prepared, ctx.cache);
 
     let package = PackageNode::new(package_name.clone(), package_path.clone());
-    let pkg_dep_pairs = gather_pkg_dep_pairs(
+    let pkg_dep_pairs = gather_pkg_dep_pairs_filtered(
         &package,
         Some(&ctx.prepared.package_graph),
+        ctx.workspace_root,
         ctx.lockfile_state,
+        &task_def.dependencies,
     )
     .unwrap_or_default();
 

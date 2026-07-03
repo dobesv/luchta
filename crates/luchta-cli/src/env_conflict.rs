@@ -160,6 +160,7 @@ mod tests {
             cache: None,
             inputs: vec![],
             outputs: vec![],
+            dependencies: vec!["**/*".to_string()],
             env,
         }
     }
@@ -214,6 +215,7 @@ mod tests {
                 cache: None,
                 inputs: vec![],
                 outputs: vec![],
+                dependencies: vec!["**/*".to_string()],
                 env: task_env,
             },
         );
@@ -325,6 +327,7 @@ mod tests {
                 cache: None,
                 inputs: vec![],
                 outputs: vec![],
+                dependencies: vec!["**/*".to_string()],
                 env: task_env,
             },
         );

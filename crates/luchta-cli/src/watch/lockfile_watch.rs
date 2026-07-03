@@ -173,16 +173,14 @@ yarn: lockfile",
         assert_eq!(affected, package_set(["@scope/a", "b"]));
     }
 
-    /// A DEEP transitive resolved-version change (a child of a declared dep) is
-    /// intentionally NOT detected: `Lockfile::all_dependencies` returns only
-    /// direct-child *specifier* strings, not resolved versions, so watch-mode
-    /// invalidation tracks exactly what the cache's `pkg_dep_hash` tracks — the
-    /// declared external dep's resolved version plus its direct child specifiers.
-    /// This keeps watch invalidation consistent with cache correctness. Here only
-    /// `repeat-string`'s resolved version changes (3.0.0 -> 3.0.1); left-pad's
-    /// resolved version and specifiers are unchanged, so package A is unaffected.
+    /// A DEEP transitive resolved-version change IS detected because
+    /// `gather_pkg_dep_pairs` now tracks the FULL transitive closure.
+    /// When `repeat-string`'s resolved version changes (3.0.0 -> 3.0.1),
+    /// package `@scope/a` (which declares `left-pad` as a dependency) is marked
+    /// affected. This conservative invalidation ensures cache consistency — any
+    /// transitive resolved-version change invalidates the dependent package.
     #[test]
-    fn deep_transitive_resolved_version_change_is_not_detected_matches_cache_dep_hash() {
+    fn deep_transitive_resolved_version_change_busts_cache() {
         let workspace = TestWorkspace::new();
         let (packages, package_graph) = workspace.discover();
         let mut state = LockfileWatchState::new(workspace.root());
@@ -192,7 +190,9 @@ yarn: lockfile",
 
         let affected = state.affected_packages(&packages, Some(&package_graph), workspace.root());
 
-        assert!(affected.is_empty());
+        // @scope/a declares left-pad; left-pad depends on repeat-string transitively.
+        // When repeat-string's resolved version changes, @scope/a must be marked affected.
+        assert_eq!(affected, package_set(["@scope/a"]));
     }
 
     struct TestWorkspace {
