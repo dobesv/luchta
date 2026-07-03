@@ -32,6 +32,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
+use super::lockfile_watch::LockfileWatchState;
 use super::registry::dirty_packages_for_changes;
 use super::session::WatchSession;
 use super::watcher::{WatchBatch, WatcherHandle};
@@ -333,6 +334,16 @@ where
     // MUST NOT rely on it for correctness — pending.is_empty() is the source of truth.
     let wake = Arc::new(Notify::new());
     let active_cycle = Arc::new(ActiveCycle::new());
+    let workspace_root = session.repo_root();
+    let package_nodes = session.current_package_nodes();
+    let package_graph = session.current_package_graph();
+    let mut initial_lockfile_state = LockfileWatchState::new(workspace_root.as_ref());
+    initial_lockfile_state.rebuild_baseline(
+        &package_nodes,
+        Some(package_graph.as_ref()),
+        workspace_root.as_ref(),
+    );
+    let lockfile_state = Arc::new(Mutex::new(initial_lockfile_state));
     let drain_task = spawn_change_drain_task(
         changes_rx,
         Arc::clone(&pending),
@@ -370,6 +381,7 @@ where
                         pending: &pending,
                         wake: &wake,
                         active_cycle: &active_cycle,
+                        lockfile_state: &lockfile_state,
                         ui: &ui,
                     },
                     &mut signals,
@@ -489,7 +501,34 @@ where
     // content hash) — or new files matching a task's input globs — dirty a package.
     // Cache outputs, restore staging dirs, and touch-only events are ignored, which
     // is what breaks the watch rebuild loop (#161).
-    let affected = dirty_packages_for_changes(&context.session.task_watch_registry(), &changed);
+    let mut affected = dirty_packages_for_changes(&context.session.task_watch_registry(), &changed);
+    let workspace_root = context.session.repo_root();
+    let lockfile_path = {
+        let state = context
+            .lockfile_state
+            .lock()
+            .expect("lockfile watch state mutex poisoned");
+        state.lockfile_path().to_path_buf()
+    };
+    let lockfile_changed = changed.iter().any(|path| path == &lockfile_path);
+    if lockfile_changed {
+        let packages = context.session.current_package_nodes();
+        let package_graph = context.session.current_package_graph();
+        let mut lockfile_state = context
+            .lockfile_state
+            .lock()
+            .expect("lockfile watch state mutex poisoned");
+        affected.extend(lockfile_state.affected_packages(
+            &packages,
+            Some(package_graph.as_ref()),
+            workspace_root.as_ref(),
+        ));
+        lockfile_state.rebuild_baseline(
+            &packages,
+            Some(package_graph.as_ref()),
+            workspace_root.as_ref(),
+        );
+    }
     if affected.is_empty() {
         context.ui.up_to_date();
         return Ok(WatchControl::Continue);
@@ -603,6 +642,7 @@ struct WatchIterationContext<'a> {
     pending: &'a PendingChanges,
     wake: &'a Notify,
     active_cycle: &'a ActiveCycle,
+    lockfile_state: &'a Arc<Mutex<LockfileWatchState>>,
     ui: &'a WatchUi,
 }
 

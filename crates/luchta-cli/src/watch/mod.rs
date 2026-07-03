@@ -4,6 +4,7 @@
 //! build cycles without restarting workers.
 
 pub mod driver;
+pub(crate) mod lockfile_watch;
 pub mod registry;
 pub mod session;
 pub mod watcher;

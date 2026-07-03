@@ -1,5 +1,5 @@
 use super::driver_e2e_support::*;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use tokio::time::Duration;
 
@@ -311,6 +311,58 @@ async fn malformed_package_json_keeps_previous_graph_and_loop_alive() {
         read_marker_count(&harness.workspace_root),
         2,
         "expected watch loop to remain responsive after malformed package.json"
+    );
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn lockfile_change_reruns_only_affected_package() {
+    let harness = E2eHarness::start_two_package_lockfile().await;
+
+    harness.wait_for_jobs(1).await;
+    harness.release_first_cycle();
+    harness.wait_for_jobs(2).await;
+    harness
+        .wait_until(
+            Duration::from_secs(10),
+            || "timed out waiting for both initial package markers".to_string(),
+            || {
+                let counts = harness.marker_counts_by_package();
+                counts.get("a") == Some(&1) && counts.get("b") == Some(&1)
+            },
+        )
+        .await;
+
+    assert_eq!(
+        harness.marker_counts_by_package(),
+        HashMap::from([("a".to_string(), 1), ("b".to_string(), 1)]),
+        "expected both packages to build once before lockfile edit"
+    );
+
+    std::fs::write(
+        harness.workspace_root.join("yarn.lock"),
+        two_package_lockfile_contents("1.1.0", "4.0.0"),
+    )
+    .expect("rewrite yarn.lock");
+    harness.send_lockfile_change().await;
+    harness
+        .wait_until(
+            Duration::from_secs(10),
+            || "timed out waiting for package a rerun after lockfile change".to_string(),
+            || read_marker_count_for(&harness.workspace_root, "a") >= 2,
+        )
+        .await;
+
+    assert!(
+        harness.stays_for_jobs(3, Duration::from_millis(500)).await,
+        "expected exactly one extra job after lockfile change, got {} jobs",
+        read_job_count(&harness.workspace_root)
+    );
+    assert_eq!(
+        read_marker_count_for(&harness.workspace_root, "b"),
+        1,
+        "expected unrelated package b to stay idle after left-pad lockfile bump"
     );
 
     harness.shutdown().await;
