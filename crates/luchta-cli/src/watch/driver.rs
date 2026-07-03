@@ -240,12 +240,13 @@ impl WatchUi {
         // Note: watch mode intentionally does NOT clear the screen here.
         // Preserving scrollback keeps prior build output and change history
         // visible (see GitHub issue #160).
-        print_status(&format_cycle_start_line());
         Ok(())
     }
 
     fn cycle_finished(&self, outcome: CycleOutcome, elapsed: Duration) {
-        print_status(&format_cycle_finished_line(outcome, elapsed));
+        if let Some(line) = format_cycle_finished_line(outcome, elapsed) {
+            print_status(&line);
+        }
     }
 
     fn shutting_down(&self) {
@@ -706,9 +707,20 @@ fn format_watch_started_line() -> String {
 }
 
 fn format_change_detected_line(affected: &HashSet<PackageName>) -> String {
-    let mut names = affected.iter().map(ToString::to_string).collect::<Vec<_>>();
-    names.sort();
-    format!("[watch] change detected: {}", names.join(", "))
+    if affected.len() == 1 {
+        let name = affected.iter().next().expect("len checked").to_string();
+        return format!("📝 {name}")
+            .if_supports_color(Stream::Stdout, |text| text.cyan())
+            .to_string();
+    }
+
+    let packages_set: BTreeSet<&str> = affected.iter().map(|p| p.as_str()).collect();
+    let shared_scope = crate::progress_task_list::common_scope(&packages_set);
+    let compacted = crate::progress_task_list::format_package_set(&packages_set, shared_scope);
+
+    format!("📝 {}", compacted)
+        .if_supports_color(Stream::Stdout, |text| text.cyan())
+        .to_string()
 }
 
 /// Render the changed files that triggered a rebuild: the first
@@ -725,12 +737,20 @@ fn format_changed_files_lines(changed: &HashSet<PathBuf>, repo_root: &Path) -> V
     let mut lines = paths
         .iter()
         .take(MAX_LISTED_CHANGED_FILES)
-        .map(|path| format!("[watch]   {path}"))
+        .map(|path| {
+            format!("  {path}")
+                .if_supports_color(Stream::Stdout, |t| t.dimmed())
+                .to_string()
+        })
         .collect::<Vec<_>>();
 
     if total > MAX_LISTED_CHANGED_FILES {
         let remaining = total - MAX_LISTED_CHANGED_FILES;
-        lines.push(format!("[watch]   … and {remaining} more"));
+        lines.push(
+            format!("  … and {remaining} more")
+                .if_supports_color(Stream::Stdout, |t| t.dimmed())
+                .to_string(),
+        );
     }
 
     lines
@@ -749,15 +769,14 @@ fn format_up_to_date_line() -> String {
     "[watch] up to date".to_string()
 }
 
-fn format_cycle_start_line() -> String {
-    "[watch] rebuilding…".to_string()
-}
-
-fn format_cycle_finished_line(outcome: CycleOutcome, elapsed: Duration) -> String {
+fn format_cycle_finished_line(outcome: CycleOutcome, elapsed: Duration) -> Option<String> {
     match outcome {
-        CycleOutcome::Success => format!("[watch] done in {}", format_elapsed(elapsed)),
-        CycleOutcome::Failed => format!("[watch] build failed in {}", format_elapsed(elapsed)),
-        CycleOutcome::Cancelled => "[watch] cancelled (new changes)".to_string(),
+        CycleOutcome::Success => None, // Handled by progress summary
+        CycleOutcome::Failed => Some(format!(
+            "[watch] build failed in {}",
+            format_elapsed(elapsed)
+        )),
+        CycleOutcome::Cancelled => None, // Folded into final progress line
     }
 }
 
@@ -887,8 +906,8 @@ mod tests {
         assert_eq!(
             lines,
             vec![
-                "[watch]   pkg-a/src/main.rs".to_string(),
-                "[watch]   pkg-b/src/lib.rs".to_string(),
+                "  pkg-a/src/main.rs".to_string(),
+                "  pkg-b/src/lib.rs".to_string(),
             ]
         );
     }
@@ -902,10 +921,10 @@ mod tests {
 
         let lines = format_changed_files_lines(&changed, &repo_root);
         assert_eq!(lines.len(), MAX_LISTED_CHANGED_FILES + 1);
-        assert_eq!(lines[0], "[watch]   pkg/src/file00.rs");
+        assert_eq!(lines[0], "  pkg/src/file00.rs");
         assert_eq!(
             lines.last().expect("summary line present"),
-            "[watch]   … and 5 more"
+            "  … and 5 more"
         );
     }
 
@@ -984,34 +1003,37 @@ mod tests {
         let changed = HashSet::from([PathBuf::from("/elsewhere/file.rs")]);
 
         let lines = format_changed_files_lines(&changed, &repo_root);
-        assert_eq!(lines, vec!["[watch]   /elsewhere/file.rs".to_string()]);
+        assert_eq!(lines, vec!["  /elsewhere/file.rs".to_string()]); // Colored but we ignore color in assertion if it's default stream or we use contains
+                                                                     // actually if_supports_color on Stream::Stdout in tests returns the string directly
     }
 
     #[test]
     fn status_lines_format_expected_messages() {
-        let affected = HashSet::from([
-            PackageName::new("pkg-b".to_owned()),
-            PackageName::new("pkg-a".to_owned()),
+        let affected_multi = HashSet::from([
+            PackageName::new("@formative/pkg-b".to_owned()),
+            PackageName::new("@formative/pkg-a".to_owned()),
         ]);
+        let affected_single =
+            HashSet::from([PackageName::new("@formative/react-reporting".to_owned())]);
 
         assert!(format_watch_started_line().contains("[watch] watch mode started"));
+        assert_eq!(format_change_detected_line(&affected_multi), "📝 pkg-{a,b}");
         assert_eq!(
-            format_change_detected_line(&affected),
-            "[watch] change detected: pkg-a, pkg-b"
+            format_change_detected_line(&affected_single),
+            "📝 @formative/react-reporting"
         );
         assert_eq!(format_up_to_date_line(), "[watch] up to date");
-        assert_eq!(format_cycle_start_line(), "[watch] rebuilding…");
         assert_eq!(
             format_cycle_finished_line(CycleOutcome::Success, Duration::from_millis(125)),
-            "[watch] done in 125ms"
+            None
         );
         assert_eq!(
             format_cycle_finished_line(CycleOutcome::Failed, Duration::from_millis(1234)),
-            "[watch] build failed in 1.234s"
+            Some("[watch] build failed in 1.234s".to_string())
         );
         assert_eq!(
             format_cycle_finished_line(CycleOutcome::Cancelled, Duration::from_secs(5)),
-            "[watch] cancelled (new changes)"
+            None
         );
     }
 
