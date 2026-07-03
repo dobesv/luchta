@@ -2,7 +2,7 @@ use super::*;
 use crate::watch::session::WatchSession;
 use crate::watch::watcher::{WatchBatch, WatcherHandle};
 use luchta_workspace::PackageNode;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -88,6 +88,93 @@ echo '{{"concurrency":{{"maxWeight":4}},"workers":{{"fake":{{"command":"{}"}}}},
     }
 }
 
+pub(super) fn write_two_package_lockfile_workspace(workspace_root: &std::path::Path) {
+    std::fs::create_dir_all(workspace_root.join("packages/a")).expect("create package a dir");
+    std::fs::create_dir_all(workspace_root.join("packages/b")).expect("create package b dir");
+    std::fs::write(
+        workspace_root.join("package.json"),
+        r#"{"name": "root", "private": true, "workspaces": ["packages/*"]}"#,
+    )
+    .expect("write root package.json");
+    std::fs::write(
+        workspace_root.join("packages/a/package.json"),
+        r#"{"name": "@scope/a", "version": "1.0.0", "dependencies": {"left-pad": "^1.0.0"}, "scripts": {"build": "echo build"}}"#,
+    )
+    .expect("write package a package.json");
+    std::fs::write(
+        workspace_root.join("packages/b/package.json"),
+        r#"{"name": "b", "version": "1.0.0", "dependencies": {"lodash": "^4.0.0"}, "scripts": {"build": "echo build"}}"#,
+    )
+    .expect("write package b package.json");
+    std::fs::write(
+        workspace_root.join("yarn.lock"),
+        two_package_lockfile_contents("1.0.0", "4.0.0"),
+    )
+    .expect("write yarn.lock");
+
+    let release_1 = workspace_root.join(".release-1");
+    let job_count = workspace_root.join(".job-count");
+    let worker_script = format!(
+        r##"#!/bin/sh
+job_count=0
+while IFS= read -r line; do
+  case "$line" in
+  *'"type":"resolveTask"'*)
+    id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+    printf '{{"type":"resolved","id":"%s","result":{{"decision":"accept"}}}}\n' "$id"
+    ;;
+  *'"type":"run"'*)
+    id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+    package=${{id%%#*}}
+    job_count=$((job_count + 1))
+    echo "$job_count" > '{job_count}'
+    case "$package" in
+      @scope/a) marker='{marker_a}' ;;
+      b) marker='{marker_b}' ;;
+      *) marker='{marker_unknown}' ;;
+    esac
+    echo "$id" >> "$marker"
+    if [ "$job_count" -eq 1 ]; then
+      while [ ! -f '{release_1}' ]; do sleep 0.01; done
+    fi
+    printf '{{"type":"done","id":"%s","success":true,"exitCode":0}}\n' "$id"
+    ;;
+  esac
+done
+"##,
+        job_count = job_count.display(),
+        marker_a = workspace_root.join(".run-marker-a").display(),
+        marker_b = workspace_root.join(".run-marker-b").display(),
+        marker_unknown = workspace_root.join(".run-marker-unknown").display(),
+        release_1 = release_1.display(),
+    );
+    let worker_script_path = workspace_root.join("fake-worker.sh");
+    std::fs::write(&worker_script_path, &worker_script).expect("write worker script");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&worker_script_path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod worker script");
+    }
+
+    let config = format!(
+        r##"#!/bin/sh
+echo '{{"concurrency":{{"maxWeight":4}},"workers":{{"fake":{{"command":"{}"}}}},"tasks":{{"build":{{"worker":"fake"}}}}}}'
+"##,
+        worker_script_path.display()
+    );
+    std::fs::write(workspace_root.join("luchta-config.sh"), &config).expect("write config");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            workspace_root.join("luchta-config.sh"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("chmod config");
+    }
+}
+
 pub(super) fn read_marker_count(workspace_root: &std::path::Path) -> usize {
     let marker = workspace_root.join(".run-marker");
     std::fs::read_to_string(&marker)
@@ -130,9 +217,17 @@ pub(super) enum PackageMutation<'a> {
 
 impl E2eHarness {
     pub(super) async fn start() -> Self {
+        Self::start_with_workspace(write_blocking_workspace).await
+    }
+
+    pub(super) async fn start_two_package_lockfile() -> Self {
+        Self::start_with_workspace(write_two_package_lockfile_workspace).await
+    }
+
+    pub(super) async fn start_with_workspace(writer: fn(&std::path::Path)) -> Self {
         let temp_dir = tempfile::tempdir().expect("create temp dir");
         let workspace_root = temp_dir.path().canonicalize().expect("canonicalize");
-        write_blocking_workspace(&workspace_root);
+        writer(&workspace_root);
 
         let session = Arc::new(
             WatchSession::new(&workspace_root, None)
@@ -304,6 +399,15 @@ impl E2eHarness {
         self.send_batch(HashSet::from([changed_path]), true).await;
     }
 
+    pub(super) async fn send_lockfile_change(&self) {
+        let lockfile_path = self
+            .workspace_root
+            .join("yarn.lock")
+            .canonicalize()
+            .expect("canonicalize lockfile path");
+        self.send_batch(HashSet::from([lockfile_path]), false).await;
+    }
+
     pub(super) async fn mutate_packages_and_signal(&self, mutation: PackageMutation<'_>) {
         let changed_path = match mutation {
             PackageMutation::Add {
@@ -412,6 +516,19 @@ impl E2eHarness {
         self.session.worker_manager_handle()
     }
 
+    pub(super) fn marker_counts_by_package(&self) -> HashMap<String, usize> {
+        HashMap::from([
+            (
+                "a".to_string(),
+                read_marker_count_for(&self.workspace_root, "a"),
+            ),
+            (
+                "b".to_string(),
+                read_marker_count_for(&self.workspace_root, "b"),
+            ),
+        ])
+    }
+
     pub(super) fn worker_manager_is_shutdown(&self) -> bool {
         self.session.worker_manager_is_shutdown()
     }
@@ -478,4 +595,34 @@ pub(super) fn discover_package_names(workspace_root: &Path) -> Result<Vec<String
         .collect::<Vec<_>>();
     names.sort();
     Ok(names)
+}
+
+pub(super) fn read_marker_count_for(workspace_root: &std::path::Path, package_key: &str) -> usize {
+    count_lines(&workspace_root.join(format!(".run-marker-{package_key}")))
+}
+
+pub(super) fn two_package_lockfile_contents(
+    left_pad_version: &str,
+    lodash_version: &str,
+) -> String {
+    [
+        "# THIS IS AN AUTOGENERATED FILE. DO NOT EDIT THIS FILE DIRECTLY.".to_string(),
+        "# yarn lockfile v1".to_string(),
+        String::new(),
+        "left-pad@^1.0.0:".to_string(),
+        format!("  version \"{left_pad_version}\""),
+        format!(
+            "  resolved \"https://registry.yarnpkg.com/left-pad/-/left-pad-{left_pad_version}.tgz#leftpad\""
+        ),
+        "  integrity sha512-leftpad".to_string(),
+        String::new(),
+        "lodash@^4.0.0:".to_string(),
+        format!("  version \"{lodash_version}\""),
+        format!(
+            "  resolved \"https://registry.yarnpkg.com/lodash/-/lodash-{lodash_version}.tgz#lodash\""
+        ),
+        "  integrity sha512-lodash".to_string(),
+        String::new(),
+    ]
+    .join("\n")
 }

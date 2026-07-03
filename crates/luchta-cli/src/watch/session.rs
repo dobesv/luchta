@@ -131,6 +131,10 @@ impl WatchSession {
         self.run_context().package_nodes.clone()
     }
 
+    pub(crate) fn current_package_graph(&self) -> Arc<PackageGraph> {
+        Arc::new(self.run_context().package_graph.clone())
+    }
+
     /// Test-only hook for checking whether manager was shut down.
     #[cfg(test)]
     pub fn worker_manager_is_shutdown(&self) -> bool {
