@@ -2202,6 +2202,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "luchta-worker-watcher"
+version = "0.1.10"
+dependencies = [
+ "assert_cmd",
+ "globset",
+ "luchta-worker",
+ "notify",
+ "notify-debouncer-full",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
 name = "luchta-workspace"
 version = "0.1.10"
 dependencies = [
