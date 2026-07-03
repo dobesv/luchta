@@ -12,12 +12,13 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use ignore::WalkBuilder;
-use notify::event::CreateKind;
+use luchta_workspace::PackageNode;
+use notify::event::{CreateKind, ModifyKind, RemoveKind};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use notify_debouncer_full::{
     new_debouncer, DebounceEventResult, DebouncedEvent, Debouncer, FileIdMap,
@@ -25,19 +26,30 @@ use notify_debouncer_full::{
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tracing::warn;
 
 const DEFAULT_CHANNEL_CAPACITY: usize = 32;
 const DEFAULT_DEBOUNCE_MS: u64 = 150;
 const IGNORED_DIR_NAMES: &[&str] = &["target", "node_modules", ".git", ".luchta"];
 
 type SharedDebouncer = Arc<Mutex<Debouncer<RecommendedWatcher, FileIdMap>>>;
+type SharedWatchedDirs = Arc<Mutex<HashSet<PathBuf>>>;
+
+struct BridgeTaskParams {
+    debouncer: SharedDebouncer,
+    ignore_filter: Arc<IgnoreFilter>,
+    watched_dirs: SharedWatchedDirs,
+    raw_rx: mpsc::Receiver<Vec<DebouncedEvent>>,
+    batch_tx: mpsc::Sender<WatchBatch>,
+}
 
 /// Keeps debouncer and bridge task alive. Dropping handle aborts bridge task and
 /// releases this handle's debouncer reference; OS-watch teardown happens when last
 /// debouncer reference is dropped, not necessarily synchronously with `drop`.
 pub struct WatcherHandle {
-    #[allow(dead_code)]
     debouncer: Option<SharedDebouncer>,
+    watched_dirs: SharedWatchedDirs,
+    ignore_filter: Arc<IgnoreFilter>,
     bridge_task: JoinHandle<()>,
 }
 
@@ -55,8 +67,37 @@ impl WatcherHandle {
         let handle = tokio::spawn(std::future::pending::<()>());
         Self {
             debouncer: None,
+            watched_dirs: Arc::new(Mutex::new(HashSet::new())),
+            ignore_filter: Arc::new(
+                IgnoreFilter::new(&std::env::temp_dir()).expect("build noop ignore filter"),
+            ),
             bridge_task: handle,
         }
+    }
+}
+
+impl WatcherHandle {
+    pub fn reconcile_watch_roots(
+        &self,
+        workspace_root: &Path,
+        _packages: &[PackageNode],
+    ) -> Result<(), WatcherError> {
+        let desired_dirs = discover_watch_dirs(workspace_root, &self.ignore_filter)?;
+        self.reconcile_watched_dirs(desired_dirs)
+    }
+
+    fn reconcile_watched_dirs(&self, desired_dirs: HashSet<PathBuf>) -> Result<(), WatcherError> {
+        let Some(debouncer) = &self.debouncer else {
+            let mut watched_dirs = lock_watched_dirs(&self.watched_dirs)?;
+            *watched_dirs = desired_dirs;
+            return Ok(());
+        };
+
+        let mut guard = debouncer
+            .lock()
+            .map_err(|_| WatcherError::WatchStatePoisoned)?;
+        let mut watched_dirs = lock_watched_dirs(&self.watched_dirs)?;
+        reconcile_watched_dirs(guard.watcher(), &mut watched_dirs, desired_dirs)
     }
 }
 
@@ -90,10 +131,16 @@ pub enum WatcherError {
     WatchStatePoisoned,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WatchBatch {
+    pub changed_paths: HashSet<PathBuf>,
+    pub structural: bool,
+}
+
 pub fn spawn_watcher(
     workspace_root: &Path,
     debounce_ms: u64,
-) -> Result<(WatcherHandle, mpsc::Receiver<HashSet<PathBuf>>), WatcherError> {
+) -> Result<(WatcherHandle, mpsc::Receiver<WatchBatch>), WatcherError> {
     let workspace_root = workspace_root.canonicalize().map_err(|source| {
         WatcherError::CanonicalizeWorkspaceRoot {
             path: workspace_root.to_path_buf(),
@@ -125,43 +172,49 @@ pub fn spawn_watcher(
         watch_directories(guard.watcher(), initial_dirs.iter().cloned())?;
     }
 
-    let bridge_task = spawn_bridge_task(
-        Arc::clone(&debouncer),
-        Arc::clone(&ignore_filter),
+    let watched_dirs = Arc::new(Mutex::new(initial_dirs.clone()));
+
+    let bridge_task = spawn_bridge_task(BridgeTaskParams {
+        debouncer: Arc::clone(&debouncer),
+        ignore_filter: Arc::clone(&ignore_filter),
+        watched_dirs: Arc::clone(&watched_dirs),
         raw_rx,
         batch_tx,
-    );
+    });
 
     Ok((
         WatcherHandle {
             debouncer: Some(debouncer),
+            watched_dirs,
+            ignore_filter,
             bridge_task,
         },
         batch_rx,
     ))
 }
 
-fn spawn_bridge_task(
-    debouncer: SharedDebouncer,
-    ignore_filter: Arc<IgnoreFilter>,
-    mut raw_rx: mpsc::Receiver<Vec<DebouncedEvent>>,
-    batch_tx: mpsc::Sender<HashSet<PathBuf>>,
-) -> JoinHandle<()> {
+fn spawn_bridge_task(params: BridgeTaskParams) -> JoinHandle<()> {
+    let BridgeTaskParams {
+        debouncer,
+        ignore_filter,
+        watched_dirs,
+        mut raw_rx,
+        batch_tx,
+    } = params;
     tokio::spawn(async move {
-        let mut watched_dirs = HashSet::new();
         while let Some(events) = raw_rx.recv().await {
             let created_dirs = created_directories(&ignore_filter, events.iter());
-            if let Ok(mut guard) = debouncer.lock() {
+            if let (Ok(mut guard), Ok(mut watched_dirs)) = (debouncer.lock(), watched_dirs.lock()) {
                 let new_dirs = pending_watch_dirs(&ignore_filter, &mut watched_dirs, created_dirs);
                 let _ = watch_directories(guard.watcher(), new_dirs.into_iter());
             }
 
-            let changed_paths = collect_changed_paths(&ignore_filter, events);
-            if changed_paths.is_empty() {
+            let batch = collect_watch_batch(&ignore_filter, events);
+            if batch.changed_paths.is_empty() {
                 continue;
             }
 
-            if batch_tx.send(changed_paths).await.is_err() {
+            if batch_tx.send(batch).await.is_err() {
                 break;
             }
         }
@@ -188,16 +241,42 @@ fn watch_directories(
     Ok(())
 }
 
-fn collect_changed_paths(
-    ignore_filter: &IgnoreFilter,
-    events: Vec<DebouncedEvent>,
-) -> HashSet<PathBuf> {
-    events
+fn collect_watch_batch(ignore_filter: &IgnoreFilter, events: Vec<DebouncedEvent>) -> WatchBatch {
+    let structural = contains_structural_change(ignore_filter, events.iter());
+    let changed_paths = events
         .into_iter()
         .flat_map(|event| event.paths.clone().into_iter())
         .filter_map(normalize_absolute_path)
         .filter(|path| !ignore_filter.should_ignore(path))
-        .collect()
+        .collect();
+
+    WatchBatch {
+        changed_paths,
+        structural,
+    }
+}
+
+fn contains_structural_change<'a>(
+    ignore_filter: &IgnoreFilter,
+    mut events: impl Iterator<Item = &'a DebouncedEvent>,
+) -> bool {
+    events.any(|event| {
+        is_structural_event_kind(&event.kind)
+            && event
+                .paths
+                .iter()
+                .filter_map(|path| normalize_absolute_path(path.clone()))
+                .any(|path| !ignore_filter.should_ignore(&path))
+    })
+}
+
+fn is_structural_event_kind(kind: &EventKind) -> bool {
+    matches!(
+        kind,
+        EventKind::Create(CreateKind::Any | CreateKind::Folder)
+            | EventKind::Remove(RemoveKind::Any | RemoveKind::Folder)
+            | EventKind::Modify(ModifyKind::Name(_))
+    )
 }
 
 fn normalize_absolute_path(path: PathBuf) -> Option<PathBuf> {
@@ -288,6 +367,34 @@ impl IgnoreFilter {
     }
 }
 
+fn lock_watched_dirs(
+    watched_dirs: &SharedWatchedDirs,
+) -> Result<MutexGuard<'_, HashSet<PathBuf>>, WatcherError> {
+    watched_dirs
+        .lock()
+        .map_err(|_| WatcherError::WatchStatePoisoned)
+}
+
+fn reconcile_watched_dirs(
+    watcher: &mut RecommendedWatcher,
+    watched_dirs: &mut HashSet<PathBuf>,
+    desired_dirs: HashSet<PathBuf>,
+) -> Result<(), WatcherError> {
+    let dirs_to_watch: Vec<_> = desired_dirs.difference(watched_dirs).cloned().collect();
+    let dirs_to_unwatch: Vec<_> = watched_dirs.difference(&desired_dirs).cloned().collect();
+
+    watch_directories(watcher, dirs_to_watch.iter().cloned())?;
+
+    for path in &dirs_to_unwatch {
+        if let Err(source) = watcher.unwatch(path) {
+            warn!(path = %path.display(), error = %source, "failed to unwatch path");
+        }
+    }
+
+    *watched_dirs = desired_dirs;
+    Ok(())
+}
+
 fn discover_watch_dirs(
     workspace_root: &Path,
     ignore_filter: &IgnoreFilter,
@@ -356,11 +463,12 @@ fn pending_watch_dirs(
 #[cfg(test)]
 mod tests {
     use super::{
-        created_directories, discover_watch_dirs, pending_watch_dirs, spawn_watcher,
-        DebouncedEvent, IgnoreFilter, DEFAULT_DEBOUNCE_MS,
+        collect_watch_batch, created_directories, discover_watch_dirs, pending_watch_dirs,
+        reconcile_watched_dirs, spawn_watcher, DebouncedEvent, IgnoreFilter, WatchBatch,
+        DEFAULT_DEBOUNCE_MS,
     };
-    use notify::event::CreateKind;
-    use notify::{Event, EventKind};
+    use notify::event::{CreateKind, ModifyKind};
+    use notify::{Event, EventKind, RecommendedWatcher, Watcher};
     use std::collections::HashSet;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -459,6 +567,137 @@ mod tests {
     }
 
     #[test]
+    fn collect_watch_batch_sets_structural_for_folder_create_and_false_for_file_edit() {
+        let temp = tempdir().expect("create tempdir");
+        let root = canonical(temp.path());
+        let package_dir = root.join("packages/app");
+        let source_file = package_dir.join("src/lib.rs");
+        let new_dir = package_dir.join("src/new-dir");
+        fs::create_dir_all(source_file.parent().expect("source parent"))
+            .expect("create source parent");
+        fs::write(&source_file, "export const value = 1;\n").expect("write source file");
+        fs::create_dir_all(&new_dir).expect("create new dir");
+        let ignore_filter = IgnoreFilter::new(&root).expect("build ignore filter");
+
+        let structural_batch = collect_watch_batch(
+            &ignore_filter,
+            vec![debounced_event(
+                EventKind::Create(CreateKind::Folder),
+                vec![new_dir.clone()],
+            )],
+        );
+        assert!(structural_batch.structural);
+        assert_eq!(structural_batch.changed_paths, HashSet::from([new_dir]));
+
+        let file_edit_batch = collect_watch_batch(
+            &ignore_filter,
+            vec![debounced_event(
+                EventKind::Modify(ModifyKind::Data(notify::event::DataChange::Any)),
+                vec![source_file.clone()],
+            )],
+        );
+        assert!(!file_edit_batch.structural);
+        assert_eq!(file_edit_batch.changed_paths, HashSet::from([source_file]));
+    }
+
+    fn seed_reconcile_watcher(
+        root: &Path,
+        keep_src: &Path,
+        keep_tests: &Path,
+        orphan_src: &Path,
+    ) -> (RecommendedWatcher, HashSet<PathBuf>) {
+        let mut watcher =
+            notify::recommended_watcher(|_: Result<Event, notify::Error>| {}).expect("watcher");
+        let packages_dir = root.join("packages");
+        let keep_package = root.join("packages/keep");
+        let orphan_package = root.join("packages/orphan");
+        for path in [
+            root,
+            packages_dir.as_path(),
+            keep_package.as_path(),
+            keep_src,
+            keep_tests,
+            orphan_package.as_path(),
+            orphan_src,
+        ] {
+            watcher
+                .watch(path, notify::RecursiveMode::NonRecursive)
+                .expect("seed watch");
+        }
+
+        let watched_dirs = HashSet::from([
+            root.to_path_buf(),
+            packages_dir,
+            keep_package,
+            keep_src.to_path_buf(),
+            keep_tests.to_path_buf(),
+            orphan_package,
+            orphan_src.to_path_buf(),
+        ]);
+        (watcher, watched_dirs)
+    }
+
+    #[test]
+    fn reconcile_watched_dirs_preserves_survivors_adds_new_package_tree_and_unwatches_removed_tree()
+    {
+        let temp = tempdir().expect("create tempdir");
+        let root = canonical(temp.path());
+        let keep_src = root.join("packages/keep/src");
+        let keep_tests = root.join("packages/keep/tests");
+        let orphan_src = root.join("packages/orphan/src");
+        let new_src = root.join("packages/new/pkg/src");
+        let new_tests = root.join("packages/new/pkg/tests");
+        fs::create_dir_all(&keep_src).expect("create keep src dir");
+        fs::create_dir_all(&keep_tests).expect("create keep tests dir");
+        fs::create_dir_all(&orphan_src).expect("create orphan src dir");
+        fs::create_dir_all(&new_src).expect("create new src dir");
+        fs::create_dir_all(&new_tests).expect("create new tests dir");
+
+        let ignore_filter = IgnoreFilter::new(&root).expect("build ignore filter");
+        let (mut watcher, mut watched_dirs) =
+            seed_reconcile_watcher(&root, &keep_src, &keep_tests, &orphan_src);
+        let orphan_package = root.join("packages/orphan");
+
+        fs::remove_dir_all(&orphan_package).expect("remove orphan package tree");
+        let desired_dirs =
+            discover_watch_dirs(&root, &ignore_filter).expect("discover desired dirs");
+
+        reconcile_watched_dirs(&mut watcher, &mut watched_dirs, desired_dirs.clone())
+            .expect("reconcile watch dirs");
+
+        assert!(
+            watched_dirs.contains(&keep_src),
+            "surviving package content dir remains watched"
+        );
+        assert!(
+            watched_dirs.contains(&keep_tests),
+            "surviving package sibling content dir remains watched"
+        );
+        assert!(
+            watched_dirs.contains(&new_src),
+            "new package content dir added"
+        );
+        assert!(
+            watched_dirs.contains(&new_tests),
+            "new package sibling content dir added"
+        );
+        assert!(
+            !watched_dirs.contains(&orphan_src),
+            "removed package content dir unwatched"
+        );
+        assert_eq!(
+            watched_dirs, desired_dirs,
+            "authoritative set matches full discover walk"
+        );
+
+        let touch_file = new_src.join("lib.rs");
+        fs::write(&touch_file, "pub fn added() {}\n").expect("write touched file");
+        watcher
+            .unwatch(&orphan_src)
+            .expect_err("removed package dir already unwatched");
+    }
+
+    #[test]
     fn pending_watch_dirs_filters_duplicates_and_ignored_dirs() {
         let temp = tempdir().expect("create tempdir");
         let root = canonical(temp.path());
@@ -484,15 +723,15 @@ mod tests {
     }
 
     async fn receive_batch_containing(
-        rx: &mut mpsc::Receiver<HashSet<PathBuf>>,
+        rx: &mut mpsc::Receiver<WatchBatch>,
         expected_path: &Path,
     ) -> HashSet<PathBuf> {
         let expected_path = canonical(expected_path);
         timeout(RECEIVE_TIMEOUT, async {
             loop {
                 let batch = rx.recv().await.expect("watcher channel open");
-                if batch.contains(&expected_path) {
-                    return batch;
+                if batch.changed_paths.contains(&expected_path) {
+                    return batch.changed_paths;
                 }
             }
         })
@@ -500,15 +739,23 @@ mod tests {
         .expect("timed out waiting for watcher event")
     }
 
-    async fn assert_no_batch_containing(
-        rx: &mut mpsc::Receiver<HashSet<PathBuf>>,
-        ignored_path: &Path,
-    ) {
+    fn debounced_event(kind: EventKind, paths: Vec<PathBuf>) -> DebouncedEvent {
+        DebouncedEvent {
+            event: Event {
+                kind,
+                paths,
+                attrs: Default::default(),
+            },
+            time: std::time::Instant::now(),
+        }
+    }
+
+    async fn assert_no_batch_containing(rx: &mut mpsc::Receiver<WatchBatch>, ignored_path: &Path) {
         let ignored_path = canonical(ignored_path);
         let result = timeout(QUIET_TIMEOUT, async {
             while let Some(batch) = rx.recv().await {
                 assert!(
-                    !batch.contains(&ignored_path),
+                    !batch.changed_paths.contains(&ignored_path),
                     "received ignored path batch: {batch:?}"
                 );
             }

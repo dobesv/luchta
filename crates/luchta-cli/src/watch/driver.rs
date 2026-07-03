@@ -16,8 +16,7 @@
 //! to decide whether to wait or proceed — Notify is purely an optimization
 //! to wake the loop faster, never required for correctness.
 
-use std::collections::BTreeSet;
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -25,15 +24,17 @@ use std::time::{Duration, Instant};
 
 use luchta_cache::resolve_cache_dir;
 use luchta_types::PackageName;
+use luchta_workspace::{WorkspaceDiscovery, YarnWorkspace};
 use miette::Result;
 use owo_colors::{OwoColorize, Stream};
 use tokio::sync::{mpsc, Notify};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use tracing::warn;
 
 use super::registry::dirty_packages_for_changes;
 use super::session::WatchSession;
-use super::watcher::WatcherHandle;
+use super::watcher::{WatchBatch, WatcherHandle};
 use crate::build_lock;
 use crate::cli::OutputMode;
 use crate::run::{CycleOutcome, MemoryPressureConfig, RunCycleParams, TaskSelection};
@@ -41,6 +42,42 @@ use crate::run::{CycleOutcome, MemoryPressureConfig, RunCycleParams, TaskSelecti
 /// Maximum number of changed file paths to list under `--show-changed-files`
 /// before collapsing the remainder into a count.
 const MAX_LISTED_CHANGED_FILES: usize = 10;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StructuralPackageSetDiff {
+    Changed(BTreeSet<PathBuf>),
+    Unchanged,
+    KeepPrevious,
+}
+
+#[allow(dead_code)]
+pub(crate) fn diff_discovered_package_paths(
+    workspace_root: &Path,
+    current_package_paths: &BTreeSet<PathBuf>,
+) -> StructuralPackageSetDiff {
+    let workspace = YarnWorkspace::new(workspace_root);
+    match workspace.discover() {
+        Ok(packages) => {
+            let discovered_package_paths = packages
+                .into_iter()
+                .map(|package| package.path)
+                .collect::<BTreeSet<_>>();
+            if discovered_package_paths == *current_package_paths {
+                StructuralPackageSetDiff::Unchanged
+            } else {
+                StructuralPackageSetDiff::Changed(discovered_package_paths)
+            }
+        }
+        Err(error) => {
+            warn!(
+                error = %error,
+                workspace_root = %workspace_root.display(),
+                "workspace discovery failed"
+            );
+            StructuralPackageSetDiff::KeepPrevious
+        }
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct OwnedSelection {
@@ -67,7 +104,13 @@ impl OwnedSelection {
 /// set or will cause a follow-up cycle.
 #[derive(Debug, Default)]
 pub struct PendingChanges {
-    inner: Mutex<HashSet<PathBuf>>,
+    inner: Mutex<PendingState>,
+}
+
+#[derive(Debug, Default)]
+struct PendingState {
+    paths: HashSet<PathBuf>,
+    structural: bool,
 }
 
 impl PendingChanges {
@@ -83,15 +126,27 @@ impl PendingChanges {
         }
 
         let mut pending = self.inner.lock().expect("pending changes mutex poisoned");
-        let was_empty = pending.is_empty();
-        pending.extend(batch);
-        was_empty && !pending.is_empty()
+        let was_empty = pending.paths.is_empty() && !pending.structural;
+        pending.paths.extend(batch);
+        was_empty && (!pending.paths.is_empty() || pending.structural)
     }
 
-    /// Drain and return whether the set was non-empty.
+    pub fn mark_structural(&self) -> bool {
+        let mut pending = self.inner.lock().expect("pending changes mutex poisoned");
+        let was_empty = pending.paths.is_empty() && !pending.structural;
+        pending.structural = true;
+        was_empty
+    }
+
+    pub fn take_structural(&self) -> bool {
+        let mut pending = self.inner.lock().expect("pending changes mutex poisoned");
+        std::mem::take(&mut pending.structural)
+    }
+
+    /// Drain and return whether set was non-empty.
     pub fn drain_non_empty(&self) -> Option<HashSet<PathBuf>> {
         let mut pending = self.inner.lock().expect("pending changes mutex poisoned");
-        let drained = std::mem::take(&mut *pending);
+        let drained = std::mem::take(&mut pending.paths);
         if drained.is_empty() {
             None
         } else {
@@ -100,10 +155,8 @@ impl PendingChanges {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.inner
-            .lock()
-            .expect("pending changes mutex poisoned")
-            .is_empty()
+        let pending = self.inner.lock().expect("pending changes mutex poisoned");
+        pending.paths.is_empty() && !pending.structural
     }
 
     fn has_changes(&self) -> bool {
@@ -123,9 +176,9 @@ pub struct WatchRunConfig {
 ///
 /// Bundles all inputs to reduce function argument count.
 pub struct WatchInputs {
-    pub session: WatchSession,
+    pub session: Arc<WatchSession>,
     pub watcher_handle: WatcherHandle,
-    pub changes_rx: mpsc::Receiver<HashSet<PathBuf>>,
+    pub changes_rx: mpsc::Receiver<WatchBatch>,
     pub selection: OwnedSelection,
     pub config: WatchRunConfig,
 }
@@ -311,6 +364,7 @@ where
                 run_one_iteration(
                     WatchIterationContext {
                         session: &session,
+                        watcher_handle: &watcher_handle,
                         selection: &selection,
                         config: &config,
                         pending: &pending,
@@ -348,7 +402,7 @@ where
     F: Future<Output = std::result::Result<(), std::io::Error>> + Send,
     G: Future<Output = std::result::Result<(), std::io::Error>> + Send,
 {
-    let cache_dir = resolve_cache_dir(session.repo_root());
+    let cache_dir = resolve_cache_dir(session.repo_root().as_ref());
     let acquire_lock = build_lock::acquire(&cache_dir);
     tokio::pin!(acquire_lock);
     let _build_lock = tokio::select! {
@@ -393,15 +447,49 @@ where
         return Ok(WatchControl::Stop);
     }
 
+    let structural_pending = context.pending.take_structural();
+    if structural_pending {
+        match diff_discovered_package_paths(
+            context.session.repo_root().as_ref(),
+            &context.session.current_package_paths(),
+        ) {
+            StructuralPackageSetDiff::KeepPrevious => return Ok(WatchControl::Continue),
+            StructuralPackageSetDiff::Unchanged => {}
+            StructuralPackageSetDiff::Changed(discovered_package_paths) => {
+                if let Err(error) = context
+                    .session
+                    .rebuild_for_packages(&discovered_package_paths)
+                    .await
+                {
+                    warn!(error = %error, "structural workspace rebuild failed; keeping previous graph");
+                    return Ok(WatchControl::Continue);
+                }
+                let package_nodes = context.session.current_package_nodes();
+                if let Err(error) = context
+                    .watcher_handle
+                    .reconcile_watch_roots(context.session.repo_root().as_ref(), &package_nodes)
+                {
+                    warn!(error = %error, "watch root reconcile failed after rebuild");
+                    return Ok(WatchControl::Continue);
+                }
+            }
+        }
+    }
+
     let changed = match context.pending.drain_non_empty() {
         Some(changed) => changed,
+        None if structural_pending => context
+            .session
+            .current_package_paths()
+            .into_iter()
+            .collect::<HashSet<_>>(),
         None => return Ok(WatchControl::Continue),
     };
     // Only real changes to a task's declared inputs (verified by size/mtime, then
     // content hash) — or new files matching a task's input globs — dirty a package.
     // Cache outputs, restore staging dirs, and touch-only events are ignored, which
     // is what breaks the watch rebuild loop (#161).
-    let affected = dirty_packages_for_changes(context.session.task_watch_registry(), &changed);
+    let affected = dirty_packages_for_changes(&context.session.task_watch_registry(), &changed);
     if affected.is_empty() {
         context.ui.up_to_date();
         return Ok(WatchControl::Continue);
@@ -409,9 +497,9 @@ where
 
     context
         .ui
-        .change_detected(&affected, &changed, context.session.repo_root());
+        .change_detected(&affected, &changed, context.session.repo_root().as_ref());
     let cycle_selection = context.selection.as_task_selection();
-    let cache_dir = resolve_cache_dir(context.session.repo_root());
+    let cache_dir = resolve_cache_dir(context.session.repo_root().as_ref());
     let acquire_lock = build_lock::acquire(&cache_dir);
     tokio::pin!(acquire_lock);
     let _build_lock = tokio::select! {
@@ -475,21 +563,28 @@ fn cycle_request<'a>(
 }
 
 fn spawn_change_drain_task(
-    mut changes_rx: mpsc::Receiver<HashSet<PathBuf>>,
+    mut changes_rx: mpsc::Receiver<WatchBatch>,
     pending: Arc<PendingChanges>,
     wake: Arc<Notify>,
     active_cycle: Arc<ActiveCycle>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(batch) = changes_rx.recv().await {
-            let was_added = pending.add(batch);
-            if was_added {
+            let structural_pending = batch.structural && pending.mark_structural();
+            let paths_pending = pending.add(batch.changed_paths);
+            if batch.structural {
+                active_cycle.cancel_if_active();
+                wake.notify_one();
+            } else if paths_pending {
                 // Cancel the active cycle directly. This ensures the change is NOT lost
                 // even if Notify permit semantics would have dropped it.
                 // Only fire cancellation if there's an active cycle.
                 active_cycle.cancel_if_active();
                 // Wake hint — may or may not be consumed; pending.is_empty() is the source of truth.
                 wake.notify_one();
+            }
+            if structural_pending {
+                continue;
             }
         }
     })
@@ -502,6 +597,7 @@ enum WatchControl {
 
 struct WatchIterationContext<'a> {
     session: &'a WatchSession,
+    watcher_handle: &'a WatcherHandle,
     selection: &'a OwnedSelection,
     config: &'a WatchRunConfig,
     pending: &'a PendingChanges,
@@ -590,7 +686,7 @@ async fn shutdown_watch<F, G>(
 }
 
 async fn finish_shutdown(
-    session: WatchSession,
+    session: Arc<WatchSession>,
     watcher_handle: WatcherHandle,
     drain_task: JoinHandle<()>,
 ) {
@@ -697,6 +793,9 @@ fn format_elapsed(elapsed: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
+
+    use tempfile::tempdir;
 
     #[test]
     fn drain_swaps_to_fresh_pending_set() {
@@ -751,6 +850,51 @@ mod tests {
     }
 
     #[test]
+    fn structural_pending_coalesces_until_taken() {
+        let pending = PendingChanges::new();
+
+        assert!(
+            pending.mark_structural(),
+            "first structural signal should wake loop"
+        );
+        assert!(
+            !pending.mark_structural(),
+            "second structural signal should coalesce into same pending rebuild"
+        );
+        assert!(pending.has_changes());
+        assert!(
+            pending.take_structural(),
+            "pending structural signal should be visible once"
+        );
+        assert!(
+            !pending.take_structural(),
+            "latch should clear after consume so next rebuild can re-arm"
+        );
+        assert!(
+            pending.is_empty(),
+            "no paths and no structural flag after consume"
+        );
+    }
+
+    #[test]
+    fn structural_pending_keeps_non_structural_paths_pending() {
+        let pending = PendingChanges::new();
+        pending.add(HashSet::from([PathBuf::from("/repo/pkg-a/src/lib.rs")]));
+        pending.mark_structural();
+
+        assert!(pending.take_structural(), "structural latch should be set");
+        assert!(
+            !pending.is_empty(),
+            "draining structural latch alone must not drop ordinary file changes"
+        );
+        assert_eq!(
+            pending.drain_non_empty(),
+            Some(HashSet::from([PathBuf::from("/repo/pkg-a/src/lib.rs")]))
+        );
+        assert!(pending.is_empty());
+    }
+
+    #[test]
     fn changed_files_lines_relative_and_sorted() {
         let repo_root = PathBuf::from("/repo");
         let changed = HashSet::from([
@@ -782,6 +926,75 @@ mod tests {
             lines.last().expect("summary line present"),
             "  … and 5 more"
         );
+    }
+
+    #[test]
+    fn diff_discovered_package_paths_reports_changed_and_unchanged() {
+        let temp_dir = tempdir().expect("create temp dir");
+        let workspace_root = temp_dir.path();
+        write_workspace_package_json(workspace_root, &["packages/*"]);
+        write_package_json(&workspace_root.join("packages/app/package.json"), "app");
+
+        let current_package_paths = BTreeSet::from([
+            workspace_root.to_path_buf(),
+            workspace_root.join("packages/app"),
+        ]);
+        assert_eq!(
+            diff_discovered_package_paths(workspace_root, &current_package_paths),
+            StructuralPackageSetDiff::Unchanged
+        );
+
+        write_package_json(&workspace_root.join("packages/web/package.json"), "web");
+        let expected_discovered_paths = BTreeSet::from([
+            workspace_root.to_path_buf(),
+            workspace_root.join("packages/app"),
+            workspace_root.join("packages/web"),
+        ]);
+        assert_eq!(
+            diff_discovered_package_paths(workspace_root, &current_package_paths),
+            StructuralPackageSetDiff::Changed(expected_discovered_paths)
+        );
+    }
+
+    #[test]
+    fn diff_discovered_package_paths_keeps_previous_on_discovery_error() {
+        let temp_dir = tempdir().expect("create temp dir");
+        let workspace_root = temp_dir.path();
+        write_workspace_package_json(workspace_root, &["packages/*"]);
+        std::fs::create_dir_all(workspace_root.join("packages/app")).expect("create package dir");
+        std::fs::write(
+            workspace_root.join("packages/app/package.json"),
+            "{ invalid json",
+        )
+        .expect("write malformed package.json");
+
+        let current_package_paths = BTreeSet::from([workspace_root.to_path_buf()]);
+        assert_eq!(
+            diff_discovered_package_paths(workspace_root, &current_package_paths),
+            StructuralPackageSetDiff::KeepPrevious
+        );
+    }
+
+    fn write_workspace_package_json(workspace_root: &Path, workspaces: &[&str]) {
+        let workspaces = workspaces
+            .iter()
+            .map(|pattern| format!("\"{pattern}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        std::fs::write(
+            workspace_root.join("package.json"),
+            format!(
+                "{{\n  \"name\": \"root\",\n  \"private\": true,\n  \"workspaces\": [{workspaces}]\n}}\n"
+            ),
+        )
+        .expect("write root package.json");
+    }
+
+    fn write_package_json(path: &Path, name: &str) {
+        std::fs::create_dir_all(path.parent().expect("package parent"))
+            .expect("create package dir");
+        std::fs::write(path, format!("{{\n  \"name\": \"{name}\"\n}}\n"))
+            .expect("write package.json");
     }
 
     #[test]
@@ -856,332 +1069,8 @@ mod tests {
 }
 
 #[cfg(test)]
-mod driver_e2e_tests {
-    use super::*;
-    use crate::watch::session::WatchSession;
-    use crate::watch::watcher::WatcherHandle;
-    use std::collections::HashSet;
-    use std::sync::Arc;
-    use tokio::sync::mpsc;
-    use tokio::time::{timeout, Duration};
-
-    const TEST_TIMEOUT: Duration = Duration::from_secs(15);
-    const POLL_INTERVAL: Duration = Duration::from_millis(20);
-
-    /// Write a workspace with a blocking shell worker.
-    /// Worker appends a newline to `.run-marker` on every job.
-    /// First job BLOCKS until `.release-1` sentinel appears.
-    /// Subsequent jobs run free (don't block).
-    fn write_blocking_workspace(workspace_root: &std::path::Path) {
-        std::fs::create_dir_all(workspace_root.join("packages/app")).expect("create package dir");
-        std::fs::write(
-            workspace_root.join("package.json"),
-            r#"{"name": "root", "private": true, "workspaces": ["packages/*"]}"#,
-        )
-        .expect("write root package.json");
-        std::fs::write(
-            workspace_root.join("packages/app/package.json"),
-            r#"{"name": "app", "version": "1.0.0", "scripts": {"build": "echo build"}}"#,
-        )
-        .expect("write app package.json");
-
-        // Worker script:
-        // - On first job, wait for .release-1 sentinel (blocking)
-        // - Appends to .run-marker on every job
-        // - Jobs 2+ run free
-        let marker_file = workspace_root.join(".run-marker");
-        let release_1 = workspace_root.join(".release-1");
-        let job_count = workspace_root.join(".job-count");
-        let worker_script = format!(
-            r##"#!/bin/sh
-job_count=0
-while IFS= read -r line; do
-  case "$line" in
-    *'"type":"resolveTask"'*)
-      id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
-      printf '{{"type":"resolved","id":"%s","result":{{"decision":"accept"}}}}\n' "$id"
-      ;;
-    *'"type":"run"'*)
-      id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
-      job_count=$((job_count + 1))
-      echo "$job_count" > '{}'
-      if [ "$job_count" -eq 1 ]; then
-        while [ ! -f '{}' ]; do sleep 0.01; done
-      fi
-      echo "" >> '{}'
-      printf '{{"type":"done","id":"%s","success":true,"exitCode":0}}\n' "$id"
-      ;;
-  esac
-done
-"##,
-            job_count.display(),
-            release_1.display(),
-            marker_file.display(),
-        );
-        let worker_script_path = workspace_root.join("fake-worker.sh");
-        std::fs::write(&worker_script_path, &worker_script).expect("write worker script");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&worker_script_path, std::fs::Permissions::from_mode(0o755))
-                .expect("chmod worker script");
-        }
-
-        let config = format!(
-            r##"#!/bin/sh
-echo '{{"concurrency":{{"maxWeight":4}},"workers":{{"fake":{{"command":"{}"}}}},"tasks":{{"build":{{"worker":"fake"}}}}}}'
-"##,
-            worker_script_path.display()
-        );
-        std::fs::write(workspace_root.join("luchta-config.sh"), &config).expect("write config");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(
-                workspace_root.join("luchta-config.sh"),
-                std::fs::Permissions::from_mode(0o755),
-            )
-            .expect("chmod config");
-        }
-    }
-
-    fn read_marker_count(workspace_root: &std::path::Path) -> usize {
-        let marker = workspace_root.join(".run-marker");
-        std::fs::read_to_string(&marker)
-            .map(|s| s.lines().count())
-            .unwrap_or(0)
-    }
-
-    fn read_job_count(workspace_root: &std::path::Path) -> usize {
-        std::fs::read_to_string(workspace_root.join(".job-count"))
-            .ok()
-            .and_then(|s| s.trim().parse::<usize>().ok())
-            .unwrap_or(0)
-    }
-
-    struct E2eHarness {
-        _temp_dir: tempfile::TempDir,
-        workspace_root: PathBuf,
-        worker_manager_handle: Arc<luchta_engine::WorkerManager>,
-        changes_tx: mpsc::Sender<HashSet<PathBuf>>,
-        shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
-        handle: Option<tokio::task::JoinHandle<()>>,
-    }
-
-    impl E2eHarness {
-        async fn start() -> Self {
-            let temp_dir = tempfile::tempdir().expect("create temp dir");
-            let workspace_root = temp_dir.path().canonicalize().expect("canonicalize");
-            write_blocking_workspace(&workspace_root);
-
-            let session = WatchSession::new(&workspace_root, None)
-                .await
-                .expect("create watch session")
-                .expect("session should not be None");
-            let worker_manager_handle = session.worker_manager_handle();
-            let watcher_handle = WatcherHandle::noop();
-            let (changes_tx, changes_rx) = mpsc::channel(32);
-            let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-
-            let handle = tokio::spawn(async move {
-                let shutdown_future = async move {
-                    let _ = shutdown_rx.await;
-                    Ok::<(), std::io::Error>(())
-                };
-                let force_shutdown = async { std::future::pending::<std::io::Result<()>>().await };
-
-                run_watch_until(
-                    WatchInputs {
-                        session,
-                        watcher_handle,
-                        changes_rx,
-                        selection: OwnedSelection {
-                            requested_tasks: vec!["build".to_string()],
-                            packages: vec![],
-                            top_level: false,
-                        },
-                        config: WatchRunConfig {
-                            output: OutputMode::Default,
-                            continue_on_failure: false,
-                            memory_pressure: crate::run::MemoryPressureConfig {
-                                usage: None,
-                                free: None,
-                            },
-                            show_changed_files: false,
-                        },
-                    },
-                    shutdown_future,
-                    force_shutdown,
-                )
-                .await
-                .expect("watch loop");
-            });
-
-            Self {
-                _temp_dir: temp_dir,
-                workspace_root,
-                worker_manager_handle,
-                changes_tx,
-                shutdown_tx: Some(shutdown_tx),
-                handle: Some(handle),
-            }
-        }
-
-        async fn wait_for_jobs(&self, target: usize) {
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-            while tokio::time::Instant::now() < deadline {
-                if read_job_count(&self.workspace_root) >= target {
-                    return;
-                }
-                tokio::time::sleep(POLL_INTERVAL).await;
-            }
-            panic!("timed out waiting for job count {target}");
-        }
-
-        async fn wait_for_markers(&self, target: usize) {
-            assert!(
-                wait_for_count(
-                    &self.workspace_root.join(".run-marker"),
-                    target,
-                    Duration::from_secs(10)
-                )
-                .await,
-                "timed out waiting for marker count {}",
-                target
-            );
-        }
-
-        async fn send_package_change(&self) {
-            let app_path = self.workspace_root.join("packages/app/src/lib.rs");
-            std::fs::create_dir_all(app_path.parent().expect("app parent")).ok();
-            std::fs::write(&app_path, "// change").expect("write change");
-            self.changes_tx
-                .send(HashSet::from([app_path]))
-                .await
-                .expect("send change");
-        }
-
-        async fn send_outside_change(&self) {
-            let outside_path = self.workspace_root.join("README.md");
-            std::fs::write(&outside_path, "change").expect("write change");
-            self.changes_tx
-                .send(HashSet::from([outside_path]))
-                .await
-                .expect("send change");
-        }
-
-        fn release_first_cycle(&self) {
-            std::fs::write(self.workspace_root.join(".release-1"), "")
-                .expect("release first cycle");
-        }
-
-        async fn shutdown(mut self) {
-            let _ = self.shutdown_tx.take().expect("shutdown tx").send(());
-            timeout(TEST_TIMEOUT, self.handle.take().expect("watch handle"))
-                .await
-                .expect("watch loop timeout")
-                .expect("watch loop join");
-        }
-    }
-
-    async fn wait_for_count(path: &std::path::Path, target: usize, timeout: Duration) -> bool {
-        let deadline = tokio::time::Instant::now() + timeout;
-        while tokio::time::Instant::now() < deadline {
-            if count_lines(path) >= target {
-                return true;
-            }
-            tokio::time::sleep(POLL_INTERVAL).await;
-        }
-        false
-    }
-
-    fn count_lines(path: &std::path::Path) -> usize {
-        std::fs::read_to_string(path)
-            .map(|s| s.lines().count())
-            .unwrap_or(0)
-    }
-
-    async fn marker_count_stays_at(
-        workspace_root: &std::path::Path,
-        expected: usize,
-        duration: Duration,
-    ) -> bool {
-        let deadline = tokio::time::Instant::now() + duration;
-        while tokio::time::Instant::now() < deadline {
-            if read_marker_count(workspace_root) != expected {
-                return false;
-            }
-            tokio::time::sleep(POLL_INTERVAL).await;
-        }
-        read_marker_count(workspace_root) == expected
-    }
-
-    /// NO-LOST-CHANGES: Prove that injecting a change during an in-flight cycle triggers a follow-up cycle.
-    #[tokio::test]
-    async fn no_lost_changes_change_during_build_triggers_second_cycle() {
-        let harness = E2eHarness::start().await;
-
-        harness.wait_for_jobs(1).await;
-        harness.send_package_change().await;
-        harness.release_first_cycle();
-        harness.wait_for_jobs(2).await;
-        harness.wait_for_markers(2).await;
-
-        assert_eq!(
-            read_marker_count(&harness.workspace_root),
-            2,
-            "expected exactly 2 worker jobs before shutdown"
-        );
-
-        harness.shutdown().await;
-    }
-
-    /// KEEPS-MANAGER-ALIVE: Prove manager survives a change-triggered cancel.
-    #[tokio::test]
-    async fn change_during_cycle_keeps_worker_manager_alive() {
-        let harness = E2eHarness::start().await;
-        let h1 = Arc::clone(&harness.worker_manager_handle);
-        let h2 = Arc::clone(&harness.worker_manager_handle);
-
-        harness.wait_for_jobs(1).await;
-        harness.send_package_change().await;
-        harness.release_first_cycle();
-        harness.wait_for_jobs(2).await;
-        harness.wait_for_markers(2).await;
-
-        assert_eq!(
-            read_marker_count(&harness.workspace_root),
-            2,
-            "expected exactly 2 worker jobs before shutdown"
-        );
-        assert!(
-            Arc::ptr_eq(&h1, &h2),
-            "worker manager Arc identity should stay stable across cycles"
-        );
-        assert!(
-            !h1.is_shutdown(),
-            "worker manager should NOT be shut down mid-watch"
-        );
-
-        harness.shutdown().await;
-    }
-
-    /// IGNORE/EMPTY-AFFECTED: Prove changes outside all packages don't trigger rebuild.
-    #[tokio::test]
-    async fn change_outside_package_does_not_trigger_rebuild() {
-        let harness = E2eHarness::start().await;
-
-        harness.wait_for_jobs(1).await;
-        harness.release_first_cycle();
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        harness.send_outside_change().await;
-
-        assert!(
-            marker_count_stays_at(&harness.workspace_root, 1, Duration::from_millis(500)).await,
-            "expected marker count to stay at 1 for change outside packages, got {}",
-            read_marker_count(&harness.workspace_root)
-        );
-
-        harness.shutdown().await;
-    }
-}
+#[path = "driver_e2e_support.rs"]
+mod driver_e2e_support;
+#[cfg(test)]
+#[path = "driver_e2e_tests.rs"]
+mod driver_e2e_tests;

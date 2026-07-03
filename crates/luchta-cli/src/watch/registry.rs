@@ -36,6 +36,16 @@ pub(crate) fn empty_task_watch_registry() -> TaskWatchRegistry {
     Arc::new(Mutex::new(HashMap::new()))
 }
 
+pub(crate) fn retain_task_watch_registry_task_ids(
+    registry: &TaskWatchRegistry,
+    live_task_ids: &HashSet<TaskId>,
+) {
+    registry
+        .lock()
+        .expect("task watch registry mutex poisoned")
+        .retain(|task_id, _| live_task_ids.contains(task_id));
+}
+
 /// Register a task's inputs from `record`, resolving the package directory from
 /// the workspace `packages`. No-op for the root package or when the package is
 /// not found (nothing to watch in those cases).
@@ -314,6 +324,29 @@ mod tests {
             output_globset: globset(output_globs),
             inputs,
         }
+    }
+
+    #[test]
+    fn retain_task_watch_registry_task_ids_prunes_removed_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path();
+        let reg = empty_task_watch_registry();
+        let kept = TaskId::new("pkg", "build");
+        let removed = TaskId::new("pkg", "test");
+        reg.lock().unwrap().insert(
+            kept.clone(),
+            state_for(pkg, HashMap::new(), &["src/**/*.ts"]),
+        );
+        reg.lock().unwrap().insert(
+            removed.clone(),
+            state_for(pkg, HashMap::new(), &["tests/**/*.ts"]),
+        );
+
+        retain_task_watch_registry_task_ids(&reg, &HashSet::from([kept.clone()]));
+
+        let states = reg.lock().unwrap();
+        assert!(states.contains_key(&kept));
+        assert!(!states.contains_key(&removed));
     }
 
     #[test]

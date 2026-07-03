@@ -41,6 +41,8 @@ luchta-cache = { path = "../luchta-cache" }
 luchta-lockfiles = { path = "../luchta-lockfiles" }
 luchta-worker = { path = "../luchta-worker" }
 blake3 = { workspace = true }
+tracing = "0.1"
+arc-swap = "1.7"
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }

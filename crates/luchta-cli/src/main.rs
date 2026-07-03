@@ -340,7 +340,7 @@ async fn watch_command(workspace_root: &std::path::Path, command: Commands) -> R
     };
 
     watch::driver::run_watch(watch::driver::WatchInputs {
-        session,
+        session: session.into(),
         watcher_handle,
         changes_rx,
         selection,
