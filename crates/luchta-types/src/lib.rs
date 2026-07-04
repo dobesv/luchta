@@ -224,6 +224,17 @@ pub struct TaskDefinition {
     /// Output paths or globs produced by task for cache restore.
     #[serde(default)]
     pub outputs: Vec<String>,
+    /// Package-dependency filter selecting which dependencies' resolved
+    /// versions (and their full transitive closures) feed this task's
+    /// dependency cache hash. Reuses the same pattern grammar as `inputs`
+    /// (`^`/`^^` inherit dependency specs from direct/transitive upstream
+    /// workspace packages, `pkg#`/`#` scope to a specific package / project
+    /// root, plain globs match the package's own dependency names). Unlike
+    /// `inputs`, these patterns select dependency VERSIONS, not file contents.
+    /// Defaults to `["**/*"]` (all package dependencies + closures =
+    /// conservative default; narrowing only reduces cache invalidation).
+    #[serde(default = "default_dependencies")]
+    pub dependencies: Vec<String>,
     /// Environment variables provided to task, keyed by variable name.
     #[serde(default)]
     pub env: BTreeMap<String, EnvSpec>,
@@ -240,6 +251,7 @@ impl TaskDefinition {
             cache: None,
             inputs: Vec::new(),
             outputs: Vec::new(),
+            dependencies: default_dependencies(),
             env: BTreeMap::new(),
         }
     }
@@ -290,6 +302,7 @@ impl Default for TaskDefinition {
             cache: None,
             inputs: Vec::new(),
             outputs: Vec::new(),
+            dependencies: default_dependencies(),
             env: BTreeMap::new(),
         }
     }
@@ -297,6 +310,10 @@ impl Default for TaskDefinition {
 
 fn default_task_weight() -> u32 {
     1
+}
+
+fn default_dependencies() -> Vec<String> {
+    vec!["**/*".to_string()]
 }
 
 fn default_env_input() -> bool {
@@ -901,7 +918,35 @@ mod tests {
         assert!(!task.cache_enabled());
         assert!(task.inputs.is_empty());
         assert!(task.outputs.is_empty());
+        assert_eq!(task.dependencies, vec!["**/*".to_string()]);
         assert_eq!(task.env, BTreeMap::new());
+    }
+
+    #[test]
+    fn task_definition_dependencies_defaults_when_omitted() {
+        let task: TaskDefinition =
+            serde_json::from_str(r#"{}"#).expect("deserialize task without dependencies");
+        assert_eq!(task.dependencies, vec!["**/*".to_string()]);
+    }
+
+    #[test]
+    fn task_definition_dependencies_round_trips_explicit() {
+        let json = r#"{"dependencies":["babel","^lib"]}"#;
+        let task: TaskDefinition =
+            serde_json::from_str(json).expect("deserialize task with explicit dependencies");
+        assert_eq!(
+            task.dependencies,
+            vec!["babel".to_string(), "^lib".to_string()]
+        );
+
+        // Round-trip: serialize and deserialize again
+        let serialized = serde_json::to_string(&task).expect("serialize task");
+        let round_tripped: TaskDefinition =
+            serde_json::from_str(&serialized).expect("deserialize round-tripped task");
+        assert_eq!(
+            round_tripped.dependencies,
+            vec!["babel".to_string(), "^lib".to_string()]
+        );
     }
 
     #[test]

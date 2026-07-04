@@ -2451,6 +2451,7 @@ mod tests {
                 command: Some("compile".to_owned()),
                 depends_on: Some(vec![DependsOn::DirectUpstream(TaskName::from("build"))]),
                 weight: Some(7),
+                dependencies: None,
             })
         });
         let (graph, pruned) = TaskGraph::build_resolved(
@@ -2768,6 +2769,7 @@ mod tests {
                 command: None,
                 depends_on: Some(vec![DependsOn::SamePackage(TaskName::from("other"))]),
                 weight: None,
+                dependencies: None,
             })
         });
 

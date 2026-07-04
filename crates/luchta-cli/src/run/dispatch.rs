@@ -8,6 +8,8 @@
 
 use super::*;
 
+use crate::cache_ctx::gather_pkg_dep_pairs_filtered;
+
 use luchta_cache::shared::{
     combined_dep_outputs_hash, derive_input_key, RestoredHit, StoreOutcome,
 };
@@ -532,6 +534,7 @@ fn cache_pkg_dep_pairs(
     ctx: &DecisionContext,
     cache_package: &CachePackageContext<'_>,
 ) -> Option<Vec<(String, String)>> {
+    let task_def = ctx.task_graph.task_definition(task_id)?;
     let synthetic_package;
     let package = if let Some(package) = cache_package.package {
         package
@@ -543,10 +546,12 @@ fn cache_pkg_dep_pairs(
         &synthetic_package
     };
 
-    match gather_pkg_dep_pairs(
+    match gather_pkg_dep_pairs_filtered(
         package,
         cache_package.package.map(|_| ctx.package_graph.as_ref()),
+        &ctx.workspace_root,
         ctx.lockfile.as_ref(),
+        &task_def.dependencies,
     ) {
         Ok(pkg_dep_pairs) => Some(pkg_dep_pairs),
         Err(error) => {
@@ -1695,6 +1700,7 @@ pub(super) fn replay_logs(hit: &RestoredHit, _reporter: &Arc<ProgressReporter>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::cli::OutputMode;
     use crate::progress::ProgressReporter;
     use luchta_cache::{decide, FileDelta, ReportInput, RunReason, SCHEMA_VERSION_V4};

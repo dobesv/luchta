@@ -598,6 +598,7 @@ mod tests {
             cache: Some(CacheConfig::default()),
             inputs: vec!["src/**/*.ts".to_owned(), "package.json".to_owned()],
             outputs: vec!["dist/**".to_owned()],
+            dependencies: vec!["**/*".to_string()],
             env,
         }
     }

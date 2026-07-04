@@ -430,6 +430,11 @@ pub struct TaskModification {
     /// Replacement scheduler weight.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub weight: Option<u32>,
+    /// Replacement package-dependency filter (raw pattern strings, same
+    /// grammar as `TaskDefinition::dependencies`). `None` leaves the task's
+    /// static filter unchanged; `Some(list)` fully replaces it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dependencies: Option<Vec<String>>,
 }
 
 impl TaskModification {
@@ -443,6 +448,9 @@ impl TaskModification {
         }
         if let Some(weight) = self.weight {
             definition.weight = weight;
+        }
+        if let Some(dependencies) = &self.dependencies {
+            definition.dependencies = dependencies.clone();
         }
     }
 }
@@ -814,6 +822,7 @@ mod tests {
                     command: Some("compile".to_owned()),
                     depends_on: Some(vec![DependsOn::DirectUpstream(TaskName::from("build"))]),
                     weight: Some(4),
+                    dependencies: None,
                 }),
                 json!({
                     "decision": "modify",
@@ -856,5 +865,55 @@ mod tests {
         let decoded: WorkerResponse = serde_json::from_value(value).expect("response deserializes");
         assert_eq!(decoded, response);
         assert_eq!(decoded.id(), "pkg#build");
+    }
+
+    #[test]
+    fn task_modification_dependencies_replaces_when_some() {
+        use luchta_types::TaskDefinition;
+
+        // Start with a definition that has default dependencies
+        let mut definition = TaskDefinition::default();
+        assert_eq!(
+            definition.dependencies,
+            vec!["**/*"],
+            "default should be **/*"
+        );
+
+        // Apply modification with Some(vec!["babel"])
+        let modification = TaskModification {
+            command: None,
+            depends_on: None,
+            weight: None,
+            dependencies: Some(vec!["babel".to_owned()]),
+        };
+        modification.apply_to(&mut definition);
+
+        assert_eq!(definition.dependencies, vec!["babel"], "should be replaced");
+    }
+
+    #[test]
+    fn task_modification_dependencies_unchanged_when_none() {
+        use luchta_types::TaskDefinition;
+
+        // Start with a definition that has non-default dependencies
+        let mut definition = TaskDefinition {
+            dependencies: vec!["webpack".to_owned(), "rollup".to_owned()],
+            ..TaskDefinition::default()
+        };
+
+        // Apply modification with None for dependencies
+        let modification = TaskModification {
+            command: None,
+            depends_on: None,
+            weight: None,
+            dependencies: None,
+        };
+        modification.apply_to(&mut definition);
+
+        assert_eq!(
+            definition.dependencies,
+            vec!["webpack".to_owned(), "rollup".to_owned()],
+            "should remain unchanged"
+        );
     }
 }

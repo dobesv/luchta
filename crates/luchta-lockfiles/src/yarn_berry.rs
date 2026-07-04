@@ -114,7 +114,7 @@ impl Lockfile for YarnBerryLockfile {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     use super::*;
     use crate::parse_lockfile;
@@ -326,5 +326,103 @@ chalk@^4.1.2:
 
         assert_eq!(package.version, "4.1.2");
         assert_eq!(package.key, "chalk@^4.1.2");
+    }
+
+    // Fixture for transitive dependency chain: A -> B -> C (using npm: protocol)
+    const TRANSITIVE_FIXTURE: &str = r#"__metadata:
+  version: 8
+  cacheKey: 10
+
+"package-a@npm:^1.0.0":
+  version: 1.0.0
+  resolution: "package-a@npm:1.0.0"
+  dependencies:
+    package-b: "npm:^2.0.0"
+  languageName: node
+  linkType: hard
+
+"package-b@npm:^2.0.0":
+  version: 2.0.0
+  resolution: "package-b@npm:2.0.0"
+  dependencies:
+    package-c: "npm:^3.0.0"
+  languageName: node
+  linkType: hard
+
+"package-c@npm:^3.0.0":
+  version: 3.0.0
+  resolution: "package-c@npm:3.0.0"
+  languageName: node
+  linkType: hard
+"#;
+
+    #[test]
+    fn transitive_dependencies_returns_full_closure() {
+        let lockfile = YarnBerryLockfile::parse(TRANSITIVE_FIXTURE).expect("fixture should parse");
+
+        let deps = lockfile
+            .transitive_dependencies("package-a@npm:^1.0.0")
+            .expect("transitive lookup should succeed");
+
+        assert_eq!(
+            deps,
+            BTreeSet::from([
+                ("package-b".to_string(), "2.0.0".to_string()),
+                ("package-c".to_string(), "3.0.0".to_string()),
+            ])
+        );
+    }
+
+    // Fixture for cycle detection: A -> B -> A (using npm: protocol)
+    const CYCLE_FIXTURE: &str = r#"__metadata:
+  version: 8
+  cacheKey: 10
+
+"package-a@npm:^1.0.0":
+  version: 1.0.0
+  resolution: "package-a@npm:1.0.0"
+  dependencies:
+    package-b: "npm:^2.0.0"
+  languageName: node
+  linkType: hard
+
+"package-b@npm:^2.0.0":
+  version: 2.0.0
+  resolution: "package-b@npm:2.0.0"
+  dependencies:
+    package-a: "npm:^1.0.0"
+  languageName: node
+  linkType: hard
+"#;
+
+    #[test]
+    fn transitive_dependencies_handles_cycle() {
+        let lockfile = YarnBerryLockfile::parse(CYCLE_FIXTURE).expect("fixture should parse");
+
+        let deps = lockfile
+            .transitive_dependencies("package-a@npm:^1.0.0")
+            .expect("transitive lookup should succeed");
+
+        assert_eq!(
+            deps,
+            BTreeSet::from([
+                ("package-a".to_string(), "1.0.0".to_string()),
+                ("package-b".to_string(), "2.0.0".to_string()),
+            ])
+        );
+    }
+
+    #[test]
+    fn transitive_dependencies_deterministic() {
+        let lockfile = YarnBerryLockfile::parse(TRANSITIVE_FIXTURE).expect("fixture should parse");
+
+        let deps1 = lockfile
+            .transitive_dependencies("package-a@npm:^1.0.0")
+            .expect("transitive lookup should succeed");
+        let deps2 = lockfile
+            .transitive_dependencies("package-a@npm:^1.0.0")
+            .expect("transitive lookup should succeed");
+
+        assert_eq!(deps1, deps2);
     }
 }
