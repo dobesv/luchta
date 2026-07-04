@@ -317,6 +317,186 @@ async fn malformed_package_json_keeps_previous_graph_and_loop_alive() {
 }
 
 #[tokio::test]
+async fn config_edit_triggers_rebuild() {
+    let harness = E2eHarness::start().await;
+
+    harness.wait_for_jobs(1).await;
+    harness.release_first_cycle();
+    harness.wait_for_markers(1).await;
+
+    let config_path = harness
+        .config_path()
+        .canonicalize()
+        .expect("canonicalize config path");
+    let updated_config = format!(
+        "#!/bin/sh\necho '{{\"concurrency\":{{\"maxWeight\":7}},\"workers\":{{\"fake\":{{\"command\":\"{}\"}}}},\"tasks\":{{\"build\":{{\"worker\":\"fake\"}}}}}}'\n",
+        harness.worker_script_path().display()
+    );
+    harness.rewrite_config(&updated_config);
+    harness
+        .send_batch(BTreeSet::from([config_path]).into_iter().collect(), true)
+        .await;
+
+    harness
+        .wait_until(
+            Duration::from_secs(10),
+            || "timed out waiting for config edit rebuild to update session max_weight".to_string(),
+            || harness.current_max_weight() == 7,
+        )
+        .await;
+
+    assert_eq!(
+        harness.session_package_names(),
+        vec!["app".to_string()],
+        "expected config-only rebuild to preserve package graph"
+    );
+    assert!(
+        harness
+            .stays_for_markers(1, Duration::from_millis(500))
+            .await,
+        "expected config-only rebuild to avoid extra task execution when package set is unchanged, got {} markers",
+        read_marker_count(&harness.workspace_root)
+    );
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn malformed_config_does_not_crash_watch() {
+    let harness = E2eHarness::start().await;
+
+    harness.wait_for_jobs(1).await;
+    harness.release_first_cycle();
+    harness.wait_for_markers(1).await;
+
+    let config_path = harness
+        .config_path()
+        .canonicalize()
+        .expect("canonicalize config path");
+    harness.rewrite_config("#!/bin/sh\necho not-json\n");
+    harness
+        .send_batch(
+            BTreeSet::from([config_path.clone()]).into_iter().collect(),
+            true,
+        )
+        .await;
+
+    assert!(
+        harness
+            .stays_for_markers(1, Duration::from_millis(500))
+            .await,
+        "expected malformed config reload to avoid extra successful rebuild, got {} markers",
+        read_marker_count(&harness.workspace_root)
+    );
+    assert_eq!(
+        harness.current_max_weight(),
+        4,
+        "expected malformed config reload to keep previous run context active"
+    );
+    assert_eq!(
+        harness.session_package_names(),
+        vec!["app".to_string()],
+        "expected malformed config reload to keep previous good graph alive"
+    );
+
+    let recovered_config = format!(
+        "#!/bin/sh\necho '{{\"concurrency\":{{\"maxWeight\":9}},\"workers\":{{\"fake\":{{\"command\":\"{}\"}}}},\"tasks\":{{\"build\":{{\"worker\":\"fake\"}}}}}}'\n",
+        harness.worker_script_path().display()
+    );
+    harness.rewrite_config(&recovered_config);
+    harness
+        .send_batch(BTreeSet::from([config_path]).into_iter().collect(), true)
+        .await;
+    harness
+        .wait_until(
+            Duration::from_secs(10),
+            || {
+                "timed out waiting for recovered config rebuild to update session max_weight"
+                    .to_string()
+            },
+            || harness.current_max_weight() == 9,
+        )
+        .await;
+
+    assert_eq!(
+        harness.session_package_names(),
+        vec!["app".to_string()],
+        "expected recovered config reload to restore same package graph"
+    );
+    assert!(
+        harness
+            .stays_for_markers(1, Duration::from_millis(500))
+            .await,
+        "expected config-only recovery rebuild to avoid extra task execution when package set is unchanged, got {} markers",
+        read_marker_count(&harness.workspace_root)
+    );
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn config_reload_preserves_explicit_max_weight_override() {
+    let harness = E2eHarness::start_with_max_weight_override(Some(5)).await;
+
+    harness.wait_for_jobs(1).await;
+    harness.release_first_cycle();
+    harness.wait_for_markers(1).await;
+    assert_eq!(
+        harness.current_max_weight(),
+        5,
+        "expected explicit max weight override to apply on initial watch session"
+    );
+
+    let config_path = harness
+        .config_path()
+        .canonicalize()
+        .expect("canonicalize config path");
+    let rebuild_generation_before = harness.rebuild_generation();
+    let updated_config = format!(
+        "#!/bin/sh\necho '{{\"concurrency\":{{\"maxWeight\":8}},\"workers\":{{\"fake\":{{\"command\":\"{}\"}}}},\"tasks\":{{\"build\":{{\"worker\":\"fake\"}}}}}}'\n",
+        harness.worker_script_path().display()
+    );
+    harness.rewrite_config(&updated_config);
+    harness
+        .send_batch(BTreeSet::from([config_path]).into_iter().collect(), true)
+        .await;
+    harness
+        .wait_until(
+            Duration::from_secs(10),
+            || "timed out waiting for config reload rebuild generation to increment".to_string(),
+            || harness.rebuild_generation() > rebuild_generation_before,
+        )
+        .await;
+
+    assert!(
+        harness
+            .stays_for(Duration::from_millis(500), || harness.current_max_weight()
+                == 5)
+            .await,
+        "expected explicit max weight override to survive executed config reload"
+    );
+    assert_eq!(
+        harness.current_max_weight(),
+        5,
+        "expected explicit max weight override to win over reloaded config"
+    );
+    assert_eq!(
+        harness.session_package_names(),
+        vec!["app".to_string()],
+        "expected config reload with explicit override to preserve package graph"
+    );
+    assert!(
+        harness
+            .stays_for_markers(1, Duration::from_millis(500))
+            .await,
+        "expected config-only reload with explicit override to avoid extra task execution, got {} markers",
+        read_marker_count(&harness.workspace_root)
+    );
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn lockfile_change_reruns_only_affected_package() {
     let harness = E2eHarness::start_two_package_lockfile().await;
 

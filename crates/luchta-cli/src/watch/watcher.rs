@@ -261,12 +261,18 @@ fn contains_structural_change<'a>(
     mut events: impl Iterator<Item = &'a DebouncedEvent>,
 ) -> bool {
     events.any(|event| {
-        is_structural_event_kind(&event.kind)
-            && event
-                .paths
-                .iter()
-                .filter_map(|path| normalize_absolute_path(path.clone()))
-                .any(|path| !ignore_filter.should_ignore(&path))
+        event
+            .paths
+            .iter()
+            .filter_map(|path| normalize_absolute_path(path.clone()))
+            .filter(|path| !ignore_filter.should_ignore(path))
+            .any(|path| {
+                is_structural_event_kind(&event.kind)
+                    || path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().starts_with("luchta-config."))
+                        .unwrap_or(false)
+            })
     })
 }
 
@@ -566,6 +572,21 @@ mod tests {
         assert!(ignore_filter.should_watch_dir(&source_dir));
     }
 
+    fn assert_collect_watch_batch(
+        root: &Path,
+        kind: EventKind,
+        changed_path: PathBuf,
+        expected_structural: bool,
+    ) {
+        let ignore_filter = IgnoreFilter::new(root).expect("build ignore filter");
+        let batch = collect_watch_batch(
+            &ignore_filter,
+            vec![debounced_event(kind, vec![changed_path.clone()])],
+        );
+        assert_eq!(batch.structural, expected_structural);
+        assert_eq!(batch.changed_paths, HashSet::from([changed_path]));
+    }
+
     #[test]
     fn collect_watch_batch_sets_structural_for_folder_create_and_false_for_file_edit() {
         let temp = tempdir().expect("create tempdir");
@@ -577,27 +598,39 @@ mod tests {
             .expect("create source parent");
         fs::write(&source_file, "export const value = 1;\n").expect("write source file");
         fs::create_dir_all(&new_dir).expect("create new dir");
-        let ignore_filter = IgnoreFilter::new(&root).expect("build ignore filter");
 
-        let structural_batch = collect_watch_batch(
-            &ignore_filter,
-            vec![debounced_event(
-                EventKind::Create(CreateKind::Folder),
-                vec![new_dir.clone()],
-            )],
+        assert_collect_watch_batch(&root, EventKind::Create(CreateKind::Folder), new_dir, true);
+        assert_collect_watch_batch(
+            &root,
+            EventKind::Modify(ModifyKind::Data(notify::event::DataChange::Any)),
+            source_file,
+            false,
         );
-        assert!(structural_batch.structural);
-        assert_eq!(structural_batch.changed_paths, HashSet::from([new_dir]));
+    }
 
-        let file_edit_batch = collect_watch_batch(
-            &ignore_filter,
-            vec![debounced_event(
-                EventKind::Modify(ModifyKind::Data(notify::event::DataChange::Any)),
-                vec![source_file.clone()],
-            )],
+    #[test]
+    fn collect_watch_batch_sets_structural_for_root_config_data_edit() {
+        let temp = tempdir().expect("create tempdir");
+        let root = canonical(temp.path());
+        let config_path = root.join("luchta-config.sh");
+        let normal_file = root.join("src/foo.rs");
+        fs::create_dir_all(normal_file.parent().expect("normal file parent"))
+            .expect("create normal file parent");
+        fs::write(&config_path, "#!/bin/sh\necho '{}'\n").expect("write config file");
+        fs::write(&normal_file, "export const value = 1;\n").expect("write normal file");
+
+        assert_collect_watch_batch(
+            &root,
+            EventKind::Modify(ModifyKind::Data(notify::event::DataChange::Any)),
+            config_path,
+            true,
         );
-        assert!(!file_edit_batch.structural);
-        assert_eq!(file_edit_batch.changed_paths, HashSet::from([source_file]));
+        assert_collect_watch_batch(
+            &root,
+            EventKind::Modify(ModifyKind::Data(notify::event::DataChange::Any)),
+            normal_file,
+            false,
+        );
     }
 
     fn seed_reconcile_watcher(

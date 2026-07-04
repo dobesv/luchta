@@ -2,6 +2,8 @@
 
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -20,6 +22,9 @@ use luchta_workspace::{PackageGraph, PackageNode, WorkspaceDiscovery, YarnWorksp
 /// multiple build cycles without respawning workers between cycles.
 pub struct WatchSession {
     run: ArcSwap<RunContext>,
+    max_weight_override: Option<u32>,
+    #[cfg(test)]
+    rebuild_generation: AtomicU64,
 }
 
 impl WatchSession {
@@ -38,6 +43,9 @@ impl WatchSession {
             };
         Ok(Some(Self {
             run: ArcSwap::from_pointee(run),
+            max_weight_override,
+            #[cfg(test)]
+            rebuild_generation: AtomicU64::new(0),
         }))
     }
 
@@ -70,7 +78,7 @@ impl WatchSession {
         } = build_reused_worker_run_context(ReusedContextParams {
             workspace_root: &current.workspace_root,
             packages,
-            max_weight_override: current.max_weight,
+            max_weight_override: self.max_weight_override,
             worker_manager: Arc::clone(&current.worker_manager),
             config,
         })
@@ -95,6 +103,8 @@ impl WatchSession {
             workspace_root,
             task_watch_registry,
         }));
+        #[cfg(test)]
+        self.rebuild_generation.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -108,6 +118,11 @@ impl WatchSession {
     #[cfg(test)]
     pub(crate) fn run_context_for_test(&self) -> Arc<RunContext> {
         self.run_context()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn rebuild_generation(&self) -> u64 {
+        self.rebuild_generation.load(Ordering::Relaxed)
     }
 
     /// Repo root used for absolute-path -> package mapping.
@@ -185,7 +200,7 @@ pub(crate) struct PreparedRunContext {
 pub(crate) struct ReusedContextParams<'a> {
     workspace_root: &'a Path,
     packages: Vec<PackageNode>,
-    max_weight_override: u32,
+    max_weight_override: Option<u32>,
     worker_manager: Arc<WorkerManager>,
     config: crate::config::LuchtaConfig,
 }
@@ -235,7 +250,7 @@ pub(crate) async fn build_reused_worker_run_context(
         env: config.env,
         task_graph,
         workers: config.workers,
-        max_weight: max_weight_override,
+        max_weight: max_weight_override.unwrap_or(config.concurrency.max_weight),
         pruned,
         worker_manager,
         global_cache_nonce: config.cache.and_then(|cache| cache.cache_nonce),
