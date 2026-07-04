@@ -80,6 +80,24 @@ pub(crate) fn diff_discovered_package_paths(
     }
 }
 
+async fn rebuild_and_reconcile_watch_state(
+    context: &WatchIterationContext<'_>,
+    package_paths: &BTreeSet<PathBuf>,
+) -> Result<WatchControl> {
+    if let Err(error) = context.session.rebuild_for_packages(package_paths).await {
+        warn!(error = %error, "structural workspace rebuild failed; keeping previous graph");
+        return Ok(WatchControl::Continue);
+    }
+    let package_nodes = context.session.current_package_nodes();
+    if let Err(error) = context
+        .watcher_handle
+        .reconcile_watch_roots(context.session.repo_root().as_ref(), &package_nodes)
+    {
+        warn!(error = %error, "watch root reconcile failed after rebuild");
+        return Ok(WatchControl::Continue);
+    }
+    Ok(WatchControl::Stop)
+}
 #[derive(Debug, Clone, Default)]
 pub struct OwnedSelection {
     pub requested_tasks: Vec<String>,
@@ -466,22 +484,23 @@ where
             &context.session.current_package_paths(),
         ) {
             StructuralPackageSetDiff::KeepPrevious => return Ok(WatchControl::Continue),
-            StructuralPackageSetDiff::Unchanged => {}
-            StructuralPackageSetDiff::Changed(discovered_package_paths) => {
-                if let Err(error) = context
-                    .session
-                    .rebuild_for_packages(&discovered_package_paths)
-                    .await
-                {
-                    warn!(error = %error, "structural workspace rebuild failed; keeping previous graph");
+            StructuralPackageSetDiff::Unchanged => {
+                if matches!(
+                    rebuild_and_reconcile_watch_state(
+                        &context,
+                        &context.session.current_package_paths(),
+                    )
+                    .await?,
+                    WatchControl::Continue
+                ) {
                     return Ok(WatchControl::Continue);
                 }
-                let package_nodes = context.session.current_package_nodes();
-                if let Err(error) = context
-                    .watcher_handle
-                    .reconcile_watch_roots(context.session.repo_root().as_ref(), &package_nodes)
-                {
-                    warn!(error = %error, "watch root reconcile failed after rebuild");
+            }
+            StructuralPackageSetDiff::Changed(discovered_package_paths) => {
+                if matches!(
+                    rebuild_and_reconcile_watch_state(&context, &discovered_package_paths).await?,
+                    WatchControl::Continue
+                ) {
                     return Ok(WatchControl::Continue);
                 }
             }

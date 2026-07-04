@@ -15,6 +15,15 @@ pub(super) const POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// Worker appends a newline to `.run-marker` on every job.
 /// First job BLOCKS until `.release-1` sentinel appears.
 /// Subsequent jobs run free (don't block).
+pub(super) fn blocking_workspace_config(worker_script_path: &std::path::Path) -> String {
+    format!(
+        r##"#!/bin/sh
+echo '{{"concurrency":{{"maxWeight":4}},"workers":{{"fake":{{"command":"{}"}}}},"tasks":{{"build":{{"worker":"fake"}}}}}}'
+"##,
+        worker_script_path.display()
+    )
+}
+
 pub(super) fn write_blocking_workspace(workspace_root: &std::path::Path) {
     std::fs::create_dir_all(workspace_root.join("packages/app")).expect("create package dir");
     std::fs::write(
@@ -70,12 +79,7 @@ done
             .expect("chmod worker script");
     }
 
-    let config = format!(
-        r##"#!/bin/sh
-echo '{{"concurrency":{{"maxWeight":4}},"workers":{{"fake":{{"command":"{}"}}}},"tasks":{{"build":{{"worker":"fake"}}}}}}'
-"##,
-        worker_script_path.display()
-    );
+    let config = blocking_workspace_config(&worker_script_path);
     std::fs::write(workspace_root.join("luchta-config.sh"), &config).expect("write config");
     #[cfg(unix)]
     {
@@ -157,12 +161,7 @@ done
             .expect("chmod worker script");
     }
 
-    let config = format!(
-        r##"#!/bin/sh
-echo '{{"concurrency":{{"maxWeight":4}},"workers":{{"fake":{{"command":"{}"}}}},"tasks":{{"build":{{"worker":"fake"}}}}}}'
-"##,
-        worker_script_path.display()
-    );
+    let config = blocking_workspace_config(&worker_script_path);
     std::fs::write(workspace_root.join("luchta-config.sh"), &config).expect("write config");
     #[cfg(unix)]
     {
@@ -217,7 +216,15 @@ pub(super) enum PackageMutation<'a> {
 
 impl E2eHarness {
     pub(super) async fn start() -> Self {
-        Self::start_with_workspace(write_blocking_workspace).await
+        Self::start_with_max_weight_override(None).await
+    }
+
+    pub(super) async fn start_with_max_weight_override(max_weight_override: Option<u32>) -> Self {
+        Self::start_with_workspace_and_max_weight_override(
+            write_blocking_workspace,
+            max_weight_override,
+        )
+        .await
     }
 
     pub(super) async fn start_two_package_lockfile() -> Self {
@@ -225,12 +232,19 @@ impl E2eHarness {
     }
 
     pub(super) async fn start_with_workspace(writer: fn(&std::path::Path)) -> Self {
+        Self::start_with_workspace_and_max_weight_override(writer, None).await
+    }
+
+    pub(super) async fn start_with_workspace_and_max_weight_override(
+        writer: fn(&std::path::Path),
+        max_weight_override: Option<u32>,
+    ) -> Self {
         let temp_dir = tempfile::tempdir().expect("create temp dir");
         let workspace_root = temp_dir.path().canonicalize().expect("canonicalize");
         writer(&workspace_root);
 
         let session = Arc::new(
-            WatchSession::new(&workspace_root, None)
+            WatchSession::new(&workspace_root, max_weight_override)
                 .await
                 .expect("create watch session")
                 .expect("session should not be None"),
@@ -382,6 +396,14 @@ impl E2eHarness {
         .await;
     }
 
+    pub(super) fn current_max_weight(&self) -> u32 {
+        self.session.run_context_for_test().max_weight
+    }
+
+    pub(super) fn rebuild_generation(&self) -> u64 {
+        self.session.rebuild_generation()
+    }
+
     pub(super) async fn send_package_change(&self) {
         let app_path = self.workspace_root.join("packages/app/src/lib.rs");
         std::fs::create_dir_all(app_path.parent().expect("app parent")).ok();
@@ -406,6 +428,18 @@ impl E2eHarness {
             .canonicalize()
             .expect("canonicalize lockfile path");
         self.send_batch(HashSet::from([lockfile_path]), false).await;
+    }
+
+    pub(super) fn config_path(&self) -> PathBuf {
+        self.workspace_root.join("luchta-config.sh")
+    }
+
+    pub(super) fn worker_script_path(&self) -> PathBuf {
+        self.workspace_root.join("fake-worker.sh")
+    }
+
+    pub(super) fn rewrite_config(&self, contents: &str) {
+        std::fs::write(self.config_path(), contents).expect("rewrite config");
     }
 
     pub(super) async fn mutate_packages_and_signal(&self, mutation: PackageMutation<'_>) {
