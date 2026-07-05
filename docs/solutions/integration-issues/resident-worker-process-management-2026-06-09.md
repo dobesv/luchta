@@ -20,6 +20,9 @@ tags:
 plan_ref: luchta-resident-workers
 ---
 
+> [!NOTE]
+> The worker protocol terminal `Done` message no longer carries inputs. Inputs are now reported during the resolve phase. See [worker-inputs-moved-to-resolve-phase-2026-07-05.md](../logic-errors/worker-inputs-moved-to-resolve-phase-2026-07-05.md).
+
 ## Problem
 
 Stay-resident worker processes for the luchta task runner introduced multiple concurrency bugs: (1) shutdown timeout starvation when a reaper task held a child-wait lock across `child.wait().await`, (2) TOCTOU duplicate-spawn race in `get_or_spawn` allowing two concurrent callers to both spawn workers, (3) worker protocol liveness violation where workers consuming requests but not emitting terminal `Done` hung the engine's `run_job` forever, and (4) ungated Unix-only APIs breaking Windows builds in a cross-platform workspace.

@@ -15,6 +15,9 @@ tags:
   - input-resolution
 plan_ref: "concurrent-change-handling"
 ---
+
+> [!IMPORTANT]
+> This document describes the initial pre-snapshot mechanism for declared inputs. For worker-provided inputs, this has been superseded by resolve-phase input reporting. See [worker-inputs-moved-to-resolve-phase-2026-07-05.md](worker-inputs-moved-to-resolve-phase-2026-07-05.md).
 # Problem
 
 Luchta's task cache resolved input file hashes AFTER task execution, storing them as the record's authoritative inputs. A concurrent edit during task execution (H1 → H2 while task reads H1) produced output from H1 but recorded metadata with H2 hashes — causing later wrongly-skipped rebuilds and stale shared-cache restores. Watch mode could also miss rebuilds.

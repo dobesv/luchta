@@ -52,7 +52,7 @@ async fn single_job_happy_path() {
 
     assert_eq!(outcome.0, 7);
     assert_eq!(outcome.1, None);
-    assert_eq!(outcome.2, None);
+    assert!(outcome.2.is_empty());
     manager.shutdown().await;
 }
 
@@ -427,6 +427,7 @@ while IFS= read -r _; do :; done
                 package: "pkg".to_string(),
                 cwd: None,
                 scripts: Vec::new(),
+                inputs: Vec::new(),
                 mode: luchta_worker::ResolveMode::Run,
             },
         )

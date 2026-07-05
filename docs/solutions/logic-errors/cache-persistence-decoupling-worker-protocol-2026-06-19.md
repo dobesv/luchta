@@ -17,6 +17,9 @@ tags:
 plan_ref: luchta-logs-output-ux
 ---
 
+> [!NOTE]
+> The worker protocol now supports reporting inputs during the resolve phase via `TaskModification.inputs`. This is the preferred way to report inputs to avoid TOCTOU races. See [worker-inputs-moved-to-resolve-phase-2026-07-05.md](worker-inputs-moved-to-resolve-phase-2026-07-05.md).
+
 ## Problem
 
 Two distinct issues emerged during implementation of `luchta logs` command and improved failure-output display:
@@ -137,7 +140,7 @@ done
 
 Key requirements:
 - Each output line must be `{"type":"log","id":"<job_id>","stream":"stdout|stderr","line":"<content>"}`
-- Terminal message must be `{"type":"done","id":"<job_id>","exitCode":<int>}`
+- Terminal message must be `{"type":"done","id":"<job_id>","exitCode":<int>,"outputs":["<pattern>",...]}` (outputs optional)
 - Never print raw text to stdout — it corrupts JSONL stream
 
 ## Why This Works
