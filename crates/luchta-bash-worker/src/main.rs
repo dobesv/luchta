@@ -93,6 +93,7 @@ mod tests {
             package: "@repo/app".to_owned(),
             cwd: Some("packages/app".to_owned()),
             scripts: vec!["ignored".to_owned()],
+            inputs: Vec::new(),
             mode,
         }
     }

@@ -488,6 +488,23 @@ fn build_cache_write_context(task_id: &TaskId, ctx: &DecisionContext) -> CacheIn
     let env_hash = current.env_hash;
     let pkg_dep_hash = current.pkg_dep_hash;
 
+    // Capture the pre-execution input snapshot used for the stability check.
+    //
+    // `task_def.inputs` here is the task's RESOLVED input set: any worker
+    // `Modify.inputs` returned during `TaskGraph::build_resolved` has already
+    // replaced the declared config inputs by this point (resolve completes
+    // before any task is dispatched). Snapshotting them BEFORE the task runs
+    // gives every tracked input — worker-provided ones included — a pre-execution
+    // baseline, so a concurrent edit during execution is detected by the
+    // post-run stability check (which re-hashes this same set and, on mismatch,
+    // skips the cache write and leaves the task dirty).
+    let pre_snapshot = resolve_pre_execution_inputs(
+        &task_def.inputs,
+        &cache_context.cache_package.package_name,
+        &cache_context.resolver.package_graph,
+        &cache_context.resolver.repo_root,
+    );
+
     CacheInputState::Ready(Box::new(CacheWriteContext {
         task_id: task_id.clone(),
         task_def,
@@ -503,6 +520,7 @@ fn build_cache_write_context(task_id: &TaskId, ctx: &DecisionContext) -> CacheIn
         cache_nonce: nonce,
         decision: cache_run_decision(),
         task_watch_registry: Arc::clone(&ctx.task_watch_registry),
+        pre_snapshot,
     }))
 }
 
@@ -579,37 +597,42 @@ fn build_cache_current_state(input: CacheCurrentStateInput<'_>) -> CurrentState<
 enum BuildRecordResult {
     Ok(Box<TaskRunRecord>),
     ExpansionError(String),
+    /// Inputs changed during execution - cache Skipped, but run was successful.
+    StabilityMismatch(String),
 }
 
-fn build_run_record(
+/// Effective input/output patterns for a run, plus whether the worker reported
+/// additional (detected) patterns beyond the declared ones.
+struct RunRecordPatterns {
+    input_patterns: Vec<String>,
+    output_patterns: Vec<String>,
+    detected_output_patterns: bool,
+}
+
+/// Assemble a [`TaskRunRecord`] from the cache context, effective patterns, and the
+/// resolved input entries to store. Resolves and hashes outputs here.
+fn assemble_run_record(
     cache_ctx: &CacheWriteContext,
-    args: BuildRunRecordArgs<'_>,
-) -> BuildRecordResult {
-    let (output_patterns, detected_output_patterns) =
-        effective_output_patterns(&cache_ctx.task_def, args.outcome);
-    let (input_patterns, detected_input_patterns) =
-        effective_input_patterns(&cache_ctx.task_def, args.outcome);
-    let inputs = match resolve_cache_inputs(cache_ctx, &input_patterns) {
-        CacheInputResult::Ok(entries) => entries,
-        CacheInputResult::ExpansionError(msg) => return BuildRecordResult::ExpansionError(msg),
-        CacheInputResult::IoError => Vec::new(),
-    };
-    let outputs = resolve_cache_outputs(cache_ctx, &output_patterns).unwrap_or_default();
+    args: &BuildRunRecordArgs<'_>,
+    patterns: &RunRecordPatterns,
+    inputs: Vec<FileEntry>,
+) -> Box<TaskRunRecord> {
+    let outputs = resolve_cache_outputs(cache_ctx, &patterns.output_patterns).unwrap_or_default();
     let outputs_hash = combined_outputs_hash(&outputs);
     let exit_status = args
         .outcome
         .map(|result| result.status.code().unwrap_or(1))
         .unwrap_or(1);
 
-    let record = Box::new(TaskRunRecord {
+    Box::new(TaskRunRecord {
         schema_version: SCHEMA_VERSION_V4,
         task_spec_hash: cache_ctx.task_spec_hash,
-        input_patterns,
+        input_patterns: patterns.input_patterns.clone(),
         inputs,
-        output_patterns,
+        output_patterns: patterns.output_patterns.clone(),
         outputs,
-        detected_input_patterns,
-        detected_output_patterns,
+        detected_input_patterns: false,
+        detected_output_patterns: patterns.detected_output_patterns,
         outputs_hash,
         env_hash: cache_ctx.env_hash,
         pkg_dep_hash: cache_ctx.pkg_dep_hash,
@@ -620,8 +643,33 @@ fn build_run_record(
         end_unix_ms: args.end_unix_ms,
         reports: vec![],
         cache_nonce: cache_ctx.cache_nonce.clone(),
-        run_reason: args.run_reason,
-    });
+        run_reason: args.run_reason.clone(),
+    })
+}
+
+/// Build the run record for a SUCCESSFUL run.
+///
+/// The strict concurrent-change guarantee applies only to DECLARED inputs (those
+/// captured in `cache_ctx.pre_snapshot` before the task ran). `check_input_stability`
+/// compares the pre-snapshot against the declared subset of `post_inputs`:
+/// - A declared input changed/deleted mid-run -> `StabilityMismatch` (no cache
+///   write, no watch-state registration; the task stays dirty so watch mode reruns).
+/// - Otherwise record inputs come from verified-stable pre-snapshot captured
+///   before execution. This authoritative snapshot already reflects any
+///   resolve-time worker input override and closes post-resolve->write gap.
+fn build_successful_run_record(
+    cache_ctx: &CacheWriteContext,
+    args: &BuildRunRecordArgs<'_>,
+    patterns: &RunRecordPatterns,
+    post_inputs: &[FileEntry],
+) -> BuildRecordResult {
+    let stable_inputs =
+        match check_input_stability(&cache_ctx.pre_snapshot, post_inputs, &cache_ctx.task_id) {
+            Ok(inputs) => inputs,
+            Err(reason) => return BuildRecordResult::StabilityMismatch(reason),
+        };
+
+    let record = assemble_run_record(cache_ctx, args, patterns, stable_inputs);
 
     register_task_watch_state(
         &cache_ctx.task_watch_registry,
@@ -635,68 +683,47 @@ fn build_run_record(
     BuildRecordResult::Ok(record)
 }
 
-/// Result of cache input resolution for the write path.
-/// Distinguishes between expansion errors (fatal) and IO errors (warn + skip).
-enum CacheInputResult {
-    Ok(Vec<FileEntry>),
-    ExpansionError(String),
-    IoError,
-}
-
-fn resolve_cache_inputs(
+fn build_run_record(
     cache_ctx: &CacheWriteContext,
-    input_patterns: &[String],
-) -> CacheInputResult {
-    let requests = match expand_input_patterns(
-        input_patterns,
-        &cache_ctx.source_pkg,
-        &cache_ctx.package_graph,
-        &cache_ctx.repo_root,
-    ) {
-        Ok(reqs) => reqs,
-        Err(error) => {
-            return CacheInputResult::ExpansionError(format!(
-                "input \"{}\" in package \"{}\": {}",
-                error.pattern(),
-                cache_ctx.source_pkg,
-                error
-            ));
-        }
+    args: BuildRunRecordArgs<'_>,
+) -> BuildRecordResult {
+    let (output_patterns, detected_output_patterns) =
+        effective_output_patterns(&cache_ctx.task_def, args.outcome);
+    let input_patterns = cache_ctx.task_def.inputs.clone();
+
+    // Resolve inputs after execution for the stability comparison.
+    let post_inputs = match resolve_cache_inputs(cache_ctx, &input_patterns) {
+        CacheInputResult::Ok(entries) => entries,
+        CacheInputResult::ExpansionError(msg) => return BuildRecordResult::ExpansionError(msg),
+        CacheInputResult::IoError => Vec::new(),
     };
 
-    match resolve_inputs_with_semantics(&requests) {
-        Ok(inputs) => CacheInputResult::Ok(inputs),
-        Err(error) => {
-            eprintln!(
-                "warning: failed to resolve cache inputs for task '{}': {error} — recording run with empty inputs",
-                cache_ctx.task_id
-            );
-            CacheInputResult::IoError
-        }
-    }
-}
+    let patterns = RunRecordPatterns {
+        input_patterns,
+        output_patterns,
+        detected_output_patterns,
+    };
 
-fn resolve_cache_outputs(
-    cache_ctx: &CacheWriteContext,
-    output_patterns: &[String],
-) -> Option<Vec<FileEntry>> {
-    match resolve_outputs(&cache_ctx.package_path, output_patterns) {
-        Ok(outputs) => Some(outputs),
-        Err(error) => {
-            eprintln!(
-                "warning: failed to resolve cache outputs for task '{}': {error} — recording run with empty outputs",
-                cache_ctx.task_id
-            );
-            None
-        }
+    if !args.succeeded {
+        // Failed run: record with post-run inputs; do NOT register watch state.
+        return BuildRecordResult::Ok(assemble_run_record(
+            cache_ctx,
+            &args,
+            &patterns,
+            post_inputs,
+        ));
     }
+
+    build_successful_run_record(cache_ctx, &args, &patterns, &post_inputs)
 }
 
 /// Result of writing a run record to cache.
 /// ExpansionError signals a fatal security error that must fail the task.
+/// StabilityMismatch indicates inputs changed during execution - cache skipped.
 enum WriteRecordResult {
     Ok,
     ExpansionError(String),
+    StabilityMismatch(#[allow(dead_code)] String),
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -724,6 +751,14 @@ async fn write_run_record(
     ) {
         BuildRecordResult::Ok(record) => record,
         BuildRecordResult::ExpansionError(msg) => return WriteRecordResult::ExpansionError(msg),
+        BuildRecordResult::StabilityMismatch(reason) => {
+            // Emit warning but don't fail the task - just skip cache write
+            eprintln!(
+                "{}",
+                reason.if_supports_color(Stream::Stderr, |text| text.yellow())
+            );
+            return WriteRecordResult::StabilityMismatch(reason);
+        }
     };
     record_output_hash(&output_hashes, &cache_ctx.task_id, record.outputs_hash);
     let (stdout, stderr) = log_sink.map(split_captured_logs).unwrap_or_default();
@@ -1366,6 +1401,7 @@ fn record_successful_output_hash(
 fn cache_write_error(result: WriteRecordResult) -> Option<String> {
     match result {
         WriteRecordResult::Ok => None,
+        WriteRecordResult::StabilityMismatch(_) => None, // Non-fatal - cache skipped
         WriteRecordResult::ExpansionError(msg) => Some(msg),
     }
 }
@@ -1450,16 +1486,6 @@ fn effective_output_patterns(
     match outcome.and_then(|o| o.detected_outputs.clone()) {
         Some(p) => (p, true),
         None => (task_def.outputs.clone(), false),
-    }
-}
-
-fn effective_input_patterns(
-    task_def: &TaskDefinition,
-    outcome: Option<&TaskRunOutcome>,
-) -> (Vec<String>, bool) {
-    match outcome.and_then(|o| o.detected_inputs.clone()) {
-        Some(patterns) => (patterns, true),
-        None => (task_def.inputs.clone(), false),
     }
 }
 
@@ -1847,6 +1873,19 @@ mod tests {
         PackageGraph::build(vec![package.clone()]).expect("build package graph")
     }
 
+    /// Initialize a git repo at `root`. Input resolution walks up to a git repo
+    /// boundary, so tests that resolve real inputs need one.
+    fn init_git_repo(root: &Path) {
+        use std::process::Command;
+        let ok = Command::new("git")
+            .arg("init")
+            .current_dir(root)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "git init failed for {}", root.display());
+    }
+
     fn build_test_task_graph(package_graph: &PackageGraph) -> TaskGraph {
         let pipeline = HashMap::from([(
             TaskName::from("invalid"),
@@ -1884,6 +1923,7 @@ mod tests {
                 run_reason: RunReason::NoPriorRecord,
             },
             task_watch_registry: crate::watch::registry::empty_task_watch_registry(),
+            pre_snapshot: Vec::new(),
         }
     }
 
@@ -1919,10 +1959,130 @@ mod tests {
         ) {
             BuildRecordResult::Ok(record) => record,
             BuildRecordResult::ExpansionError(msg) => panic!("unexpected expansion error: {msg}"),
+            BuildRecordResult::StabilityMismatch(msg) => {
+                panic!("unexpected stability mismatch: {msg}")
+            }
         };
 
         assert_eq!(record.schema_version, SCHEMA_VERSION_V4);
         assert_eq!(record.run_reason, Some(run_reason));
+    }
+
+    #[test]
+    fn build_run_record_declared_input_changed_mid_run_is_stability_mismatch() {
+        // A declared input is edited DURING the run: the pre-snapshot captured
+        // its pre-run state, but the post-run resolution sees the new content.
+        // build_run_record must return StabilityMismatch and must NOT register
+        // watch state (so the task stays dirty for the next watch cycle).
+        let task_id = TaskId::new("pkg", "build");
+        let mut cache_ctx = sample_cache_write_context(task_id.clone());
+        cache_ctx.task_def.inputs = vec!["src.txt".to_string()];
+        init_git_repo(&cache_ctx.repo_root);
+        let input_path = cache_ctx.package_path.join("src.txt");
+
+        // Pre-run state H1, captured into the pre-snapshot.
+        std::fs::write(&input_path, "H1\n").expect("write input");
+        cache_ctx.pre_snapshot = resolve_pre_execution_inputs(
+            &cache_ctx.task_def.inputs,
+            &cache_ctx.source_pkg,
+            &cache_ctx.package_graph,
+            &cache_ctx.repo_root,
+        );
+        assert!(
+            !cache_ctx.pre_snapshot.is_empty(),
+            "pre-snapshot should capture the declared input"
+        );
+
+        // Concurrent edit to H2 before the record is built (post-run resolution).
+        std::fs::write(&input_path, "H2-changed\n").expect("edit input");
+
+        let result = build_run_record(
+            &cache_ctx,
+            BuildRunRecordArgs {
+                outcome: None,
+                succeeded: true,
+                end_unix_ms: 20,
+                run_reason: Some(RunReason::NoPriorRecord),
+            },
+        );
+
+        match result {
+            BuildRecordResult::StabilityMismatch(reason) => {
+                assert!(
+                    reason.contains("changed during execution"),
+                    "reason should describe the concurrent change: {reason}"
+                );
+            }
+            BuildRecordResult::Ok(_) => {
+                panic!("expected StabilityMismatch when a declared input changed mid-run")
+            }
+            BuildRecordResult::ExpansionError(msg) => panic!("unexpected expansion error: {msg}"),
+        }
+
+        // Watch state must NOT be registered for an unstable run.
+        assert!(
+            cache_ctx
+                .task_watch_registry
+                .lock()
+                .expect("lock watch registry")
+                .is_empty(),
+            "stability mismatch must not register watch state"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_run_record_skips_cache_on_stability_mismatch() {
+        // End-to-end of the write path: a declared input changes mid-run, so
+        // write_run_record must return StabilityMismatch and leave the local
+        // cache untouched (no record persisted).
+        let cache_dir = tempfile::tempdir().expect("cache tempdir");
+        let cache =
+            Arc::new(Cache::open(&cache_dir.path().join(".luchta/cache")).expect("open cache"));
+        let task_id = TaskId::new("pkg", "build");
+        let mut cache_ctx = sample_cache_write_context(task_id.clone());
+        cache_ctx.task_def.inputs = vec!["src.txt".to_string()];
+        init_git_repo(&cache_ctx.repo_root);
+        let repo_root = cache_ctx.repo_root.clone();
+        let input_path = cache_ctx.package_path.join("src.txt");
+
+        std::fs::write(&input_path, "H1\n").expect("write input");
+        cache_ctx.pre_snapshot = resolve_pre_execution_inputs(
+            &cache_ctx.task_def.inputs,
+            &cache_ctx.source_pkg,
+            &cache_ctx.package_graph,
+            &cache_ctx.repo_root,
+        );
+        // Concurrent edit before the record is written.
+        std::fs::write(&input_path, "H2-changed\n").expect("edit input");
+
+        let output_hashes = Arc::new(Mutex::new(HashMap::new()));
+        let result = write_run_record(
+            Arc::clone(&cache),
+            cache_ctx,
+            Arc::clone(&output_hashes),
+            None,
+            None,
+            true,
+            20,
+            Some(RunReason::NoPriorRecord),
+            None,
+            false,
+            repo_root,
+        )
+        .await;
+
+        assert!(
+            matches!(result, WriteRecordResult::StabilityMismatch(_)),
+            "write should report a stability mismatch"
+        );
+        assert!(
+            cache.read(&task_id.to_string()).is_none(),
+            "no cache record should be written on a stability mismatch"
+        );
+        assert!(
+            output_hashes.lock().expect("lock output hashes").is_empty(),
+            "no output hash should be recorded on a stability mismatch"
+        );
     }
 
     #[test]
@@ -1950,6 +2110,9 @@ mod tests {
         ) {
             BuildRecordResult::Ok(record) => record,
             BuildRecordResult::ExpansionError(msg) => panic!("unexpected expansion error: {msg}"),
+            BuildRecordResult::StabilityMismatch(msg) => {
+                panic!("unexpected stability mismatch: {msg}")
+            }
         };
 
         assert_eq!(record.run_reason, None);
@@ -1974,6 +2137,9 @@ mod tests {
         ) {
             BuildRecordResult::Ok(record) => *record,
             BuildRecordResult::ExpansionError(msg) => panic!("unexpected expansion error: {msg}"),
+            BuildRecordResult::StabilityMismatch(msg) => {
+                panic!("unexpected stability mismatch: {msg}")
+            }
         };
         let hit = RestoredHit {
             record,
@@ -2005,6 +2171,9 @@ mod tests {
         ) {
             BuildRecordResult::Ok(record) => *record,
             BuildRecordResult::ExpansionError(msg) => panic!("unexpected expansion error: {msg}"),
+            BuildRecordResult::StabilityMismatch(msg) => {
+                panic!("unexpected stability mismatch: {msg}")
+            }
         };
         record.reports = vec![luchta_cache::ReportMeta {
             filename: "report.txt".to_string(),
@@ -2081,6 +2250,9 @@ mod tests {
             BuildRecordResult::Ok(record) => record,
             BuildRecordResult::ExpansionError(msg) => {
                 panic!("unexpected expansion error: {msg}")
+            }
+            BuildRecordResult::StabilityMismatch(msg) => {
+                panic!("unexpected stability mismatch: {msg}")
             }
         };
         cache

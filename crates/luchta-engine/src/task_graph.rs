@@ -747,6 +747,7 @@ impl ResolvedPipeline {
                 package: task_id.package.as_str().to_owned(),
                 cwd: info.and_then(|info| info.cwd.clone()),
                 scripts: info.map(|info| info.scripts.clone()).unwrap_or_default(),
+                inputs: definition.inputs.clone(),
                 mode,
             };
             requests.push((task_id, worker, request));
@@ -2452,6 +2453,7 @@ mod tests {
                 depends_on: Some(vec![DependsOn::DirectUpstream(TaskName::from("build"))]),
                 weight: Some(7),
                 dependencies: None,
+                inputs: None,
             })
         });
         let (graph, pruned) = TaskGraph::build_resolved(
@@ -2770,6 +2772,7 @@ mod tests {
                 depends_on: Some(vec![DependsOn::SamePackage(TaskName::from("other"))]),
                 weight: None,
                 dependencies: None,
+                inputs: None,
             })
         });
 
@@ -2813,6 +2816,56 @@ mod tests {
             definition.depends_on.contains(&injected_dep),
             "injected worker dep should survive Modify"
         );
+    }
+
+    #[tokio::test]
+    async fn worker_modify_inputs_replace_declared_inputs() {
+        let package_graph = package_graph_single("@repo/a");
+        let pipeline = HashMap::from([(
+            TaskName::from("build"),
+            TaskDefinition {
+                inputs: vec!["src/**".to_owned(), "package.json".to_owned()],
+                ..worker_task(vec![])
+            },
+        )]);
+
+        let resolver = StubResolver(|request: &ResolveTask| {
+            assert_eq!(
+                request.inputs,
+                vec!["src/**".to_owned(), "package.json".to_owned()]
+            );
+            ResolveResult::modify(TaskModification {
+                inputs: Some(vec!["generated/**".to_owned()]),
+                ..TaskModification::default()
+            })
+        });
+
+        let workers: HashMap<String, WorkerDefinition> = HashMap::from([(
+            "yarn".to_string(),
+            WorkerDefinition {
+                command: "yarn".to_string(),
+                depends_on: vec![],
+                env: BTreeMap::new(),
+                cache: None,
+            },
+        )]);
+
+        let (graph, pruned) = TaskGraph::build_resolved(
+            &package_graph,
+            &pipeline,
+            &empty_resolve_info(),
+            &workers,
+            &resolver,
+            ResolveMode::Run,
+        )
+        .await
+        .expect("build resolved graph");
+
+        assert!(pruned.is_empty());
+
+        let task_id = TaskId::new("@repo/a", "build");
+        let definition = graph.task_definition(&task_id).expect("task exists");
+        assert_eq!(definition.inputs, vec!["generated/**".to_owned()]);
     }
 
     #[tokio::test]

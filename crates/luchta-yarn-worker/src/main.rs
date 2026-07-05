@@ -1,37 +1,34 @@
 use std::collections::BTreeSet;
 
 use luchta_worker::{
-    run_worker_main, shell_single_quote, ResolveResult, ResolveTask, Worker, WorkerRequest,
-    WorkerResponse,
+    run_worker_main, shell_single_quote, ResolveResult, ResolveTask, TaskModification, Worker,
+    WorkerRequest, WorkerResponse,
 };
 
 struct YarnWorker;
 
-fn detected_inputs_with_package_json(inputs: Option<&[String]>) -> Option<Vec<String>> {
+fn resolved_inputs_with_package_json(inputs: Option<&[String]>) -> Vec<String> {
     let mut detected = BTreeSet::from(["package.json".to_owned()]);
     if let Some(inputs) = inputs {
         detected.extend(inputs.iter().cloned());
     }
-    Some(detected.into_iter().collect())
+    detected.into_iter().collect()
 }
 
 impl Worker for YarnWorker {
     fn done_response(&self, req: &WorkerRequest, exit_code: i32) -> WorkerResponse {
-        // Worker-reported inputs replace declared cache inputs for this run, so yarn
-        // worker reports full set it wants engine/CLI to persist. Always include
-        // package.json so script changes invalidate cache entries.
-        WorkerResponse::done_with_io(
-            req.id.clone(),
-            exit_code,
-            detected_inputs_with_package_json(req.inputs.as_deref()),
-            req.outputs.clone(),
-        )
+        WorkerResponse::done_with_outputs(req.id.clone(), exit_code, req.outputs.clone())
     }
 
     fn resolve_task(&self, req: &ResolveTask) -> ResolveResult {
         let script = req.resolved_script_name();
         if req.scripts.iter().any(|candidate| candidate == script) {
-            ResolveResult::accept()
+            ResolveResult::modify(TaskModification {
+                inputs: Some(resolved_inputs_with_package_json(Some(
+                    req.inputs.as_slice(),
+                ))),
+                ..TaskModification::default()
+            })
         } else {
             ResolveResult::prune(Some(format!(
                 "script `{script}` not found in package `{}`",
@@ -69,13 +66,18 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use luchta_worker::{
-        shell_single_quote, ResolveDecision, ResolveMode, ResolveTask, WorkerRequest,
+        shell_single_quote, ResolveMode, ResolveTask, TaskModification, WorkerRequest,
         WorkerResponse,
     };
 
     use super::{Worker, YarnWorker};
 
-    fn resolve_request(name: &str, command: &str, scripts: &[&str]) -> ResolveTask {
+    fn resolve_request(
+        name: &str,
+        command: &str,
+        scripts: &[&str],
+        inputs: Option<&[&str]>,
+    ) -> ResolveTask {
         ResolveTask {
             id: format!("@repo/app#{name}"),
             name: name.to_owned(),
@@ -83,21 +85,36 @@ mod tests {
             package: "@repo/app".to_owned(),
             cwd: Some("packages/app".to_owned()),
             scripts: scripts.iter().map(|script| script.to_string()).collect(),
+            inputs: inputs
+                .map(|patterns| {
+                    patterns
+                        .iter()
+                        .map(|pattern| (*pattern).to_owned())
+                        .collect()
+                })
+                .unwrap_or_default(),
             mode: ResolveMode::Run,
         }
     }
 
     #[test]
     fn resolve_accepts_task_whose_name_is_a_declared_script() {
-        let result = YarnWorker.resolve_task(&resolve_request("build", "", &["build", "test"]));
-        assert_eq!(result.decision, ResolveDecision::Accept);
+        let result =
+            YarnWorker.resolve_task(&resolve_request("build", "", &["build", "test"], None));
+        assert_eq!(
+            result.decision,
+            luchta_worker::ResolveDecision::Modify(TaskModification {
+                inputs: Some(vec!["package.json".to_owned()]),
+                ..TaskModification::default()
+            })
+        );
     }
 
     #[test]
     fn resolve_prunes_task_whose_name_is_absent_from_scripts() {
-        let result = YarnWorker.resolve_task(&resolve_request("build", "", &["test"]));
+        let result = YarnWorker.resolve_task(&resolve_request("build", "", &["test"], None));
         match result.decision {
-            ResolveDecision::Prune { reason } => {
+            luchta_worker::ResolveDecision::Prune { reason } => {
                 let reason = reason.expect("prune carries a reason");
                 assert!(reason.contains("build"), "reason: {reason}");
                 assert!(reason.contains("@repo/app"), "reason: {reason}");
@@ -108,17 +125,48 @@ mod tests {
 
     #[test]
     fn resolve_uses_explicit_command_as_script_name() {
-        let accepted = YarnWorker.resolve_task(&resolve_request("start", "serve", &["serve"]));
-        assert_eq!(accepted.decision, ResolveDecision::Accept);
+        let accepted =
+            YarnWorker.resolve_task(&resolve_request("start", "serve", &["serve"], None));
+        assert_eq!(
+            accepted.decision,
+            luchta_worker::ResolveDecision::Modify(TaskModification {
+                inputs: Some(vec!["package.json".to_owned()]),
+                ..TaskModification::default()
+            })
+        );
 
-        let pruned = YarnWorker.resolve_task(&resolve_request("serve", "missing", &["serve"]));
-        assert!(matches!(pruned.decision, ResolveDecision::Prune { .. }));
+        let pruned =
+            YarnWorker.resolve_task(&resolve_request("serve", "missing", &["serve"], None));
+        assert!(matches!(
+            pruned.decision,
+            luchta_worker::ResolveDecision::Prune { .. }
+        ));
     }
 
     #[test]
     fn resolve_prunes_when_package_declares_no_scripts() {
-        let result = YarnWorker.resolve_task(&resolve_request("build", "", &[]));
-        assert!(matches!(result.decision, ResolveDecision::Prune { .. }));
+        let result = YarnWorker.resolve_task(&resolve_request("build", "", &[], None));
+        assert!(matches!(
+            result.decision,
+            luchta_worker::ResolveDecision::Prune { .. }
+        ));
+    }
+
+    #[test]
+    fn resolve_returns_declared_inputs_plus_package_json() {
+        let result = YarnWorker.resolve_task(&resolve_request(
+            "build",
+            "",
+            &["build", "test"],
+            Some(&["src/**"]),
+        ));
+        assert_eq!(
+            result.decision,
+            luchta_worker::ResolveDecision::Modify(TaskModification {
+                inputs: Some(vec!["package.json".to_owned(), "src/**".to_owned()]),
+                ..TaskModification::default()
+            })
+        );
     }
 
     #[test]
@@ -149,7 +197,7 @@ mod tests {
     }
 
     #[test]
-    fn done_response_includes_package_json_input() {
+    fn done_response_emits_only_outputs() {
         let response = YarnWorker.done_response(
             &WorkerRequest::new("job", "build")
                 .with_inputs(["src/**/*.ts"])
@@ -159,23 +207,18 @@ mod tests {
 
         assert_eq!(
             response,
-            WorkerResponse::done_with_io(
-                "job",
-                0,
-                Some(vec!["package.json".to_owned(), "src/**/*.ts".to_owned()]),
-                Some(vec!["dist/**".to_owned()]),
-            )
+            WorkerResponse::done_with_outputs("job", 0, Some(vec!["dist/**".to_owned()]),)
         );
     }
 
     #[test]
-    fn detected_inputs_dedupes_package_json() {
+    fn resolved_inputs_dedupes_package_json() {
         assert_eq!(
-            super::detected_inputs_with_package_json(Some(&[
+            super::resolved_inputs_with_package_json(Some(&[
                 "src/**/*.ts".to_owned(),
                 "package.json".to_owned(),
             ])),
-            Some(vec!["package.json".to_owned(), "src/**/*.ts".to_owned()])
+            vec!["package.json".to_owned(), "src/**/*.ts".to_owned()]
         );
     }
 

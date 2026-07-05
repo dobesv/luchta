@@ -23,6 +23,7 @@ fn resolve_task(id: &str) -> ResolveTask {
         package: "@repo/app".to_owned(),
         cwd: Some("packages/app".to_owned()),
         scripts: vec!["build".to_owned()],
+        inputs: Vec::new(),
         mode: ResolveMode::Run,
     }
 }

@@ -61,6 +61,7 @@ fn resolve_task(id: &str, name: &str, command: &str, mode: ResolveMode) -> Resol
         package: "@repo/app".to_owned(),
         cwd: Some("packages/app".to_owned()),
         scripts: vec!["ignored".to_owned()],
+        inputs: Vec::new(),
         mode,
     }
 }

@@ -342,6 +342,7 @@ mod tests {
             package: "pkg".to_owned(),
             cwd: None,
             scripts: Vec::new(),
+            inputs: Vec::new(),
             mode: ResolveMode::Run,
         })
     }
