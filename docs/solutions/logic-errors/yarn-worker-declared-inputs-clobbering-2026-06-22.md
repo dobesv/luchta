@@ -17,6 +17,9 @@ tags:
 plan_ref: luchta-yarn-worker-inputs-clobbering
 ---
 
+> [!IMPORTANT]
+> The run-time `Done.inputs` mechanism described here has been **removed**. Inputs are now reported during the resolve phase via `TaskModification.inputs`. This change ensures authoritative pre-execution snapshots and closes TOCTOU races. See [worker-inputs-moved-to-resolve-phase-2026-07-05.md](worker-inputs-moved-to-resolve-phase-2026-07-05.md).
+
 ## Problem
 
 Yarn worker reported only `package.json` as a task's done-time inputs. The engine treats worker-reported done-time inputs/outputs as REPLACE semantics (not merge), so this clobbered the task's declared inputs (e.g. `src/**/*.ts`), breaking cache invalidation — edits to source files no longer busted the build cache.
@@ -123,8 +126,8 @@ Two distinct phases:
 
 | Phase | Mechanism | What it modifies |
 |-------|-----------|------------------|
-| Resolve-time | `TaskModification` / `Modify` | Command, `depends_on`, weight — structural edits |
-| Run-time | `Done.inputs/outputs` | Effective I/O for cache hashing |
+| Resolve-time | `TaskModification` / `Modify` | Command, `depends_on`, weight, inputs — structural edits |
+| Run-time | `Done.outputs` | Effective outputs for cache hashing |
 
 This fix is the run-time analogue of the resolve-time `TaskModification` mechanism. Both follow "edit, don't reconstruct" — workers modify specific fields while preserving the rest.
 

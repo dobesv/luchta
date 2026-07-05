@@ -76,14 +76,9 @@ pub struct WorkerRequest {
     pub id: String,
     pub command: String,
     pub cwd: Option<String>,
-    /// The task's declared input/output glob patterns, forwarded so a worker can
-    /// *edit* them (e.g. yarn worker returns declared inputs plus `package.json`)
-    /// rather than reconstruct the set from scratch. This is the run-time analogue
-    /// of resolve-time [`TaskModification`]: `TaskModification` edits the task spec
-    /// (command/depends_on/weight) before execution, while these fields feed the
-    /// worker's `Done` response, which the engine uses as the task's effective I/O
-    /// patterns for cache hashing. `None` means the worker leaves the engine's
-    /// declared patterns untouched.
+    /// The task's resolved input/output glob patterns, forwarded for reference.
+    /// Note: Inputs are reported during the resolve phase via `TaskModification.inputs`;
+    /// the `Done` message only carries `outputs`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inputs: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -157,8 +152,7 @@ pub enum WorkerResponse {
     Done {
         id: String,
         exit_code: i32,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        inputs: Option<Vec<String>>,
+        /// Optional list of output patterns discovered during the run.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         outputs: Option<Vec<String>>,
     },
@@ -188,12 +182,7 @@ pub fn is_valid_report_filename(name: &str) -> bool {
     !matches!(name, "stdout.log" | "stderr.log" | "meta.bincode")
 }
 
-pub type WorkerDonePayload = (
-    i32,
-    Option<Vec<String>>,
-    Option<Vec<String>>,
-    Vec<CapturedLogLine>,
-);
+pub type WorkerDonePayload = (i32, Option<Vec<String>>, Vec<CapturedLogLine>);
 
 impl WorkerResponse {
     pub fn log(id: impl Into<String>, stream: LogStream, line: impl Into<String>) -> Self {
@@ -222,21 +211,18 @@ impl WorkerResponse {
         Self::Done {
             id: id.into(),
             exit_code,
-            inputs: None,
             outputs: None,
         }
     }
 
-    pub fn done_with_io(
+    pub fn done_with_outputs(
         id: impl Into<String>,
         exit_code: i32,
-        inputs: Option<Vec<String>>,
         outputs: Option<Vec<String>>,
     ) -> Self {
         Self::Done {
             id: id.into(),
             exit_code,
-            inputs,
             outputs,
         }
     }
@@ -280,10 +266,9 @@ impl WorkerResponse {
         match self {
             Self::Done {
                 exit_code,
-                inputs,
                 outputs,
                 ..
-            } => Some((exit_code, inputs, outputs, Vec::new())),
+            } => Some((exit_code, outputs, Vec::new())),
             _ => None,
         }
     }
@@ -380,6 +365,10 @@ pub struct ResolveTask {
     /// Script names declared by the target package (from `PackageNode`).
     #[serde(default)]
     pub scripts: Vec<String>,
+    /// Declared task inputs from config. Resolve-time worker modifications may
+    /// replace these with worker-computed canonical inputs.
+    #[serde(default)]
+    pub inputs: Vec<String>,
     /// Graph-build mode.
     #[serde(default)]
     pub mode: ResolveMode,
@@ -435,6 +424,14 @@ pub struct TaskModification {
     /// static filter unchanged; `Some(list)` fully replaces it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dependencies: Option<Vec<String>>,
+    /// Replacement file input glob patterns, computed by the worker at resolve
+    /// time. `Some(list)` fully REPLACES the task's declared inputs (the worker
+    /// may narrow or expand the set; it must re-include any declared pattern it
+    /// still wants tracked). `None` leaves the declared inputs unchanged. The
+    /// engine snapshots these before the run, so they — not the run-phase
+    /// output — are what the build cache hashes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inputs: Option<Vec<String>>,
 }
 
 impl TaskModification {
@@ -451,6 +448,9 @@ impl TaskModification {
         }
         if let Some(dependencies) = &self.dependencies {
             definition.dependencies = dependencies.clone();
+        }
+        if let Some(inputs) = &self.inputs {
+            definition.inputs = inputs.clone();
         }
     }
 }
@@ -633,17 +633,15 @@ mod tests {
                 }),
             ),
             (
-                WorkerResponse::done_with_io(
+                WorkerResponse::done_with_outputs(
                     "pkg#task",
                     0,
-                    Some(vec!["src/**/*.ts".to_owned()]),
                     Some(vec!["dist/**".to_owned()]),
                 ),
                 json!({
                     "type": "done",
                     "id": "pkg#task",
                     "exitCode": 0,
-                    "inputs": ["src/**/*.ts"],
                     "outputs": ["dist/**"]
                 }),
             ),
@@ -764,6 +762,7 @@ mod tests {
             package: "@repo/app".to_owned(),
             cwd: Some("packages/app".to_owned()),
             scripts: vec!["build".to_owned(), "test".to_owned()],
+            inputs: vec!["src/**/*.ts".to_owned()],
             mode: ResolveMode::Check,
         };
         let message = WorkerMessage::from(resolve.clone());
@@ -798,6 +797,7 @@ mod tests {
             package: "p".to_owned(),
             cwd: None,
             scripts: Vec::new(),
+            inputs: Vec::new(),
             mode: ResolveMode::Run,
         };
         assert_eq!(with_command.resolved_script_name(), "compile");
@@ -823,6 +823,7 @@ mod tests {
                     depends_on: Some(vec![DependsOn::DirectUpstream(TaskName::from("build"))]),
                     weight: Some(4),
                     dependencies: None,
+                    inputs: None,
                 }),
                 json!({
                     "decision": "modify",
@@ -885,6 +886,7 @@ mod tests {
             depends_on: None,
             weight: None,
             dependencies: Some(vec!["babel".to_owned()]),
+            inputs: None,
         };
         modification.apply_to(&mut definition);
 
@@ -907,6 +909,7 @@ mod tests {
             depends_on: None,
             weight: None,
             dependencies: None,
+            inputs: None,
         };
         modification.apply_to(&mut definition);
 

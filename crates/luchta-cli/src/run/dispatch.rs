@@ -490,16 +490,14 @@ fn build_cache_write_context(task_id: &TaskId, ctx: &DecisionContext) -> CacheIn
 
     // Capture the pre-execution input snapshot used for the stability check.
     //
-    // This resolves the task's DECLARED inputs BEFORE the task runs, so we can
-    // detect a concurrent edit to a declared input during execution.
-    //
-    // Worker-detected inputs (files a worker discovers only during the run) are
-    // intentionally NOT part of this snapshot: they have no pre-execution
-    // baseline. Seeding them from a prior record's stored hashes would be wrong —
-    // a legitimate change to a detected input between runs (the very reason the
-    // task is re-running) would then look like a mid-run concurrent change and
-    // spuriously suppress the cache write. Detected inputs are instead recorded
-    // best-effort with their post-run hash in `check_input_stability`.
+    // `task_def.inputs` here is the task's RESOLVED input set: any worker
+    // `Modify.inputs` returned during `TaskGraph::build_resolved` has already
+    // replaced the declared config inputs by this point (resolve completes
+    // before any task is dispatched). Snapshotting them BEFORE the task runs
+    // gives every tracked input — worker-provided ones included — a pre-execution
+    // baseline, so a concurrent edit during execution is detected by the
+    // post-run stability check (which re-hashes this same set and, on mismatch,
+    // skips the cache write and leaves the task dirty).
     let pre_snapshot = resolve_pre_execution_inputs(
         &task_def.inputs,
         &cache_context.cache_package.package_name,
@@ -607,7 +605,6 @@ enum BuildRecordResult {
 /// additional (detected) patterns beyond the declared ones.
 struct RunRecordPatterns {
     input_patterns: Vec<String>,
-    detected_input_patterns: bool,
     output_patterns: Vec<String>,
     detected_output_patterns: bool,
 }
@@ -634,7 +631,7 @@ fn assemble_run_record(
         inputs,
         output_patterns: patterns.output_patterns.clone(),
         outputs,
-        detected_input_patterns: patterns.detected_input_patterns,
+        detected_input_patterns: false,
         detected_output_patterns: patterns.detected_output_patterns,
         outputs_hash,
         env_hash: cache_ctx.env_hash,
@@ -657,11 +654,9 @@ fn assemble_run_record(
 /// compares the pre-snapshot against the declared subset of `post_inputs`:
 /// - A declared input changed/deleted mid-run -> `StabilityMismatch` (no cache
 ///   write, no watch-state registration; the task stays dirty so watch mode reruns).
-/// - Otherwise the record's declared inputs come from the verified-stable
-///   pre-snapshot (authoritative — this also closes the post-resolve->write gap),
-///   and any worker-detected inputs (absent from the pre-snapshot) are appended
-///   best-effort with their post-run hash. A later change to a detected input is
-///   still caught by the normal decide() comparison on the next run.
+/// - Otherwise record inputs come from verified-stable pre-snapshot captured
+///   before execution. This authoritative snapshot already reflects any
+///   resolve-time worker input override and closes post-resolve->write gap.
 fn build_successful_run_record(
     cache_ctx: &CacheWriteContext,
     args: &BuildRunRecordArgs<'_>,
@@ -671,7 +666,6 @@ fn build_successful_run_record(
     let stable_inputs = match check_input_stability(
         &cache_ctx.pre_snapshot,
         post_inputs,
-        patterns.detected_input_patterns,
         &cache_ctx.task_id,
     ) {
         Ok(inputs) => inputs,
@@ -698,8 +692,7 @@ fn build_run_record(
 ) -> BuildRecordResult {
     let (output_patterns, detected_output_patterns) =
         effective_output_patterns(&cache_ctx.task_def, args.outcome);
-    let (input_patterns, detected_input_patterns) =
-        effective_input_patterns(&cache_ctx.task_def, args.outcome);
+    let input_patterns = cache_ctx.task_def.inputs.clone();
 
     // Resolve inputs after execution for the stability comparison.
     let post_inputs = match resolve_cache_inputs(cache_ctx, &input_patterns) {
@@ -710,7 +703,6 @@ fn build_run_record(
 
     let patterns = RunRecordPatterns {
         input_patterns,
-        detected_input_patterns,
         output_patterns,
         detected_output_patterns,
     };
@@ -1497,16 +1489,6 @@ fn effective_output_patterns(
     match outcome.and_then(|o| o.detected_outputs.clone()) {
         Some(p) => (p, true),
         None => (task_def.outputs.clone(), false),
-    }
-}
-
-fn effective_input_patterns(
-    task_def: &TaskDefinition,
-    outcome: Option<&TaskRunOutcome>,
-) -> (Vec<String>, bool) {
-    match outcome.and_then(|o| o.detected_inputs.clone()) {
-        Some(patterns) => (patterns, true),
-        None => (task_def.inputs.clone(), false),
     }
 }
 

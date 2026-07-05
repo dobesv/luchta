@@ -29,6 +29,7 @@ fn resolve_task(
         package: "@repo/app".to_owned(),
         cwd: cwd.map(str::to_owned),
         scripts: scripts.iter().map(|script| script.to_string()).collect(),
+        inputs: Vec::new(),
         mode: ResolveMode::Run,
     }
 }

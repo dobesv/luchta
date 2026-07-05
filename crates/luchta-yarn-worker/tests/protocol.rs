@@ -81,7 +81,7 @@ fn failing_request_preserves_exit_code() {
 }
 
 #[test]
-fn done_response_preserves_declared_inputs_and_outputs() {
+fn done_response_preserves_declared_outputs_only() {
     let request = WorkerRequest::new("job-io", "echo hi")
         .with_inputs(["src/**/*.ts"])
         .with_outputs(["dist/**"]);
@@ -94,13 +94,7 @@ fn done_response_preserves_declared_inputs_and_outputs() {
             value["type"].as_str() == Some("done") && value["id"].as_str() == Some("job-io")
         })
         .expect("done response present");
-    assert_eq!(
-        done["inputs"],
-        Value::Array(vec![
-            Value::String("package.json".to_owned()),
-            Value::String("src/**/*.ts".to_owned()),
-        ])
-    );
+    assert!(done.get("inputs").is_none(), "done should not include inputs: {done}");
     assert_eq!(
         done["outputs"],
         Value::Array(vec![Value::String("dist/**".to_owned())])

@@ -286,6 +286,7 @@ mod tests {
             package: "@repo/app".to_owned(),
             cwd: Some("packages/app".to_owned()),
             scripts: scripts.iter().map(|script| script.to_string()).collect(),
+            inputs: Vec::new(),
             mode: ResolveMode::Run,
         }
     }

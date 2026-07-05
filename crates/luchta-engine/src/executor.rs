@@ -176,7 +176,6 @@ impl ExecutionLogSink {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskRunOutcome {
     pub status: ExitStatus,
-    pub detected_inputs: Option<Vec<String>>,
     pub detected_outputs: Option<Vec<String>>,
 }
 
@@ -184,19 +183,13 @@ impl TaskRunOutcome {
     fn shell(status: ExitStatus) -> Self {
         Self {
             status,
-            detected_inputs: None,
             detected_outputs: None,
         }
     }
 
-    fn worker(
-        status: ExitStatus,
-        detected_inputs: Option<Vec<String>>,
-        detected_outputs: Option<Vec<String>>,
-    ) -> Self {
+    fn worker(status: ExitStatus, detected_outputs: Option<Vec<String>>) -> Self {
         Self {
             status,
-            detected_inputs,
             detected_outputs,
         }
     }
@@ -314,8 +307,8 @@ impl WeightedExecutor {
                         source,
                     });
                 drop(permit);
-                return result.map(|(code, inputs, outputs, _logs)| {
-                    TaskRunOutcome::worker(synthesize_exit_status(code), inputs, outputs)
+                return result.map(|(code, outputs, _logs)| {
+                    TaskRunOutcome::worker(synthesize_exit_status(code), outputs)
                 });
             }
             (Some(worker_name), None) => {
