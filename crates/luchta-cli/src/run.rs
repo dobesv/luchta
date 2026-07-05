@@ -14,8 +14,8 @@ use globset::{Glob, GlobSet, GlobSetBuilder};
 use luchta_cache::shared::SharedCache;
 use luchta_cache::{
     combined_outputs_hash, decide, resolve_cache_dir, resolve_inputs_with_semantics,
-    resolve_outputs, Cache, CurrentState, Decision, DecisionResult, FileEntry, ListingCache,
-    RunReason, TaskRunRecord,
+    resolve_outputs, Cache, CurrentState, Decision, DecisionResult, ListingCache, RunReason,
+    TaskRunRecord,
 };
 use luchta_engine::{
     expand_input_patterns, is_root_task, CompletionSignal, ExecutionLogSink, ExecutionRequest,
@@ -37,13 +37,8 @@ use crate::watch::registry::TaskWatchRegistry;
 use tokio_util::sync::CancellationToken;
 
 mod dispatch;
-mod input_stability;
 mod pause;
 use dispatch::{build_command_map, CommandMap};
-use input_stability::{
-    check_input_stability, resolve_cache_inputs, resolve_cache_outputs,
-    resolve_pre_execution_inputs, CacheInputResult,
-};
 use pause::dispatch_loop;
 
 mod setup;
@@ -456,10 +451,6 @@ struct CacheWriteContext {
     decision: CacheDecisionContext,
     /// Registry of watched task inputs, updated when this task's record is built.
     task_watch_registry: TaskWatchRegistry,
-    /// Pre-execution snapshot of resolved input files (content hashes).
-    /// Captured BEFORE task execution for ALL cacheable tasks, used to detect
-    /// concurrent edits during execution. On mismatch, cache write is skipped.
-    pre_snapshot: Vec<FileEntry>,
 }
 
 struct CacheStateContext {

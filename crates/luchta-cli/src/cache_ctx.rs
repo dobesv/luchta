@@ -48,9 +48,9 @@ pub(crate) fn load_lockfile_state(workspace_root: &Path) -> LockfileState {
 
 pub(crate) struct PackageDirResolver {
     package_dir: PathBuf,
-    pub(crate) repo_root: PathBuf,
+    repo_root: PathBuf,
     source_pkg: PackageName,
-    pub(crate) package_graph: PackageGraph,
+    package_graph: PackageGraph,
     listing_cache: Arc<ListingCache>,
 }
 
