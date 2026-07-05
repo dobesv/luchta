@@ -32,10 +32,27 @@ pub(crate) fn resolve_pre_execution_inputs(
     let requests = match expand_input_patterns(input_patterns, source_pkg, package_graph, repo_root)
     {
         Ok(reqs) => reqs,
-        Err(_) => return Vec::new(),
+        Err(error) => {
+            // A pre-run resolution failure yields an empty baseline. Log it so it
+            // is not silently mistaken for "task has no inputs": if the post-run
+            // resolution then succeeds, the diff would otherwise look like inputs
+            // appeared mid-run and spuriously skip the cache write.
+            eprintln!(
+                "warning: failed to expand input patterns for pre-execution snapshot in package '{source_pkg}': {error} — skipping concurrent-change detection for this run"
+            );
+            return Vec::new();
+        }
     };
 
-    resolve_inputs_with_semantics(&requests).unwrap_or_default()
+    match resolve_inputs_with_semantics(&requests) {
+        Ok(entries) => entries,
+        Err(error) => {
+            eprintln!(
+                "warning: failed to resolve inputs for pre-execution snapshot in package '{source_pkg}': {error} — skipping concurrent-change detection for this run"
+            );
+            Vec::new()
+        }
+    }
 }
 
 /// Check input stability across task execution and build record's input list.

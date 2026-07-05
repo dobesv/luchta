@@ -2818,7 +2818,6 @@ mod tests {
         );
     }
 
-
     #[tokio::test]
     async fn worker_modify_inputs_replace_declared_inputs() {
         let package_graph = package_graph_single("@repo/a");
@@ -2831,7 +2830,10 @@ mod tests {
         )]);
 
         let resolver = StubResolver(|request: &ResolveTask| {
-            assert_eq!(request.inputs, vec!["src/**".to_owned(), "package.json".to_owned()]);
+            assert_eq!(
+                request.inputs,
+                vec!["src/**".to_owned(), "package.json".to_owned()]
+            );
             ResolveResult::modify(TaskModification {
                 inputs: Some(vec!["generated/**".to_owned()]),
                 ..TaskModification::default()

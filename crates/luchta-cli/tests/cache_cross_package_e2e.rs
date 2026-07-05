@@ -68,4 +68,3 @@ fn declared_input_unknown_package_fails_task() {
     // References a package that does not exist in the workspace graph.
     run_declared_input(&temp, "nonexistent#file.txt").failure();
 }
-

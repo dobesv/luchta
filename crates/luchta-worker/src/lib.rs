@@ -265,9 +265,7 @@ impl WorkerResponse {
     pub fn into_done(self) -> Option<WorkerDonePayload> {
         match self {
             Self::Done {
-                exit_code,
-                outputs,
-                ..
+                exit_code, outputs, ..
             } => Some((exit_code, outputs, Vec::new())),
             _ => None,
         }
@@ -633,11 +631,7 @@ mod tests {
                 }),
             ),
             (
-                WorkerResponse::done_with_outputs(
-                    "pkg#task",
-                    0,
-                    Some(vec!["dist/**".to_owned()]),
-                ),
+                WorkerResponse::done_with_outputs("pkg#task", 0, Some(vec!["dist/**".to_owned()])),
                 json!({
                     "type": "done",
                     "id": "pkg#task",

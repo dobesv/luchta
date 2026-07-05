@@ -24,7 +24,9 @@ impl Worker for YarnWorker {
         let script = req.resolved_script_name();
         if req.scripts.iter().any(|candidate| candidate == script) {
             ResolveResult::modify(TaskModification {
-                inputs: Some(resolved_inputs_with_package_json(Some(req.inputs.as_slice()))),
+                inputs: Some(resolved_inputs_with_package_json(Some(
+                    req.inputs.as_slice(),
+                ))),
                 ..TaskModification::default()
             })
         } else {
@@ -84,7 +86,12 @@ mod tests {
             cwd: Some("packages/app".to_owned()),
             scripts: scripts.iter().map(|script| script.to_string()).collect(),
             inputs: inputs
-                .map(|patterns| patterns.iter().map(|pattern| (*pattern).to_owned()).collect())
+                .map(|patterns| {
+                    patterns
+                        .iter()
+                        .map(|pattern| (*pattern).to_owned())
+                        .collect()
+                })
                 .unwrap_or_default(),
             mode: ResolveMode::Run,
         }
@@ -92,7 +99,8 @@ mod tests {
 
     #[test]
     fn resolve_accepts_task_whose_name_is_a_declared_script() {
-        let result = YarnWorker.resolve_task(&resolve_request("build", "", &["build", "test"], None));
+        let result =
+            YarnWorker.resolve_task(&resolve_request("build", "", &["build", "test"], None));
         assert_eq!(
             result.decision,
             luchta_worker::ResolveDecision::Modify(TaskModification {
@@ -117,7 +125,8 @@ mod tests {
 
     #[test]
     fn resolve_uses_explicit_command_as_script_name() {
-        let accepted = YarnWorker.resolve_task(&resolve_request("start", "serve", &["serve"], None));
+        let accepted =
+            YarnWorker.resolve_task(&resolve_request("start", "serve", &["serve"], None));
         assert_eq!(
             accepted.decision,
             luchta_worker::ResolveDecision::Modify(TaskModification {
@@ -126,14 +135,21 @@ mod tests {
             })
         );
 
-        let pruned = YarnWorker.resolve_task(&resolve_request("serve", "missing", &["serve"], None));
-        assert!(matches!(pruned.decision, luchta_worker::ResolveDecision::Prune { .. }));
+        let pruned =
+            YarnWorker.resolve_task(&resolve_request("serve", "missing", &["serve"], None));
+        assert!(matches!(
+            pruned.decision,
+            luchta_worker::ResolveDecision::Prune { .. }
+        ));
     }
 
     #[test]
     fn resolve_prunes_when_package_declares_no_scripts() {
         let result = YarnWorker.resolve_task(&resolve_request("build", "", &[], None));
-        assert!(matches!(result.decision, luchta_worker::ResolveDecision::Prune { .. }));
+        assert!(matches!(
+            result.decision,
+            luchta_worker::ResolveDecision::Prune { .. }
+        ));
     }
 
     #[test]
@@ -191,11 +207,7 @@ mod tests {
 
         assert_eq!(
             response,
-            WorkerResponse::done_with_outputs(
-                "job",
-                0,
-                Some(vec!["dist/**".to_owned()]),
-            )
+            WorkerResponse::done_with_outputs("job", 0, Some(vec!["dist/**".to_owned()]),)
         );
     }
 

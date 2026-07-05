@@ -663,14 +663,11 @@ fn build_successful_run_record(
     patterns: &RunRecordPatterns,
     post_inputs: &[FileEntry],
 ) -> BuildRecordResult {
-    let stable_inputs = match check_input_stability(
-        &cache_ctx.pre_snapshot,
-        post_inputs,
-        &cache_ctx.task_id,
-    ) {
-        Ok(inputs) => inputs,
-        Err(reason) => return BuildRecordResult::StabilityMismatch(reason),
-    };
+    let stable_inputs =
+        match check_input_stability(&cache_ctx.pre_snapshot, post_inputs, &cache_ctx.task_id) {
+            Ok(inputs) => inputs,
+            Err(reason) => return BuildRecordResult::StabilityMismatch(reason),
+        };
 
     let record = assemble_run_record(cache_ctx, args, patterns, stable_inputs);
 

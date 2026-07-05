@@ -94,7 +94,10 @@ fn done_response_preserves_declared_outputs_only() {
             value["type"].as_str() == Some("done") && value["id"].as_str() == Some("job-io")
         })
         .expect("done response present");
-    assert!(done.get("inputs").is_none(), "done should not include inputs: {done}");
+    assert!(
+        done.get("inputs").is_none(),
+        "done should not include inputs: {done}"
+    );
     assert_eq!(
         done["outputs"],
         Value::Array(vec![Value::String("dist/**".to_owned())])

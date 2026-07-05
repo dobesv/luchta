@@ -1,4 +1,8 @@
-use std::{process::Command, thread, time::{Duration, Instant}};
+use std::{
+    process::Command,
+    thread,
+    time::{Duration, Instant},
+};
 
 use assert_cmd::prelude::*;
 use assert_fs::prelude::*;
@@ -91,7 +95,9 @@ fn worker_resolve_inputs_toctou_edit_skips_cache_write_and_reruns() {
     let started = pkg.child("started-run");
     let allow_finish = pkg.child("allow-finish");
     pkg.child("resolved-input.txt").write_str("H1\n").unwrap();
-    pkg.child("declared-ignored.txt").write_str("declared\n").unwrap();
+    pkg.child("declared-ignored.txt")
+        .write_str("declared\n")
+        .unwrap();
 
     let workspace = temp.path().to_path_buf();
     let handle = thread::spawn(move || {
@@ -104,7 +110,11 @@ fn worker_resolve_inputs_toctou_edit_skips_cache_write_and_reruns() {
             .expect("luchta run completes")
     });
 
-    wait_for_path(started.path(), Duration::from_secs(30), "worker start sentinel");
+    wait_for_path(
+        started.path(),
+        Duration::from_secs(30),
+        "worker start sentinel",
+    );
     pkg.child("resolved-input.txt").write_str("H2\n").unwrap();
     allow_finish.write_str("go\n").unwrap();
 
@@ -142,7 +152,11 @@ fn worker_resolve_inputs_narrowing_replaces_declared_inputs_end_to_end() {
     pkg.child("counter.txt").assert("1\n");
 
     pkg.child("ignored.txt").write_str("Y\n").unwrap();
-    common::git_commit_paths(temp.path(), &["packages/app/ignored.txt"], "edit ignored file");
+    common::git_commit_paths(
+        temp.path(),
+        &["packages/app/ignored.txt"],
+        "edit ignored file",
+    );
     run_luchta(&temp, "build").success();
     pkg.child("counter.txt").assert("1\n");
 
