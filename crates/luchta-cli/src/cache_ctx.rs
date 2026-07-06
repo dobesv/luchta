@@ -50,7 +50,7 @@ pub(crate) struct PackageDirResolver {
     package_dir: PathBuf,
     pub(crate) repo_root: PathBuf,
     source_pkg: PackageName,
-    pub(crate) package_graph: PackageGraph,
+    pub(crate) package_graph: Arc<PackageGraph>,
     listing_cache: Arc<ListingCache>,
 }
 
@@ -59,14 +59,14 @@ impl PackageDirResolver {
         package_dir: PathBuf,
         repo_root: PathBuf,
         source_pkg: PackageName,
-        package_graph: PackageGraph,
+        package_graph: impl Into<Arc<PackageGraph>>,
         listing_cache: Arc<ListingCache>,
     ) -> Self {
         Self {
             package_dir,
             repo_root,
             source_pkg,
-            package_graph,
+            package_graph: package_graph.into(),
             listing_cache,
         }
     }

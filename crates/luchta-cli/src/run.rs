@@ -39,7 +39,10 @@ use tokio_util::sync::CancellationToken;
 mod dispatch;
 mod input_stability;
 mod pause;
-use dispatch::{build_command_map, CommandMap};
+use dispatch::{
+    build_command_map, dispatch_decision_result, dispatch_ready_task, dispatch_ready_task_async,
+    CommandMap, DecisionTaskResult,
+};
 use input_stability::{
     check_input_stability, resolve_cache_inputs, resolve_cache_outputs,
     resolve_pre_execution_inputs, CacheInputResult,
@@ -52,9 +55,6 @@ use setup::{
     build_execution_resources, build_memory_pressure, report_run_outcome, BuildResourcesInputs,
     ExecutionResources,
 };
-
-// Re-exported so `run/pause.rs` can reach it via `super::dispatch_ready_task`.
-use dispatch::dispatch_ready_task;
 
 /// User's task selection from CLI arguments.
 ///
@@ -450,7 +450,7 @@ struct CacheWriteContext {
     start_unix_ms: u64,
     repo_root: PathBuf,
     source_pkg: PackageName,
-    package_graph: PackageGraph,
+    package_graph: Arc<PackageGraph>,
     /// Resolved cache nonce string for this task.
     cache_nonce: Option<String>,
     decision: CacheDecisionContext,

@@ -136,16 +136,30 @@ fn format_captured_failure_logs(context: FailureLogContext, sink: &ExecutionLogS
     )
 }
 
-pub(super) fn dispatch_ready_task(
+pub(super) fn dispatch_ready_task(task: ReadyTask, ctx: &DispatchContext<'_>) {
+    spawn_task_runner(task, ctx);
+}
+
+/// Begins handling a ready task. Fast-path terminal states (outside selection,
+/// fast-stop, invalid, ordering connector) are finalized immediately and return
+/// `None`. Otherwise the cache-skip decision is computed:
+/// - a pure LOCAL decision is offloaded to a bounded blocking pool and delivered
+///   later via `decision_result_tx` (returns `None`);
+/// - a SHARED-cache or non-cache-enabled decision is computed synchronously here
+///   (kept serialized) and returned as `Some(..)` so the caller can feed it
+///   straight into the sequential completion path.
+pub(super) fn dispatch_ready_task_async(
     task_node: TaskNode,
     done_tx: CompletionSignal,
     ctx: &DispatchContext<'_>,
-) {
+    decision_semaphore: Arc<tokio::sync::Semaphore>,
+    decision_result_tx: tokio::sync::mpsc::Sender<DecisionTaskResult>,
+) -> Option<DecisionTaskResult> {
     let task_id = task_node.id.clone();
 
     if !ctx.tasks_to_run.contains(&task_id) {
         mark_task_outside_selection(ctx.reporter, &task_id, done_tx);
-        return;
+        return None;
     }
 
     // In default mode, once a failure has occurred no further work is dispatched
@@ -154,37 +168,71 @@ pub(super) fn dispatch_ready_task(
     // suppressed (uncounted) rather than reported as an additional failure.
     if should_skip_for_fast_stop(ctx) {
         skip_task_after_prior_failure(ctx.reporter, &task_id, done_tx);
-        return;
+        return None;
     }
 
     if let Some(message) = ctx.invalid.get(&task_id) {
         fail_invalid_task(&task_id, message, done_tx, ctx);
-        return;
+        return None;
     }
 
     let Some(request) = ctx.commands.get(&task_id).cloned() else {
         mark_ordering_connector(ctx.reporter, &task_id, done_tx);
-        return;
+        return None;
     };
 
     let cache_enabled = ctx
         .task_graph
         .task_definition(&task_id)
         .is_some_and(TaskDefinition::cache_enabled);
-    let mut done_tx = Some(done_tx);
-    if handle_cache_skip(cache_enabled, &task_id, &mut done_tx, ctx) {
-        return;
-    }
 
-    spawn_task_runner(
-        ReadyTask {
+    // Only the LOCAL cache-skip decision is safe to run concurrently: it is a
+    // pure filesystem read (glob + stat) with no side effects. The SHARED-cache
+    // decision path (`try_shared_cache_skip`) restores outputs into the package
+    // directory and mutates shared state, so it must stay serialized. Tasks that
+    // are not cache-enabled need no decision at all. For those non-parallelizable
+    // cases we compute synchronously here (on the dispatch loop) and return the
+    // result so the caller feeds it straight into the sequential completion path
+    // — we deliberately do NOT `tokio::spawn` blocking work onto the async
+    // executor or bypass the decision semaphore.
+    if !cache_enabled || ctx.decision_ctx.shared_cache.is_some() {
+        let decision = if cache_enabled {
+            try_cache_skip(&task_id, &ctx.decision_ctx)
+        } else {
+            None
+        };
+        return Some(DecisionTaskResult {
             task_id,
             request,
-            done_tx: done_tx.expect("cache skip path should consume completion sender"),
+            done_tx,
             cache_enabled,
-        },
-        ctx,
-    );
+            outcome: DecisionOutcome::Direct { decision },
+        });
+    }
+
+    // Parallelizable local-cache decision: offload the blocking FS work to a
+    // bounded blocking pool and deliver the result via the channel.
+    let decision_ctx = ctx.decision_ctx.clone();
+    tokio::spawn(async move {
+        let task_id_for_decision = task_id.clone();
+        let decision_ctx_for_decision = decision_ctx.clone();
+        let decision_result = super::pause::run_decision_task(decision_semaphore, move || {
+            try_cache_skip(&task_id_for_decision, &decision_ctx_for_decision)
+        })
+        .await;
+
+        let _ = decision_result_tx
+            .send(DecisionTaskResult {
+                task_id,
+                request,
+                done_tx,
+                cache_enabled,
+                outcome: DecisionOutcome::Parallelizable { decision_result },
+            })
+            .await;
+    });
+
+    None
 }
 
 fn mark_task_outside_selection(
@@ -247,22 +295,13 @@ fn skip_task_after_prior_failure(
 }
 
 fn handle_cache_skip(
-    cache_enabled: bool,
     task_id: &TaskId,
-    done_tx: &mut Option<CompletionSignal>,
+    decision: Decision,
+    done_tx: CompletionSignal,
     ctx: &DispatchContext<'_>,
-) -> bool {
-    if !cache_enabled {
-        return false;
-    }
-
-    let Some(decision) = try_cache_skip(task_id, &ctx.decision_ctx) else {
-        return false;
-    };
-
+) {
     match decision {
         Decision::Skip => {
-            // Local cache hit — this IS the legacy "skipped" count.
             ctx.reporter.task_skipped_cache_hit(task_id);
             if let Some(prior) = ctx.cache.read(&task_id.to_string()) {
                 record_output_hash(ctx.output_hashes, task_id, prior.outputs_hash);
@@ -274,22 +313,70 @@ fn handle_cache_skip(
                 )
                 .expect("cache skip task watch registration should compile globs");
             }
-            let _ = done_tx
-                .take()
-                .expect("cache hit should own completion sender")
-                .send(true);
-            true
+            let _ = done_tx.send(true);
         }
         Decision::SharedHit => {
             ctx.reporter.task_skipped_shared_cache(task_id);
-            let _ = done_tx
-                .take()
-                .expect("shared cache hit should own completion sender")
-                .send(true);
-            true
+            let _ = done_tx.send(true);
         }
-        Decision::Run => false,
+        Decision::Run => {
+            let _ = done_tx.send(false);
+        }
     }
+}
+
+#[derive(Debug)]
+pub(super) enum DecisionOutcome {
+    Parallelizable {
+        decision_result: Result<Option<Decision>, miette::Report>,
+    },
+    Direct {
+        decision: Option<Decision>,
+    },
+}
+
+#[derive(Debug)]
+pub(super) struct DecisionTaskResult {
+    pub(super) task_id: TaskId,
+    pub(super) request: ExecutionRequest,
+    pub(super) done_tx: CompletionSignal,
+    pub(super) cache_enabled: bool,
+    pub(super) outcome: DecisionOutcome,
+}
+
+pub(super) fn dispatch_decision_result(
+    result: DecisionTaskResult,
+    ctx: &DispatchContext<'_>,
+) -> Result<Option<ReadyTask>> {
+    let DecisionTaskResult {
+        task_id,
+        request,
+        done_tx,
+        cache_enabled,
+        outcome,
+    } = result;
+
+    let decision = match outcome {
+        DecisionOutcome::Parallelizable { decision_result } => decision_result?,
+        DecisionOutcome::Direct { decision } => decision,
+    };
+
+    if let Some(decision) = decision {
+        match decision {
+            Decision::Skip | Decision::SharedHit => {
+                handle_cache_skip(&task_id, decision, done_tx, ctx);
+                return Ok(None);
+            }
+            Decision::Run => {}
+        }
+    }
+
+    Ok(Some(ReadyTask {
+        task_id,
+        request,
+        done_tx,
+        cache_enabled,
+    }))
 }
 
 fn build_task_run_context(
@@ -503,7 +590,7 @@ fn build_cache_write_context(task_id: &TaskId, ctx: &DecisionContext) -> CacheIn
         start_unix_ms: now_unix_ms(),
         repo_root: ctx.workspace_root.clone(),
         source_pkg: cache_context.cache_package.package_name.clone(),
-        package_graph: (*ctx.package_graph).clone(),
+        package_graph: Arc::clone(&ctx.package_graph),
         cache_nonce: nonce,
         decision: cache_run_decision(),
         task_watch_registry: Arc::clone(&ctx.task_watch_registry),
@@ -519,7 +606,7 @@ fn cache_state_context(task_id: &TaskId, ctx: &DecisionContext) -> Option<CacheS
         cache_package.package_path.clone(),
         ctx.workspace_root.clone(),
         cache_package.package_name.clone(),
-        (*ctx.package_graph).clone(),
+        Arc::clone(&ctx.package_graph),
         Arc::clone(&ctx.listing_cache),
     );
 
@@ -1063,7 +1150,7 @@ fn try_shared_cache_skip(
 /// A ready task to spawn: what to run, where to report completion, and whether
 /// caching applies. Groups the per-task parameters so `spawn_task_runner` stays
 /// within a sane argument count.
-struct ReadyTask {
+pub(super) struct ReadyTask {
     task_id: TaskId,
     request: ExecutionRequest,
     done_tx: CompletionSignal,
@@ -1891,7 +1978,7 @@ mod tests {
     fn sample_cache_write_context(task_id: TaskId) -> CacheWriteContext {
         let root = tempfile::tempdir().expect("tempdir").keep();
         let package = make_test_package(&root);
-        let package_graph = build_test_package_graph(&package);
+        let package_graph = Arc::new(build_test_package_graph(&package));
         CacheWriteContext {
             task_id,
             task_def: TaskDefinition::default(),
@@ -2240,7 +2327,7 @@ mod tests {
         let package = make_test_package(temp.path());
         cache_ctx.repo_root = temp.path().to_path_buf();
         cache_ctx.package_path = package.path.to_path_buf();
-        cache_ctx.package_graph = build_test_package_graph(&package);
+        cache_ctx.package_graph = Arc::new(build_test_package_graph(&package));
         std::fs::write(package.path.join("src.txt"), "hello\n").expect("write input");
         cache_ctx.task_def.inputs = vec!["src.txt".to_string()];
         (temp, cache, task_id, cache_ctx)
@@ -2326,7 +2413,13 @@ mod tests {
         let fixture = FastStopInvalidTaskFixture::new();
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
 
-        dispatch_ready_task(fixture.task_node(), done_tx, &fixture.ctx);
+        dispatch_ready_task_async(
+            fixture.task_node(),
+            done_tx,
+            &fixture.ctx,
+            Arc::new(tokio::sync::Semaphore::new(1)),
+            tokio::sync::mpsc::channel(1).0,
+        );
 
         assert_eq!(
             done_rx.blocking_recv(),
@@ -2339,6 +2432,128 @@ mod tests {
             "invalid task after prior failure must not be counted as failed"
         );
         assert_skip_progress_without_failure_marker(fixture.ctx.reporter.as_ref());
+    }
+
+    fn decision_result_execution_request(task_id: &TaskId) -> ExecutionRequest {
+        ExecutionRequest {
+            task: TaskNode {
+                id: task_id.clone(),
+                weight: 1,
+            },
+            command: "true".to_string(),
+            cwd: None,
+            env: HashMap::new(),
+            worker: None,
+            workspace: None,
+            inputs: None,
+            outputs: None,
+            log_sink: None,
+        }
+    }
+
+    // A parallel cache-skip decision that resolves to Skip must be finalized
+    // synchronously on the result-handling path: it records completion via
+    // done_tx(true) and yields no ReadyTask (nothing to dispatch to the executor).
+    #[test]
+    fn dispatch_decision_result_skip_completes_and_yields_no_ready_task() {
+        let fixture = FastStopInvalidTaskFixture::new();
+        let task_id = fixture.task_id.clone();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+
+        let result = DecisionTaskResult {
+            task_id: task_id.clone(),
+            request: decision_result_execution_request(&task_id),
+            done_tx,
+            cache_enabled: true,
+            outcome: DecisionOutcome::Parallelizable {
+                decision_result: Ok(Some(Decision::Skip)),
+            },
+        };
+
+        let ready = dispatch_decision_result(result, &fixture.ctx).expect("decision result ok");
+        assert!(
+            ready.is_none(),
+            "a cache-skip decision must not produce a ReadyTask to dispatch"
+        );
+        assert_eq!(
+            done_rx.blocking_recv(),
+            Ok(true),
+            "cache skip must signal successful completion via done_tx"
+        );
+    }
+
+    // A decision that resolves to Run must be deferred to the pressure-gated
+    // dispatch path: dispatch_decision_result returns the ReadyTask (still
+    // owning done_tx) rather than completing it here.
+    #[test]
+    fn dispatch_decision_result_run_defers_ready_task_without_completing() {
+        let fixture = FastStopInvalidTaskFixture::new();
+        let task_id = fixture.task_id.clone();
+        let (done_tx, mut done_rx) = tokio::sync::oneshot::channel();
+
+        let result = DecisionTaskResult {
+            task_id: task_id.clone(),
+            request: decision_result_execution_request(&task_id),
+            done_tx,
+            cache_enabled: true,
+            outcome: DecisionOutcome::Direct {
+                decision: Some(Decision::Run),
+            },
+        };
+
+        let ready = dispatch_decision_result(result, &fixture.ctx).expect("decision result ok");
+        let ready = ready.expect("Run decision must yield a ReadyTask for dispatch");
+        assert_eq!(ready.task_id, task_id);
+        assert!(
+            ready.cache_enabled,
+            "cache_enabled flag must be propagated to the ReadyTask"
+        );
+        // done_tx must still be owned by the ReadyTask (not yet fired): the
+        // receiver sees the channel as still open with no value.
+        assert!(
+            matches!(
+                done_rx.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "Run path must not complete done_tx during decision handling"
+        );
+    }
+
+    // A cache-disabled task (or a shared-cache fallback miss) yields a `Direct`
+    // outcome with `None` decision. It must be treated as Run: no completion is
+    // signalled here; the task is returned for pressure-gated dispatch.
+    #[test]
+    fn dispatch_decision_result_direct_none_defers_as_run() {
+        let fixture = FastStopInvalidTaskFixture::new();
+        let task_id = fixture.task_id.clone();
+        let (done_tx, mut done_rx) = tokio::sync::oneshot::channel();
+
+        let result = DecisionTaskResult {
+            task_id: task_id.clone(),
+            request: decision_result_execution_request(&task_id),
+            done_tx,
+            cache_enabled: false,
+            outcome: DecisionOutcome::Direct { decision: None },
+        };
+
+        let ready = dispatch_decision_result(result, &fixture.ctx).expect("decision result ok");
+        let ready = ready.expect("a task with no cache decision must be dispatched to run");
+        assert_eq!(ready.task_id, task_id);
+        assert!(!ready.cache_enabled);
+        assert!(
+            matches!(
+                done_rx.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "run path must not complete done_tx during decision handling"
+        );
+    }
+
+    // The bounded decision-parallelism used for the semaphore must never be zero;
+    // a zero-permit semaphore would deadlock every cache-skip decision.
+    #[test]
+    fn decision_parallelism_is_at_least_one() {
+        assert!(super::super::pause::decision_parallelism_for_test() >= 1);
     }
 
     /// Fast-stop latch: continue mode sets any_failed but leaves interrupted false.
