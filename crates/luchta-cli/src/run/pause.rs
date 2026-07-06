@@ -1,8 +1,16 @@
-use std::{future::Future, pin::Pin, sync::Arc};
+use std::{
+    future::Future,
+    pin::Pin,
+    sync::{Arc, OnceLock},
+};
 
-use miette::Result;
+use miette::{IntoDiagnostic, Result};
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 
-use super::{dispatch_ready_task, shutdown_signal, DispatchContext, ShutdownSignal};
+use super::{
+    dispatch_decision_result, dispatch_ready_task, dispatch_ready_task_async, shutdown_signal,
+    DecisionTaskResult, DispatchContext, ShutdownSignal,
+};
 use crate::{
     cli::OutputMode,
     memory_pressure::{MemoryMonitor, MemoryPressure, PressureState},
@@ -159,6 +167,9 @@ pub(super) async fn dispatch_loop(
     monitor: &mut MemoryMonitor,
     pressure_state: &Arc<PressureState>,
 ) -> Result<()> {
+    let decision_semaphore = Arc::new(Semaphore::new(decision_parallelism()));
+    let (decision_result_tx, mut decision_result_rx) =
+        mpsc::channel::<DecisionTaskResult>(decision_parallelism().saturating_mul(4).max(1));
     // A SINGLE shutdown future for the whole loop. Both the outer select arm
     // and the inner pause loop (via ProdPressureEnv) poll this same future, so
     // a signal delivered while transitioning into the pause loop is never lost.
@@ -192,23 +203,114 @@ pub(super) async fn dispatch_loop(
                     break Ok(());
                 };
 
-                let mut env = ProdPressureEnv {
-                    monitor,
-                    pressure_state,
-                    progress_interval: &mut progress_interval,
-                    progress_reporter: ctx.reporter,
-                    shutdown_signal: &mut signal,
-                };
-                match await_pressure_clearance(&mut env).await {
-                    PressureClearance::Dispatch => dispatch_ready_task(task_node, done_tx, ctx),
-                    PressureClearance::Shutdown => {
+                // Shared-cache / non-cache-enabled decisions are computed
+                // synchronously and returned here (kept serialized); local-cache
+                // decisions are offloaded and arrive via `decision_result_rx`.
+                if let Some(result) = dispatch_ready_task_async(
+                    task_node,
+                    done_tx,
+                    ctx,
+                    Arc::clone(&decision_semaphore),
+                    decision_result_tx.clone(),
+                ) {
+                    if handle_decision_result(
+                        result,
+                        ctx,
+                        monitor,
+                        pressure_state,
+                        &mut progress_interval,
+                        &mut signal,
+                    )
+                    .await?
+                    .is_break()
+                    {
                         return interrupted_during_pause(ctx, pressure_state);
                     }
+                }
+            }
+            result = decision_result_rx.recv() => {
+                let Some(result) = result else {
+                    break Ok(());
+                };
+
+                if handle_decision_result(
+                    result,
+                    ctx,
+                    monitor,
+                    pressure_state,
+                    &mut progress_interval,
+                    &mut signal,
+                )
+                .await?
+                .is_break()
+                {
+                    return interrupted_during_pause(ctx, pressure_state);
                 }
             }
             _ = progress_interval.tick() => render_status_line(ctx.reporter, pressure_state, false),
         }
     }
+}
+
+/// Finalizes a completed cache decision on the (single) dispatch-loop task.
+///
+/// A cache Skip/SharedHit is finalized inside `dispatch_decision_result`. A
+/// task that must Run is returned as a `ReadyTask` and dispatched here behind
+/// the memory-pressure gate (only actual execution consumes weight; cache
+/// skips are never pressure-gated). Returns `ControlFlow::Break` when the
+/// pressure wait resolved to shutdown so the caller can unwind cleanly.
+async fn handle_decision_result(
+    result: DecisionTaskResult,
+    ctx: &DispatchContext<'_>,
+    monitor: &mut MemoryMonitor,
+    pressure_state: &Arc<PressureState>,
+    progress_interval: &mut tokio::time::Interval,
+    signal: &mut ShutdownFuture,
+) -> Result<std::ops::ControlFlow<()>> {
+    let Some(ready) = dispatch_decision_result(result, ctx)? else {
+        return Ok(std::ops::ControlFlow::Continue(()));
+    };
+
+    let mut env = ProdPressureEnv {
+        monitor,
+        pressure_state,
+        progress_interval,
+        progress_reporter: ctx.reporter,
+        shutdown_signal: signal,
+    };
+    match await_pressure_clearance(&mut env).await {
+        PressureClearance::Dispatch => {
+            dispatch_ready_task(ready, ctx);
+            Ok(std::ops::ControlFlow::Continue(()))
+        }
+        PressureClearance::Shutdown => Ok(std::ops::ControlFlow::Break(())),
+    }
+}
+
+#[cfg(test)]
+pub(super) fn decision_parallelism_for_test() -> usize {
+    decision_parallelism()
+}
+
+fn decision_parallelism() -> usize {
+    static PARALLELISM: OnceLock<usize> = OnceLock::new();
+    *PARALLELISM.get_or_init(|| {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .max(1)
+    })
+}
+
+pub(super) async fn run_decision_task<T, F>(semaphore: Arc<Semaphore>, blocking: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let _permit: OwnedSemaphorePermit = semaphore.acquire_owned().await.into_diagnostic()?;
+    tokio::task::spawn_blocking(blocking)
+        .await
+        .into_diagnostic()
 }
 
 fn interrupted_during_pause(
