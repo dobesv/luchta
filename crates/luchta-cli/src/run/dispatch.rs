@@ -305,11 +305,15 @@ fn build_task_run_context(
                 let decision =
                     build_cache_decision_context(task_id, &ctx.decision_ctx, &mut cache_ctx);
                 match decision.action {
-                    Decision::Run => Some(*cache_ctx),
+                    Decision::Run => {
+                        cache_ctx.capture_pre_execution_snapshot();
+                        Some(*cache_ctx)
+                    }
                     Decision::Skip => None,
                     Decision::SharedHit => None,
                 }
             } else {
+                cache_ctx.capture_pre_execution_snapshot();
                 Some(*cache_ctx)
             }
         }
@@ -488,23 +492,6 @@ fn build_cache_write_context(task_id: &TaskId, ctx: &DecisionContext) -> CacheIn
     let env_hash = current.env_hash;
     let pkg_dep_hash = current.pkg_dep_hash;
 
-    // Capture the pre-execution input snapshot used for the stability check.
-    //
-    // `task_def.inputs` here is the task's RESOLVED input set: any worker
-    // `Modify.inputs` returned during `TaskGraph::build_resolved` has already
-    // replaced the declared config inputs by this point (resolve completes
-    // before any task is dispatched). Snapshotting them BEFORE the task runs
-    // gives every tracked input — worker-provided ones included — a pre-execution
-    // baseline, so a concurrent edit during execution is detected by the
-    // post-run stability check (which re-hashes this same set and, on mismatch,
-    // skips the cache write and leaves the task dirty).
-    let pre_snapshot = resolve_pre_execution_inputs(
-        &task_def.inputs,
-        &cache_context.cache_package.package_name,
-        &cache_context.resolver.package_graph,
-        &cache_context.resolver.repo_root,
-    );
-
     CacheInputState::Ready(Box::new(CacheWriteContext {
         task_id: task_id.clone(),
         task_def,
@@ -520,7 +507,7 @@ fn build_cache_write_context(task_id: &TaskId, ctx: &DecisionContext) -> CacheIn
         cache_nonce: nonce,
         decision: cache_run_decision(),
         task_watch_registry: Arc::clone(&ctx.task_watch_registry),
-        pre_snapshot,
+        pre_snapshot: None,
     }))
 }
 
@@ -664,7 +651,7 @@ fn build_successful_run_record(
     post_inputs: &[FileEntry],
 ) -> BuildRecordResult {
     let stable_inputs =
-        match check_input_stability(&cache_ctx.pre_snapshot, post_inputs, &cache_ctx.task_id) {
+        match check_input_stability(cache_ctx.pre_snapshot(), post_inputs, &cache_ctx.task_id) {
             Ok(inputs) => inputs,
             Err(reason) => return BuildRecordResult::StabilityMismatch(reason),
         };
@@ -1923,8 +1910,50 @@ mod tests {
                 run_reason: RunReason::NoPriorRecord,
             },
             task_watch_registry: crate::watch::registry::empty_task_watch_registry(),
-            pre_snapshot: Vec::new(),
+            pre_snapshot: Some(Vec::new()),
         }
+    }
+
+    #[test]
+    fn capture_pre_execution_snapshot_is_lazy_and_populates_on_demand() {
+        // Regression guard for the no-op-build perf fix: the pre-execution input
+        // snapshot must NOT be computed until a task is committed to run. A fresh
+        // CacheWriteContext (as produced on the cache-skip decision path) must have
+        // `pre_snapshot == None`; only an explicit `capture_pre_execution_snapshot`
+        // populates it (before the task is dispatched, preserving the #157 TOCTOU
+        // guarantee for tasks that actually run).
+        let task_id = TaskId::new("pkg", "build");
+        let mut cache_ctx = sample_cache_write_context(task_id);
+        // Simulate the state right after build_cache_write_context: not captured.
+        cache_ctx.pre_snapshot = None;
+        cache_ctx.task_def.inputs = vec!["src.txt".to_string()];
+        init_git_repo(&cache_ctx.repo_root);
+        std::fs::write(cache_ctx.package_path.join("src.txt"), "H1\n").expect("write input");
+
+        // Skip path never captures: accessor yields an empty slice, no hashing done.
+        assert!(
+            cache_ctx.pre_snapshot.is_none(),
+            "pre_snapshot must remain None until a task is committed to run"
+        );
+        assert!(cache_ctx.pre_snapshot().is_empty());
+
+        // Run path captures the baseline before dispatch.
+        cache_ctx.capture_pre_execution_snapshot();
+        assert!(
+            cache_ctx
+                .pre_snapshot
+                .as_ref()
+                .is_some_and(|snapshot| !snapshot.is_empty()),
+            "capture_pre_execution_snapshot should populate the declared input baseline"
+        );
+
+        // Idempotent: a second call must not re-hash or clobber the captured snapshot.
+        let captured = cache_ctx.pre_snapshot.clone();
+        cache_ctx.capture_pre_execution_snapshot();
+        assert_eq!(
+            cache_ctx.pre_snapshot, captured,
+            "capture_pre_execution_snapshot must be idempotent"
+        );
     }
 
     #[test]
@@ -1982,14 +2011,17 @@ mod tests {
 
         // Pre-run state H1, captured into the pre-snapshot.
         std::fs::write(&input_path, "H1\n").expect("write input");
-        cache_ctx.pre_snapshot = resolve_pre_execution_inputs(
+        cache_ctx.pre_snapshot = Some(resolve_pre_execution_inputs(
             &cache_ctx.task_def.inputs,
             &cache_ctx.source_pkg,
             &cache_ctx.package_graph,
             &cache_ctx.repo_root,
-        );
+        ));
         assert!(
-            !cache_ctx.pre_snapshot.is_empty(),
+            cache_ctx
+                .pre_snapshot
+                .as_ref()
+                .is_some_and(|snapshot| !snapshot.is_empty()),
             "pre-snapshot should capture the declared input"
         );
 
@@ -2046,12 +2078,12 @@ mod tests {
         let input_path = cache_ctx.package_path.join("src.txt");
 
         std::fs::write(&input_path, "H1\n").expect("write input");
-        cache_ctx.pre_snapshot = resolve_pre_execution_inputs(
+        cache_ctx.pre_snapshot = Some(resolve_pre_execution_inputs(
             &cache_ctx.task_def.inputs,
             &cache_ctx.source_pkg,
             &cache_ctx.package_graph,
             &cache_ctx.repo_root,
-        );
+        ));
         // Concurrent edit before the record is written.
         std::fs::write(&input_path, "H2-changed\n").expect("edit input");
 

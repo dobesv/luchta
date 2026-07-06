@@ -457,9 +457,36 @@ struct CacheWriteContext {
     /// Registry of watched task inputs, updated when this task's record is built.
     task_watch_registry: TaskWatchRegistry,
     /// Pre-execution snapshot of resolved input files (content hashes).
-    /// Captured BEFORE task execution for ALL cacheable tasks, used to detect
-    /// concurrent edits during execution. On mismatch, cache write is skipped.
-    pre_snapshot: Vec<FileEntry>,
+    /// Captured lazily AFTER run decision but BEFORE task execution so skipped
+    /// tasks avoid input hashing while executed tasks still get TOCTOU checks.
+    pre_snapshot: Option<Vec<FileEntry>>,
+}
+
+impl CacheWriteContext {
+    /// Capture pre-execution baseline for declared/resolved task inputs.
+    ///
+    /// `task_def.inputs` here is task's RESOLVED input set: any worker
+    /// `Modify.inputs` returned during `TaskGraph::build_resolved` has already
+    /// replaced declared config inputs by this point. Snapshotting them AFTER
+    /// cache decision but BEFORE task runs gives every tracked input —
+    /// worker-provided ones included — pre-execution baseline, so concurrent edit
+    /// during execution is detected by post-run stability check.
+    fn capture_pre_execution_snapshot(&mut self) {
+        if self.pre_snapshot.is_some() {
+            return;
+        }
+
+        self.pre_snapshot = Some(resolve_pre_execution_inputs(
+            &self.task_def.inputs,
+            &self.source_pkg,
+            &self.package_graph,
+            &self.repo_root,
+        ));
+    }
+
+    fn pre_snapshot(&self) -> &[FileEntry] {
+        self.pre_snapshot.as_deref().unwrap_or(&[])
+    }
 }
 
 struct CacheStateContext {
