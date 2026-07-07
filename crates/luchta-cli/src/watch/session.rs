@@ -36,11 +36,12 @@ impl WatchSession {
         workspace_root: &Path,
         max_weight_override: Option<u32>,
     ) -> Result<Option<Self>> {
-        let run =
+        let mut run =
             match crate::run::prepare_session_context(workspace_root, max_weight_override).await? {
                 Some(r) => r,
                 None => return Ok(None),
             };
+        run.owns_worker_manager = false;
         Ok(Some(Self {
             run: ArcSwap::from_pointee(run),
             max_weight_override,
@@ -98,6 +99,7 @@ impl WatchSession {
             max_weight,
             pruned,
             worker_manager,
+            owns_worker_manager: false,
             since_affected: None,
             global_cache_nonce,
             workspace_root,

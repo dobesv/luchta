@@ -23,6 +23,35 @@ async fn no_lost_changes_change_during_build_triggers_second_cycle() {
     harness.shutdown().await;
 }
 
+/// FAILED-CYCLE-REGISTRY: Prove failed initial cycle still registers watch state so next edit rebuilds.
+#[tokio::test]
+async fn failed_initial_cycle_edit_triggers_rebuild() {
+    let harness = E2eHarness::start_failing_initial_cycle().await;
+
+    harness.wait_for_jobs(1).await;
+    harness.wait_for_markers(1).await;
+
+    let app_src = harness.workspace_root.join("packages/app/src/lib.rs");
+    std::fs::write(&app_src, "// edited\n").expect("write edited input");
+    harness
+        .send_batch(std::collections::HashSet::from([app_src]), false)
+        .await;
+
+    harness.wait_for_jobs(2).await;
+    harness.wait_for_markers(2).await;
+    assert_eq!(
+        read_marker_count(&harness.workspace_root),
+        2,
+        "edit after FAILED initial cycle must trigger a rebuild, not [watch] up to date"
+    );
+    assert!(
+        !harness.worker_manager_is_shutdown(),
+        "worker manager should survive failed initial cycle and rebuild"
+    );
+
+    harness.shutdown().await;
+}
+
 /// KEEPS-MANAGER-ALIVE: Prove manager survives a change-triggered cancel.
 #[tokio::test]
 async fn change_during_cycle_keeps_worker_manager_alive() {
