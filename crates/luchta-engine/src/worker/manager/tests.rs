@@ -494,7 +494,7 @@ PY
 }
 
 #[tokio::test]
-async fn post_crash_job_returns_within_timeout() {
+async fn post_crash_job_retries_within_timeout() {
     let temp = TempDir::new().expect("tempdir");
     let crash_count_file = temp.path().join("crash-count.txt");
     let worker_path = write_worker_script(
@@ -522,36 +522,33 @@ done
             count_file = crash_count_file.display(),
         ),
     );
-    let manager = manager_with_worker(TestWorkerRef::new("fake"), &worker_path);
-
-    let first_error = manager
-        .run_job("fake", WorkerRequest::new("pkg#crash", "echo hi"), None)
-        .await
-        .expect_err("first job crashes worker");
-    assert_crash_detail_contains(
-        &first_error,
-        &[
-            "exited with code 17",
-            "--- worker 'fake' stderr (last 1 lines) ---",
-            "boom from first worker",
-            "--- end worker 'fake' stderr ---",
-        ],
+    let manager = manager_with_worker_timeout(
+        TestWorkerRef::new("fake"),
+        &worker_path,
+        Duration::from_millis(200),
     );
 
-    let second = tokio::time::timeout(
+    let outcome = tokio::time::timeout(
         Duration::from_secs(2),
-        manager.run_job("fake", WorkerRequest::new("pkg#after", "echo hi"), None),
+        manager.run_job("fake", WorkerRequest::new("pkg#crash", "echo hi"), None),
     )
     .await
-    .expect("post-crash job must not hang")
-    .expect("dead worker handle should be evicted and respawned");
-    assert_eq!(second.0, 0);
+    .expect("crash-then-retry job must not hang")
+    .expect("job should succeed after retry");
+    assert_eq!(outcome.0, 0);
+
+    let spawn_count = fs::read_to_string(&crash_count_file).expect("spawn count recorded");
+    assert_eq!(
+        spawn_count.trim(),
+        "2",
+        "timeout test should still perform exactly one retry"
+    );
 
     manager.shutdown().await;
 }
 
 #[tokio::test]
-async fn crashed_worker_is_evicted_and_respawned() {
+async fn crashed_worker_retry_respawns_and_reuses_successor() {
     let temp = TempDir::new().expect("tempdir");
     let spawn_count_file = temp.path().join("spawn-count.txt");
     let pid_file = temp.path().join("pids.txt");
@@ -585,26 +582,10 @@ done
     );
     let manager = manager_with_worker(TestWorkerRef::new("fake"), &worker_path);
 
-    let error = manager
+    let outcome = manager
         .run_job("fake", WorkerRequest::new("pkg#crash", "echo hi"), None)
         .await
-        .expect_err("first worker should crash");
-    assert_crash_detail_contains(
-        &error,
-        &[
-            "worker 'fake'",
-            "pkg#crash",
-            "exited with code 23",
-            "--- worker 'fake' stderr (last 1 lines) ---",
-            "first instance crashed",
-            "--- end worker 'fake' stderr ---",
-        ],
-    );
-
-    let outcome = manager
-        .run_job("fake", WorkerRequest::new("pkg#ok", "echo hi"), None)
-        .await
-        .expect("second worker should succeed");
+        .expect("job should transparently succeed after respawn");
     assert_eq!(outcome.0, 0);
 
     let spawn_count = fs::read_to_string(&spawn_count_file).expect("spawn count recorded");
@@ -620,6 +601,221 @@ done
 
     manager.shutdown().await;
 }
+
+#[tokio::test]
+async fn crash_twice_run_job_stops_after_second_attempt() {
+    let temp = TempDir::new().expect("tempdir");
+    let spawn_count_file = temp.path().join("spawn-count.txt");
+    let worker_path = write_worker_script(
+        temp.path(),
+        "retry-twice-crash-worker.sh",
+        &format!(
+            r#"#!/bin/sh
+count_file="{count_file}"
+count=0
+if [ -f "$count_file" ]; then
+  count=$(cat "$count_file")
+fi
+count=$((count + 1))
+echo "$count" > "$count_file"
+read -r _
+echo "instance $count crashed" >&2
+exit 23
+"#,
+            count_file = spawn_count_file.display(),
+        ),
+    );
+    let manager = manager_with_worker(TestWorkerRef::new("fake"), &worker_path);
+
+    let error = manager
+        .run_job(
+            "fake",
+            WorkerRequest::new("pkg#retry-crash", "echo hi"),
+            None,
+        )
+        .await
+        .expect_err("job should fail after second crash");
+
+    assert_crashed_job(&error, TestJobRef::new("fake", "pkg#retry-crash"));
+    let spawn_count = fs::read_to_string(&spawn_count_file).expect("spawn count recorded");
+    assert_eq!(
+        spawn_count.trim(),
+        "2",
+        "expected retry limit of two attempts"
+    );
+
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn crash_during_shutdown_does_not_retry() {
+    let temp = TempDir::new().expect("tempdir");
+    let spawn_count_file = temp.path().join("spawn-count.txt");
+    let gate_file = temp.path().join("gate.txt");
+    let worker_path = write_worker_script(
+        temp.path(),
+        "shutdown-crash-no-retry-worker.sh",
+        &format!(
+            r#"#!/bin/sh
+count_file="{count_file}"
+count=0
+if [ -f "$count_file" ]; then
+  count=$(cat "$count_file")
+fi
+count=$((count + 1))
+echo "$count" > "$count_file"
+read -r _
+while [ ! -f "{gate_file}" ]; do
+  sleep 0.01
+done
+exit 0
+"#,
+            count_file = spawn_count_file.display(),
+            gate_file = gate_file.display(),
+        ),
+    );
+    let manager = Arc::new(manager_with_worker_timeout(
+        TestWorkerRef::new("fake"),
+        &worker_path,
+        Duration::from_millis(50),
+    ));
+    let running_manager = Arc::clone(&manager);
+    let job = tokio::spawn(async move {
+        running_manager
+            .run_job(
+                "fake",
+                WorkerRequest::new("pkg#shutdown-crash", "echo hi"),
+                None,
+            )
+            .await
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    manager.shutdown_immediate().await;
+    fs::write(&gate_file, "release").expect("gate written");
+
+    let error = tokio::time::timeout(Duration::from_secs(2), job)
+        .await
+        .expect("job join must not hang")
+        .expect("job task joined")
+        .expect_err("shutdown-killed in-flight job should report crashed");
+
+    assert_crashed_job(&error, TestJobRef::new("fake", "pkg#shutdown-crash"));
+    // The returned error must carry the killed worker's crash detail (the
+    // signal/exit status gathered on the FIRST attempt). If the shutdown guard
+    // were missing, the retry would run, `dispatch_message` would refuse work
+    // while shutting down, and the surfaced error would be a bare
+    // detail-less `Crashed` — so this detail assertion fails on regression.
+    assert_crash_detail_contains(&error, &["worker 'fake'", "pkg#shutdown-crash", "signal"]);
+    let spawn_count = fs::read_to_string(&spawn_count_file).expect("spawn count recorded");
+    assert_eq!(
+        spawn_count.trim(),
+        "1",
+        "shutdown path must not retry after crash-style channel close"
+    );
+    assert!(
+        manager.is_shutdown(),
+        "manager should remain in shutdown state"
+    );
+}
+
+#[tokio::test]
+async fn task_failure_exit_code_does_not_retry() {
+    let temp = TempDir::new().expect("tempdir");
+    let spawn_count_file = temp.path().join("spawn-count.txt");
+    let worker_path = write_worker_script(
+        temp.path(),
+        "task-failure-no-retry-worker.sh",
+        &format!(
+            r#"#!/bin/sh
+count_file="{count_file}"
+count=0
+if [ -f "$count_file" ]; then
+  count=$(cat "$count_file")
+fi
+count=$((count + 1))
+echo "$count" > "$count_file"
+while IFS= read -r line; do
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  printf '{{"type":"done","id":"%s","exitCode":5}}\n' "$id"
+done
+"#,
+            count_file = spawn_count_file.display(),
+        ),
+    );
+    let manager = manager_with_worker(TestWorkerRef::new("fake"), &worker_path);
+
+    let outcome = manager
+        .run_job("fake", WorkerRequest::new("pkg#exit-5", "echo hi"), None)
+        .await
+        .expect("nonzero exit code is successful protocol completion");
+
+    assert_eq!(outcome.0, 5);
+    let spawn_count = fs::read_to_string(&spawn_count_file).expect("spawn count recorded");
+    assert_eq!(spawn_count.trim(), "1", "task failure must not retry");
+
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn protocol_error_on_resolve_does_not_retry() {
+    let temp = TempDir::new().expect("tempdir");
+    let spawn_count_file = temp.path().join("spawn-count.txt");
+    let worker_path = write_worker_script(
+        temp.path(),
+        "protocol-no-retry-worker.sh",
+        &format!(
+            r#"#!/bin/sh
+count_file="{count_file}"
+count=0
+if [ -f "$count_file" ]; then
+  count=$(cat "$count_file")
+fi
+count=$((count + 1))
+echo "$count" > "$count_file"
+read -r line
+id=$(printf '%s\n' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+printf '{{"type":"done","id":"%s","exitCode":0}}\n' "$id"
+while IFS= read -r _; do :; done
+"#,
+            count_file = spawn_count_file.display(),
+        ),
+    );
+    let manager = manager_with_worker(TestWorkerRef::new("fake"), &worker_path);
+
+    let error = manager
+        .resolve(
+            "fake",
+            luchta_worker::ResolveTask {
+                id: "pkg#protocol-run".to_string(),
+                name: "build".to_string(),
+                command: String::new(),
+                package: "pkg".to_string(),
+                cwd: None,
+                scripts: Vec::new(),
+                inputs: Vec::new(),
+                mode: luchta_worker::ResolveMode::Run,
+            },
+        )
+        .await
+        .expect_err("protocol mismatch should fail without retry");
+
+    assert!(
+        error.contains(
+            "worker 'fake' protocol error for job 'pkg#protocol-run': unexpected 'done' response"
+        ),
+        "unexpected protocol display: {error}"
+    );
+    let spawn_count = fs::read_to_string(&spawn_count_file).expect("spawn count recorded");
+    assert_eq!(spawn_count.trim(), "1", "protocol error must not retry");
+
+    manager.shutdown().await;
+}
+
+// WorkerError::Spawn is not retried; current integration harness launches workers via
+// `sh -c`, so missing/non-executable worker commands surface as worker crashes, not
+// `WorkerError::Spawn`. Protocol no-retry is covered by
+// `protocol_error_on_resolve_does_not_retry`.
 
 #[tokio::test]
 async fn crash_error_includes_exit_status_and_stderr_detail() {

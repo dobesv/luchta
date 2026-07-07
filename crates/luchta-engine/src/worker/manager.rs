@@ -223,17 +223,49 @@ impl WorkerManager {
         outcome
     }
 
+    async fn round_trip_retry_once_on_crash<T, F>(
+        &self,
+        worker_name: &str,
+        first_message: WorkerMessage,
+        retry_message: WorkerMessage,
+        sink: Option<&ExecutionLogSink>,
+        select: F,
+    ) -> Result<T, WorkerError>
+    where
+        F: Fn(WorkerResponse) -> Option<T> + Copy,
+    {
+        match self
+            .round_trip(worker_name, first_message, |_, _, _| {}, sink, select)
+            .await
+        {
+            // A crash mid-run is retried once. But a channel close observed
+            // while the manager is shutting down is not a real crash — the
+            // worker was intentionally killed during teardown — so suppress the
+            // warning and the retry and surface the error as-is.
+            Err(WorkerError::Crashed { worker, id, .. })
+                if !self.is_shutdown.load(Ordering::SeqCst) =>
+            {
+                eprintln!("warning: worker '{worker}' crashed during job '{id}', retrying once");
+                self.round_trip(worker_name, retry_message, |_, _, _| {}, sink, select)
+                    .await
+            }
+            other => other,
+        }
+    }
+
     pub async fn run_job(
         &self,
         worker_name: &str,
         request: WorkerRequest,
         sink: Option<&ExecutionLogSink>,
     ) -> Result<WorkerDonePayload, WorkerError> {
+        let retry_request = request.clone();
+
         // Terminal response is `Done`; logs are streamed, other responses ignored.
-        self.round_trip(
+        self.round_trip_retry_once_on_crash(
             worker_name,
             WorkerMessage::Run(request),
-            |_, _, _| {},
+            WorkerMessage::Run(retry_request),
             sink,
             WorkerResponse::into_done,
         )
@@ -524,10 +556,12 @@ impl TaskResolver for WorkerManager {
     /// Resolves a task by sending a `ResolveTask` to its worker and awaiting the
     /// single `Resolved` decision (logs are streamed; other responses ignored).
     async fn resolve(&self, worker: &str, request: ResolveTask) -> Result<ResolveResult, String> {
-        self.round_trip(
+        let retry_request = request.clone();
+
+        self.round_trip_retry_once_on_crash(
             worker,
             WorkerMessage::ResolveTask(request),
-            |_, _, _| {},
+            WorkerMessage::ResolveTask(retry_request),
             None,
             WorkerResponse::into_resolve_result,
         )
