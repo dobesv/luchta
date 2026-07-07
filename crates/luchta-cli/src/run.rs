@@ -186,6 +186,12 @@ pub(crate) struct RunContext {
     pub(crate) max_weight: u32,
     pub(crate) pruned: Vec<PrunedTask>,
     pub(crate) worker_manager: Arc<WorkerManager>,
+    /// Whether this run exclusively owns the `WorkerManager` and may shut it
+    /// down on task failure (fast-stop). One-shot `luchta run` sets this `true`.
+    /// Watch mode sets it `false`: the manager is shared and reused across build
+    /// cycles, so a failed cycle must NOT call `shutdown_immediate()` (doing so
+    /// would permanently poison the manager for the rest of the watch session).
+    pub(crate) owns_worker_manager: bool,
     pub(crate) since_affected: Option<HashSet<PackageName>>,
     /// Global cache nonce from LuchtaConfig.cache.
     pub(crate) global_cache_nonce: Option<String>,
@@ -349,6 +355,7 @@ pub(crate) async fn prepare_session_context(
         max_weight,
         pruned,
         worker_manager,
+        owns_worker_manager: true,
         since_affected: None,
         global_cache_nonce,
         workspace_root: workspace_root.to_owned(),
@@ -409,6 +416,8 @@ struct DispatchContext<'a> {
     any_failed: &'a Arc<AtomicBool>,
     interrupted: &'a Arc<AtomicBool>,
     continue_on_failure: bool,
+    /// See `RunContext::owns_worker_manager`. Gates fast-stop worker shutdown.
+    owns_worker_manager: bool,
     worker_manager: &'a Arc<WorkerManager>,
     workspace_root: &'a Path,
     packages: &'a [PackageNode],
@@ -2236,6 +2245,7 @@ fn build_dispatch_context<'a>(inputs: BuildDispatchContext<'a>) -> DispatchConte
         any_failed,
         interrupted,
         continue_on_failure,
+        owns_worker_manager: run.owns_worker_manager,
         worker_manager: &run.worker_manager,
         workspace_root: &run.workspace_root,
         packages: &run.package_nodes,
@@ -2392,7 +2402,7 @@ async fn finalize_and_report(inputs: FinalizeCycle<'_>) -> Result<(CycleOutcome,
     // On interrupt, must kill workers immediately so the walker can drain. The
     // caller also calls shutdown for cleanup, but the immediate kill is needed
     // here to unblock walker.wait().
-    if was_interrupted {
+    if was_interrupted && run.owns_worker_manager {
         run.worker_manager.shutdown_immediate().await;
     }
 

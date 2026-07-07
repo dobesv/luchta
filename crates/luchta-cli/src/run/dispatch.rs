@@ -257,6 +257,7 @@ fn fail_invalid_task(
         ctx.any_failed,
         ctx.interrupted,
         ctx.continue_on_failure,
+        ctx.owns_worker_manager,
         ctx.worker_manager,
     );
     eprintln!(
@@ -779,13 +780,18 @@ fn build_run_record(
     };
 
     if !args.succeeded {
-        // Failed run: record with post-run inputs; do NOT register watch state.
-        return BuildRecordResult::Ok(assemble_run_record(
-            cache_ctx,
-            &args,
-            &patterns,
-            post_inputs,
-        ));
+        // Failed run: record with post-run inputs and register watch state so
+        // subsequent edits to declared inputs still trigger watch rebuilds.
+        let record = assemble_run_record(cache_ctx, &args, &patterns, post_inputs);
+        register_task_watch_state(
+            &cache_ctx.task_watch_registry,
+            &cache_ctx.task_id,
+            cache_ctx.source_pkg.clone(),
+            cache_ctx.package_path.clone(),
+            &record,
+        )
+        .expect("failed to register task watch state");
+        return BuildRecordResult::Ok(record);
     }
 
     build_successful_run_record(cache_ctx, &args, &patterns, &post_inputs)
@@ -954,6 +960,7 @@ fn trigger_fast_stop_on_first_failure(
     any_failed: &Arc<AtomicBool>,
     interrupted: &Arc<AtomicBool>,
     continue_on_failure: bool,
+    owns_worker_manager: bool,
     worker_manager: &Arc<WorkerManager>,
 ) -> bool {
     let first_failure = any_failed
@@ -962,10 +969,12 @@ fn trigger_fast_stop_on_first_failure(
 
     if first_failure && !continue_on_failure {
         interrupted.store(true, Ordering::SeqCst);
-        let worker_manager = Arc::clone(worker_manager);
-        tokio::spawn(async move {
-            worker_manager.shutdown_immediate().await;
-        });
+        if owns_worker_manager {
+            let worker_manager = Arc::clone(worker_manager);
+            tokio::spawn(async move {
+                worker_manager.shutdown_immediate().await;
+            });
+        }
     }
 
     first_failure
@@ -1178,6 +1187,7 @@ fn spawn_task_runner(ready: ReadyTask, ctx: &DispatchContext<'_>) {
     let any_failed = Arc::clone(&task_ctx.any_failed);
     let interrupted = Arc::clone(&task_ctx.interrupted);
     let worker_manager = Arc::clone(ctx.worker_manager);
+    let owns_worker_manager = ctx.owns_worker_manager;
     let continue_on_failure = ctx.continue_on_failure;
     let log_sink = prepare_task_log_sink(&mut request);
 
@@ -1210,6 +1220,7 @@ fn spawn_task_runner(ready: ReadyTask, ctx: &DispatchContext<'_>) {
             any_failed: &any_failed,
             interrupted: &interrupted,
             worker_manager: &worker_manager,
+            owns_worker_manager,
             continue_on_failure,
             log_sink: &log_sink,
             outcome_res: &outcome_res,
@@ -1227,6 +1238,7 @@ struct TaskRunFinalization<'a> {
     any_failed: &'a Arc<AtomicBool>,
     interrupted: &'a Arc<AtomicBool>,
     worker_manager: &'a Arc<WorkerManager>,
+    owns_worker_manager: bool,
     continue_on_failure: bool,
     log_sink: &'a ExecutionLogSink,
     outcome_res: &'a Result<TaskRunOutcome, luchta_engine::ExecutorError>,
@@ -1243,6 +1255,7 @@ fn finalize_task_run(finalization: TaskRunFinalization<'_>) {
         any_failed,
         interrupted,
         worker_manager,
+        owns_worker_manager,
         continue_on_failure,
         log_sink,
         outcome_res,
@@ -1257,6 +1270,7 @@ fn finalize_task_run(finalization: TaskRunFinalization<'_>) {
         any_failed,
         interrupted,
         continue_on_failure,
+        owns_worker_manager,
         worker_manager,
     });
 
@@ -1293,6 +1307,7 @@ struct TaskFailureContext<'a> {
     any_failed: &'a Arc<AtomicBool>,
     interrupted: &'a Arc<AtomicBool>,
     continue_on_failure: bool,
+    owns_worker_manager: bool,
     worker_manager: &'a Arc<WorkerManager>,
 }
 
@@ -1302,6 +1317,7 @@ fn classify_task_failure(context: TaskFailureContext<'_>) -> TaskFailureKind {
         any_failed,
         interrupted,
         continue_on_failure,
+        owns_worker_manager,
         worker_manager,
     } = context;
     if succeeded {
@@ -1312,6 +1328,7 @@ fn classify_task_failure(context: TaskFailureContext<'_>) -> TaskFailureKind {
         any_failed,
         interrupted,
         continue_on_failure,
+        owns_worker_manager,
         worker_manager,
     );
     let collateral_fast_stop =
@@ -1826,6 +1843,7 @@ mod tests {
             &any_failed,
             &interrupted,
             continue_on_failure,
+            true,
             &worker_manager,
         );
         tokio::task::yield_now().await;
@@ -1868,6 +1886,7 @@ mod tests {
                 any_failed: Box::leak(Box::new(Arc::new(AtomicBool::new(true)))),
                 interrupted: Box::leak(Box::new(Arc::new(AtomicBool::new(false)))),
                 continue_on_failure: false,
+                owns_worker_manager: true,
                 worker_manager: Box::leak(Box::new(Arc::new(WorkerManager::new(HashMap::new())))),
                 workspace_root: temp_dir.path(),
                 packages: Box::leak(Box::new(vec![package.clone()])),
@@ -2573,15 +2592,25 @@ mod tests {
         let interrupted = Arc::new(AtomicBool::new(false));
         let worker_manager = Arc::new(WorkerManager::new(HashMap::new()));
 
-        let first_call =
-            trigger_fast_stop_on_first_failure(&any_failed, &interrupted, false, &worker_manager);
+        let first_call = trigger_fast_stop_on_first_failure(
+            &any_failed,
+            &interrupted,
+            false,
+            true,
+            &worker_manager,
+        );
         tokio::task::yield_now().await;
         assert!(first_call);
         assert!(interrupted.load(Ordering::SeqCst));
 
         interrupted.store(false, Ordering::SeqCst);
-        let second_call =
-            trigger_fast_stop_on_first_failure(&any_failed, &interrupted, false, &worker_manager);
+        let second_call = trigger_fast_stop_on_first_failure(
+            &any_failed,
+            &interrupted,
+            false,
+            true,
+            &worker_manager,
+        );
         tokio::task::yield_now().await;
 
         assert!(

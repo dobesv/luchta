@@ -4,6 +4,7 @@ use crate::watch::watcher::{WatchBatch, WatcherHandle};
 use luchta_workspace::PackageNode;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::time::{timeout, Duration};
@@ -80,6 +81,91 @@ done
     }
 
     let config = blocking_workspace_config(&worker_script_path);
+    std::fs::write(workspace_root.join("luchta-config.sh"), &config).expect("write config");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            workspace_root.join("luchta-config.sh"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("chmod config");
+    }
+}
+
+pub(super) fn write_failing_initial_cycle_workspace(workspace_root: &std::path::Path) {
+    std::fs::create_dir_all(workspace_root.join("packages/app/src")).expect("create package dir");
+    std::fs::write(
+        workspace_root.join("package.json"),
+        r#"{"name": "root", "private": true, "workspaces": ["packages/*"]}"#,
+    )
+    .expect("write root package.json");
+    std::fs::write(
+        workspace_root.join("packages/app/package.json"),
+        r#"{"name": "app", "version": "1.0.0", "scripts": {"build": "echo build"}}"#,
+    )
+    .expect("write app package.json");
+    std::fs::write(
+        workspace_root.join("packages/app/src/lib.rs"),
+        "// initial\n",
+    )
+    .expect("write app source");
+
+    let run_git = |args: &[&str]| {
+        let ok = Command::new("git")
+            .args(args)
+            .current_dir(workspace_root)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "git {:?} failed in test workspace", args);
+    };
+    run_git(&["init"]);
+    run_git(&["add", "-A"]);
+
+    let marker_file = workspace_root.join(".run-marker");
+    let job_count = workspace_root.join(".job-count");
+    let worker_script = format!(
+        r##"#!/bin/sh
+job_count=0
+while IFS= read -r line; do
+  case "$line" in
+*'"type":"resolveTask"'*)
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  printf '{{"type":"resolved","id":"%s","result":{{"decision":"accept"}}}}\n' "$id"
+  ;;
+*'"type":"run"'*)
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  job_count=$((job_count + 1))
+  echo "$job_count" > '{job_count}'
+  echo "" >> '{marker_file}'
+  if [ "$job_count" -eq 1 ]; then
+    printf '{{"type":"done","id":"%s","success":false,"exitCode":2}}\n' "$id"
+  else
+    printf '{{"type":"done","id":"%s","success":true,"exitCode":0}}\n' "$id"
+  fi
+  ;;
+  esac
+done
+"##,
+        job_count = job_count.display(),
+        marker_file = marker_file.display(),
+    );
+    let worker_script_path = workspace_root.join("fake-worker.sh");
+    std::fs::write(&worker_script_path, &worker_script).expect("write worker script");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&worker_script_path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod worker script");
+    }
+
+    let config = format!(
+        r##"#!/bin/sh
+echo '{{"concurrency":{{"maxWeight":4}},"workers":{{"fake":{{"command":"{}"}}}},"tasks":{{"build":{{"worker":"fake","inputs":["src/**"]}}}}}}'
+"##,
+        worker_script_path.display()
+    );
     std::fs::write(workspace_root.join("luchta-config.sh"), &config).expect("write config");
     #[cfg(unix)]
     {
@@ -229,6 +315,10 @@ impl E2eHarness {
 
     pub(super) async fn start_two_package_lockfile() -> Self {
         Self::start_with_workspace(write_two_package_lockfile_workspace).await
+    }
+
+    pub(super) async fn start_failing_initial_cycle() -> Self {
+        Self::start_with_workspace(write_failing_initial_cycle_workspace).await
     }
 
     pub(super) async fn start_with_workspace(writer: fn(&std::path::Path)) -> Self {
