@@ -1,0 +1,38 @@
+[package]
+name = "luchta-oxc-transform-worker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description.workspace = true
+
+[features]
+default = ["oxc"]
+oxc = [
+    "dep:oxc_allocator",
+    "dep:oxc_codegen",
+    "dep:oxc_parser",
+    "dep:oxc_semantic",
+    "dep:oxc_sourcemap",
+    "dep:oxc_span",
+    "dep:oxc_transformer",
+]
+
+[dependencies]
+luchta-worker = { path = "../luchta-worker" }
+tokio = { workspace = true }
+oxc_allocator = { workspace = true, optional = true }
+oxc_codegen = { workspace = true, optional = true }
+oxc_parser = { workspace = true, optional = true }
+oxc_semantic = { workspace = true, optional = true }
+oxc_sourcemap = { workspace = true, optional = true }
+oxc_span = { workspace = true, optional = true }
+oxc_transformer = { workspace = true, optional = true }
+
+[dev-dependencies]
+assert_fs = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }

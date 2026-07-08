@@ -177,7 +177,7 @@ fn non_cacheable_task_stays_out_of_shared_cache_but_writes_local_record() {
         .path()
         .join(".luchta")
         .join("cache")
-        .join(blake3::hash("app#pkgbuild".as_bytes()).to_hex().to_string());
+        .join(blake3::hash("app#pkgbuild".as_bytes()).to_hex());
     assert!(cache_dir.join("meta.bincode").exists());
     assert!(cache_dir.join("stdout.log").exists());
     assert!(cache_dir.join("stderr.log").exists());

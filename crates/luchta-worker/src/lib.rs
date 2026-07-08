@@ -10,7 +10,10 @@ pub use proxy::{
     split_current_process_argv, split_delegate_argv, DelegateArgvSplit, DelegateHandle, ProxyError,
     RawDelegate, SharedWriter,
 };
-pub use runtime::{run_worker, run_worker_main, shell_single_quote, Worker, WorkerError};
+pub use runtime::{
+    run_worker, run_worker_main, shell_single_quote, InProcessOutcome, JobContext, Worker,
+    WorkerError,
+};
 
 /// Built-in passthrough environment variables that are always inherited from
 /// the ambient environment into task execution, even under strict env isolation.

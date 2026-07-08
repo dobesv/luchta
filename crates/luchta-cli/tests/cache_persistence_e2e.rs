@@ -27,7 +27,7 @@ fn task_cache_dir(workspace_root: &std::path::Path, task_id: &str) -> std::path:
     workspace_root
         .join(".luchta")
         .join("cache")
-        .join(blake3::hash(task_id.as_bytes()).to_hex().to_string())
+        .join(blake3::hash(task_id.as_bytes()).to_hex())
 }
 
 #[test]
