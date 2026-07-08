@@ -45,6 +45,38 @@ fn render_summary_emits_no_ansi_when_color_unsupported() {
 }
 
 #[test]
+fn render_progress_colors_running_tasks_bright_black() {
+    // Currently running tasks in the status line are rendered in bright black
+    // (light grey), not yellow — see issue #153. Guards against an accidental
+    // revert since ANSI-stripping tests would not catch a color regression.
+    let task = task_id("pkg", "build");
+    let reporter =
+        ProgressReporter::new(OutputMode::Default, HashMap::from([(task.clone(), 0)]), 1);
+    reporter.task_started(&task);
+
+    let out = owo_colors::with_override(true, || {
+        reporter.render_progress(
+            "10 MB",
+            &[],
+            &pressure_snapshot(None, 0, 0),
+            owo_colors::Stream::Stdout,
+        )
+    });
+
+    // The running segment is present and colored bright black (ANSI 90),
+    // never yellow (ANSI 33).
+    assert!(out.contains("🏃 1"), "running segment present: {out}");
+    assert!(
+        out.contains("\u{1b}[90m"),
+        "running tasks must be bright black (light grey): {out:?}"
+    );
+    assert!(
+        !out.contains("\u{1b}[33m"),
+        "running tasks must not be yellow: {out:?}"
+    );
+}
+
+#[test]
 fn render_progress_emits_ansi_when_color_forced() {
     // When color is force-enabled, the status line carries ANSI escapes,
     // while the underlying text (counts/emoji) is preserved. Exercise the
