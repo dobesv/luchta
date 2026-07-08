@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 
 use luchta_cache::resolve_cache_dir;
 use luchta_types::PackageName;
-use luchta_workspace::{WorkspaceDiscovery, YarnWorkspace};
+use luchta_workspace::{PackageGraph, WorkspaceDiscovery, YarnWorkspace};
 use miette::Result;
 use owo_colors::{OwoColorize, Stream};
 use tokio::sync::{mpsc, Notify};
@@ -552,6 +552,8 @@ where
         context.ui.up_to_date();
         return Ok(WatchControl::Continue);
     }
+    affected =
+        expand_affected_with_dependents(context.session.current_package_graph().as_ref(), affected);
 
     context
         .ui
@@ -604,6 +606,19 @@ where
     }
 
     Ok(true)
+}
+
+fn expand_affected_with_dependents(
+    package_graph: &PackageGraph,
+    affected: HashSet<PackageName>,
+) -> HashSet<PackageName> {
+    match package_graph.transitive_dependents_of(affected.iter().cloned()) {
+        Ok(expanded) => expanded,
+        Err(error) => {
+            warn!(error = %error, "failed to expand affected packages with dependents");
+            affected
+        }
+    }
 }
 
 fn cycle_request<'a>(
@@ -1093,6 +1108,44 @@ mod tests {
         assert_eq!(
             format_cycle_finished_line(CycleOutcome::Cancelled, Duration::from_secs(5)),
             None
+        );
+    }
+
+    #[test]
+    fn expand_affected_with_dependents_includes_downstream_packages() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let repo_root = temp_dir.path();
+        let api_dir = repo_root.join("packages/api");
+        let app_dir = repo_root.join("packages/app");
+        std::fs::create_dir_all(&api_dir).expect("create api dir");
+        std::fs::create_dir_all(&app_dir).expect("create app dir");
+        std::fs::write(
+            api_dir.join("package.json"),
+            r#"{"name":"api","version":"1.0.0"}"#,
+        )
+        .expect("write api package.json");
+        std::fs::write(
+            app_dir.join("package.json"),
+            r#"{"name":"app","version":"1.0.0","dependencies":{"api":"1.0.0"}}"#,
+        )
+        .expect("write app package.json");
+        let packages = vec![
+            luchta_workspace::PackageNode::new(PackageName::new("api".to_owned()), &api_dir),
+            luchta_workspace::PackageNode::new(PackageName::new("app".to_owned()), &app_dir),
+        ];
+        let package_graph = PackageGraph::build(packages).expect("build package graph");
+
+        let expanded = expand_affected_with_dependents(
+            &package_graph,
+            HashSet::from([PackageName::new("api".to_owned())]),
+        );
+
+        assert_eq!(
+            expanded,
+            HashSet::from([
+                PackageName::new("api".to_owned()),
+                PackageName::new("app".to_owned()),
+            ])
         );
     }
 
