@@ -10,18 +10,87 @@ use tokio::process::Command;
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 
-use crate::{LogStream, ResolveResult, ResolveTask, WorkerMessage, WorkerRequest, WorkerResponse};
+use crate::{
+    is_valid_report_filename, LogStream, ResolveResult, ResolveTask, WorkerMessage, WorkerRequest,
+    WorkerResponse,
+};
 
 pub trait Worker: Send + Sync + 'static {
     fn resolve_task(&self, req: &ResolveTask) -> ResolveResult;
     fn build_command(&self, req: &WorkerRequest) -> String;
+
+    fn run_in_process(
+        &self,
+        _req: &WorkerRequest,
+        _ctx: &JobContext,
+    ) -> impl std::future::Future<Output = InProcessOutcome> + Send {
+        async { InProcessOutcome::NotHandled }
+    }
 
     fn done_response(&self, req: &WorkerRequest, exit_code: i32) -> WorkerResponse {
         WorkerResponse::done(req.id.clone(), exit_code)
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InProcessOutcome {
+    NotHandled,
+    Done {
+        exit_code: i32,
+        outputs: Option<Vec<String>>,
+    },
+}
+
 type SharedWriter = Arc<Mutex<Box<dyn AsyncWrite + Unpin + Send>>>;
+
+#[derive(Clone)]
+pub struct JobContext {
+    id: String,
+    writer: SharedWriter,
+}
+
+impl JobContext {
+    /// Construct a job context for a worker request.
+    pub fn new(id: String, writer: SharedWriter) -> Self {
+        Self { id, writer }
+    }
+
+    pub async fn emit_stdout(&self, line: impl Into<String>) -> Result<(), WorkerError> {
+        write_response(
+            &self.writer,
+            &WorkerResponse::log(self.id.clone(), LogStream::Stdout, line.into()),
+        )
+        .await
+    }
+
+    pub async fn emit_stderr(&self, line: impl Into<String>) -> Result<(), WorkerError> {
+        write_response(
+            &self.writer,
+            &WorkerResponse::log(self.id.clone(), LogStream::Stderr, line.into()),
+        )
+        .await
+    }
+
+    pub async fn emit_report(
+        &self,
+        filename: impl Into<String>,
+        mime_type: impl Into<String>,
+        content: impl Into<String>,
+    ) -> Result<(), WorkerError> {
+        let filename = filename.into();
+        if !is_valid_report_filename(&filename) {
+            self.emit_stderr(format!("ignored invalid report filename: {filename}"))
+                .await?;
+            return Ok(());
+        }
+
+        write_response(
+            &self.writer,
+            &WorkerResponse::report(self.id.clone(), filename, mime_type.into(), content.into()),
+        )
+        .await
+    }
+}
 
 pub async fn run_worker<W: Worker>(worker: W) -> Result<(), WorkerError> {
     let worker = Arc::new(worker);
@@ -124,18 +193,28 @@ async fn handle_request<W: Worker>(
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), WorkerError> {
     let id = request.id.clone();
-    let exit_code = match run_one_job(&request, worker.as_ref(), &writer).await {
-        Ok(status) => status.code().unwrap_or(1),
-        Err(error) if error.is_pipe_shutdown() => {
-            shutdown.store(true, Ordering::SeqCst);
-            return Ok(());
+    let context = JobContext::new(id.clone(), Arc::clone(&writer));
+    let done_response = match worker.run_in_process(&request, &context).await {
+        InProcessOutcome::Done { exit_code, outputs } => {
+            WorkerResponse::done_with_outputs(id.clone(), exit_code, outputs)
         }
-        Err(error) => {
-            eprintln!("job {id} failed: {error}");
-            1
+        InProcessOutcome::NotHandled => {
+            let exit_code = match run_one_job(&request, worker.as_ref(), &writer).await {
+                Ok(status) => status.code().unwrap_or(1),
+                Err(error) if error.is_pipe_shutdown() => {
+                    shutdown.store(true, Ordering::SeqCst);
+                    return Ok(());
+                }
+                Err(error) => {
+                    eprintln!("job {id} failed: {error}");
+                    1
+                }
+            };
+            worker.done_response(&request, exit_code)
         }
     };
-    write_response(&writer, &worker.done_response(&request, exit_code)).await
+
+    write_response(&writer, &done_response).await
 }
 
 async fn run_one_job<W: Worker>(
@@ -278,6 +357,13 @@ mod tests {
         command: String,
         resolve_result: ResolveResult,
         build_calls: Arc<AtomicUsize>,
+        in_process: Option<InProcessBehavior>,
+    }
+
+    #[derive(Clone)]
+    enum InProcessBehavior {
+        EmitAndFinish,
+        InvalidReportOnly,
     }
 
     impl TestWorker {
@@ -286,7 +372,13 @@ mod tests {
                 command: command.into(),
                 resolve_result: ResolveResult::accept(),
                 build_calls: Arc::new(AtomicUsize::new(0)),
+                in_process: None,
             }
+        }
+
+        fn with_in_process(mut self, behavior: InProcessBehavior) -> Self {
+            self.in_process = Some(behavior);
+            self
         }
     }
 
@@ -298,6 +390,41 @@ mod tests {
         fn build_command(&self, _req: &WorkerRequest) -> String {
             self.build_calls.fetch_add(1, Ordering::SeqCst);
             self.command.clone()
+        }
+
+        fn run_in_process(
+            &self,
+            _req: &WorkerRequest,
+            ctx: &JobContext,
+        ) -> impl std::future::Future<Output = InProcessOutcome> + Send {
+            let behavior = self.in_process.clone();
+            let ctx = ctx.clone();
+            async move {
+                match behavior {
+                    Some(InProcessBehavior::EmitAndFinish) => {
+                        ctx.emit_stdout("in-process stdout")
+                            .await
+                            .expect("emit stdout succeeds");
+                        ctx.emit_report("report.txt", "text/plain", "report-body")
+                            .await
+                            .expect("emit report succeeds");
+                        InProcessOutcome::Done {
+                            exit_code: 0,
+                            outputs: None,
+                        }
+                    }
+                    Some(InProcessBehavior::InvalidReportOnly) => {
+                        ctx.emit_report("../evil", "text/plain", "report-body")
+                            .await
+                            .expect("invalid report is ignored");
+                        InProcessOutcome::Done {
+                            exit_code: 0,
+                            outputs: None,
+                        }
+                    }
+                    None => InProcessOutcome::NotHandled,
+                }
+            }
         }
     }
 
@@ -359,6 +486,75 @@ mod tests {
                 WorkerResponse::done("pkg#task", 0),
             ]
         );
+        assert!(!shutdown.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn handle_request_emits_in_process_log_report_then_done() {
+        let worker = Arc::new(
+            TestWorker::new("echo should not run")
+                .with_in_process(InProcessBehavior::EmitAndFinish),
+        );
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let request = WorkerRequest::new("pkg#task", "ignored");
+        let (writer, reader) = writer_pair();
+
+        handle_request(
+            request,
+            worker.clone(),
+            Arc::clone(&writer),
+            Arc::clone(&shutdown),
+        )
+        .await
+        .expect("handle request succeeds");
+        drop(writer);
+        let responses = read_responses(reader).await;
+
+        assert_eq!(
+            responses,
+            vec![
+                WorkerResponse::log("pkg#task", LogStream::Stdout, "in-process stdout"),
+                WorkerResponse::report("pkg#task", "report.txt", "text/plain", "report-body"),
+                WorkerResponse::done("pkg#task", 0),
+            ]
+        );
+        assert_eq!(worker.build_calls.load(Ordering::SeqCst), 0);
+        assert!(!shutdown.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn emit_report_rejects_invalid_filename() {
+        let worker = Arc::new(
+            TestWorker::new("echo should not run")
+                .with_in_process(InProcessBehavior::InvalidReportOnly),
+        );
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let request = WorkerRequest::new("pkg#task", "ignored");
+        let (writer, reader) = writer_pair();
+
+        handle_request(
+            request,
+            worker.clone(),
+            Arc::clone(&writer),
+            Arc::clone(&shutdown),
+        )
+        .await
+        .expect("handle request succeeds");
+        drop(writer);
+        let responses = read_responses(reader).await;
+
+        assert_eq!(
+            responses,
+            vec![
+                WorkerResponse::log(
+                    "pkg#task",
+                    LogStream::Stderr,
+                    "ignored invalid report filename: ../evil",
+                ),
+                WorkerResponse::done("pkg#task", 0),
+            ]
+        );
+        assert_eq!(worker.build_calls.load(Ordering::SeqCst), 0);
         assert!(!shutdown.load(Ordering::SeqCst));
     }
 

@@ -543,6 +543,88 @@ Reports are recorded in the task metadata and can be viewed via `luchta logs`.
 - **luchta-bash-worker** runs arbitrary commands via `sh -c`, useful for
   tasks that don't need Yarn workspace wrapping.
 
+#### oxc Workers
+Luchta bundles three in-process workers built on the oxc toolchain (git-pinned to rev `415fe1e7`). All share the same limitations and upgrade cadence.
+
+**Shared limitations:**
+- Unix-only as resident workers: the engine only runs these as resident workers on Unix. Binaries ship on all platforms but Windows usage requires spawning per-task.
+- Upgrade cadence: all `oxc_*` crates move together to one main rev. Bumping requires re-verifying APIs since oxc main churns.
+
+---
+
+- **luchta-oxlint-worker** lints JavaScript/TypeScript files using `oxc_linter` and emits a SARIF report. Configure it in your `luchta-config.*` script:
+
+  ```typescript
+  workers: {
+    oxlint: {
+      command: "luchta-oxlint-worker",
+      env: { OXLINT_OPTS: "--fix" }   // optional
+    }
+  }
+  ```
+
+  **Options via `OXLINT_OPTS`:**
+  - `--fix` — Autofix in place (same as oxlint CLI).
+  - `--suppress-all` — Write `oxlint-suppressions.json` for all active violations.
+  - `--prune-suppressions` — Remove stale suppression entries.
+  - `--quiet` — Suppress stdout output.
+
+  **Suppressions:** The worker reads/writes `oxlint-suppressions.json` in the task's working directory. The file format is byte-compatible with the oxlint CLI and IDE integrations.
+
+  **SARIF report:** After linting, the worker emits `oxlint.sarif` (`application/sarif+json`). Retrieve it with:
+  ```
+  luchta logs --file oxlint.sarif
+  ```
+
+  **Config discovery:** Finds `.oxlintrc.json` or `.oxlintrc.jsonc` by walking ancestor directories from the task's `cwd`. JavaScript/TypeScript config (`oxlint.config.ts`) is not supported.
+
+  **Type-aware linting:** Supported via the external `oxlint-tsgolint` binary.
+  - **Enable:** Set `options.typeAware: true` (and `typeCheck`) in `.oxlintrc`, or use `OXLINT_OPTS="--type-aware --type-check"`.
+  - **Prerequisite:** The `oxlint-tsgolint` binary must be installed (e.g. `npm i -D oxlint-tsgolint`). It is a user-installed runtime dependency, not shipped by Luchta.
+  - **Graceful Fallback:** If the binary is missing when requested, the worker logs a warning and continues with regular non-type-aware linting.
+  - Findings are merged into the same SARIF report and exit code.
+
+---
+
+- **luchta-oxc-transform-worker** transpiles TypeScript/JavaScript (babel replacement). It transforms `src/**` to `dist/<envName>/**/*.js` and reports outputs for caching.
+
+  ```typescript
+  workers: {
+    "oxc-transform": {
+      command: "luchta-oxc-transform-worker"
+    }
+  }
+  ```
+
+  **Environment resolution:** The output directory `dist/<envName>` is derived from the task id: `build:<env>` → `<env>`, else `js`.
+
+  **Behavior:**
+  - Transpiles `src/**` → `dist/<envName>/**/*.js`.
+  - Reports all output files for cache tracking.
+  - Removes stale outputs on re-run (files no longer produced are deleted).
+
+  **Source maps:** Supported. The worker emits a `<name>.js.map` next to each transpiled `<name>.js` and appends a `//# sourceMappingURL=` comment. The `.map` files are included in the worker's reported outputs for cache tracking.
+
+---
+
+- **luchta-oxfmt-worker** formats JavaScript/TypeScript files using oxc's formatter. By default, it formats in place.
+
+  ```typescript
+  workers: {
+    oxfmt: {
+      command: "luchta-oxfmt-worker",
+      env: { OXFMT_OPTS: "--check" }   // optional
+    }
+  }
+  ```
+
+  **Options via `OXFMT_OPTS`:**
+  - `--check` — Check mode: reports unformatted files and exits nonzero without writing. Without this flag, files are formatted in place.
+
+  **Config discovery:** Finds `.oxfmtrc.json` or `.oxfmtrc.jsonc` by walking up from the task's `cwd`. If no config is found, it uses oxfmt defaults.
+  - **Supported fields:** `useTabs`, `tabWidth`, `printWidth`, `endOfLine` (lf|crlf|cr), `singleQuote`, `jsxSingleQuote`, `semi`, `trailingComma` (all|es5|none), `bracketSpacing`, `bracketSameLine`.
+  - **Other fields:** All other Prettier/oxfmt fields (overrides, ignore patterns, editorconfig, plugins, arrowParens, etc.) are currently ignored.
+
 #### Wrapper & Filter Workers
 Luchta provides a set of composable wrapper workers that can be chained using
 `--` to add laziness or conditional pruning to any worker. Each wrapper spawns

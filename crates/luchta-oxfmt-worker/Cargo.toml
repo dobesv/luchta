@@ -1,0 +1,36 @@
+[package]
+name = "luchta-oxfmt-worker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description.workspace = true
+
+[features]
+default = ["oxc"]
+oxc = [
+    "dep:json-strip-comments",
+    "dep:oxc_allocator",
+    "dep:oxc_formatter",
+    "dep:oxc_formatter_core",
+    "dep:oxc_span",
+    "dep:serde",
+    "dep:serde_json",
+]
+
+[dependencies]
+luchta-worker = { path = "../luchta-worker" }
+tokio = { workspace = true }
+json-strip-comments = { workspace = true, optional = true }
+oxc_allocator = { workspace = true, optional = true }
+oxc_formatter = { workspace = true, optional = true }
+oxc_formatter_core = { workspace = true, optional = true }
+oxc_span = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+
+[dev-dependencies]
+assert_fs = { workspace = true }

@@ -1,0 +1,46 @@
+[package]
+name = "luchta-oxlint-worker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description.workspace = true
+
+[features]
+default = ["oxc"]
+oxc = [
+    "dep:ignore",
+    "dep:oxc_allocator",
+    "dep:oxc_parser",
+    "dep:oxc_semantic",
+    "dep:oxc_linter",
+    "dep:oxc_span",
+    "dep:oxc_diagnostics",
+    "dep:oxc_syntax",
+    "dep:serde",
+    "dep:serde_json",
+]
+
+[dependencies]
+luchta-worker = { path = "../luchta-worker" }
+tokio = { workspace = true }
+ignore = { workspace = true, optional = true }
+oxc_allocator = { workspace = true, optional = true }
+oxc_parser = { workspace = true, optional = true }
+oxc_semantic = { workspace = true, optional = true }
+oxc_linter = { workspace = true, optional = true }
+oxc_span = { workspace = true, optional = true }
+oxc_diagnostics = { workspace = true, optional = true }
+oxc_syntax = { git = "https://github.com/oxc-project/oxc", rev = "415fe1e7bb423cf05019c5e2c9a5705eebbc5447", optional = true }
+rustc-hash = "2.1.1"
+serde = { workspace = true, optional = true, features = ["derive"] }
+serde_json = { workspace = true, optional = true }
+
+[dev-dependencies]
+assert_cmd = { workspace = true }
+luchta-engine = { path = "../luchta-engine" }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
