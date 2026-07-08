@@ -1,8 +1,9 @@
-use std::ffi::OsString;
+use std::collections::HashMap;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use serde::Deserialize;
 
 /// Project automation tasks for the Luchta workspace.
@@ -17,36 +18,322 @@ struct Cli {
 enum XtaskCommand {
     /// Install all workspace binary crates via `cargo install --path`.
     Install,
+    /// Build Go TypeScript worker into target output directory.
+    BuildWorker(BuildWorkerArgs),
+}
+
+#[derive(Debug, Args)]
+struct BuildWorkerArgs {
+    /// Rust target triple to build for. Defaults to host triple.
+    #[arg(long)]
+    target: Option<String>,
+    /// Override output directory for built worker binary.
+    #[arg(long)]
+    out_dir: Option<PathBuf>,
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
         XtaskCommand::Install => install_bins(),
+        XtaskCommand::BuildWorker(args) => build_worker(args),
+    }
+}
+
+fn build_worker(args: BuildWorkerArgs) -> ExitCode {
+    match try_build_worker(args) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("{error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn try_build_worker(args: BuildWorkerArgs) -> Result<(), String> {
+    let repo_root = repo_root()?;
+    let target = args.target.unwrap_or(host_target_triple()?);
+    let out_dir = args
+        .out_dir
+        .unwrap_or_else(|| repo_root.join("target").join(&target).join("release"));
+    let output_path = build_worker_to(&repo_root, &target, &out_dir)?;
+
+    println!("Built {}", output_path.display());
+    Ok(())
+}
+
+fn build_worker_to(repo_root: &Path, target: &str, out_dir: &Path) -> Result<PathBuf, String> {
+    let vendor_dir = repo_root.join("vendor/tsgo");
+    ensure_tsgo_submodule_initialized(&vendor_dir)?;
+
+    let go_target = go_target_for_rust_triple(target)?;
+    std::fs::create_dir_all(out_dir).map_err(|error| {
+        format!(
+            "failed to create output directory {}: {error}",
+            out_dir.display()
+        )
+    })?;
+
+    let patch_path = repo_root.join("patches/tsgo.patch");
+    let output_path = out_dir.join(worker_binary_name(go_target.goos));
+
+    reset_tsgo_worktree(&vendor_dir)?;
+    apply_tsgo_patch(&vendor_dir, &patch_path)?;
+
+    let build_result = go_build_worker(&vendor_dir, &output_path, go_target);
+    let reset_result = reset_tsgo_worktree(&vendor_dir);
+
+    build_result?;
+    reset_result?;
+    Ok(output_path)
+}
+
+fn repo_root() -> Result<PathBuf, String> {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    manifest_dir.parent().map(Path::to_path_buf).ok_or_else(|| {
+        format!(
+            "failed to determine repository root from {}",
+            manifest_dir.display()
+        )
+    })
+}
+
+fn ensure_tsgo_submodule_initialized(vendor_dir: &Path) -> Result<(), String> {
+    if vendor_dir.join(".git").exists() {
+        Ok(())
+    } else {
+        Err("vendor/tsgo not initialized — run: git submodule update --init".to_string())
+    }
+}
+
+fn host_target_triple() -> Result<String, String> {
+    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| OsString::from("rustc"));
+    let output = Command::new(rustc)
+        .arg("-vV")
+        .output()
+        .map_err(|error| format!("failed to run rustc -vV: {error}"))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "rustc -vV exited with {}",
+            exit_code_label(output.status.code())
+        ));
+    }
+
+    let stdout = String::from_utf8(output.stdout)
+        .map_err(|error| format!("rustc -vV produced non-UTF-8 output: {error}"))?;
+
+    stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("host: ").map(str::to_owned))
+        .ok_or_else(|| "failed to find host triple in rustc -vV output".to_string())
+}
+
+fn apply_tsgo_patch(vendor_dir: &Path, patch_path: &Path) -> Result<(), String> {
+    let check_status = run_command(
+        Command::new("git")
+            .arg("-C")
+            .arg(vendor_dir)
+            .arg("apply")
+            .arg("--check")
+            .arg(patch_path),
+        "failed to run git apply --check",
+    )?;
+
+    if !check_status.success() {
+        return Err("patches/tsgo.patch does not apply to vendor/tsgo — rebase needed".to_string());
+    }
+
+    let apply_status = run_command(
+        Command::new("git")
+            .arg("-C")
+            .arg(vendor_dir)
+            .arg("apply")
+            .arg(patch_path),
+        "failed to run git apply",
+    )?;
+
+    if apply_status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "git apply exited with {}",
+            exit_code_label(apply_status.code())
+        ))
+    }
+}
+
+fn reset_tsgo_worktree(vendor_dir: &Path) -> Result<(), String> {
+    let checkout_status = run_command(
+        Command::new("git")
+            .arg("-C")
+            .arg(vendor_dir)
+            .arg("checkout")
+            .arg("."),
+        "failed to run git checkout .",
+    )?;
+
+    if !checkout_status.success() {
+        return Err(format!(
+            "git checkout . exited with {}",
+            exit_code_label(checkout_status.code())
+        ));
+    }
+
+    let clean_status = run_command(
+        Command::new("git")
+            .arg("-C")
+            .arg(vendor_dir)
+            .arg("clean")
+            .arg("-fd"),
+        "failed to run git clean -fd",
+    )?;
+
+    if clean_status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "git clean -fd exited with {}",
+            exit_code_label(clean_status.code())
+        ))
+    }
+}
+
+#[allow(clippy::suspicious_command_arg_space)]
+fn go_build_worker(
+    vendor_dir: &Path,
+    output_path: &Path,
+    go_target: GoTarget,
+) -> Result<(), String> {
+    let status = Command::new("go")
+        .current_dir(vendor_dir)
+        .env("CGO_ENABLED", "0")
+        .env("GOOS", go_target.goos)
+        .env("GOARCH", go_target.goarch)
+        .arg("build")
+        .arg("-trimpath")
+        .arg("-ldflags")
+        .arg("-s -w")
+        .arg("-o")
+        .arg(output_path)
+        .arg("./cmd/luchta-tsc-worker")
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .map_err(|error| format!("failed to run go build: {error}"))?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "go build exited with {}",
+            exit_code_label(status.code())
+        ))
+    }
+}
+
+fn run_command(
+    command: &mut Command,
+    spawn_error: &str,
+) -> Result<std::process::ExitStatus, String> {
+    command
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .map_err(|error| format!("{spawn_error}: {error}"))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GoTarget {
+    goos: &'static str,
+    goarch: &'static str,
+}
+
+fn go_target_for_rust_triple(target: &str) -> Result<GoTarget, String> {
+    match target {
+        "x86_64-unknown-linux-musl" | "x86_64-unknown-linux-gnu" => Ok(GoTarget {
+            goos: "linux",
+            goarch: "amd64",
+        }),
+        "aarch64-unknown-linux-musl" | "aarch64-unknown-linux-gnu" => Ok(GoTarget {
+            goos: "linux",
+            goarch: "arm64",
+        }),
+        "x86_64-apple-darwin" => Ok(GoTarget {
+            goos: "darwin",
+            goarch: "amd64",
+        }),
+        "aarch64-apple-darwin" => Ok(GoTarget {
+            goos: "darwin",
+            goarch: "arm64",
+        }),
+        "x86_64-pc-windows-msvc" => Ok(GoTarget {
+            goos: "windows",
+            goarch: "amd64",
+        }),
+        "aarch64-pc-windows-msvc" => Ok(GoTarget {
+            goos: "windows",
+            goarch: "arm64",
+        }),
+        "i686-pc-windows-msvc" => Ok(GoTarget {
+            goos: "windows",
+            goarch: "386",
+        }),
+        _ => Err(format!(
+            "unsupported target `{target}`. Supported targets: {}",
+            supported_target_triples().join(", ")
+        )),
+    }
+}
+
+fn supported_target_triples() -> &'static [&'static str] {
+    &[
+        "x86_64-unknown-linux-musl",
+        "aarch64-unknown-linux-musl",
+        "x86_64-unknown-linux-gnu",
+        "aarch64-unknown-linux-gnu",
+        "x86_64-apple-darwin",
+        "aarch64-apple-darwin",
+        "x86_64-pc-windows-msvc",
+        "aarch64-pc-windows-msvc",
+        "i686-pc-windows-msvc",
+    ]
+}
+
+fn worker_binary_name(goos: &str) -> &'static OsStr {
+    if goos == "windows" {
+        OsStr::new("luchta-tsc-worker.exe")
+    } else {
+        OsStr::new("luchta-tsc-worker")
     }
 }
 
 fn install_bins() -> ExitCode {
-    let metadata = match workspace_metadata() {
-        Ok(metadata) => metadata,
-        Err(error) => {
-            eprintln!("failed to load cargo metadata: {error}");
-            return ExitCode::FAILURE;
+    match try_install_bins() {
+        Ok(summary) => {
+            println!("\nSummary: installed {summary}");
+            ExitCode::SUCCESS
         }
-    };
+        Err(error) => {
+            eprintln!("{error}");
+            ExitCode::FAILURE
+        }
+    }
+}
 
+fn try_install_bins() -> Result<String, String> {
+    let metadata =
+        workspace_metadata().map_err(|error| format!("failed to load cargo metadata: {error}"))?;
     let packages = workspace_bin_packages(&metadata);
+    let total = packages.len();
 
-    if packages.is_empty() {
+    if total == 0 {
         println!("No workspace binary crates found.");
-        return ExitCode::SUCCESS;
+    } else {
+        println!("Installing {total} workspace binary crate(s)...");
     }
 
-    let total = packages.len();
-    println!("Installing {total} workspace binary crate(s)...");
-
     let mut installed = 0usize;
-
     for package in &packages {
         println!(
             "\n==> Installing {} from {}",
@@ -55,16 +342,89 @@ fn install_bins() -> ExitCode {
         );
 
         if let Err(error) = cargo_install(&package.crate_dir) {
-            eprintln!("\nInstall failed for {}: {error}", package.name);
-            eprintln!("Summary: installed {installed}/{total} crate(s).");
-            return ExitCode::FAILURE;
+            return Err(format!(
+                "\nInstall failed for {}: {error}\nSummary: installed {installed}/{total} crate(s).",
+                package.name
+            ));
         }
 
         installed += 1;
     }
 
-    println!("\nSummary: installed {installed}/{total} crate(s).");
-    ExitCode::SUCCESS
+    println!("\n==> Installing luchta-tsc-worker");
+    let installed_worker_path = install_host_worker()?;
+    println!("Installed {}", installed_worker_path.display());
+
+    Ok(format!("{installed}/{total} crate(s) + tsc worker"))
+}
+
+fn install_host_worker() -> Result<PathBuf, String> {
+    let repo_root = repo_root()?;
+    let target = host_target_triple()?;
+    let build_out_dir = repo_root.join("target").join(&target).join("release");
+    let built_path = build_worker_to(&repo_root, &target, &build_out_dir)?;
+
+    let bin_dir = cargo_install_bin_dir_from_env(&cargo_install_env())?;
+    std::fs::create_dir_all(&bin_dir).map_err(|error| {
+        format!(
+            "failed to create cargo install bin directory {}: {error}",
+            bin_dir.display()
+        )
+    })?;
+
+    let installed_path = bin_dir.join(built_path.file_name().ok_or_else(|| {
+        format!(
+            "built worker path {} has no file name",
+            built_path.display()
+        )
+    })?);
+    std::fs::copy(&built_path, &installed_path).map_err(|error| {
+        format!(
+            "failed to copy {} to {}: {error}",
+            built_path.display(),
+            installed_path.display()
+        )
+    })?;
+
+    Ok(installed_path)
+}
+
+fn cargo_install_env() -> HashMap<String, OsString> {
+    std::env::vars_os()
+        .map(|(key, value)| (key.to_string_lossy().into_owned(), value))
+        .collect()
+}
+
+fn cargo_install_bin_dir_from_env(env: &HashMap<String, OsString>) -> Result<PathBuf, String> {
+    if let Some(root) = env
+        .get("CARGO_INSTALL_ROOT")
+        .filter(|v| is_non_empty_env(v))
+    {
+        return Ok(PathBuf::from(root).join("bin"));
+    }
+
+    if let Some(cargo_home) = env.get("CARGO_HOME").filter(|v| is_non_empty_env(v)) {
+        return Ok(PathBuf::from(cargo_home).join("bin"));
+    }
+
+    cargo_home_base_dir(env).map(|dir| dir.join(".cargo").join("bin"))
+}
+
+fn cargo_home_base_dir(env: &HashMap<String, OsString>) -> Result<PathBuf, String> {
+    if let Some(home) = env.get("HOME").filter(|v| is_non_empty_env(v)) {
+        return Ok(PathBuf::from(home));
+    }
+
+    if let Some(user_profile) = env.get("USERPROFILE").filter(|v| is_non_empty_env(v)) {
+        return Ok(PathBuf::from(user_profile));
+    }
+
+    Err("failed to determine cargo install root: set CARGO_INSTALL_ROOT, CARGO_HOME, HOME, or USERPROFILE".to_string())
+}
+
+/// Returns true if the env value is non-empty and not whitespace-only.
+fn is_non_empty_env(value: &OsStr) -> bool {
+    !value.to_string_lossy().trim().is_empty()
 }
 
 /// The cargo executable to invoke. Prefer the `CARGO` env var (set by cargo when
@@ -239,6 +599,13 @@ mod tests {
         serde_json::from_str(SAMPLE_METADATA).expect("sample metadata parses")
     }
 
+    fn env_map(pairs: &[(&str, &str)]) -> HashMap<String, OsString> {
+        pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), OsString::from(value)))
+            .collect()
+    }
+
     #[test]
     fn target_is_bin_detects_bin_kind() {
         assert!(Target {
@@ -362,5 +729,120 @@ mod tests {
     fn exit_code_label_formats_code_and_signal() {
         assert_eq!(exit_code_label(Some(2)), "2");
         assert_eq!(exit_code_label(None), "signal");
+    }
+
+    #[test]
+    fn go_target_mapping_covers_supported_linux_host_variant() {
+        assert_eq!(
+            go_target_for_rust_triple("x86_64-unknown-linux-gnu"),
+            Ok(GoTarget {
+                goos: "linux",
+                goarch: "amd64"
+            })
+        );
+        assert_eq!(
+            go_target_for_rust_triple("aarch64-unknown-linux-musl"),
+            Ok(GoTarget {
+                goos: "linux",
+                goarch: "arm64"
+            })
+        );
+    }
+
+    #[test]
+    fn go_target_mapping_covers_windows_variants() {
+        assert_eq!(
+            go_target_for_rust_triple("x86_64-pc-windows-msvc"),
+            Ok(GoTarget {
+                goos: "windows",
+                goarch: "amd64"
+            })
+        );
+        assert_eq!(
+            go_target_for_rust_triple("i686-pc-windows-msvc"),
+            Ok(GoTarget {
+                goos: "windows",
+                goarch: "386"
+            })
+        );
+    }
+
+    #[test]
+    fn worker_binary_name_adds_windows_suffix() {
+        assert_eq!(
+            worker_binary_name("windows"),
+            OsStr::new("luchta-tsc-worker.exe")
+        );
+        assert_eq!(worker_binary_name("linux"), OsStr::new("luchta-tsc-worker"));
+    }
+
+    #[test]
+    fn cargo_install_bin_dir_prefers_install_root() {
+        let env = env_map(&[
+            ("CARGO_INSTALL_ROOT", "/x/install"),
+            ("CARGO_HOME", "/x/cargo-home"),
+            ("HOME", "/x/home"),
+        ]);
+        assert_eq!(
+            cargo_install_bin_dir_from_env(&env),
+            Ok(PathBuf::from("/x/install/bin"))
+        );
+    }
+
+    #[test]
+    fn cargo_install_bin_dir_falls_back_to_cargo_home() {
+        let env = env_map(&[("CARGO_HOME", "/x/cargo-home"), ("HOME", "/x/home")]);
+        assert_eq!(
+            cargo_install_bin_dir_from_env(&env),
+            Ok(PathBuf::from("/x/cargo-home/bin"))
+        );
+    }
+
+    #[test]
+    fn cargo_install_bin_dir_falls_back_to_home_dot_cargo_bin() {
+        let env = env_map(&[("HOME", "/x/home")]);
+        assert_eq!(
+            cargo_install_bin_dir_from_env(&env),
+            Ok(PathBuf::from("/x/home/.cargo/bin"))
+        );
+    }
+
+    #[test]
+    fn cargo_install_bin_dir_accepts_userprofile_fallback() {
+        let env = env_map(&[("USERPROFILE", "C:/Users/tester")]);
+        assert_eq!(
+            cargo_install_bin_dir_from_env(&env),
+            Ok(PathBuf::from("C:/Users/tester/.cargo/bin"))
+        );
+    }
+
+    #[test]
+    fn cargo_install_bin_dir_errors_when_no_root_env_present() {
+        let env = HashMap::new();
+        assert_eq!(
+            cargo_install_bin_dir_from_env(&env),
+            Err(
+                "failed to determine cargo install root: set CARGO_INSTALL_ROOT, CARGO_HOME, HOME, or USERPROFILE"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn cargo_install_bin_dir_ignores_empty_cargo_install_root() {
+        let env = env_map(&[("CARGO_INSTALL_ROOT", ""), ("CARGO_HOME", "/x/cargo-home")]);
+        assert_eq!(
+            cargo_install_bin_dir_from_env(&env),
+            Ok(PathBuf::from("/x/cargo-home/bin"))
+        );
+    }
+
+    #[test]
+    fn unsupported_target_lists_supported_triples() {
+        let error = go_target_for_rust_triple("foo-bar").expect_err("target rejected");
+        assert!(error.contains("unsupported target `foo-bar`"));
+        for target in supported_target_triples() {
+            assert!(error.contains(target), "missing {target} in {error}");
+        }
     }
 }

@@ -1,0 +1,4 @@
+[submodule "vendor/tsgo"]
+	path = vendor/tsgo
+	url = https://github.com/microsoft/typescript-go
+	shallow = true

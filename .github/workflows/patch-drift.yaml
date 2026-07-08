@@ -1,0 +1,103 @@
+name: Patch drift
+
+on:
+  schedule:
+    # Weekly on Monday at 00:00 UTC
+    - cron: '0 0 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+env:
+  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  check-patch:
+    name: Check patch applies to pinned submodule
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Ensure submodules initialized
+        shell: bash
+        run: git submodule update --init --recursive
+
+      - name: Check patch applies
+        id: check-patch
+        shell: bash
+        run: |
+          # Run git apply --check and capture output WITHOUT aborting under set -e
+          # GitHub Actions runs bash with -e (errexit), so we use if ! to trap failure
+          if ! OUTPUT=$(git -C vendor/tsgo apply --check ../../patches/tsgo.patch 2>&1); then
+            # Patch does NOT apply - capture failure for issue body
+            {
+              echo "patch_check_output<<EOF"
+              echo "$OUTPUT"
+              echo "EOF"
+              echo "patch_applies=false"
+            } >> "$GITHUB_OUTPUT"
+          else
+            # Patch applies cleanly
+            echo "patch_check_output=" >> "$GITHUB_OUTPUT"
+            echo "patch_applies=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create or find maintenance label
+        if: steps.check-patch.outputs.patch_applies == 'false'
+        shell: bash
+        run: |
+          # Ensure 'maintenance' label exists; ignore error if already present
+          gh label create maintenance --color "ededed" --description "Maintenance / upkeep" 2>/dev/null || true
+
+      - name: Check for existing open issue
+        if: steps.check-patch.outputs.patch_applies == 'false'
+        id: check-issue
+        shell: bash
+        run: |
+          # Search for existing open issue with exact title
+          EXISTING=$(gh issue list --search "tsgo patch no longer applies in:title" --state open --json number --jq 'length')
+          if [ "$EXISTING" -gt 0 ]; then
+            echo "issue_exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "issue_exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Open drift issue
+        if: steps.check-patch.outputs.patch_applies == 'false' && steps.check-issue.outputs.issue_exists == 'false'
+        shell: bash
+        run: |
+          ISSUE_BODY="## Patch Drift Detected
+
+          The patch \`patches/tsgo.patch\` no longer applies cleanly to the pinned \`vendor/tsgo\` submodule.
+
+          **Pinned upstream SHA:** \`e578159b7ae473127056a65748d7b3a4daa9a93f\`
+
+          The patch needs to be regenerated or rebased against the pinned submodule commit.
+
+          ### Error Output
+
+          \`\`\`
+          ${{ steps.check-patch.outputs.patch_check_output }}
+          \`\`\`
+
+          ---
+
+          This issue was automatically created by the \`patch-drift\` workflow."
+
+          gh issue create \
+            --title "tsgo patch no longer applies" \
+            --label maintenance \
+            --body "$ISSUE_BODY"
+
+      - name: Fail if patch does not apply
+        if: steps.check-patch.outputs.patch_applies == 'false'
+        shell: bash
+        run: |
+          echo "::error::Patch drift detected - patches/tsgo.patch does not apply to pinned vendor/tsgo"
+          exit 1

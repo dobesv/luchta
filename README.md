@@ -57,11 +57,45 @@ cargo build -p luchta-cli
 Repetitive project tasks live in the `xtask` crate, run through the
 `cargo xtask` alias. To install all workspace binary crates in one step:
 ```bash
-cargo xtask install
+cargo xtask install          # Install all workspace binary crates (including the Go worker)
+cargo xtask build-worker     # Build the TypeScript Go worker standalone (requires Go 1.26+)
 ```
 This discovers every workspace member with a binary target via `cargo
 metadata` and runs `cargo install --path` for each, so it stays correct as
-crates are added.
+crates are added. `install` also builds the Go worker for the host and
+places `luchta-tsc-worker` in the cargo bin directory alongside the Rust
+binaries, so it requires Go 1.26+ and an initialized `vendor/tsgo`
+submodule (`git submodule update --init`).
+
+#### Building the TypeScript Worker
+
+The TypeScript worker (`luchta-tsc-worker`) is written in Go and is built using `xtask`.
+
+1. **Prerequisites:** Install [Go 1.26+](https://go.dev/doc/install) and ensure git submodules are initialized:
+   ```bash
+   git submodule update --init
+   ```
+2. **Build:**
+   ```bash
+   cargo xtask build-worker --target <rust-triple>
+   ```
+   Optional: `--out-dir <dir>` overrides the default output directory.
+3. **Output:** The binary is placed at `target/<triple>/release/luchta-tsc-worker` (or `.exe` on Windows).
+
+#### Patch Maintenance
+
+The worker uses a vendored `vendor/tsgo` (git submodule) pinned to the upstream `microsoft/typescript-go` merge-base `e578159b7ae473127056a65748d7b3a4daa9a93f`. Changes are applied via `patches/tsgo.patch` (the diff against the fork `dobesv/typescript-go` at `9ed9a7d054c8dd0655bce2e4c3248a14da7d8772`).
+
+**Regenerating the Patch:**
+To update the patch from a scratch clone containing both remotes (`upstream=microsoft/typescript-go`, `fork=dobesv/typescript-go`):
+```bash
+git diff --no-color --binary e578159b7ae473127056a65748d7b3a4daa9a93f..9ed9a7d054c8dd0655bce2e4c3248a14da7d8772 \
+  -- . ':!node_modules' ':!docs/superpowers/**' ':!testdata/fixtures/pnp/*.cjs' > patches/tsgo.patch
+```
+
+**Important:**
+- The repository uses `core.autocrlf=input`. `.gitattributes` marks `patches/tsgo.patch -text` to ensure CRLF line endings survive checkout. Maintainers MUST preserve this attribute.
+- A scheduled workflow (`patch-drift.yaml`) monitors the patch and opens a maintenance issue if it can no longer be applied.
 
 ### Verification
 
@@ -93,9 +127,7 @@ Brief description of the change.
 The front-matter key is always `luchta`, and the bump level is one of `patch`,
 `minor`, or `major`. To cut a release, run the **Prepare Release** GitHub
 Action (or `knope release` locally); knope bumps the version, updates
-`CHANGELOG.md`, and pushes a `luchta/v<version>` tag. The tag push triggers the
-**Release** workflow, which cross-builds the `luchta` binary for Linux, macOS,
-and Windows and attaches the archives to the GitHub Release. The Release
+`CHANGELOG.md`, and pushes a `luchta/v<version>` tag. The tag push triggers the **Release** workflow, which cross-builds platform binaries for Linux, macOS, and Windows and attaches the archives to the GitHub Release. The Release
 workflow can also be run on demand (`workflow_dispatch`) to build binaries
 without cutting a version.
 
@@ -532,6 +564,10 @@ Workers can attach report files (e.g., test results or linting findings) to a ta
 Reports are recorded in the task metadata and can be viewed via `luchta logs`.
 
 #### Standard Worker Binaries
+
+Standard worker binaries are resolved via `PATH`. They ship inside each release archive alongside the `luchta` binary. Add the extraction directory to your `PATH` so Luchta can locate them.
+
+- **luchta-tsc-worker** is a high-performance TypeScript/tsc worker built from an in-tree vendored and patched [typescript-go](https://github.com/microsoft/typescript-go).
 - **luchta-yarn-worker** runs each task through Yarn so that Yarn-injected
   environment variables (`PATH`, `NODE_OPTIONS`, …) are available. For
   yarn-worker tasks, the task's `command` becomes the Yarn subcommand
