@@ -12,6 +12,67 @@ Luchta optimizes monorepo workflows by:
 - Constructing a **Task Graph** (e.g., `ui#build`) for granular execution.
 - Executing tasks in topological order with **weight-based concurrency** to manage resources like RAM.
 
+## Installation
+
+### Quick install (recommended)
+
+For a fast, automated installation, use the standalone installer scripts. They detect your OS and architecture, download the latest release, and extract all available binaries to `~/.luchta/bin` (on Unix) or `%USERPROFILE%\.luchta\bin` (on Windows).
+
+**Unix / macOS (recommended: download, inspect, run):**
+```bash
+curl -fsSLO https://raw.githubusercontent.com/dobesv/luchta/main/scripts/install.sh
+less install.sh   # review
+bash install.sh
+```
+
+**Windows PowerShell (recommended: download, inspect, run):**
+```powershell
+Invoke-WebRequest https://raw.githubusercontent.com/dobesv/luchta/main/scripts/install.ps1 -OutFile install.ps1
+notepad .\install.ps1   # review
+powershell -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+**Convenience option (pin to a release tag):**
+
+Replace `<version>` with a released version whose tag includes these installer
+scripts (available from the first release cut after they land, e.g. `0.1.14`):
+```bash
+curl -fsSL https://raw.githubusercontent.com/dobesv/luchta/luchta/v<version>/scripts/install.sh | bash
+```
+
+```powershell
+irm https://raw.githubusercontent.com/dobesv/luchta/luchta/v<version>/scripts/install.ps1 | iex
+```
+
+**Security note:** Piping a script straight into a shell executes whatever bytes are served at that URL. For safest use, download the script, inspect it, and run it locally. For reproducible automation, replace `main` with a pinned release tag that includes these scripts (e.g. `luchta/v0.1.14`).
+
+After installation, add the install directory to your `PATH` if the script tells you it is missing.
+
+Luchta discovers workers (like `luchta-tsc-worker`, `luchta-yarn-worker`, etc.) via your `PATH`. Because the installer bundles all workers in the same directory as the `luchta` binary, adding that directory to your `PATH` ensures all workers are automatically resolved without additional configuration.
+
+### Manual download
+
+If you prefer to install manually, download the appropriate archive for your platform from the [GitHub Releases](https://github.com/dobesv/luchta/releases) page.
+
+1. Extract the archive (e.g., `luchta-v<version>-x86_64-unknown-linux-musl.tar.gz`).
+2. Move the extracted binaries to a directory of your choice.
+3. Add that directory to your `PATH`.
+
+**Note:** The archive contains the `luchta` binary along with all standard worker binaries. They should be kept together in the same directory to ensure they are correctly resolved at runtime.
+
+### From source
+
+To build and install Luchta from source, you will need the Rust toolchain and Go 1.26+ (for the TypeScript worker).
+
+```bash
+# Ensure submodules are initialized
+git submodule update --init
+# Build and install all binaries to your cargo bin directory
+cargo xtask install
+```
+
+See the [Project Automation (xtask)](#project-automation-xtask) section for more details on building the Go-based workers.
+
 ## Crate Layout
 
 The project is organized into a multi-crate Cargo workspace under `crates/`:
