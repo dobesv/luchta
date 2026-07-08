@@ -369,7 +369,7 @@ fn extend_progress_segments(
             counts.running_count,
             render_task_id_list(running.keys().collect())
         )
-        .if_supports_color(stream, |value| value.yellow())
+        .if_supports_color(stream, |value| value.bright_black())
         .to_string()
     });
     if let Some(segment) = failed_segment {
