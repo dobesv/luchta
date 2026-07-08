@@ -39,6 +39,7 @@ cargo nextest run --workspace                            # Run all tests via nex
 cargo nextest run --workspace --stress-count=5           # Repeat 5x to catch flaky tests
 cs delta origin/HEAD                                     # CodeScene quality analysis of branch changes
 cargo xtask install                                      # Install all workspace binary crates locally
+cargo xtask build-worker --target <triple>                  # Build the Go-based TypeScript worker
 ```
 
 **CodeScene must be all green.** `cs delta` must report no new code-health
