@@ -138,7 +138,10 @@ jobs:
           -p luchta-command-filter \
           -p luchta-file-exists-filter \
           -p luchta-lazy-worker \
-          -p luchta-yarn-filter
+          -p luchta-yarn-filter \
+          -p luchta-oxlint-worker \
+          -p luchta-oxc-transform-worker \
+          -p luchta-oxfmt-worker
 
     - name: Build tsc worker
       shell: bash
@@ -178,6 +181,9 @@ jobs:
         printf '' | "$rel/luchta-lazy-worker$ext" -- true
         printf '' | "$rel/luchta-yarn-filter$ext" -- true
         printf '' | "$rel/luchta-tsc-worker$ext"
+        printf '' | "$rel/luchta-oxlint-worker$ext"
+        printf '' | "$rel/luchta-oxc-transform-worker$ext"
+        printf '' | "$rel/luchta-oxfmt-worker$ext"
 
     - name: Build archive
       id: package
@@ -207,7 +213,10 @@ jobs:
           luchta-file-exists-filter \
           luchta-lazy-worker \
           luchta-yarn-filter \
-          luchta-tsc-worker; do
+          luchta-tsc-worker \
+          luchta-oxlint-worker \
+          luchta-oxc-transform-worker \
+          luchta-oxfmt-worker; do
           cp "target/$target/release/$bin$ext" "$staging/"
         done
 

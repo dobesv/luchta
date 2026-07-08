@@ -1097,7 +1097,7 @@ pub(crate) fn package_matches(task_id: &TaskId, criteria: &SelectionCriteria<'_>
     }
     let passes_since = criteria
         .since_affected
-        .map_or(true, |set| set.contains(&task_id.package));
+        .is_none_or(|set| set.contains(&task_id.package));
     base_match && passes_since
 }
 

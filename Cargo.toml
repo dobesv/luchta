@@ -13,8 +13,11 @@ members = [
     "crates/luchta-worker-watcher",
     "crates/luchta-file-exists-filter",
     "crates/luchta-yarn-filter",
-  "crates/luchta-command-filter",
+    "crates/luchta-command-filter",
     "crates/luchta-cache",
+    "crates/luchta-oxlint-worker",
+    "crates/luchta-oxc-transform-worker",
+    "crates/luchta-oxfmt-worker",
     "xtask",
 ]
 
@@ -23,7 +26,8 @@ edition = "2021"
 version = "0.1.13"
 license = "MIT"
 authors = ["Luchta Contributors"]
-rust-version = "1.78"
+# oxc main requires Rust >= 1.94.0 at pinned rev 415fe1e7bb423cf05019c5e2c9a5705eebbc5447.
+rust-version = "1.94.0"
 repository = "https://example.com/luchta"
 homepage = "https://example.com/luchta"
 description = "Rust monorepo build orchestration tool"
@@ -58,6 +62,22 @@ tar = "0.4.44"
 dirs = "6.0.0"
 fd-lock = "4"
 fs2 = "0.4.3"
-ignore = "0.4"
+ignore = "0.4.27"
 notify = "6"
 notify-debouncer-full = "0.3"
+
+# oxc toolchain pinned to a single main rev 415fe1e7bb423cf05019c5e2c9a5705eebbc5447
+# (see plan note open-verification-items). Requires Rust >= 1.94.
+oxc_allocator = { git = "https://github.com/oxc-project/oxc.git", rev = "415fe1e7bb423cf05019c5e2c9a5705eebbc5447" }
+oxc_parser = { git = "https://github.com/oxc-project/oxc.git", rev = "415fe1e7bb423cf05019c5e2c9a5705eebbc5447" }
+oxc_semantic = { git = "https://github.com/oxc-project/oxc.git", rev = "415fe1e7bb423cf05019c5e2c9a5705eebbc5447" }
+oxc_linter = { git = "https://github.com/oxc-project/oxc.git", rev = "415fe1e7bb423cf05019c5e2c9a5705eebbc5447" }
+oxc_span = { git = "https://github.com/oxc-project/oxc.git", rev = "415fe1e7bb423cf05019c5e2c9a5705eebbc5447" }
+oxc_diagnostics = { git = "https://github.com/oxc-project/oxc.git", rev = "415fe1e7bb423cf05019c5e2c9a5705eebbc5447" }
+oxc_transformer = { git = "https://github.com/oxc-project/oxc.git", rev = "415fe1e7bb423cf05019c5e2c9a5705eebbc5447" }
+oxc_codegen = { git = "https://github.com/oxc-project/oxc.git", rev = "415fe1e7bb423cf05019c5e2c9a5705eebbc5447" }
+oxc_sourcemap = "8.0.2"
+oxc_formatter = { git = "https://github.com/oxc-project/oxc.git", rev = "415fe1e7bb423cf05019c5e2c9a5705eebbc5447" }
+oxc_formatter_core = { git = "https://github.com/oxc-project/oxc.git", rev = "415fe1e7bb423cf05019c5e2c9a5705eebbc5447" }
+json-strip-comments = "3.1.1"
+serde-sarif = "0.8.0"
