@@ -171,7 +171,11 @@ fn parse_stage_args(args: &[String]) -> Result<Config, String> {
 }
 
 fn should_keep(config: &Config, resolve: &ResolveTask) -> bool {
-    if should_check_default_script(config) && !has_script(resolve, resolve.resolved_script_name()) {
+    // The filter checks for the task's own script name, not the resolved
+    // `command`. The `command` exists for the underlying worker to run; using it
+    // here would make the filter drop tasks whose `command` overrides the script
+    // name even though the package declares the named script.
+    if should_check_default_script(config) && !has_script(resolve, &resolve.name) {
         return false;
     }
 
@@ -340,14 +344,22 @@ mod tests {
     }
 
     #[test]
-    fn default_script_check_uses_resolved_script_name() {
-        let resolve = resolve_task("build", "compile", &["compile"]);
-        assert!(should_keep(
-            &Config {
-                scripts: Vec::new(),
-                dependencies: Vec::new(),
-            },
-            &resolve,
-        ));
+    fn default_script_check_uses_task_name_not_command() {
+        // The task name is the script the filter looks for. A `command`
+        // override is for the worker to run and must be ignored here.
+        let config = Config {
+            scripts: Vec::new(),
+            dependencies: Vec::new(),
+        };
+
+        // Package declares the task's own script name -> keep, even though the
+        // `command` names a different (absent) script.
+        let named = resolve_task("build", "compile", &["build"]);
+        assert!(should_keep(&config, &named));
+
+        // Package declares only the `command`'s script, not the task name ->
+        // prune, because the filter ignores `command`.
+        let command_only = resolve_task("build", "compile", &["compile"]);
+        assert!(!should_keep(&config, &command_only));
     }
 }
