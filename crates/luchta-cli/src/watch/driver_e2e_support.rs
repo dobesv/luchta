@@ -178,6 +178,121 @@ echo '{{"concurrency":{{"maxWeight":4}},"workers":{{"fake":{{"command":"{}"}}}},
     }
 }
 
+pub(super) fn write_two_package_dependency_watch_workspace(workspace_root: &std::path::Path) {
+    write_two_package_dependency_watch_workspace_with_api_source(workspace_root, "fail\n");
+}
+
+pub(super) fn write_two_package_dependency_success_workspace(workspace_root: &std::path::Path) {
+    write_two_package_dependency_watch_workspace_with_api_source(workspace_root, "pass\n");
+}
+
+fn write_two_package_dependency_watch_workspace_with_api_source(
+    workspace_root: &std::path::Path,
+    api_source: &str,
+) {
+    std::fs::create_dir_all(workspace_root.join("packages/api/src")).expect("create api dir");
+    std::fs::create_dir_all(workspace_root.join("packages/app/src")).expect("create app dir");
+    std::fs::write(
+        workspace_root.join("package.json"),
+        r#"{"name": "root", "private": true, "workspaces": ["packages/*"]}"#,
+    )
+    .expect("write root package.json");
+    std::fs::write(
+        workspace_root.join("packages/api/package.json"),
+        r#"{"name": "api", "version": "1.0.0", "scripts": {"build": "echo build"}}"#,
+    )
+    .expect("write api package.json");
+    std::fs::write(
+        workspace_root.join("packages/app/package.json"),
+        r#"{"name": "app", "version": "1.0.0", "dependencies": {"api": "1.0.0"}, "scripts": {"build": "echo build"}}"#,
+    )
+    .expect("write app package.json");
+    std::fs::write(workspace_root.join("packages/api/src/lib.rs"), api_source)
+        .expect("write api src");
+    std::fs::write(workspace_root.join("packages/app/src/lib.rs"), "app\n").expect("write app src");
+
+    let run_git = |args: &[&str]| {
+        let ok = Command::new("git")
+            .args(args)
+            .current_dir(workspace_root)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "git {:?} failed in test workspace", args);
+    };
+    run_git(&["init"]);
+    run_git(&["add", "-A"]);
+
+    let job_count = workspace_root.join(".job-count");
+    let marker_api = workspace_root.join(".run-marker-api");
+    let marker_app = workspace_root.join(".run-marker-app");
+    let worker_script = format!(
+        r##"#!/bin/sh
+job_count=0
+while IFS= read -r line; do
+  case "$line" in
+  *'"type":"resolveTask"'*)
+    id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+    printf '{{"type":"resolved","id":"%s","result":{{"decision":"accept"}}}}\n' "$id"
+    ;;
+  *'"type":"run"'*)
+    id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+    package=${{id%%#*}}
+    job_count=$((job_count + 1))
+    echo "$job_count" > '{job_count}'
+    case "$package" in
+      api)
+        echo "$job_count:$id" >> '{marker_api}'
+        if grep -q 'fail' '{api_src}'; then
+          printf '{{"type":"done","id":"%s","success":false,"exitCode":2}}\n' "$id"
+        else
+          printf '{{"type":"done","id":"%s","success":true,"exitCode":0}}\n' "$id"
+        fi
+        ;;
+      app)
+        echo "$job_count:$id" >> '{marker_app}'
+        printf '{{"type":"done","id":"%s","success":true,"exitCode":0}}\n' "$id"
+        ;;
+      *)
+        printf '{{"type":"done","id":"%s","success":true,"exitCode":0}}\n' "$id"
+        ;;
+    esac
+    ;;
+  esac
+done
+"##,
+        job_count = job_count.display(),
+        marker_api = marker_api.display(),
+        marker_app = marker_app.display(),
+        api_src = workspace_root.join("packages/api/src/lib.rs").display(),
+    );
+    let worker_script_path = workspace_root.join("fake-worker.sh");
+    std::fs::write(&worker_script_path, &worker_script).expect("write worker script");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&worker_script_path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod worker script");
+    }
+
+    let config = format!(
+        r##"#!/bin/sh
+echo '{{"concurrency":{{"maxWeight":4}},"workers":{{"fake":{{"command":"{}"}}}},"tasks":{{"build":{{"worker":"fake","dependsOn":["^build"],"inputs":["src/**"]}}}}}}'
+"##,
+        worker_script_path.display()
+    );
+    std::fs::write(workspace_root.join("luchta-config.sh"), &config).expect("write config");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            workspace_root.join("luchta-config.sh"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("chmod config");
+    }
+}
+
 pub(super) fn write_two_package_lockfile_workspace(workspace_root: &std::path::Path) {
     std::fs::create_dir_all(workspace_root.join("packages/a")).expect("create package a dir");
     std::fs::create_dir_all(workspace_root.join("packages/b")).expect("create package b dir");
@@ -315,6 +430,14 @@ impl E2eHarness {
 
     pub(super) async fn start_two_package_lockfile() -> Self {
         Self::start_with_workspace(write_two_package_lockfile_workspace).await
+    }
+
+    pub(super) async fn start_two_package_dependency_watch() -> Self {
+        Self::start_with_workspace(write_two_package_dependency_watch_workspace).await
+    }
+
+    pub(super) async fn start_two_package_dependency_success_watch() -> Self {
+        Self::start_with_workspace(write_two_package_dependency_success_workspace).await
     }
 
     pub(super) async fn start_failing_initial_cycle() -> Self {
@@ -723,6 +846,15 @@ pub(super) fn discover_package_names(workspace_root: &Path) -> Result<Vec<String
 
 pub(super) fn read_marker_count_for(workspace_root: &std::path::Path, package_key: &str) -> usize {
     count_lines(&workspace_root.join(format!(".run-marker-{package_key}")))
+}
+
+pub(super) fn read_marker_entries_for(
+    workspace_root: &std::path::Path,
+    package_key: &str,
+) -> Vec<String> {
+    std::fs::read_to_string(workspace_root.join(format!(".run-marker-{package_key}")))
+        .map(|s| s.lines().map(str::to_owned).collect())
+        .unwrap_or_default()
 }
 
 pub(super) fn two_package_lockfile_contents(

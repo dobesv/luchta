@@ -526,6 +526,93 @@ async fn config_reload_preserves_explicit_max_weight_override() {
 }
 
 #[tokio::test]
+async fn failed_upstream_fix_reruns_dependent_task() {
+    let harness = E2eHarness::start_two_package_dependency_watch().await;
+
+    harness
+        .wait_until(
+            Duration::from_secs(10),
+            || "timed out waiting for failed api build".to_string(),
+            || read_marker_count_for(&harness.workspace_root, "api") == 1,
+        )
+        .await;
+    assert_eq!(
+        read_marker_count_for(&harness.workspace_root, "app"),
+        0,
+        "expected app build to stay skipped while api build fails"
+    );
+
+    let api_src = harness.workspace_root.join("packages/api/src/lib.rs");
+    std::fs::write(&api_src, "pass\n").expect("rewrite api src");
+    harness
+        .send_batch(std::collections::HashSet::from([api_src]), false)
+        .await;
+    harness
+        .wait_until(
+            Duration::from_secs(10),
+            || "timed out waiting for dependent app build after api fix".to_string(),
+            || {
+                read_marker_count_for(&harness.workspace_root, "api") >= 2
+                    && read_marker_count_for(&harness.workspace_root, "app") >= 1
+            },
+        )
+        .await;
+
+    assert_eq!(
+        read_marker_count_for(&harness.workspace_root, "api"),
+        2,
+        "expected api to rerun after fix"
+    );
+    assert_eq!(
+        read_marker_count_for(&harness.workspace_root, "app"),
+        1,
+        "expected app to run after fixed api reruns"
+    );
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn rerun_upstream_change_reruns_dependent_task() {
+    let harness = E2eHarness::start_two_package_dependency_success_watch().await;
+
+    harness
+        .wait_until(
+            Duration::from_secs(10),
+            || "timed out waiting for initial api/app builds".to_string(),
+            || {
+                read_marker_count_for(&harness.workspace_root, "api") == 1
+                    && read_marker_count_for(&harness.workspace_root, "app") == 1
+            },
+        )
+        .await;
+
+    let api_src = harness.workspace_root.join("packages/api/src/lib.rs");
+    std::fs::write(&api_src, "pass-again\n").expect("rewrite api src");
+    harness
+        .send_batch(std::collections::HashSet::from([api_src]), false)
+        .await;
+    harness
+        .wait_until(
+            Duration::from_secs(10),
+            || "timed out waiting for dependent app rerun after api change".to_string(),
+            || {
+                read_marker_count_for(&harness.workspace_root, "api") >= 2
+                    && read_marker_count_for(&harness.workspace_root, "app") >= 2
+            },
+        )
+        .await;
+
+    assert_eq!(
+        read_marker_entries_for(&harness.workspace_root, "app"),
+        vec!["2:app#build".to_string(), "4:app#build".to_string()],
+        "expected app build to rerun after api rerun"
+    );
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn lockfile_change_reruns_only_affected_package() {
     let harness = E2eHarness::start_two_package_lockfile().await;
 
