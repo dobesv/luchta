@@ -67,7 +67,10 @@ fn build_worker_to(repo_root: &Path, target: &str, out_dir: &Path) -> Result<Pat
     ensure_tsgo_submodule_initialized(&vendor_dir)?;
 
     let go_target = go_target_for_rust_triple(target)?;
-    std::fs::create_dir_all(out_dir).map_err(|error| {
+    let current_dir = std::env::current_dir()
+        .map_err(|error| format!("failed to determine current directory: {error}"))?;
+    let out_dir = resolve_out_dir(&current_dir, out_dir);
+    std::fs::create_dir_all(&out_dir).map_err(|error| {
         format!(
             "failed to create output directory {}: {error}",
             out_dir.display()
@@ -86,6 +89,14 @@ fn build_worker_to(repo_root: &Path, target: &str, out_dir: &Path) -> Result<Pat
     build_result?;
     reset_result?;
     Ok(output_path)
+}
+
+fn resolve_out_dir(cwd: &Path, out_dir: &Path) -> PathBuf {
+    if out_dir.is_absolute() {
+        out_dir.to_path_buf()
+    } else {
+        cwd.join(out_dir)
+    }
 }
 
 fn repo_root() -> Result<PathBuf, String> {
@@ -774,6 +785,22 @@ mod tests {
             OsStr::new("luchta-tsc-worker.exe")
         );
         assert_eq!(worker_binary_name("linux"), OsStr::new("luchta-tsc-worker"));
+    }
+
+    #[test]
+    fn resolve_out_dir_joins_relative_path_to_current_dir() {
+        assert_eq!(
+            resolve_out_dir(Path::new("/repo"), Path::new("target/testrel")),
+            PathBuf::from("/repo/target/testrel")
+        );
+    }
+
+    #[test]
+    fn resolve_out_dir_preserves_absolute_path() {
+        assert_eq!(
+            resolve_out_dir(Path::new("/repo"), Path::new("/tmp/abs-out")),
+            PathBuf::from("/tmp/abs-out")
+        );
     }
 
     #[test]
