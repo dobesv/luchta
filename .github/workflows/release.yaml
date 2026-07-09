@@ -154,7 +154,16 @@ jobs:
 
     - name: Build tsc worker
       shell: bash
-      run: cargo xtask build-worker --target ${{ matrix.target }} --out-dir "target/${{ matrix.target }}/release"
+      run: |
+        rel="target/${{ matrix.target }}/release"
+        cargo xtask build-worker --target ${{ matrix.target }} --out-dir "$rel"
+        ext=""
+        if [[ "$RUNNER_OS" == "Windows" ]]; then ext=".exe"; fi
+        # Fail here (not at the archive step) if the worker did not land where expected.
+        if [[ ! -f "$rel/luchta-tsc-worker$ext" ]]; then
+          echo "::error::luchta-tsc-worker$ext not found in $rel after build" >&2
+          exit 1
+        fi
 
     # Smoke test: run each freshly built binary so a broken artifact (bad
     # dynamic linking, missing symbols) fails the job before it is published.
