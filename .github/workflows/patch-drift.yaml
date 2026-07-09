@@ -22,11 +22,13 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          submodules: recursive
+          submodules: true
 
+      # Only vendor/tsgo is needed to check the patch; do NOT recurse into its
+      # nested `_submodules/TypeScript` submodule (large, unused here).
       - name: Ensure submodules initialized
         shell: bash
-        run: git submodule update --init --recursive
+        run: git submodule update --init vendor/tsgo
 
       - name: Check patch applies
         id: check-patch
