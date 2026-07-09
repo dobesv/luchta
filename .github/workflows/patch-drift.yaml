@@ -74,11 +74,14 @@ jobs:
         if: steps.check-patch.outputs.patch_applies == 'false' && steps.check-issue.outputs.issue_exists == 'false'
         shell: bash
         run: |
+          # Derive the pinned SHA from the recorded submodule pointer so this
+          # stays correct across rebases instead of hardcoding a stale value.
+          PINNED_SHA=$(git ls-tree HEAD vendor/tsgo | awk '{print $3}')
           ISSUE_BODY="## Patch Drift Detected
 
           The patch \`patches/tsgo.patch\` no longer applies cleanly to the pinned \`vendor/tsgo\` submodule.
 
-          **Pinned upstream SHA:** \`e578159b7ae473127056a65748d7b3a4daa9a93f\`
+          **Pinned upstream SHA:** \`${PINNED_SHA}\`
 
           The patch needs to be regenerated or rebased against the pinned submodule commit.
 

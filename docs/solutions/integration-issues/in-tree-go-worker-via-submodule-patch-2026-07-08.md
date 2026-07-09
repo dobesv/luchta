@@ -1,6 +1,7 @@
 ---
 title: "In-tree Go worker build via git submodule + binary patch"
 date: 2026-07-08
+last_updated: 2026-07-08
 category: integration-issues
 problem_type: integration_issue
 component: xtask, vendor/tsgo, release workflow
@@ -232,8 +233,110 @@ No engine/luchta-config changes required.
   - [ ] GitHub Actions failure-handling tested under `-eo pipefail`?
   - [ ] Submodule pinned to merge-base?
 
+## Appendix A: Rebasing Onto Newer Upstream (TypeScript 7.0 GA)
+
+The original integration pinned the submodule to merge-base `e578159b`. Rebasing onto TypeScript 7.0 GA (`typescript/v7.0.2` → `2bd066d87f5bafd315be9f40889d0a60b9e58e0b`) required deriving a new patch. This section documents the rebase procedure and key gotchas.
+
+### Procedure
+
+```bash
+# 1. Fetch the target tag into the shallow submodule
+cd vendor/tsgo
+git fetch --depth=1 origin tag typescript/v7.0.2
+
+# 2. Check out the new base
+git checkout 2bd066d87f5bafd315be9f40889d0a60b9e58e0b
+
+# 3. Attempt patch application with --reject to surface conflicts
+git apply --reject --whitespace=nowarn ../../patches/tsgo.patch
+
+# 4. Inspect .rej files — only 4 of 93 files rejected
+#    Resolve each reject by hand, preserving upstream semantics
+
+# 5. Delete .rej files after resolution
+find . -name '*.rej' -delete
+
+# 6. Stage and regenerate patch from new base
+git add -A
+cd ../..
+git -C vendor/tsgo diff --binary --staged 2bd066d87f5bafd315be9f40889d0a60b9e58e0b > patches/tsgo.patch
+
+# 7. Update submodule pointer
+git -C vendor/tsgo checkout 2bd066d87f5bafd315be9f40889d0a60b9e58e0b
+
+# 8. Verify from fresh checkout
+rm patches/tsgo.patch && git checkout -- patches/tsgo.patch
+git -C vendor/tsgo apply --check ../../patches/tsgo.patch
+cargo xtask build-worker
+```
+
+### Gotcha 3: `git apply --3way` is Atomic
+
+`git apply --3way` aborts the ENTIRE application on any single conflicting hunk. One conflict in `diagnostics_generated.go` caused a rollback of all 93 files, leaving `git status` clean — appearing as if nothing applied.
+
+**Diagnosis:** Use `git apply --reject` instead. This materializes clean hunks and creates `.rej` files only for conflicting hunks. This revealed only 4 rejected files out of 93, making the actual conflict surface visible and bounded.
+
+### Gotcha 4: Self-Contained Fixtures
+
+The original patch referenced Yarn PnP runtime fixtures (`testdata/fixtures/pnp/*.cjs`) in tests but excluded their bodies:
+
+```bash
+# Old regenerate (excluded fixtures)
+git diff --binary <old-base>..<fork-head> -- . '!testdata/fixtures/pnp/*.cjs'
+```
+
+On fresh checkout, tests failed with missing fixture files. The rebase bundled these fixtures (~18k lines), making vendored PnP tests self-contained.
+
+**Patch grew from +5795 lines to +24030 lines.** This is expected — the patch must now carry fixtures to be portable.
+
+### Gotcha 5: Semantic Reject Resolution
+
+Reject resolution is not purely mechanical. Example: `internal/module/resolver.go`.
+
+Upstream changed:
+```go
+// Before (old base)
+if resolved == nil {
+    return nil
+}
+```
+
+To:
+```go
+// After (v7.0 GA)
+if !resolved.Exists() {
+    return nil
+}
+```
+
+Our patch added optional-peer-filter logic + PnP `ResolveToUnqualified`. Resolution required merging our changes onto the new upstream form, preserving both upstream semantics (nil → `.Exists()`) and our PnP extensions.
+
+**Always compile after resolving rejects:** `go build ./cmd/tsc-worker` must succeed.
+
+### Gotcha 6: Dynamic Patch-Drift SHA
+
+`patch-drift.yaml` originally hardcoded the pinned SHA. Rebases would break this.
+
+**Fix:** Derive dynamically from submodule pointer:
+
+```yaml
+- name: Get pinned SHA
+  run: echo "PINNED_SHA=$(git ls-tree HEAD vendor/tsgo | awk '{print $3}')" >> $GITHUB_OUTPUT
+```
+
+This survives rebases without manual updates.
+
+### Upstream Status Snapshot (2026-07-08 GA)
+
+- **Repo:** Still `microsoft/typescript-go` (no stable integration API until 7.1)
+- **Yarn PnP:** NOT upstream — issue [#460](https://github.com/microsoft/typescript-go/issues/460) open, PR [#1966](https://github.com/microsoft/typescript-go/pull/1966) open-unmerged
+- **Implication:** Subprocess-worker + `internal/luchta` glue remains necessary; patch concern (A) must still be carried
+- **New pinned base:** `2bd066d87f5bafd315be9f40889d0a60b9e58e0b` (tag `typescript/v7.0.2`)
+
 ## Related Issues
 
 - **GitHub Issue:** [#193](https://github.com/dobesv/luchta-tsc-worker/issues/193) — In-tree tsc-worker
+- **GitHub Issue:** [#199](https://github.com/dobesv/luchta-tsc-worker/issues/199) — Rebase onto TypeScript 7.0 GA
 - **Plan:** `luchta-193-tsc-worker-in-tree`
+- **Plan:** `luchta-tsc-worker-v7-rebase-investigation`
 - **Related Solution:** [workflow-issues/xtask-automation-pattern-2026-06-10.md](../workflow-issues/xtask-automation-pattern-2026-06-10.md) — xtask pattern for project automation
