@@ -59,13 +59,22 @@ jobs:
       BUILD_CMD: cargo
 
     steps:
+    # Enable long paths on Windows so submodule checkouts with deep/long
+    # filenames don't fail with "Filename too long". No-op on Linux/macOS.
+    - name: Enable git long paths (Windows)
+      shell: bash
+      run: git config --global core.longpaths true
+
+    # Only vendor/tsgo is needed to build the worker; do NOT recurse into its
+    # nested `_submodules/TypeScript` (microsoft/TypeScript), whose long test
+    # baseline paths break checkout on Windows and which the worker never uses.
     - uses: actions/checkout@v4
       with:
-        submodules: recursive
+        submodules: true
 
     - name: Initialize submodules
       shell: bash
-      run: git submodule update --init --recursive
+      run: git submodule update --init vendor/tsgo
 
     - name: Check tag
       id: check-tag
