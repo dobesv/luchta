@@ -704,6 +704,48 @@ Luchta bundles three in-process workers built on the oxc toolchain (git-pinned t
 
 ---
 
+- **luchta-swc-transform-worker** transpiles TypeScript/JavaScript via SWC (babel/swc-cli replacement). It transforms `src/**` to `dist/js/**/*.js` and reports outputs for caching.
+
+  ```typescript
+  workers: {
+    "swc-transform": {
+      command: "luchta-swc-transform-worker"
+    }
+  }
+  ```
+
+  With no flags it honors `.swcrc` when present (crawls up from each source file, SWC-CLI parity), otherwise built-in defaults (TS + JSX strip, target es2022, sourcemaps on) and writes to `dist/js/`. For deterministic built-in `es2022` when you are not using a `.swcrc`, pass `--no-swcrc`. Coexists with `oxc-transform` as an alternative.
+
+  **SWC-CLI-style config flags** (set per task via the `command` string) let you drive SWC programmatically instead of via `.swcrc` — useful for multi-env (browser/node) builds:
+
+  ```typescript
+  workers: {
+    "swc-transform": { command: "luchta-swc-transform-worker" }
+  }
+  // then per build task, e.g.:
+  //   command: "--no-swcrc --env-name node --out-dir dist/node --config-file swc.config.json
+  //             -C jsc.transform.react.runtime=automatic -C module.type=commonjs"
+  ```
+
+  - `--no-swcrc` — disable `.swcrc` discovery (use flags/defaults only).
+  - `--config-file <path>` — read a package-relative config file (`.swcrc` format); combine with `--no-swcrc`. Use `--config-file '#<path>'` for a workspace-root-relative shared config, tracked precisely as a cache input.
+  - `-C, --config <key=value>` (repeatable) — set nested SWC config by dotted path, JSON-coerced. E.g. `-C jsc.transform.react.runtime=automatic`, `-C module.type=commonjs|es6`, `-C jsc.target=es2022`, `-C env.mode=entry -C env.coreJs=3.30`. Array-valued config (e.g. WASM plugins) and browserslist `env.targets` are better set via `--config-file`.
+  - `-d, --out-dir <dir>` — output directory (relative to cwd), default `dist/js`. Use distinct per-task values (e.g. `dist/browser`, `dist/node`) for multi-env builds.
+  - `--env-name <name>` — sets SWC's env name (CLI parity).
+  - `--source-maps <true|false>` — external source-map mode; `inline` and `both` are treated as `true`.
+
+  Note: `env` (preset-env) and `jsc.target` are mutually exclusive in SWC; when an `env` block is present the worker omits the default `jsc.target`.
+
+  **Behavior:**
+  - Transpiles `src/**` → `<out-dir>/**/*.js` (default `dist/js/`).
+  - Reports all output files for cache tracking.
+  - Removes stale outputs on re-run (files no longer produced are deleted).
+  - Copies non-transformable assets (e.g., `.json`, `.css`) to output directory.
+
+  **Source maps:** Supported. The worker emits a `<name>.js.map` next to each transpiled `<name>.js` and appends a `//# sourceMappingURL=` comment. The `.map` files are included in the worker's reported outputs for cache tracking.
+
+---
+
 - **luchta-oxfmt-worker** formats JavaScript/TypeScript files using oxc's formatter. By default, it formats in place.
 
   ```typescript

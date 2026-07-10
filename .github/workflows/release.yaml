@@ -150,6 +150,7 @@ jobs:
           -p luchta-yarn-filter \
           -p luchta-oxlint-worker \
           -p luchta-oxc-transform-worker \
+          -p luchta-swc-transform-worker \
           -p luchta-oxfmt-worker
 
     - name: Build tsc worker
@@ -201,6 +202,7 @@ jobs:
         printf '' | "$rel/luchta-tsc-worker$ext"
         printf '' | "$rel/luchta-oxlint-worker$ext"
         printf '' | "$rel/luchta-oxc-transform-worker$ext"
+        printf '' | "$rel/luchta-swc-transform-worker$ext"
         printf '' | "$rel/luchta-oxfmt-worker$ext"
 
     - name: Build archive
@@ -234,6 +236,7 @@ jobs:
           luchta-tsc-worker \
           luchta-oxlint-worker \
           luchta-oxc-transform-worker \
+          luchta-swc-transform-worker \
           luchta-oxfmt-worker; do
           cp "target/$target/release/$bin$ext" "$staging/"
         done

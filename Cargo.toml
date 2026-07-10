@@ -17,6 +17,7 @@ members = [
     "crates/luchta-cache",
     "crates/luchta-oxlint-worker",
     "crates/luchta-oxc-transform-worker",
+    "crates/luchta-swc-transform-worker",
     "crates/luchta-oxfmt-worker",
     "xtask",
 ]
@@ -81,3 +82,6 @@ oxc_formatter = { git = "https://github.com/oxc-project/oxc.git", rev = "415fe1e
 oxc_formatter_core = { git = "https://github.com/oxc-project/oxc.git", rev = "415fe1e7bb423cf05019c5e2c9a5705eebbc5447" }
 json-strip-comments = "3.1.1"
 serde-sarif = "0.8.0"
+
+# swc pinned exact — SWC breaks public API on minor bumps. See plan note a394e139 (probe).
+swc_core = { version = "=73.0.0", features = ["base_module", "common", "ecma_ast", "ecma_parser", "plugin_transform_host_native", "plugin_transform_host_native_filesystem_cache", "plugin_backend_wasmer"] }
