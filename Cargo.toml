@@ -84,4 +84,4 @@ json-strip-comments = "3.1.1"
 serde-sarif = "0.8.0"
 
 # swc pinned exact — SWC breaks public API on minor bumps. See plan note a394e139 (probe).
-swc_core = { version = "=73.0.0", features = ["base_module", "common", "ecma_ast", "ecma_parser", "plugin_transform_host_native", "plugin_transform_host_native_filesystem_cache", "plugin_backend_wasmer"] }
+swc_core = { version = "=73.0.0", features = ["base_module", "common", "ecma_ast", "ecma_parser"] }
