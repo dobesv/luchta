@@ -2677,6 +2677,7 @@ name = "luchta-oxfmt-worker"
 version = "0.1.18"
 dependencies = [
  "assert_fs",
+ "ignore",
  "json-strip-comments",
  "luchta-worker",
  "oxc_allocator",
@@ -2693,6 +2694,7 @@ name = "luchta-oxlint-worker"
 version = "0.1.18"
 dependencies = [
  "assert_cmd",
+ "assert_fs",
  "ignore",
  "luchta-engine",
  "luchta-worker",

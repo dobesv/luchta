@@ -12,6 +12,7 @@ description.workspace = true
 [features]
 default = ["oxc"]
 oxc = [
+    "dep:ignore",
     "dep:json-strip-comments",
     "dep:oxc_allocator",
     "dep:oxc_formatter",
@@ -24,6 +25,7 @@ oxc = [
 [dependencies]
 luchta-worker = { path = "../luchta-worker" }
 tokio = { workspace = true }
+ignore = { workspace = true, optional = true }
 json-strip-comments = { workspace = true, optional = true }
 oxc_allocator = { workspace = true, optional = true }
 oxc_formatter = { workspace = true, optional = true }

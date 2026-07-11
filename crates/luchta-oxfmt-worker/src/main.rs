@@ -13,6 +13,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 #[cfg(feature = "oxc")]
+use ignore::{gitignore::Gitignore, WalkBuilder};
+#[cfg(feature = "oxc")]
 use luchta_worker::{
     run_worker_main, InProcessOutcome, JobContext, ResolveResult, ResolveTask, TaskModification,
     Worker, WorkerRequest,
@@ -36,6 +38,9 @@ impl Worker for OxfmtWorker {
             "src/**".to_owned(),
             ".oxfmtrc.json".to_owned(),
             ".oxfmtrc.jsonc".to_owned(),
+            ".gitignore".to_owned(),
+            ".ignore".to_owned(),
+            ".oxfmtignore".to_owned(),
         ]);
         inputs.extend(req.inputs.iter().cloned());
 
@@ -47,10 +52,21 @@ impl Worker for OxfmtWorker {
         };
 
         let cwd = Path::new(cwd);
-        let files = match collect_formattable_files(cwd) {
-            Ok(files) => files,
+        let config = match discover_config(cwd) {
+            Ok(config) => config,
             Err(error) => return ResolveResult::reject(error),
         };
+        if !config.warnings.is_empty() {
+            return ResolveResult::reject(config.warnings.join("; "));
+        }
+        let (files, warnings) = match collect_formattable_files(cwd, config.ignore_matcher.as_ref())
+        {
+            Ok(result) => result,
+            Err(error) => return ResolveResult::reject(error),
+        };
+        if !warnings.is_empty() {
+            return ResolveResult::reject(warnings.join("; "));
+        }
 
         if files.is_empty() {
             return ResolveResult::prune(Some("no JS/TS source files found for oxfmt".to_owned()));
@@ -85,23 +101,13 @@ impl Worker for OxfmtWorker {
 
             let cwd = PathBuf::from(cwd);
             let opts = OxfmtOpts::from_request(req);
-            let files = match collect_formattable_files(&cwd) {
-                Ok(files) => files,
-                Err(error) => {
-                    let _ = ctx.emit_stderr(error).await;
-                    return InProcessOutcome::Done {
-                        exit_code: 1,
-                        outputs: None,
-                    };
-                }
-            };
-            let format_options = match task::spawn_blocking({
+            let loaded_config = match task::spawn_blocking({
                 let cwd = cwd.clone();
                 move || discover_config(&cwd)
             })
             .await
             {
-                Ok(Ok(config)) => config.options,
+                Ok(Ok(config)) => config,
                 Ok(Err(error)) => {
                     let _ = ctx.emit_stderr(error).await;
                     return InProcessOutcome::Done {
@@ -119,6 +125,44 @@ impl Worker for OxfmtWorker {
                     };
                 }
             };
+            let warnings = loaded_config.warnings.clone();
+            let (files, collection_warnings) = match task::spawn_blocking({
+                let cwd = cwd.clone();
+                let ignore_matcher = loaded_config.ignore_matcher.clone();
+                move || collect_formattable_files(&cwd, ignore_matcher.as_ref())
+            })
+            .await
+            {
+                Ok(Ok(result)) => result,
+                Ok(Err(error)) => {
+                    let _ = ctx.emit_stderr(error).await;
+                    return InProcessOutcome::Done {
+                        exit_code: 1,
+                        outputs: None,
+                    };
+                }
+                Err(error) => {
+                    let _ = ctx
+                        .emit_stderr(format!("failed to collect oxfmt sources: {error}"))
+                        .await;
+                    return InProcessOutcome::Done {
+                        exit_code: 1,
+                        outputs: None,
+                    };
+                }
+            };
+            for warning in warnings.into_iter().chain(collection_warnings) {
+                if let Err(error) = ctx.emit_stderr(warning).await {
+                    let _ = ctx
+                        .emit_stderr(format!("failed to emit formatter log: {error}"))
+                        .await;
+                    return InProcessOutcome::Done {
+                        exit_code: 1,
+                        outputs: None,
+                    };
+                }
+            }
+            let format_options = loaded_config.options;
 
             if files.is_empty() {
                 return InProcessOutcome::Done {
@@ -238,62 +282,60 @@ impl OxfmtOpts {
 }
 
 #[cfg(feature = "oxc")]
-fn collect_formattable_files(cwd: &Path) -> Result<Vec<PathBuf>, String> {
-    let mut files = Vec::new();
+fn collect_formattable_files(
+    cwd: &Path,
+    config_ignore_matcher: Option<&Gitignore>,
+) -> Result<(Vec<PathBuf>, Vec<String>), String> {
+    let mut builder = WalkBuilder::new(cwd);
+    builder
+        .hidden(false)
+        .git_ignore(true)
+        .ignore(true)
+        .parents(true)
+        .require_git(false)
+        .git_global(false)
+        .git_exclude(false)
+        // Intentional: keep existing worker behavior for symlink traversal.
+        .follow_links(true)
+        .filter_entry(|entry| !should_skip_walk_entry(entry.path()));
 
-    for relative in [Path::new("src"), Path::new("")] {
-        let root = cwd.join(relative);
-        if !root.exists() {
+    let mut warnings = Vec::new();
+    let tool_ignore = cwd.join(".oxfmtignore");
+    if tool_ignore.is_file() {
+        if let Some(error) = builder.add_ignore(&tool_ignore) {
+            warnings.push(format!(
+                "warning: failed to load {}: {error}",
+                tool_ignore.display()
+            ));
+        }
+    }
+
+    let mut files = Vec::new();
+    for entry in builder.build() {
+        let entry =
+            entry.map_err(|error| format!("failed to walk workspace for sources: {error}"))?;
+        let path = entry.into_path();
+        if path.is_dir() || !is_formattable_path(&path) {
             continue;
         }
-        if root.is_file() {
-            if is_formattable_path(&root) {
-                files.push(root);
+        if let Some(ignore_matcher) = config_ignore_matcher {
+            if ignore_matcher
+                .matched_path_or_any_parents(&path, false)
+                .is_ignore()
+            {
+                continue;
             }
-            continue;
         }
-        collect_from_dir(&root, &mut files)?;
+        files.push(path);
     }
 
     files.sort();
     files.dedup();
-    Ok(files)
+    Ok((files, warnings))
 }
 
 #[cfg(feature = "oxc")]
-fn collect_from_dir(dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
-    let mut stack = vec![dir.to_path_buf()];
-
-    while let Some(current) = stack.pop() {
-        let entries = fs::read_dir(&current)
-            .map_err(|error| format!("failed to read directory {}: {error}", current.display()))?;
-        for entry in entries {
-            let entry = entry.map_err(|error| {
-                format!(
-                    "failed to read directory entry in {}: {error}",
-                    current.display()
-                )
-            })?;
-            let path = entry.path();
-            let file_type = entry.file_type().map_err(|error| {
-                format!("failed to read file type for {}: {error}", path.display())
-            })?;
-            if file_type.is_dir() {
-                if should_skip_dir(&path) {
-                    continue;
-                }
-                stack.push(path);
-            } else if file_type.is_file() && is_formattable_path(&path) {
-                files.push(path);
-            }
-        }
-    }
-
-    Ok(())
-}
-
-#[cfg(feature = "oxc")]
-fn should_skip_dir(path: &Path) -> bool {
+fn should_skip_walk_entry(path: &Path) -> bool {
     path.file_name()
         .and_then(OsStr::to_str)
         .is_some_and(|name| matches!(name, "node_modules" | ".git"))
@@ -304,6 +346,7 @@ fn is_formattable_path(path: &Path) -> bool {
     let Some(extension) = path.extension().and_then(OsStr::to_str) else {
         return false;
     };
+    // Intentionally exclude .d.ts here: formatter should not rewrite declaration files.
     if !matches!(
         extension,
         "js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs" | "mts" | "cts"
@@ -338,13 +381,14 @@ fn main() {
 mod tests {
     use std::collections::HashMap;
     use std::fs;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     use assert_fs::TempDir;
     use luchta_worker::{InProcessOutcome, JobContext, SharedWriter, Worker, WorkerRequest};
     use oxc_formatter::JsFormatOptions;
 
     use super::{collect_formattable_files, is_formattable_path, OxfmtOpts, OxfmtWorker};
+    use crate::config::discover_config;
     use crate::format::format_path;
 
     #[test]
@@ -371,17 +415,105 @@ mod tests {
         .expect("ignored");
         fs::write(cwd.join(".git/hooks/ignored.js"), "console.log(1)\n").expect("ignored");
 
-        let files = collect_formattable_files(cwd).expect("collect");
-        let rel: Vec<_> = files
-            .into_iter()
-            .map(|path| {
-                path.strip_prefix(cwd)
-                    .unwrap()
-                    .to_string_lossy()
-                    .replace('\\', "/")
-            })
-            .collect();
-        assert_eq!(rel, vec!["package.js", "src/index.ts"]);
+        let (files, warnings) = collect_formattable_files(cwd, None).expect("collect");
+
+        assert!(warnings.is_empty(), "warnings: {warnings:?}");
+        assert_eq!(
+            relative_paths(cwd, files),
+            vec!["package.js", "src/index.ts"]
+        );
+    }
+
+    #[test]
+    fn collect_formattable_files_skips_gitignored_directory() {
+        let temp = TempDir::new().expect("tempdir");
+        let cwd = temp.path();
+        fs::write(cwd.join(".gitignore"), "/dist/\n").expect("gitignore");
+        fs::create_dir_all(cwd.join("src")).expect("src");
+        fs::create_dir_all(cwd.join("dist/browser")).expect("dist");
+        fs::write(cwd.join("src/foo.ts"), "export const foo = 1;\n").expect("src file");
+        fs::write(cwd.join("dist/browser/out.js"), "export const out = 1;\n").expect("dist file");
+
+        let (files, warnings) = collect_formattable_files(cwd, None).expect("collect");
+
+        assert!(warnings.is_empty(), "warnings: {warnings:?}");
+        assert_eq!(relative_paths(cwd, files), vec!["src/foo.ts"]);
+    }
+
+    #[test]
+    fn collect_formattable_files_honors_repo_root_gitignore_from_package_subdir() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo = temp.path();
+        let pkg = repo.join("packages/app");
+        fs::write(repo.join(".gitignore"), "/packages/app/dist/\n").expect("gitignore");
+        fs::create_dir_all(pkg.join("src")).expect("src");
+        fs::create_dir_all(pkg.join("dist")).expect("dist");
+        fs::write(pkg.join("src/foo.ts"), "export const foo = 1;\n").expect("src file");
+        fs::write(pkg.join("dist/out.js"), "export const out = 1;\n").expect("dist file");
+
+        let (files, warnings) = collect_formattable_files(&pkg, None).expect("collect");
+
+        assert!(warnings.is_empty(), "warnings: {warnings:?}");
+        assert_eq!(relative_paths(&pkg, files), vec!["src/foo.ts"]);
+    }
+
+    #[test]
+    fn collect_formattable_files_honors_tool_ignore_file() {
+        let temp = TempDir::new().expect("tempdir");
+        let cwd = temp.path();
+        fs::write(cwd.join(".oxfmtignore"), "generated.ts\n").expect("ignore file");
+        fs::create_dir_all(cwd.join("src")).expect("src");
+        fs::write(cwd.join("src/foo.ts"), "export const foo = 1;\n").expect("src file");
+        fs::write(cwd.join("generated.ts"), "export const generated = 1;\n").expect("generated");
+
+        let (files, warnings) = collect_formattable_files(cwd, None).expect("collect");
+
+        assert!(warnings.is_empty(), "warnings: {warnings:?}");
+        assert_eq!(relative_paths(cwd, files), vec!["src/foo.ts"]);
+    }
+
+    #[test]
+    fn collect_formattable_files_honors_config_ignore_patterns() {
+        let temp = TempDir::new().expect("tempdir");
+        let cwd = temp.path();
+        fs::write(
+            cwd.join(".oxfmtrc.json"),
+            r#"{"ignorePatterns":["generated.ts"]}"#,
+        )
+        .expect("config");
+        fs::create_dir_all(cwd.join("src")).expect("src");
+        fs::write(cwd.join("src/foo.ts"), "export const foo = 1;\n").expect("src file");
+        fs::write(cwd.join("generated.ts"), "export const generated = 1;\n").expect("generated");
+
+        let loaded = discover_config(cwd).expect("discover");
+        let (files, warnings) =
+            collect_formattable_files(cwd, loaded.ignore_matcher.as_ref()).expect("collect");
+
+        assert!(warnings.is_empty(), "warnings: {warnings:?}");
+        assert_eq!(relative_paths(cwd, files), vec!["src/foo.ts"]);
+    }
+
+    #[test]
+    fn collect_formattable_files_honors_parent_config_root_for_anchored_ignore_patterns() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo = temp.path();
+        let pkg = repo.join("packages/app");
+        fs::write(
+            repo.join(".oxfmtrc.json"),
+            r#"{"ignorePatterns":["/packages/app/dist/"]}"#,
+        )
+        .expect("config");
+        fs::create_dir_all(pkg.join("src")).expect("src");
+        fs::create_dir_all(pkg.join("dist")).expect("dist");
+        fs::write(pkg.join("src/foo.ts"), "export const foo = 1;\n").expect("src file");
+        fs::write(pkg.join("dist/out.js"), "export const out = 1;\n").expect("dist file");
+
+        let loaded = discover_config(&pkg).expect("discover");
+        let (files, warnings) =
+            collect_formattable_files(&pkg, loaded.ignore_matcher.as_ref()).expect("collect");
+
+        assert!(warnings.is_empty(), "warnings: {warnings:?}");
+        assert_eq!(relative_paths(&pkg, files), vec!["src/foo.ts"]);
     }
 
     #[test]
@@ -491,6 +623,18 @@ mod tests {
             fs::read_to_string(&target).expect("check contents"),
             formatted
         );
+    }
+
+    fn relative_paths(cwd: &Path, files: Vec<PathBuf>) -> Vec<String> {
+        files
+            .into_iter()
+            .map(|path| {
+                path.strip_prefix(cwd)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect()
     }
 
     #[test]
