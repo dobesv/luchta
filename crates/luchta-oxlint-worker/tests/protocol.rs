@@ -107,6 +107,52 @@ fn resolve_task_prunes_when_no_supported_files() {
 }
 
 #[test]
+fn resolve_task_anchors_parent_config_ignore_patterns_to_config_dir() {
+    // Regression: the resolve (preflight) path must anchor config `ignorePatterns`
+    // to the discovered config file's directory, NOT the task cwd.
+    //
+    // The root config uses the absolute-rooted pattern `/src/`. Anchored to the
+    // config dir (repo root) this matches only `<repo>/src`, so the package's
+    // `packages/app/src/foo.ts` survives and the task is kept. If the base were
+    // wrongly the task cwd (`packages/app`), `/src/` would match
+    // `packages/app/src`, ignore the only source file, and prune the task.
+    let fixture = tempdir().expect("tempdir");
+    let repo = fixture.path();
+    let pkg = repo.join("packages/app");
+    write_file(
+        repo.join(".oxlintrc.json"),
+        r#"{"ignorePatterns":["/src/"]}"#,
+    );
+    write_file(
+        pkg.join("package.json"),
+        r#"{"name":"app","scripts":{"lint":"oxlint"}}"#,
+    );
+    write_file(pkg.join("src/foo.ts"), "export const foo = 1;\n");
+
+    let input = format!(
+        "{}\n",
+        resolve_line(resolve_task_request(
+            "resolve-anchored",
+            &pkg,
+            ResolveMode::Run
+        ))
+    );
+    let (output, stderr) = run_worker(&input);
+    assert!(stderr.is_empty(), "unexpected worker stderr: {stderr}");
+    let resolved = output
+        .iter()
+        .find(|value| value["type"].as_str() == Some("resolved"))
+        .expect("resolved message");
+    assert_eq!(resolved["id"].as_str(), Some("resolve-anchored"));
+    // Correctly anchored: `src/foo.ts` survives, so the task must be kept (modify), not pruned.
+    assert_ne!(
+        resolved["result"]["decision"].as_str(),
+        Some("prune"),
+        "resolve pruned the task; config ignorePatterns anchored to cwd instead of config dir"
+    );
+}
+
+#[test]
 fn lint_violation_emits_log_report_and_done() {
     let fixture = tempdir().expect("tempdir");
     write_file(

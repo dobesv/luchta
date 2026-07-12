@@ -46,10 +46,18 @@ impl Worker for OxlintWorker {
         };
 
         let cwd = Path::new(cwd);
-        let files = match collect_target_files(cwd) {
-            Ok(files) => files,
+        let loaded = match discover_config(cwd) {
+            Ok(loaded) => loaded,
             Err(error) => return ResolveResult::reject(error),
         };
+        let (files, warnings) =
+            match collect_target_files(cwd, &loaded.ignore_patterns, &loaded.ignore_base) {
+                Ok(result) => result,
+                Err(error) => return ResolveResult::reject(error),
+            };
+        if !warnings.is_empty() {
+            return ResolveResult::reject(warnings.join("; "));
+        }
 
         if files.is_empty() {
             return ResolveResult::prune(Some("no JS/TS source files found for oxlint".to_owned()));
@@ -134,16 +142,39 @@ impl Worker for OxlintWorker {
                 }
             }
 
-            let files = match collect_target_files(cwd) {
-                Ok(files) => files,
-                Err(error) => {
-                    let _ = ctx.emit_stderr(error).await;
+            let (files, warnings) =
+                match collect_target_files(cwd, &loaded.ignore_patterns, &loaded.ignore_base) {
+                    Ok(result) => result,
+                    Err(error) => {
+                        let _ = ctx.emit_stderr(error).await;
+                        return InProcessOutcome::Done {
+                            exit_code: 1,
+                            outputs: None,
+                        };
+                    }
+                };
+            for warning in &loaded.warnings {
+                if let Err(error) = ctx.emit_stderr(warning.clone()).await {
+                    let _ = ctx
+                        .emit_stderr(format!("failed to emit oxlint log: {error}"))
+                        .await;
                     return InProcessOutcome::Done {
                         exit_code: 1,
                         outputs: None,
                     };
                 }
-            };
+            }
+            for warning in warnings {
+                if let Err(error) = ctx.emit_stderr(warning).await {
+                    let _ = ctx
+                        .emit_stderr(format!("failed to emit oxlint log: {error}"))
+                        .await;
+                    return InProcessOutcome::Done {
+                        exit_code: 1,
+                        outputs: None,
+                    };
+                }
+            }
 
             if files.is_empty() {
                 return InProcessOutcome::Done {
@@ -268,6 +299,9 @@ fn default_inputs() -> Vec<String> {
         "src/**".to_owned(),
         ".oxlintrc.json".to_owned(),
         ".oxlintrc.jsonc".to_owned(),
+        ".gitignore".to_owned(),
+        ".ignore".to_owned(),
+        ".oxlintignore".to_owned(),
         SUPPRESSIONS_FILENAME.to_owned(),
     ]
 }

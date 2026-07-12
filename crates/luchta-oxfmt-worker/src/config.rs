@@ -4,6 +4,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use json_strip_comments::StripComments;
 use oxc_formatter::{
     BracketSameLine, BracketSpacing, JsFormatOptions, QuoteStyle, Semicolons, TrailingCommas,
@@ -18,6 +19,8 @@ const CONFIG_FILENAMES: [&str; 2] = [".oxfmtrc.json", ".oxfmtrc.jsonc"];
 pub struct LoadedConfig {
     pub options: JsFormatOptions,
     pub path: Option<PathBuf>,
+    pub ignore_matcher: Option<Gitignore>,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -33,6 +36,7 @@ struct OxfmtRc {
     trailing_comma: Option<TrailingComma>,
     bracket_spacing: Option<bool>,
     bracket_same_line: Option<bool>,
+    ignore_patterns: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -53,16 +57,25 @@ enum TrailingComma {
 
 pub fn discover_config(cwd: &Path) -> Result<LoadedConfig, String> {
     let path = find_config_path(cwd);
-    let options = match path.as_deref() {
-        Some(path) => load_options_from_path(path)?,
-        None => JsFormatOptions::new(),
+    let (options, ignore_matcher, warnings) = match path.as_deref() {
+        Some(path) => load_config_from_path(path)?,
+        None => (JsFormatOptions::new(), None, Vec::new()),
     };
-    Ok(LoadedConfig { options, path })
+    Ok(LoadedConfig {
+        options,
+        path,
+        ignore_matcher,
+        warnings,
+    })
 }
 
-pub fn oxfmtrc_to_options(json: &str) -> Result<JsFormatOptions, String> {
-    let config: OxfmtRc =
-        serde_json::from_str(json).map_err(|error| format!("failed to parse .oxfmtrc: {error}"))?;
+#[cfg(test)]
+fn oxfmtrc_to_options(json: &str) -> Result<JsFormatOptions, String> {
+    let config = parse_oxfmtrc(json)?;
+    options_from_oxfmtrc(&config)
+}
+
+fn options_from_oxfmtrc(config: &OxfmtRc) -> Result<JsFormatOptions, String> {
     let mut options = JsFormatOptions::new();
 
     if let Some(use_tabs) = config.use_tabs {
@@ -122,21 +135,60 @@ pub fn oxfmtrc_to_options(json: &str) -> Result<JsFormatOptions, String> {
         options.bracket_same_line = BracketSameLine::from(bracket_same_line);
     }
 
-    // Supported subset only. Intentionally ignored for now: overrides/per-file resolution,
-    // ignore patterns, editorconfig merging, JS/TS config files, plugins, quoteProps,
+    // Supported subset only. Still ignored: overrides/per-file resolution,
+    // editorconfig merging, JS/TS config files, plugins, quoteProps,
     // arrowParens, singleAttributePerLine, objectWrap, htmlWhitespaceSensitivity,
     // embeddedLanguageFormatting, sortImports, Tailwind sorting, JSDoc, Svelte payloads.
     Ok(options)
 }
 
-fn load_options_from_path(path: &Path) -> Result<JsFormatOptions, String> {
+pub fn build_ignore_matcher(patterns: &[String], root: &Path) -> (Option<Gitignore>, Vec<String>) {
+    if patterns.is_empty() {
+        return (None, Vec::new());
+    }
+    let mut builder = GitignoreBuilder::new(root);
+    let mut warnings = Vec::new();
+    for pattern in patterns {
+        if let Err(error) = builder.add_line(None, pattern) {
+            warnings.push(format!(
+                "warning: failed to parse ignore pattern {pattern:?} in {}: {error}",
+                root.display()
+            ));
+        }
+    }
+    let matcher = match builder.build() {
+        Ok(matcher) => Some(matcher),
+        Err(error) => {
+            warnings.push(format!(
+                "warning: failed to build ignore matcher in {}: {error}",
+                root.display()
+            ));
+            None
+        }
+    };
+    (matcher, warnings)
+}
+
+fn parse_oxfmtrc(json: &str) -> Result<OxfmtRc, String> {
+    serde_json::from_str(json).map_err(|error| format!("failed to parse .oxfmtrc: {error}"))
+}
+
+fn load_config_from_path(
+    path: &Path,
+) -> Result<(JsFormatOptions, Option<Gitignore>, Vec<String>), String> {
     let source = fs::read_to_string(path)
         .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
     // Strip comments for both .json and .jsonc — harmless for comment-free JSON
     let json = strip_json_comments(&source)
         .map_err(|error| format!("failed to strip comments in {}: {error}", path.display()))?;
-    oxfmtrc_to_options(&json)
-        .map_err(|error| format!("failed to load oxfmt config {}: {error}", path.display()))
+    let config = parse_oxfmtrc(&json)
+        .map_err(|error| format!("failed to load oxfmt config {}: {error}", path.display()))?;
+    let options = options_from_oxfmtrc(&config)
+        .map_err(|error| format!("failed to load oxfmt config {}: {error}", path.display()))?;
+    let root = path.parent().unwrap_or_else(|| Path::new("."));
+    let (ignore_matcher, warnings) =
+        build_ignore_matcher(config.ignore_patterns.as_deref().unwrap_or(&[]), root);
+    Ok((options, ignore_matcher, warnings))
 }
 
 fn strip_json_comments(source: &str) -> Result<String, std::io::Error> {
@@ -342,6 +394,60 @@ mod tests {
     fn trailing_comma_none_maps_to_none() {
         let options = oxfmtrc_to_options(r#"{"trailingComma":"none"}"#).expect("parse");
         assert!(matches!(options.trailing_commas, TrailingCommas::None));
+    }
+
+    #[test]
+    fn discover_config_parses_ignore_patterns() {
+        let temp = TempDir::new().expect("tempdir");
+        let config_path = temp.path().join(CONFIG_FILENAMES[0]);
+        fs::write(&config_path, r#"{"ignorePatterns":["dist/"]}"#).expect("config");
+
+        let loaded = discover_config(temp.path()).expect("discover");
+        let ignored = temp.path().join("dist/out.ts");
+        let kept = temp.path().join("src/out.ts");
+
+        assert!(loaded
+            .ignore_matcher
+            .as_ref()
+            .expect("ignore matcher")
+            .matched_path_or_any_parents(&ignored, false)
+            .is_ignore());
+        assert!(!loaded
+            .ignore_matcher
+            .as_ref()
+            .expect("ignore matcher")
+            .matched_path_or_any_parents(&kept, false)
+            .is_ignore());
+    }
+
+    #[test]
+    fn discover_config_anchors_parent_ignore_patterns_to_config_directory() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo = temp.path();
+        let pkg = repo.join("packages/app");
+        fs::create_dir_all(pkg.join("src")).expect("src");
+        fs::write(
+            repo.join(CONFIG_FILENAMES[0]),
+            r#"{"ignorePatterns":["/packages/app/dist/"]}"#,
+        )
+        .expect("config");
+
+        let loaded = discover_config(&pkg).expect("discover");
+        let ignored = repo.join("packages/app/dist/out.ts");
+        let kept = repo.join("packages/app/src/out.ts");
+
+        assert!(loaded
+            .ignore_matcher
+            .as_ref()
+            .expect("ignore matcher")
+            .matched_path_or_any_parents(&ignored, false)
+            .is_ignore());
+        assert!(!loaded
+            .ignore_matcher
+            .as_ref()
+            .expect("ignore matcher")
+            .matched_path_or_any_parents(&kept, false)
+            .is_ignore());
     }
 
     #[test]
