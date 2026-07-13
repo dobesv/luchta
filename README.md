@@ -465,6 +465,15 @@ Precedence: flag > env var > config `concurrency.maxWeight` > default.
   - Use this to quickly force-bust the entire workspace cache from a CI script or local shell.
 
 
+#### Disable cache
+
+- `--no-cache` / `LUCHTA_NO_CACHE`
+  - Disables task skipping and shared cache interaction for `run` and `watch`.
+  - Every task always runs; local skip logic is bypassed and the shared cache is neither read nor written.
+  - Local workspace cache metadata is still written after each task, so subsequent normal runs can skip unchanged tasks as usual.
+  - Provides a simpler, explicit alternative to the `LUCHTA_CACHE_NONCE` workaround for forcing a fresh execution.
+  - The environment variable accepts `1`, `true`, or `on` (case-insensitive).
+
 ### Viewing Logs
 
 By default, `luchta run` suppresses the output of successful tasks to keep the console clean. You can view the full stdout, stderr, and execution metadata for any previously run task using the `luchta logs` command.
@@ -822,6 +831,7 @@ Luchta build cache is **opt-in** per task via `cache: {}`. Cached task skips onl
 - **Transitive Lockfile Detection (#89):** Cache hashing and watch-mode invalidation both track the **full transitive closure** of external package dependencies from `yarn.lock`. Any transitive dependency's resolved-version change now busts the cache, even when the direct specifier is unchanged. Lockfile cycles are handled silently. `gather_pkg_dep_pairs` serves as the single source of truth for both cache and watch.
 - Default cache dir: `<workspace>/.luchta/cache`
 - Override: `LUCHTA_CACHE_DIR=/abs/path`
+- Disable: `LUCHTA_NO_CACHE=1` (or `--no-cache`)
 - Inputs use git-tracked listing, so `.gitignore` is honored for globs and literals.
 - Input prefixes may target repo root (`#...`), named packages (`pkg#...`, `@scope/pkg#...`), direct upstream packages (`^...`), or transitive upstream packages (`^^...`).
 - `^` / `^^` inputs are wildcard-only and never error on zero matches; missing literals become `absent` entries only for bare / `#` / `pkg#` forms.
@@ -854,12 +864,12 @@ Nonces are available at four scopes and are **additive**:
 - **Global:** `cache: { nonce: "..." }` on the top-level `LuchtaConfig`.
 - **Worker:** `cache: { nonce: "..." }` on a worker definition. Affects all tasks using that worker.
 - **Task:** `cache: { nonce: "..." }` on a task definition.
-- **Environment variable:** `LUCHTA_CACHE_NONCE` — an independent global 4th nonce, read once per run.
+- **Environment variable:** `LUCHTA_CACHE_NONCE` — an independent global 4th nonce, read once per run. See also [`--no-cache`](#disable-cache).
 
 #### Semantics
 - **Combine:** All nonces combine; changing any single one invalidates the affected scope's cache. Empty/absent everywhere has no effect.
 - **Stale Entries:** Setting a nonce does NOT delete old cache entries; it changes the hash so a fresh entry is written. The local cache keeps only the most recent entry per task, so reverting a nonce is a fresh cache miss (the task re-runs) rather than restoring the old result; the shared cache may still hold a matching prior candidate.
-- **Recovery (GitHub #118):** If a worker under-reports a task's inputs (a worker bug), a cache entry can be "poisoned" with wrong outputs. Fixing the worker does NOT invalidate that entry, because the task spec hash does not include the worker's version/code. To recover, bump the relevant-scope `nonce` (e.g. change `nonce: "v1"` → `"v2"`) or set `LUCHTA_CACHE_NONCE`.
+- **Recovery (GitHub #118):** If a worker under-reports a task's inputs (a worker bug), a cache entry can be "poisoned" with wrong outputs. Fixing the worker does NOT invalidate that entry, because the task spec hash does not include the worker's version/code. To recover, bump the relevant-scope `nonce` (e.g. change `nonce: "v1"` → `"v2"`), set `LUCHTA_CACHE_NONCE`, or use `--no-cache`.
 - **Upgrade Note:** Upgrading to the version containing `luchta why` bumps the cache schema to V4. This triggers a one-time cache invalidation and full rebuild on the first run after upgrade, which is expected and harmless.
 
 #### Inspection

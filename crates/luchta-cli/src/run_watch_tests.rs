@@ -56,6 +56,89 @@ fn write_watch_test_workspace(workspace_root: &std::path::Path, worker_script_bo
     }
 }
 
+fn write_watch_counter_workspace(workspace_root: &std::path::Path) {
+    fn set_executable(path: &std::path::Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+                .expect("chmod executable");
+        }
+    }
+
+    fs::create_dir_all(workspace_root.join("packages/app")).expect("create package dir");
+    fs::write(
+        workspace_root.join("package.json"),
+        r#"{
+            "name": "root",
+            "private": true,
+            "workspaces": ["packages/*"]
+        }"#,
+    )
+    .expect("write root package.json");
+    fs::write(
+        workspace_root.join("packages/app/package.json"),
+        r#"{
+            "name": "app",
+            "version": "1.0.0",
+            "scripts": {
+                "build": "echo ignored"
+            }
+        }"#,
+    )
+    .expect("write app package.json");
+    fs::write(workspace_root.join("packages/app/src.txt"), "stable-input\n")
+        .expect("write input file");
+
+    let worker_script = workspace_root.join("shell-worker.sh");
+    fs::write(
+        &worker_script,
+        r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  case "$line" in
+    *'"type":"resolveTask"'*)
+      printf '{"type":"resolved","id":"%s","result":{"decision":"accept"}}\n' "$id"
+      ;;
+    *'"type":"run"'*)
+      cmd=$(printf '%s\n' "$line" | sed -n 's/.*"command":"\([^"]*\)".*/\1/p' | sed 's/\\"/"/g; s/\\\\/\\/g')
+      cwd=$(printf '%s\n' "$line" | sed -n 's/.*"cwd":"\([^"]*\)".*/\1/p' | sed 's/\\"/"/g; s/\\\\/\\/g')
+      (cd "$cwd" && sh -lc "$cmd")
+      code=$?
+      printf '{"type":"done","id":"%s","exitCode":%s}\n' "$id" "$code"
+      ;;
+  esac
+done
+"#,
+    )
+    .expect("write worker script");
+    set_executable(&worker_script);
+
+    fs::write(
+        workspace_root.join("luchta-config.sh"),
+        format!(
+            "#!/bin/sh\necho '{{\"concurrency\":{{\"maxWeight\":4}},\"workers\":{{\"shell\":{{\"command\":\"{}\"}}}},\"tasks\":{{\"build\":{{\"cache\":{{}},\"worker\":\"shell\",\"inputs\":[\"src.txt\"],\"outputs\":[\"counter.txt\"],\"command\":\"count=$(cat counter.txt 2>/dev/null || echo 0); count=$((count+1)); echo $count > counter.txt\"}}}}}}'\n",
+            worker_script.display()
+        ),
+    )
+    .expect("write config");
+    set_executable(&workspace_root.join("luchta-config.sh"));
+
+    let git = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(workspace_root)
+            .status()
+            .expect("run git command");
+        assert!(status.success(), "git command failed: {args:?}");
+    };
+    git(&["init"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "user.name", "Test User"]);
+    git(&["add", "."]);
+    git(&["commit", "-m", "init"]);
+}
+
 fn watch_selection<'a>(requested_tasks: &'a [String]) -> TaskSelection<'a> {
     TaskSelection {
         requested_tasks,
@@ -135,8 +218,23 @@ impl WatchTestHarness {
         selection: &TaskSelection<'_>,
         token: CancellationToken,
     ) -> CycleOutcome {
+        self.run_cycle_with_no_cache(selection, false, token).await
+    }
+
+    async fn run_cycle_with_no_cache(
+        &self,
+        selection: &TaskSelection<'_>,
+        no_cache: bool,
+        token: CancellationToken,
+    ) -> CycleOutcome {
         self.session
-            .run_cycle(default_watch_cycle_params(selection), token)
+            .run_cycle(
+                RunCycleParams {
+                    no_cache,
+                    ..default_watch_cycle_params(selection)
+                },
+                token,
+            )
             .await
             .expect("watch cycle result")
     }
@@ -148,11 +246,20 @@ fn default_watch_cycle_params<'a>(selection: &'a TaskSelection<'a>) -> RunCycleP
         since_affected: None,
         output: OutputMode::Default,
         continue_on_failure: false,
+        no_cache: false,
         memory_pressure: MemoryPressureConfig {
             usage: None,
             free: None,
         },
     }
+}
+
+fn read_counter_file(workspace_root: &std::path::Path) -> u32 {
+    fs::read_to_string(workspace_root.join("packages/app/counter.txt"))
+        .expect("read counter file")
+        .trim()
+        .parse()
+        .expect("parse counter file")
 }
 
 fn worker_script(success: bool) -> String {
@@ -205,6 +312,7 @@ async fn watch_session_reuses_worker_manager_across_two_real_cycles() {
                 since_affected: None,
                 output: OutputMode::Default,
                 continue_on_failure: false,
+                no_cache: false,
                 memory_pressure: MemoryPressureConfig {
                     usage: None,
                     free: None,
@@ -223,6 +331,7 @@ async fn watch_session_reuses_worker_manager_across_two_real_cycles() {
                 since_affected: None,
                 output: OutputMode::Default,
                 continue_on_failure: false,
+                no_cache: false,
                 memory_pressure: MemoryPressureConfig {
                     usage: None,
                     free: None,
@@ -379,6 +488,43 @@ async fn watch_session_cancellation_drains_in_flight_job_and_keeps_workers_alive
     assert!(
         !harness.session.worker_manager_is_shutdown(),
         "worker manager should stay alive after successful reuse"
+    );
+
+    harness.session.shutdown().await;
+}
+
+#[tokio::test]
+async fn watch_no_cache_forces_rerun() {
+    let harness = WatchTestHarness::with_workspace(|workspace_root, _started| {
+        write_watch_counter_workspace(workspace_root);
+    })
+    .await;
+    let selection = harness.selection();
+
+    let outcome1 = harness
+        .run_cycle_with_no_cache(&selection, false, CancellationToken::new())
+        .await;
+    assert_eq!(outcome1, CycleOutcome::Success);
+    assert_eq!(read_counter_file(&harness.workspace_root), 1);
+
+    let outcome2 = harness
+        .run_cycle_with_no_cache(&selection, false, CancellationToken::new())
+        .await;
+    assert_eq!(outcome2, CycleOutcome::Success);
+    assert_eq!(
+        read_counter_file(&harness.workspace_root),
+        1,
+        "control: cache-enabled repeat cycle skips (counter stays 1)"
+    );
+
+    let outcome3 = harness
+        .run_cycle_with_no_cache(&selection, true, CancellationToken::new())
+        .await;
+    assert_eq!(outcome3, CycleOutcome::Success);
+    assert_eq!(
+        read_counter_file(&harness.workspace_root),
+        2,
+        "no_cache=true forces rerun (counter=2)"
     );
 
     harness.session.shutdown().await;

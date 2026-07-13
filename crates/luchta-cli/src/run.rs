@@ -49,7 +49,7 @@ use input_stability::{
 };
 use pause::dispatch_loop;
 
-mod setup;
+pub(crate) mod setup;
 pub use setup::MemoryPressureConfig;
 use setup::{
     build_execution_resources, build_memory_pressure, report_run_outcome, BuildResourcesInputs,
@@ -220,6 +220,7 @@ pub(crate) struct RunCycleParams<'a> {
     pub since_affected: Option<&'a HashSet<PackageName>>,
     pub output: OutputMode,
     pub continue_on_failure: bool,
+    pub no_cache: bool,
     pub memory_pressure: MemoryPressureConfig,
 }
 
@@ -228,6 +229,7 @@ pub struct RunTasksRequest<'a> {
     pub selection: &'a TaskSelection<'a>,
     pub output: OutputMode,
     pub continue_on_failure: bool,
+    pub no_cache: bool,
     pub memory_pressure: MemoryPressureConfig,
     pub max_weight_override: Option<u32>,
 }
@@ -238,6 +240,7 @@ pub async fn run_tasks(request: RunTasksRequest<'_>) -> Result<()> {
         selection,
         output,
         continue_on_failure,
+        no_cache,
         memory_pressure,
         max_weight_override,
     } = request;
@@ -263,6 +266,7 @@ pub async fn run_tasks(request: RunTasksRequest<'_>) -> Result<()> {
             since_affected: run.since_affected.as_ref(),
             output,
             continue_on_failure,
+            no_cache,
             memory_pressure,
         },
         cancel_token,
@@ -416,6 +420,7 @@ struct DispatchContext<'a> {
     any_failed: &'a Arc<AtomicBool>,
     interrupted: &'a Arc<AtomicBool>,
     continue_on_failure: bool,
+    no_cache: bool,
     /// See `RunContext::owns_worker_manager`. Gates fast-stop worker shutdown.
     owns_worker_manager: bool,
     worker_manager: &'a Arc<WorkerManager>,
@@ -2159,6 +2164,7 @@ pub(crate) fn run_cycle<'a>(
             since_affected,
             output,
             continue_on_failure,
+            no_cache,
             memory_pressure,
         } = params;
         let (mut memory_monitor, pressure_state) = build_memory_pressure(memory_pressure);
@@ -2183,6 +2189,7 @@ pub(crate) fn run_cycle<'a>(
             interrupted: &interrupted,
             lockfile_state: &lockfile_state,
             continue_on_failure,
+            no_cache,
         });
 
         let (run_result, was_cancelled, receiver_option) = run_dispatch_with_cancel(
@@ -2222,6 +2229,7 @@ struct BuildDispatchContext<'a> {
     interrupted: &'a Arc<AtomicBool>,
     lockfile_state: &'a LockfileState,
     continue_on_failure: bool,
+    no_cache: bool,
 }
 
 /// Assembles the read-only [`DispatchContext`] handed to each ready task from the
@@ -2236,6 +2244,7 @@ fn build_dispatch_context<'a>(inputs: BuildDispatchContext<'a>) -> DispatchConte
         interrupted,
         lockfile_state,
         continue_on_failure,
+        no_cache,
     } = inputs;
     DispatchContext {
         tasks_to_run,
@@ -2245,6 +2254,7 @@ fn build_dispatch_context<'a>(inputs: BuildDispatchContext<'a>) -> DispatchConte
         any_failed,
         interrupted,
         continue_on_failure,
+        no_cache,
         owns_worker_manager: run.owns_worker_manager,
         worker_manager: &run.worker_manager,
         workspace_root: &run.workspace_root,
