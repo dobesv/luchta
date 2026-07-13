@@ -34,6 +34,15 @@ repository = "https://example.com/luchta"
 homepage = "https://example.com/luchta"
 description = "Rust monorepo build orchestration tool"
 
+# `oxc_formatter_css` pulls the registry `oxc-css-parser`, which depends on the
+# registry `oxc_allocator`. Without this patch Cargo builds two distinct
+# `oxc_allocator` crates and `oxc_formatter_css` fails to compile with an
+# allocator type mismatch. This patch forces the git `oxc_allocator` (same rev
+# as the other oxc crates) workspace-wide. Keep this rev in sync whenever the
+# oxc git rev is bumped.
+[patch.crates-io]
+oxc_allocator = { git = "https://github.com/oxc-project/oxc.git", rev = "415fe1e7bb423cf05019c5e2c9a5705eebbc5447", package = "oxc_allocator" }
+
 [workspace.dependencies]
 petgraph = "0.6.5"
 tokio = { version = "1.38.0", features = ["full"] }
@@ -81,6 +90,7 @@ oxc_codegen = { git = "https://github.com/oxc-project/oxc.git", rev = "415fe1e7b
 oxc_sourcemap = "8.0.2"
 oxc_formatter = { git = "https://github.com/oxc-project/oxc.git", rev = "415fe1e7bb423cf05019c5e2c9a5705eebbc5447" }
 oxc_formatter_core = { git = "https://github.com/oxc-project/oxc.git", rev = "415fe1e7bb423cf05019c5e2c9a5705eebbc5447" }
+oxc_formatter_css = { git = "https://github.com/oxc-project/oxc.git", rev = "415fe1e7bb423cf05019c5e2c9a5705eebbc5447", default-features = false }
 json-strip-comments = "3.1.1"
 serde-sarif = "0.8.0"
 
