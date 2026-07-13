@@ -19,7 +19,7 @@ Luchta optimizes monorepo workflows by:
 You can use `asdf` to install luchta binaries:
 
 ```
-asdf plugin add luchta            https://github.com/dobesv/asdf-plugins.git
+asdf plugin add luchta https://github.com/dobesv/asdf-plugins.git
 asdf set luchta latest
 asdf install
 ```
