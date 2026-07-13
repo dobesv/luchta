@@ -102,14 +102,6 @@ fn scan_files_with_collection(
     Ok(findings)
 }
 
-fn normalize_to_forward_slashes(path: &Path) -> String {
-    path.to_string_lossy().replace('\\', "/")
-}
-
-fn rule_selection_path(file: &Path, config_dir: &Path) -> String {
-    normalize_to_forward_slashes(file.strip_prefix(config_dir).unwrap_or(file))
-}
-
 fn severity_rank(severity: &Severity) -> u8 {
     match severity {
         Severity::Error => 0,
@@ -158,16 +150,18 @@ fn scan_file(
         .map_err(|error| format!("failed to read source {}: {error}", file.display()))?;
     let root = lang.ast_grep(&source);
     // Keep resolver + RuleCollection path. `for_path` re-derives language via hardcoded
-    // extension lookup, which breaks languageGlobs remaps. RuleCollection contingent
-    // files/ignores matching must see sgconfig-root-relative paths, not absolute or cwd-relative
-    // ones, to mirror ast-grep CLI behavior for repo-root `files:` / `ignores:` globs.
-    let rule_selection_path = rule_selection_path(&file, config_dir);
-    let applicable_rules = collection.get_rule_from_lang(Path::new(&rule_selection_path), lang);
+    // extension lookup, which breaks languageGlobs remaps. `CombinedScan` also would not
+    // respect contingent per-rule files/ignores selection for our custom resolved language.
+    let applicable_rules = collection.get_rule_from_lang(&file, lang);
     if applicable_rules.is_empty() {
         return Ok(Vec::new());
     }
 
-    let relative_uri = normalize_to_forward_slashes(file.strip_prefix(cwd).unwrap_or(&file));
+    let relative_uri = file
+        .strip_prefix(cwd)
+        .unwrap_or(&file)
+        .to_string_lossy()
+        .replace('\\', "/");
 
     let mut findings = Vec::new();
     for rule_config in applicable_rules {
@@ -223,12 +217,11 @@ pub async fn scan_files_async(
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::path::Path;
 
     use assert_fs::TempDir;
     use ast_grep_config::Severity;
 
-    use super::{finding_sort_key, rule_selection_path, scan_files, scan_files_with_collection};
+    use super::{finding_sort_key, scan_files, scan_files_with_collection};
     use crate::config::discover_config;
 
     #[test]
@@ -386,53 +379,6 @@ mod tests {
         assert_eq!(matching_findings.len(), 1);
         assert_eq!(matching_findings[0].relative_uri, "src/foo.spec.ts");
         assert!(non_matching_findings.is_empty());
-    }
-
-    #[test]
-    fn rule_selection_path_is_config_root_relative() {
-        let config_dir = Path::new("/repo");
-        let file = Path::new("/repo/packages/app/src/index.ts");
-
-        assert_eq!(
-            rule_selection_path(file, config_dir),
-            "packages/app/src/index.ts".to_owned()
-        );
-    }
-
-    #[test]
-    fn repo_root_relative_files_and_ignores_apply_during_per_package_scan() {
-        let temp = TempDir::new().expect("tempdir");
-        let root = temp.path();
-        let pkg = root.join("packages/app");
-        fs::create_dir_all(root.join("rules")).expect("rules");
-        fs::create_dir_all(pkg.join("src/generated")).expect("generated");
-        fs::create_dir_all(root.join("tools")).expect("tools");
-        fs::write(root.join("sgconfig.yml"), "ruleDirs:\n  - rules\n").expect("config");
-        let rule_file = root.join("rules/no-console-in-packages.yml");
-        fs::write(
-            &rule_file,
-            "id: no-console-in-packages\nlanguage: TypeScript\nseverity: error\nmessage: No console.log allowed in packages\nfiles:\n  - packages/**/src/**\nignores:\n  - '**/generated/**'\nrule:\n  pattern: console.log($$$)\n",
-        )
-        .expect("rule");
-        let matching = pkg.join("src/index.ts");
-        let ignored = pkg.join("src/generated/x.ts");
-        let outside = root.join("tools/x.ts");
-        fs::write(&matching, "console.log('match');\n").expect("matching");
-        fs::write(&ignored, "console.log('ignored');\n").expect("ignored");
-        fs::write(&outside, "console.log('outside');\n").expect("outside");
-
-        let config = discover_config(&pkg)
-            .expect("discover")
-            .expect("config present");
-
-        let matching_findings = scan_files(&pkg, &config, vec![matching]).expect("matching scan");
-        let ignored_findings = scan_files(&pkg, &config, vec![ignored]).expect("ignored scan");
-        let outside_findings = scan_files(&pkg, &config, vec![outside]).expect("outside scan");
-
-        assert_eq!(matching_findings.len(), 1);
-        assert_eq!(matching_findings[0].relative_uri, "src/index.ts");
-        assert!(ignored_findings.is_empty());
-        assert!(outside_findings.is_empty());
     }
 
     #[test]

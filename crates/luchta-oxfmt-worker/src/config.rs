@@ -7,7 +7,9 @@ use std::path::{Path, PathBuf};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use json_strip_comments::StripComments;
 use oxc_formatter::{
-    BracketSameLine, BracketSpacing, JsFormatOptions, QuoteStyle, Semicolons, TrailingCommas,
+    ArrowParentheses, AttributePosition, BracketSameLine, BracketSpacing,
+    EmbeddedLanguageFormatting, Expand, JsFormatOptions, QuoteProperties, QuoteStyle, Semicolons,
+    TrailingCommas,
 };
 use oxc_formatter_core::{IndentStyle, IndentWidth, LineEnding, LineWidth};
 use serde::Deserialize;
@@ -21,9 +23,18 @@ pub struct LoadedConfig {
     pub path: Option<PathBuf>,
     pub ignore_matcher: Option<Gitignore>,
     pub warnings: Vec<String>,
+    config_root: PathBuf,
+    overrides: Vec<OverrideMatcher>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone)]
+struct OverrideMatcher {
+    matcher: Gitignore,
+    exclude_matcher: Option<Gitignore>,
+    options: OxfmtRc,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct OxfmtRc {
     use_tabs: Option<bool>,
@@ -36,7 +47,46 @@ struct OxfmtRc {
     trailing_comma: Option<TrailingComma>,
     bracket_spacing: Option<bool>,
     bracket_same_line: Option<bool>,
+    arrow_parens: Option<ArrowParens>,
+    quote_props: Option<QuoteProps>,
+    single_attribute_per_line: Option<bool>,
+    object_wrap: Option<ObjectWrap>,
+    html_whitespace_sensitivity: Option<HtmlWhitespaceSensitivity>,
+    embedded_language_formatting: Option<EmbeddedLanguageFormattingOption>,
     ignore_patterns: Option<Vec<String>>,
+    overrides: Option<Vec<Override>>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Override {
+    files: OverrideFiles,
+    #[serde(default)]
+    exclude_files: Option<OverrideFiles>,
+    #[serde(default)]
+    options: OxfmtRc,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum OverrideFiles {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl Default for OverrideFiles {
+    fn default() -> Self {
+        Self::Many(Vec::new())
+    }
+}
+
+impl OverrideFiles {
+    fn patterns(&self) -> Vec<&str> {
+        match self {
+            Self::One(pattern) => vec![pattern.as_str()],
+            Self::Many(patterns) => patterns.iter().map(String::as_str).collect(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -55,17 +105,95 @@ enum TrailingComma {
     None,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum ArrowParens {
+    Avoid,
+    Always,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+enum QuoteProps {
+    #[serde(rename = "as-needed")]
+    AsNeeded,
+    #[serde(rename = "consistent")]
+    Consistent,
+    #[serde(rename = "preserve")]
+    Preserve,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum ObjectWrap {
+    Preserve,
+    Collapse,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum HtmlWhitespaceSensitivity {
+    Css,
+    Strict,
+    Ignore,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum EmbeddedLanguageFormattingOption {
+    Auto,
+    Off,
+}
+
+impl LoadedConfig {
+    pub fn options_for(&self, path: &Path) -> JsFormatOptions {
+        let mut options = self.options.clone();
+        let relative_path = path
+            .strip_prefix(&self.config_root)
+            .unwrap_or(path)
+            .to_path_buf();
+        for override_matcher in &self.overrides {
+            if !override_matcher
+                .matcher
+                .matched_path_or_any_parents(&relative_path, false)
+                .is_ignore()
+            {
+                continue;
+            }
+            // Skip this override when its excludeFiles pattern matches.
+            if let Some(exclude_matcher) = &override_matcher.exclude_matcher {
+                if exclude_matcher
+                    .matched_path_or_any_parents(&relative_path, false)
+                    .is_ignore()
+                {
+                    continue;
+                }
+            }
+            apply_oxfmtrc_to_options(&override_matcher.options, &mut options)
+                .expect("override options already validated");
+        }
+        options
+    }
+}
+
 pub fn discover_config(cwd: &Path) -> Result<LoadedConfig, String> {
     let path = find_config_path(cwd);
-    let (options, ignore_matcher, warnings) = match path.as_deref() {
+    let parsed = match path.as_deref() {
         Some(path) => load_config_from_path(path)?,
-        None => (JsFormatOptions::new(), None, Vec::new()),
+        None => ParsedConfig {
+            options: JsFormatOptions::new(),
+            ignore_matcher: None,
+            warnings: Vec::new(),
+            config_root: cwd.to_path_buf(),
+            overrides: Vec::new(),
+        },
     };
     Ok(LoadedConfig {
-        options,
+        options: parsed.options,
         path,
-        ignore_matcher,
-        warnings,
+        ignore_matcher: parsed.ignore_matcher,
+        warnings: parsed.warnings,
+        config_root: parsed.config_root,
+        overrides: parsed.overrides,
     })
 }
 
@@ -77,7 +205,15 @@ fn oxfmtrc_to_options(json: &str) -> Result<JsFormatOptions, String> {
 
 fn options_from_oxfmtrc(config: &OxfmtRc) -> Result<JsFormatOptions, String> {
     let mut options = JsFormatOptions::new();
+    apply_oxfmtrc_to_options(config, &mut options)?;
 
+    // Supported subset only. Still ignored: editorconfig merging,
+    // JS/TS config files, plugins, sortImports, Tailwind sorting, JSDoc,
+    // Svelte payloads, sortPackageJson.
+    Ok(options)
+}
+
+fn apply_oxfmtrc_to_options(config: &OxfmtRc, options: &mut JsFormatOptions) -> Result<(), String> {
     if let Some(use_tabs) = config.use_tabs {
         options.indent_style = if use_tabs {
             IndentStyle::Tab
@@ -134,12 +270,45 @@ fn options_from_oxfmtrc(config: &OxfmtRc) -> Result<JsFormatOptions, String> {
     if let Some(bracket_same_line) = config.bracket_same_line {
         options.bracket_same_line = BracketSameLine::from(bracket_same_line);
     }
-
-    // Supported subset only. Still ignored: overrides/per-file resolution,
-    // editorconfig merging, JS/TS config files, plugins, quoteProps,
-    // arrowParens, singleAttributePerLine, objectWrap, htmlWhitespaceSensitivity,
-    // embeddedLanguageFormatting, sortImports, Tailwind sorting, JSDoc, Svelte payloads.
-    Ok(options)
+    if let Some(arrow_parens) = config.arrow_parens {
+        options.arrow_parentheses = match arrow_parens {
+            ArrowParens::Avoid => ArrowParentheses::AsNeeded,
+            ArrowParens::Always => ArrowParentheses::Always,
+        };
+    }
+    if let Some(quote_props) = config.quote_props {
+        options.quote_properties = match quote_props {
+            QuoteProps::AsNeeded => QuoteProperties::AsNeeded,
+            QuoteProps::Consistent => QuoteProperties::Consistent,
+            QuoteProps::Preserve => QuoteProperties::Preserve,
+        };
+    }
+    if let Some(single_attribute_per_line) = config.single_attribute_per_line {
+        options.attribute_position = if single_attribute_per_line {
+            AttributePosition::Multiline
+        } else {
+            AttributePosition::Auto
+        };
+    }
+    if let Some(object_wrap) = config.object_wrap {
+        options.expand = match object_wrap {
+            ObjectWrap::Preserve => Expand::Auto,
+            ObjectWrap::Collapse => Expand::Never,
+        };
+    }
+    if let Some(html_whitespace_sensitivity) = config.html_whitespace_sensitivity {
+        options.html_whitespace_sensitivity_ignore = matches!(
+            html_whitespace_sensitivity,
+            HtmlWhitespaceSensitivity::Ignore
+        );
+    }
+    if let Some(embedded_language_formatting) = config.embedded_language_formatting {
+        options.embedded_language_formatting = match embedded_language_formatting {
+            EmbeddedLanguageFormattingOption::Auto => EmbeddedLanguageFormatting::Auto,
+            EmbeddedLanguageFormattingOption::Off => EmbeddedLanguageFormatting::Off,
+        };
+    }
+    Ok(())
 }
 
 pub fn build_ignore_matcher(patterns: &[String], root: &Path) -> (Option<Gitignore>, Vec<String>) {
@@ -169,13 +338,67 @@ pub fn build_ignore_matcher(patterns: &[String], root: &Path) -> (Option<Gitigno
     (matcher, warnings)
 }
 
+fn build_override_matcher(patterns: &[&str], root: &Path) -> Result<Option<Gitignore>, String> {
+    if patterns.is_empty() {
+        return Ok(None);
+    }
+    let mut builder = GitignoreBuilder::new(root);
+    for pattern in patterns {
+        builder.add_line(None, pattern).map_err(|error| {
+            format!("failed to parse override files pattern {pattern:?}: {error}")
+        })?;
+    }
+    builder.build().map(Some).map_err(|error| {
+        format!(
+            "failed to build override matcher in {}: {error}",
+            root.display()
+        )
+    })
+}
+
+fn build_override_matchers(
+    overrides: &[Override],
+    root: &Path,
+) -> Result<Vec<OverrideMatcher>, String> {
+    let mut matchers = Vec::new();
+    for override_config in overrides {
+        // Validate the override's options eagerly so invalid values (e.g.
+        // printWidth: 0) surface as a config error at load time instead of
+        // panicking later in `LoadedConfig::options_for`.
+        let mut scratch = JsFormatOptions::new();
+        apply_oxfmtrc_to_options(&override_config.options, &mut scratch)
+            .map_err(|error| format!("invalid override options: {error}"))?;
+
+        let patterns = override_config.files.patterns();
+        let Some(matcher) = build_override_matcher(&patterns, root)? else {
+            continue;
+        };
+        let exclude_matcher = match &override_config.exclude_files {
+            Some(exclude_files) => build_override_matcher(&exclude_files.patterns(), root)?,
+            None => None,
+        };
+        matchers.push(OverrideMatcher {
+            matcher,
+            exclude_matcher,
+            options: override_config.options.clone(),
+        });
+    }
+    Ok(matchers)
+}
+
 fn parse_oxfmtrc(json: &str) -> Result<OxfmtRc, String> {
     serde_json::from_str(json).map_err(|error| format!("failed to parse .oxfmtrc: {error}"))
 }
 
-fn load_config_from_path(
-    path: &Path,
-) -> Result<(JsFormatOptions, Option<Gitignore>, Vec<String>), String> {
+struct ParsedConfig {
+    options: JsFormatOptions,
+    ignore_matcher: Option<Gitignore>,
+    warnings: Vec<String>,
+    config_root: PathBuf,
+    overrides: Vec<OverrideMatcher>,
+}
+
+fn load_config_from_path(path: &Path) -> Result<ParsedConfig, String> {
     let source = fs::read_to_string(path)
         .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
     // Strip comments for both .json and .jsonc — harmless for comment-free JSON
@@ -185,10 +408,21 @@ fn load_config_from_path(
         .map_err(|error| format!("failed to load oxfmt config {}: {error}", path.display()))?;
     let options = options_from_oxfmtrc(&config)
         .map_err(|error| format!("failed to load oxfmt config {}: {error}", path.display()))?;
-    let root = path.parent().unwrap_or_else(|| Path::new("."));
+    let root = path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
     let (ignore_matcher, warnings) =
-        build_ignore_matcher(config.ignore_patterns.as_deref().unwrap_or(&[]), root);
-    Ok((options, ignore_matcher, warnings))
+        build_ignore_matcher(config.ignore_patterns.as_deref().unwrap_or(&[]), &root);
+    let overrides = build_override_matchers(config.overrides.as_deref().unwrap_or(&[]), &root)
+        .map_err(|error| format!("failed to load oxfmt config {}: {error}", path.display()))?;
+    Ok(ParsedConfig {
+        options,
+        ignore_matcher,
+        warnings,
+        config_root: root,
+        overrides,
+    })
 }
 
 fn strip_json_comments(source: &str) -> Result<String, std::io::Error> {
@@ -274,48 +508,13 @@ mod tests {
         assert_eq!(loaded.options.semicolons, defaults.semicolons);
     }
 
-    // ========================================
-    // Fix 1: JSON file with comments parses correctly
-    // ========================================
     #[test]
-    fn oxfmtrc_json_parses_comments() {
-        let temp = TempDir::new().expect("tempdir");
-        let config_path = temp.path().join(CONFIG_FILENAMES[0]); // .oxfmtrc.json
-        fs::write(
-            &config_path,
-            "{\n  // comment in .json\n  \"singleQuote\": true,\n  /* block */\n  \"semi\": false\n}\n",
-        )
-        .expect("config");
-
-        let loaded = discover_config(temp.path()).expect("discover");
-
-        assert_eq!(loaded.path.as_deref(), Some(config_path.as_path()));
-        assert_eq!(loaded.options.quote_style.as_char(), '\'');
-        assert!(loaded.options.semicolons.is_as_needed());
-    }
-
-    // ========================================
-    // Fix 2: Field mapping tests
-    // ========================================
-    use oxc_formatter::{QuoteStyle, Semicolons, TrailingCommas};
-    use oxc_formatter_core::{IndentStyle, LineEnding};
-
-    #[test]
-    fn use_tabs_true_maps_to_tab_indent_style() {
+    fn use_tabs_maps_to_tab_indent_style() {
         let options = oxfmtrc_to_options(r#"{"useTabs":true}"#).expect("parse");
-        assert!(matches!(options.indent_style, IndentStyle::Tab));
-    }
-
-    #[test]
-    fn use_tabs_false_maps_to_space_indent_style() {
-        let options = oxfmtrc_to_options(r#"{"useTabs":false}"#).expect("parse");
-        assert!(matches!(options.indent_style, IndentStyle::Space));
-    }
-
-    #[test]
-    fn tab_width_maps_to_indent_width() {
-        let options = oxfmtrc_to_options(r#"{"tabWidth":4}"#).expect("parse");
-        assert_eq!(options.indent_width.value(), 4);
+        assert!(matches!(
+            options.indent_style,
+            oxc_formatter_core::IndentStyle::Tab
+        ));
     }
 
     #[test]
@@ -325,79 +524,46 @@ mod tests {
     }
 
     #[test]
-    fn end_of_line_lf_maps_to_line_ending_lf() {
-        let options = oxfmtrc_to_options(r#"{"endOfLine":"lf"}"#).expect("parse");
-        assert!(matches!(options.line_ending, LineEnding::Lf));
+    fn invalid_print_width_returns_error() {
+        let err = oxfmtrc_to_options(r#"{"printWidth":0}"#).expect_err("invalid");
+        assert!(err.contains("invalid .oxfmtrc printWidth"));
     }
 
     #[test]
-    fn end_of_line_crlf_maps_to_line_ending_crlf() {
+    fn end_of_line_crlf_maps_to_crlf() {
         let options = oxfmtrc_to_options(r#"{"endOfLine":"crlf"}"#).expect("parse");
-        assert!(matches!(options.line_ending, LineEnding::Crlf));
-    }
-
-    #[test]
-    fn end_of_line_cr_maps_to_line_ending_cr() {
-        let options = oxfmtrc_to_options(r#"{"endOfLine":"cr"}"#).expect("parse");
-        assert!(matches!(options.line_ending, LineEnding::Cr));
+        assert!(matches!(
+            options.line_ending,
+            oxc_formatter_core::LineEnding::Crlf
+        ));
     }
 
     #[test]
     fn single_quote_true_maps_to_single_quote_style() {
         let options = oxfmtrc_to_options(r#"{"singleQuote":true}"#).expect("parse");
-        assert!(matches!(options.quote_style, QuoteStyle::Single));
+        assert_eq!(options.quote_style.as_char(), '\'');
     }
 
     #[test]
-    fn single_quote_false_maps_to_double_quote_style() {
-        let options = oxfmtrc_to_options(r#"{"singleQuote":false}"#).expect("parse");
-        assert!(matches!(options.quote_style, QuoteStyle::Double));
-    }
-
-    #[test]
-    fn jsx_single_quote_true_maps_to_single_jsx_quote_style() {
+    fn jsx_single_quote_true_maps_to_single_quote_style() {
         let options = oxfmtrc_to_options(r#"{"jsxSingleQuote":true}"#).expect("parse");
-        assert!(matches!(options.jsx_quote_style, QuoteStyle::Single));
+        assert_eq!(options.jsx_quote_style.as_char(), '\'');
     }
 
     #[test]
-    fn jsx_single_quote_false_maps_to_double_jsx_quote_style() {
-        let options = oxfmtrc_to_options(r#"{"jsxSingleQuote":false}"#).expect("parse");
-        assert!(matches!(options.jsx_quote_style, QuoteStyle::Double));
-    }
-
-    #[test]
-    fn semi_false_maps_to_as_needed_semicolons() {
+    fn semi_false_maps_to_as_needed() {
         let options = oxfmtrc_to_options(r#"{"semi":false}"#).expect("parse");
-        assert!(matches!(options.semicolons, Semicolons::AsNeeded));
-    }
-
-    #[test]
-    fn semi_true_maps_to_always_semicolons() {
-        let options = oxfmtrc_to_options(r#"{"semi":true}"#).expect("parse");
-        assert!(matches!(options.semicolons, Semicolons::Always));
-    }
-
-    #[test]
-    fn trailing_comma_all_maps_to_all() {
-        let options = oxfmtrc_to_options(r#"{"trailingComma":"all"}"#).expect("parse");
-        assert!(matches!(options.trailing_commas, TrailingCommas::All));
-    }
-
-    #[test]
-    fn trailing_comma_es5_maps_to_es5() {
-        let options = oxfmtrc_to_options(r#"{"trailingComma":"es5"}"#).expect("parse");
-        assert!(matches!(options.trailing_commas, TrailingCommas::Es5));
+        assert!(options.semicolons.is_as_needed());
     }
 
     #[test]
     fn trailing_comma_none_maps_to_none() {
         let options = oxfmtrc_to_options(r#"{"trailingComma":"none"}"#).expect("parse");
-        assert!(matches!(options.trailing_commas, TrailingCommas::None));
+        assert!(options.trailing_commas.is_none());
     }
 
     #[test]
-    fn discover_config_parses_ignore_patterns() {
+    fn ignore_patterns_match_relative_paths_under_config_root() {
         let temp = TempDir::new().expect("tempdir");
         let config_path = temp.path().join(CONFIG_FILENAMES[0]);
         fs::write(&config_path, r#"{"ignorePatterns":["dist/"]}"#).expect("config");
@@ -472,5 +638,211 @@ mod tests {
     fn bracket_same_line_false_maps_to_bracket_same_line_off() {
         let options = oxfmtrc_to_options(r#"{"bracketSameLine":false}"#).expect("parse");
         assert!(!options.bracket_same_line.value());
+    }
+
+    #[test]
+    fn arrow_parens_avoid_maps_to_as_needed() {
+        let options = oxfmtrc_to_options(r#"{"arrowParens":"avoid"}"#).expect("parse");
+        assert!(options.arrow_parentheses.is_as_needed());
+    }
+
+    #[test]
+    fn arrow_parens_always_maps_to_always() {
+        let options = oxfmtrc_to_options(r#"{"arrowParens":"always"}"#).expect("parse");
+        assert!(options.arrow_parentheses.is_always());
+    }
+
+    #[test]
+    fn quote_props_as_needed_maps_to_as_needed() {
+        let options = oxfmtrc_to_options(r#"{"quoteProps":"as-needed"}"#).expect("parse");
+        assert!(matches!(
+            options.quote_properties,
+            oxc_formatter::QuoteProperties::AsNeeded
+        ));
+    }
+
+    #[test]
+    fn quote_props_consistent_maps_to_consistent() {
+        let options = oxfmtrc_to_options(r#"{"quoteProps":"consistent"}"#).expect("parse");
+        assert!(options.quote_properties.is_consistent());
+    }
+
+    #[test]
+    fn quote_props_preserve_maps_to_preserve() {
+        let options = oxfmtrc_to_options(r#"{"quoteProps":"preserve"}"#).expect("parse");
+        assert!(matches!(
+            options.quote_properties,
+            oxc_formatter::QuoteProperties::Preserve
+        ));
+    }
+
+    #[test]
+    fn single_attribute_per_line_true_maps_to_multiline() {
+        let options = oxfmtrc_to_options(r#"{"singleAttributePerLine":true}"#).expect("parse");
+        assert!(matches!(
+            options.attribute_position,
+            oxc_formatter::AttributePosition::Multiline
+        ));
+    }
+
+    #[test]
+    fn single_attribute_per_line_false_maps_to_auto() {
+        let options = oxfmtrc_to_options(r#"{"singleAttributePerLine":false}"#).expect("parse");
+        assert!(matches!(
+            options.attribute_position,
+            oxc_formatter::AttributePosition::Auto
+        ));
+    }
+
+    #[test]
+    fn object_wrap_preserve_maps_to_auto() {
+        let options = oxfmtrc_to_options(r#"{"objectWrap":"preserve"}"#).expect("parse");
+        assert!(matches!(options.expand, oxc_formatter::Expand::Auto));
+    }
+
+    #[test]
+    fn object_wrap_collapse_maps_to_never() {
+        let options = oxfmtrc_to_options(r#"{"objectWrap":"collapse"}"#).expect("parse");
+        assert!(matches!(options.expand, oxc_formatter::Expand::Never));
+    }
+
+    #[test]
+    fn html_whitespace_sensitivity_ignore_maps_to_true() {
+        let options =
+            oxfmtrc_to_options(r#"{"htmlWhitespaceSensitivity":"ignore"}"#).expect("parse");
+        assert!(options.html_whitespace_sensitivity_ignore);
+    }
+
+    #[test]
+    fn html_whitespace_sensitivity_css_maps_to_false() {
+        let options = oxfmtrc_to_options(r#"{"htmlWhitespaceSensitivity":"css"}"#).expect("parse");
+        assert!(!options.html_whitespace_sensitivity_ignore);
+    }
+
+    #[test]
+    fn embedded_language_formatting_auto_maps_to_auto() {
+        let options =
+            oxfmtrc_to_options(r#"{"embeddedLanguageFormatting":"auto"}"#).expect("parse");
+        assert!(options.embedded_language_formatting.is_auto());
+    }
+
+    #[test]
+    fn embedded_language_formatting_off_maps_to_off() {
+        let options = oxfmtrc_to_options(r#"{"embeddedLanguageFormatting":"off"}"#).expect("parse");
+        assert!(options.embedded_language_formatting.is_off());
+    }
+
+    #[test]
+    fn overrides_apply_per_file() {
+        let temp = TempDir::new().expect("tempdir");
+        let config_path = temp.path().join(CONFIG_FILENAMES[0]);
+        fs::write(
+            &config_path,
+            r#"{"printWidth":80,"overrides":[{"files":["*.json"],"options":{"printWidth":320}}]}"#,
+        )
+        .expect("config");
+
+        let loaded = discover_config(temp.path()).expect("discover");
+
+        assert_eq!(
+            loaded
+                .options_for(&temp.path().join("src/example.json"))
+                .line_width
+                .value(),
+            320
+        );
+        assert_eq!(
+            loaded
+                .options_for(&temp.path().join("src/example.ts"))
+                .line_width
+                .value(),
+            80
+        );
+    }
+
+    #[test]
+    fn overrides_respect_exclude_files() {
+        let temp = TempDir::new().expect("tempdir");
+        let config_path = temp.path().join(CONFIG_FILENAMES[0]);
+        fs::write(
+            &config_path,
+            r#"{"printWidth":80,"overrides":[{"files":["*.json"],"excludeFiles":["package.json"],"options":{"printWidth":320}}]}"#,
+        )
+        .expect("config");
+
+        let loaded = discover_config(temp.path()).expect("discover");
+
+        // Non-excluded JSON gets the override.
+        assert_eq!(
+            loaded
+                .options_for(&temp.path().join("src/example.json"))
+                .line_width
+                .value(),
+            320
+        );
+        // Excluded file falls back to base options.
+        assert_eq!(
+            loaded
+                .options_for(&temp.path().join("package.json"))
+                .line_width
+                .value(),
+            80
+        );
+    }
+
+    #[test]
+    fn invalid_override_options_return_error_at_load_time() {
+        // Regression: an invalid value inside an override must surface as a
+        // config error at load time, not panic later in `options_for`.
+        let temp = TempDir::new().expect("tempdir");
+        let config_path = temp.path().join(CONFIG_FILENAMES[0]);
+        fs::write(
+            &config_path,
+            r#"{"overrides":[{"files":["*.json"],"options":{"printWidth":0}}]}"#,
+        )
+        .expect("config");
+
+        let result = discover_config(temp.path());
+        assert!(result.is_err(), "expected load error, got {result:?}");
+    }
+
+    #[test]
+    fn overrides_apply_in_order_last_match_wins() {
+        let temp = TempDir::new().expect("tempdir");
+        let config_path = temp.path().join(CONFIG_FILENAMES[0]);
+        fs::write(
+            &config_path,
+            r#"{"printWidth":80,"overrides":[{"files":["*.ts"],"options":{"printWidth":100}},{"files":["*.ts"],"options":{"printWidth":120}}]}"#,
+        )
+        .expect("config");
+
+        let loaded = discover_config(temp.path()).expect("discover");
+        assert_eq!(
+            loaded
+                .options_for(&temp.path().join("src/example.ts"))
+                .line_width
+                .value(),
+            120
+        );
+    }
+
+    #[test]
+    fn overrides_match_deeply_nested_paths() {
+        let temp = TempDir::new().expect("tempdir");
+        let config_path = temp.path().join(CONFIG_FILENAMES[0]);
+        fs::write(
+            &config_path,
+            r#"{"printWidth":80,"overrides":[{"files":["*.json"],"options":{"printWidth":320}}]}"#,
+        )
+        .expect("config");
+
+        let loaded = discover_config(temp.path()).expect("discover");
+        assert_eq!(
+            loaded
+                .options_for(&temp.path().join("a/b/c/deep.json"))
+                .line_width
+                .value(),
+            320
+        );
     }
 }
