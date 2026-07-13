@@ -162,8 +162,6 @@ impl Worker for OxfmtWorker {
                     };
                 }
             }
-            let format_options = loaded_config.options;
-
             if files.is_empty() {
                 return InProcessOutcome::Done {
                     exit_code: 0,
@@ -188,7 +186,7 @@ impl Worker for OxfmtWorker {
                 let relative = relative_display(&cwd, &path);
                 let path_for_blocking = path.clone();
                 let source_for_blocking = source.clone();
-                let options_for_blocking = format_options.clone();
+                let options_for_blocking = loaded_config.options_for(&path);
                 let result = match task::spawn_blocking(move || {
                     format_path(
                         &path_for_blocking,
@@ -643,9 +641,8 @@ mod tests {
         let cwd = temp.path();
         let config_path = cwd.join(".oxfmtrc.json");
         fs::write(&config_path, "{\"singleQuote\":true,\"unknownKey\":123}").expect("config");
-        let options = crate::config::discover_config(cwd)
-            .expect("discover")
-            .options;
+        let loaded = crate::config::discover_config(cwd).expect("discover");
+        let options = loaded.options_for(&cwd.join("src/example.ts"));
 
         let result = format_path(
             Path::new("src/example.ts"),
@@ -663,9 +660,8 @@ mod tests {
         let cwd = temp.path();
         let config_path = cwd.join(".oxfmtrc.jsonc");
         fs::write(&config_path, "{\n  // comment\n  \"semi\": false\n}\n").expect("config");
-        let options = crate::config::discover_config(cwd)
-            .expect("discover")
-            .options;
+        let loaded = crate::config::discover_config(cwd).expect("discover");
+        let options = loaded.options_for(&cwd.join("src/example.ts"));
 
         let result = format_path(
             Path::new("src/example.ts"),
@@ -694,6 +690,48 @@ mod tests {
 
         assert_eq!(from_worker_default.formatted, explicit_default.formatted);
         assert_eq!(from_worker_default.changed, explicit_default.changed);
+    }
+
+    #[test]
+    fn format_path_uses_oxfmtrc_overrides_per_file() {
+        let temp = TempDir::new().expect("tempdir");
+        let cwd = temp.path();
+        let config_path = cwd.join(".oxfmtrc.json");
+        // Base printWidth is 80; the *.ts override bumps it to 320. A wide array
+        // literal wraps onto multiple lines at width 80 but stays on a single
+        // line at width 320, so the formatted output differs per file. This
+        // verifies main.rs's formatting path applies the per-file resolved
+        // options rather than a single global config.
+        fs::write(
+            &config_path,
+            "{\"printWidth\":80,\"overrides\":[{\"files\":[\"*.ts\"],\"options\":{\"printWidth\":320}}]}",
+        )
+        .expect("config");
+        let loaded = crate::config::discover_config(cwd).expect("discover");
+
+        let source =
+            "export const value = [1111111, 2222222, 3333333, 4444444, 5555555, 6666666, 7777777];\n";
+
+        // .ts file matches the override -> width 320 -> stays on one line.
+        let ts_path = cwd.join("src/example.ts");
+        let ts_result =
+            format_path(&ts_path, source, &loaded.options_for(&ts_path)).expect("format ts");
+        assert_eq!(
+            ts_result.formatted.trim_end().lines().count(),
+            1,
+            "expected single-line output at width 320, got: {:?}",
+            ts_result.formatted
+        );
+
+        // .mts file does not match the override -> base width 80 -> wraps.
+        let base_path = cwd.join("src/example.mts");
+        let base_result =
+            format_path(&base_path, source, &loaded.options_for(&base_path)).expect("format base");
+        assert!(
+            base_result.formatted.lines().count() > 1,
+            "expected wrapped output at width 80, got: {:?}",
+            base_result.formatted
+        );
     }
 
     async fn run_worker(req: &WorkerRequest) -> (InProcessOutcome, String, String) {

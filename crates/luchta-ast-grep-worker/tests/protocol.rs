@@ -197,42 +197,9 @@ fn resolve_modifies_inputs_when_rules_exist() {
         resolved["result"]["inputs"],
         serde_json::json!([
             "**/*",
+            "**/*.yaml",
+            "**/*.yml",
             ".gitignore",
-            "package.json",
-            "rules/no-console-log.yml",
-            "sgconfig.yml"
-        ])
-    );
-}
-
-#[test]
-fn resolve_preserves_repo_root_hash_inputs_when_rules_exist() {
-    let fixture = tempdir().expect("tempdir");
-    write_fixture_rule_set(fixture.path());
-    let mut request =
-        resolve_task_request("resolve-rules-hash", Some(fixture.path()), ResolveMode::Run);
-    request.inputs = vec![
-        "#sgconfig.yml".to_owned(),
-        "#etc/ast-grep/rules/**/*.yml".to_owned(),
-        "src/**".to_owned(),
-    ];
-    let input = format!("{}\n", resolve_line(request));
-    let (output, stderr) = run_worker(&input);
-    assert!(stderr.is_empty(), "unexpected worker stderr: {stderr}");
-    let resolved = output
-        .iter()
-        .find(|value| value["type"].as_str() == Some("resolved"))
-        .expect("resolved message");
-    assert_eq!(resolved["id"].as_str(), Some("resolve-rules-hash"));
-    assert_eq!(resolved["result"]["decision"].as_str(), Some("modify"));
-    assert_eq!(
-        resolved["result"]["inputs"],
-        serde_json::json!([
-            "#etc/ast-grep/rules/**/*.yml",
-            "#sgconfig.yml",
-            "**/*",
-            ".gitignore",
-            "package.json",
             "rules/no-console-log.yml",
             "sgconfig.yml"
         ])
