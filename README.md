@@ -14,7 +14,17 @@ Luchta optimizes monorepo workflows by:
 
 ## Installation
 
-### Quick install (recommended)
+### ASDF
+
+You can use `asdf` to install luchta binaries:
+
+```
+asdf plugin add luchta            https://github.com/dobesv/asdf-plugins.git
+asdf set luchta latest
+asdf install
+```
+
+### Install script
 
 For a fast, automated installation, use the standalone installer scripts. They detect your OS and architecture, download the latest release, and extract all available binaries to `~/.luchta/bin` (on Unix) or `%USERPROFILE%\.luchta\bin` (on Windows).
 
