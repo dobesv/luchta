@@ -39,7 +39,7 @@ impl Worker for AstGrepWorker {
         }
 
         ResolveResult::modify(TaskModification {
-            inputs: Some(resolve_inputs(cwd, &config, &req.inputs)),
+            inputs: Some(declared_inputs(cwd, &config)),
             ..TaskModification::default()
         })
     }
@@ -212,52 +212,68 @@ impl Worker for AstGrepWorker {
     }
 }
 
-/// Declare only package-relative worker-owned inputs.
-///
-/// Shared root `sgconfig.yml` and rule dirs discovered via ancestor walk are intentionally
-/// omitted here when they live outside task `cwd`; worker must never synthesize `../` inputs for
-/// per-package tasks.
 fn declared_inputs(cwd: &Path, config: &DiscoveredConfig) -> Vec<String> {
     let mut inputs = vec![
-        "package.json".to_owned(),
-        "**/*".to_owned(),
+        "**/*.yml".to_owned(),
+        "**/*.yaml".to_owned(),
         ".gitignore".to_owned(),
     ];
 
-    if let Some(relative_config) = relative_within_cwd(cwd, &config.config_path) {
+    if let Some(relative_config) = relative_or_parent_path(cwd, &config.config_path) {
         inputs.push(relative_config);
+    } else {
+        inputs.push("sgconfig.yml".to_owned());
     }
 
     for rule_file in &config.rule_files {
-        if let Some(relative_rule) = relative_within_cwd(cwd, rule_file) {
+        if let Some(relative_rule) = relative_or_parent_path(cwd, rule_file) {
             inputs.push(relative_rule);
         }
     }
 
+    // Worker walks whole task cwd with ignore/gitignore semantics, not only src/**.
+    // Declare broad tree inputs so any lintable file under cwd invalidates cache, while
+    // still relying on .gitignore and worker-side language filtering to avoid absurd churn.
+    inputs.push("**/*".to_owned());
+
     inputs.sort();
     inputs.dedup();
     inputs
 }
 
-/// Engine applies worker input modifications as replacement, not merge.
-/// Preserve consumer-declared repo-root `#...` inputs so shared root `sgconfig.yml` and rule-dir
-/// cache invalidation survives resolve. Keep filter narrow: package-relative user inputs are
-/// already subsumed by worker-owned `**/*` coverage.
-fn resolve_inputs(cwd: &Path, config: &DiscoveredConfig, user_inputs: &[String]) -> Vec<String> {
-    let mut inputs = declared_inputs(cwd, config);
-    inputs.extend(
-        user_inputs
-            .iter()
-            .filter(|input| input.starts_with('#'))
-            .cloned(),
-    );
-    inputs.sort();
-    inputs.dedup();
-    inputs
+fn relative_or_parent_path(cwd: &Path, path: &Path) -> Option<String> {
+    if let Ok(relative) = path.strip_prefix(cwd) {
+        return Some(normalize_path(relative));
+    }
+
+    let cwd_parts = path_components(cwd);
+    let path_parts = path_components(path);
+    let common_len = cwd_parts
+        .iter()
+        .zip(&path_parts)
+        .take_while(|(left, right)| left == right)
+        .count();
+    if common_len == 0 {
+        return None;
+    }
+
+    let mut relative_parts = Vec::new();
+    for _ in common_len..cwd_parts.len() {
+        relative_parts.push("..".to_owned());
+    }
+    for component in &path_parts[common_len..] {
+        relative_parts.push(component.clone());
+    }
+    Some(relative_parts.join("/"))
 }
 
-fn relative_within_cwd(cwd: &Path, path: &Path) -> Option<String> {
-    path.strip_prefix(cwd).ok().map(normalize_path)
+fn path_components(path: &Path) -> Vec<String> {
+    path.components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect()
 }
 
 fn normalize_path(path: &Path) -> String {
@@ -283,9 +299,11 @@ async fn main() {
 mod tests {
     use std::fs;
 
+    use std::path::PathBuf;
+
     use luchta_worker::{ResolveDecision, ResolveMode, ResolveTask, TaskModification, Worker};
 
-    use super::{declared_inputs, resolve_inputs, AstGrepWorker};
+    use super::{declared_inputs, relative_or_parent_path, AstGrepWorker};
     use crate::config::discover_config;
 
     fn resolve_task(cwd: Option<String>) -> ResolveTask {
@@ -299,12 +317,6 @@ mod tests {
             inputs: vec![],
             mode: ResolveMode::Run,
         }
-    }
-
-    fn resolve_task_with_inputs(cwd: Option<String>, inputs: Vec<&str>) -> ResolveTask {
-        let mut req = resolve_task(cwd);
-        req.inputs = inputs.into_iter().map(str::to_owned).collect();
-        req
     }
 
     #[test]
@@ -338,73 +350,36 @@ mod tests {
         assert_eq!(
             result.decision,
             ResolveDecision::Modify(TaskModification {
-                inputs: Some(resolve_inputs(temp.path(), &config, &[])),
+                inputs: Some(declared_inputs(temp.path(), &config)),
                 ..TaskModification::default()
             })
         );
     }
 
     #[test]
-    fn resolve_inputs_preserve_repo_root_hash_inputs() {
+    fn declared_inputs_include_parent_config_and_full_tree() {
         let temp = tempfile::tempdir().expect("tempdir");
         let pkg = temp.path().join("packages/app");
-        fs::create_dir_all(&pkg).expect("pkg");
-        fs::create_dir_all(temp.path().join("rules")).expect("rules");
-        fs::write(temp.path().join("sgconfig.yml"), "ruleDirs:\n  - rules\n").expect("config");
-        fs::write(temp.path().join("rules/shared.yml"), "id: shared\n").expect("rule");
+        fs::create_dir_all(pkg.join("rules")).expect("rules");
+        fs::write(
+            temp.path().join("sgconfig.yml"),
+            "ruleDirs:\n  - packages/app/rules\n",
+        )
+        .expect("config");
+        fs::write(pkg.join("rules/no-console.yml"), "id: no-console\n").expect("rule");
 
         let config = discover_config(&pkg)
             .expect("discover")
             .expect("config present");
-        let inputs = resolve_inputs(
-            &pkg,
-            &config,
-            &[
-                "#sgconfig.yml".to_owned(),
-                "#etc/ast-grep/rules/**/*.yml".to_owned(),
-                "src/**".to_owned(),
-            ],
-        );
+        let inputs = declared_inputs(&pkg, &config);
 
-        assert!(inputs.iter().all(|input| !input.starts_with("../")));
-        assert!(inputs.contains(&"package.json".to_owned()));
-        assert!(inputs.contains(&"**/*".to_owned()));
-        assert!(inputs.contains(&".gitignore".to_owned()));
-        assert!(inputs.contains(&"#sgconfig.yml".to_owned()));
-        assert!(inputs.contains(&"#etc/ast-grep/rules/**/*.yml".to_owned()));
-        assert!(!inputs.contains(&"src/**".to_owned()));
-    }
-
-    #[test]
-    fn resolve_task_preserves_repo_root_hash_inputs() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        fs::create_dir_all(temp.path().join("rules")).expect("rules");
-        fs::write(temp.path().join("sgconfig.yml"), "ruleDirs:\n  - rules\n").expect("config");
-        fs::write(temp.path().join("rules/no-console.yml"), "id: no-console\n").expect("rule");
-
-        let result = AstGrepWorker.resolve_task(&resolve_task_with_inputs(
-            Some(temp.path().display().to_string()),
-            vec!["#sgconfig.yml", "#etc/ast-grep/rules/**/*.yml", "src/**"],
-        ));
-
-        let ResolveDecision::Modify(modification) = result.decision else {
-            panic!("expected modify decision");
-        };
-        let inputs = modification.inputs.expect("inputs");
-
-        assert!(inputs.iter().all(|input| !input.starts_with("../")));
-        assert!(inputs.contains(&"package.json".to_owned()));
-        assert!(inputs.contains(&"**/*".to_owned()));
-        assert!(inputs.contains(&".gitignore".to_owned()));
-        assert!(inputs.contains(&"sgconfig.yml".to_owned()));
+        assert!(inputs.contains(&"../../sgconfig.yml".to_owned()));
         assert!(inputs.contains(&"rules/no-console.yml".to_owned()));
-        assert!(inputs.contains(&"#sgconfig.yml".to_owned()));
-        assert!(inputs.contains(&"#etc/ast-grep/rules/**/*.yml".to_owned()));
-        assert!(!inputs.contains(&"src/**".to_owned()));
+        assert!(inputs.contains(&"**/*".to_owned()));
     }
 
     #[test]
-    fn declared_inputs_omit_ancestor_config_and_rule_files() {
+    fn declared_inputs_include_rule_files_outside_task_cwd() {
         let temp = tempfile::tempdir().expect("tempdir");
         let pkg = temp.path().join("packages/app");
         fs::create_dir_all(&pkg).expect("pkg");
@@ -417,38 +392,18 @@ mod tests {
             .expect("config present");
         let inputs = declared_inputs(&pkg, &config);
 
-        assert!(inputs.iter().all(|input| !input.starts_with("../")));
-        assert!(inputs.contains(&"package.json".to_owned()));
-        assert!(inputs.contains(&"**/*".to_owned()));
-        assert!(inputs.contains(&".gitignore".to_owned()));
-        assert!(!inputs.contains(&"sgconfig.yml".to_owned()));
-        assert!(!inputs.contains(&"../../sgconfig.yml".to_owned()));
-        assert!(!inputs.contains(&"../../rules/shared.yml".to_owned()));
+        assert!(inputs.contains(&"../../sgconfig.yml".to_owned()));
+        assert!(inputs.contains(&"../../rules/shared.yml".to_owned()));
     }
 
     #[test]
-    fn declared_inputs_include_config_and_rules_within_task_cwd() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        fs::create_dir_all(temp.path().join("rules/nested")).expect("rules");
-        fs::write(temp.path().join("sgconfig.yml"), "ruleDirs:\n  - rules\n").expect("config");
-        fs::write(temp.path().join("rules/no-console.yml"), "id: no-console\n").expect("rule");
-        fs::write(
-            temp.path().join("rules/nested/no-debug.yaml"),
-            "id: no-debug\n",
-        )
-        .expect("rule");
+    fn relative_or_parent_path_reaches_ancestor_config() {
+        let cwd = PathBuf::from("/repo/packages/app");
+        let config = PathBuf::from("/repo/sgconfig.yml");
 
-        let config = discover_config(temp.path())
-            .expect("discover")
-            .expect("config present");
-        let inputs = declared_inputs(temp.path(), &config);
-
-        assert!(inputs.iter().all(|input| !input.starts_with("../")));
-        assert!(inputs.contains(&"package.json".to_owned()));
-        assert!(inputs.contains(&"**/*".to_owned()));
-        assert!(inputs.contains(&".gitignore".to_owned()));
-        assert!(inputs.contains(&"sgconfig.yml".to_owned()));
-        assert!(inputs.contains(&"rules/no-console.yml".to_owned()));
-        assert!(inputs.contains(&"rules/nested/no-debug.yaml".to_owned()));
+        assert_eq!(
+            relative_or_parent_path(&cwd, &config),
+            Some("../../sgconfig.yml".to_owned())
+        );
     }
 }
