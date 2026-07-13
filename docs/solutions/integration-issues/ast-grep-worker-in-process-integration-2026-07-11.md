@@ -191,6 +191,17 @@ for dir in cwd.ancestors() {
 
 Prune task if `sgconfig.yml` absent or `rule_files` empty.
 
+### Cache inputs for per-package tasks
+
+Ancestor discovery stays enabled, but worker-owned declared inputs must stay package-relative. If
+`sgconfig.yml` or resolved rule files live above task `cwd`, worker omits them from its generated
+`TaskModification.inputs` instead of emitting `../...` paths.
+
+Engine semantics matter here: worker `inputs` modifications replace task inputs rather than merge
+with them. To keep shared-root cache invalidation working, consumer `luchta-config.*` should
+declare shared root config/rules as repo-root `#`-prefixed inputs, and the ast-grep worker must
+preserve those `#...` entries across resolve while adding its package-relative inputs.
+
 ### SARIF construction
 
 ```rust
