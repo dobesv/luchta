@@ -16,8 +16,8 @@ use std::path::{Path, PathBuf};
 use ignore::{gitignore::Gitignore, WalkBuilder};
 #[cfg(feature = "oxc")]
 use luchta_worker::{
-    run_worker_main, InProcessOutcome, JobContext, ResolveResult, ResolveTask, TaskModification,
-    Worker, WorkerRequest,
+    process_items_in_parallel, run_worker_main, InProcessOutcome, JobContext, ResolveResult,
+    ResolveTask, TaskModification, Worker, WorkerRequest,
 };
 #[cfg(feature = "oxc")]
 use tokio::task;
@@ -198,78 +198,105 @@ impl Worker for OxfmtWorker {
 
             let mut exit_code = 0;
             let mut would_reformat = false;
+            let outcomes = match task::spawn_blocking({
+                let cwd = cwd.clone();
+                let loaded_config = loaded_config.clone();
+                let files = files.clone();
+                move || {
+                    process_items_in_parallel(
+                        &files,
+                        "oxfmt worker parallel format thread panicked",
+                        |path| {
+                            let relative = relative_display(&cwd, path);
+                            let source = match fs::read_to_string(path) {
+                                Ok(source) => source,
+                                Err(error) => {
+                                    return FileOutcome::ReadError(format!(
+                                        "failed to read {}: {error}",
+                                        path.display()
+                                    ));
+                                }
+                            };
+                            let options = loaded_config.options_for(path);
+                            let result = match format_path(path, &source, &options) {
+                                Ok(result) => result,
+                                Err(error) => return FileOutcome::FormatError(error),
+                            };
 
-            for path in files {
-                let source = match fs::read_to_string(&path) {
-                    Ok(source) => source,
-                    Err(error) => {
-                        let _ = ctx
-                            .emit_stderr(format!("failed to read {}: {error}", path.display()))
-                            .await;
-                        exit_code = 1;
-                        continue;
-                    }
-                };
-                let relative = relative_display(&cwd, &path);
-                let path_for_blocking = path.clone();
-                let source_for_blocking = source.clone();
-                let options_for_blocking = loaded_config.options_for(&path);
-                let result = match task::spawn_blocking(move || {
-                    format_path(
-                        &path_for_blocking,
-                        &source_for_blocking,
-                        &options_for_blocking,
+                            if !result.changed {
+                                return FileOutcome::Unchanged;
+                            }
+
+                            if opts.check {
+                                return FileOutcome::WouldReformat { relative };
+                            }
+
+                            if let Err(error) = write_text_file(path, &result.formatted) {
+                                return FileOutcome::WriteError(error);
+                            }
+
+                            FileOutcome::Reformatted { relative }
+                        },
                     )
-                })
-                .await
-                {
-                    Ok(Ok(result)) => result,
-                    Ok(Err(error)) => {
-                        let _ = ctx.emit_stderr(error).await;
-                        exit_code = 1;
-                        continue;
-                    }
-                    Err(error) => {
-                        let _ = ctx
-                            .emit_stderr(format!("format task failed for {relative}: {error}"))
-                            .await;
-                        exit_code = 1;
-                        continue;
-                    }
-                };
-
-                if !result.changed {
-                    continue;
                 }
-
-                if opts.check {
-                    would_reformat = true;
-                    if let Err(error) = ctx.emit_stdout(format!("would reformat: {relative}")).await
-                    {
-                        let _ = ctx
-                            .emit_stderr(format!("failed to emit formatter log: {error}"))
-                            .await;
-                        return InProcessOutcome::Done {
-                            exit_code: 1,
-                            outputs: None,
-                        };
-                    }
-                    continue;
-                }
-
-                if let Err(error) = write_text_file(&path, &result.formatted) {
+            })
+            .await
+            {
+                Ok(Ok(outcomes)) => outcomes,
+                Ok(Err(error)) => {
                     let _ = ctx.emit_stderr(error).await;
-                    exit_code = 1;
-                    continue;
+                    return InProcessOutcome::Done {
+                        exit_code: 1,
+                        outputs: None,
+                    };
                 }
-                if let Err(error) = ctx.emit_stdout(format!("reformatted: {relative}")).await {
+                Err(error) => {
                     let _ = ctx
-                        .emit_stderr(format!("failed to emit formatter log: {error}"))
+                        .emit_stderr(format!("oxfmt parallel task failed: {error}"))
                         .await;
                     return InProcessOutcome::Done {
                         exit_code: 1,
                         outputs: None,
                     };
+                }
+            };
+
+            for outcome in outcomes {
+                match outcome {
+                    FileOutcome::ReadError(error)
+                    | FileOutcome::FormatError(error)
+                    | FileOutcome::WriteError(error) => {
+                        let _ = ctx.emit_stderr(error).await;
+                        exit_code = 1;
+                    }
+                    FileOutcome::Unchanged => {}
+                    FileOutcome::WouldReformat { relative } => {
+                        would_reformat = true;
+                        if let Err(error) =
+                            ctx.emit_stdout(format!("would reformat: {relative}")).await
+                        {
+                            let _ = ctx
+                                .emit_stderr(format!("failed to emit formatter log: {error}"))
+                                .await;
+                            return InProcessOutcome::Done {
+                                exit_code: 1,
+                                outputs: None,
+                            };
+                        }
+                    }
+                    FileOutcome::Reformatted { relative } => {
+                        if let Err(error) =
+                            ctx.emit_stdout(format!("reformatted: {relative}")).await
+                        {
+                            let _ = ctx
+                                .emit_stderr(format!("failed to emit formatter log: {error}"))
+                                .await;
+                            return InProcessOutcome::Done {
+                                exit_code: 1,
+                                outputs: None,
+                            };
+                        }
+                    }
                 }
             }
 
@@ -283,6 +310,16 @@ impl Worker for OxfmtWorker {
             }
         }
     }
+}
+
+#[cfg(feature = "oxc")]
+enum FileOutcome {
+    ReadError(String),
+    FormatError(String),
+    WriteError(String),
+    Unchanged,
+    WouldReformat { relative: String },
+    Reformatted { relative: String },
 }
 
 #[cfg(feature = "oxc")]

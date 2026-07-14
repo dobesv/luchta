@@ -14,8 +14,8 @@ use std::path::{Path, PathBuf};
 
 #[cfg(feature = "swc")]
 use luchta_worker::{
-    run_worker_main, InProcessOutcome, JobContext, ResolveResult, ResolveTask, TaskModification,
-    Worker, WorkerRequest,
+    process_items_in_parallel, run_worker_main, InProcessOutcome, JobContext, ResolveResult,
+    ResolveTask, TaskModification, Worker, WorkerRequest,
 };
 #[cfg(feature = "swc")]
 use tokio::task;
@@ -23,6 +23,11 @@ use tokio::task;
 #[cfg(feature = "swc")]
 use crate::args::SwcArgs;
 #[cfg(feature = "swc")]
+struct FileOutcome {
+    produced: Vec<String>,
+    errors: Vec<String>,
+    failed: bool,
+}
 use crate::transform::{
     is_transformable, output_path_for, relative_source_map_source_path, should_skip,
     source_map_output_path, source_mapping_url, transform_source,
@@ -162,153 +167,217 @@ impl Worker for SwcTransformWorker {
 
             let mut produced = BTreeSet::new();
             let mut exit_code = 0;
+            let outcomes = match task::spawn_blocking({
+                let cwd = cwd.clone();
+                let src_root = src_root.clone();
+                let out_root = out_root.clone();
+                let args = args.clone();
+                let entries = entries.clone();
+                move || {
+                    process_items_in_parallel(
+                        &entries,
+                        "swc transform worker parallel transform thread panicked",
+                        |source_path| {
+                            let mut produced = Vec::new();
+                            let mut errors = Vec::new();
+                            let mut failed = false;
 
-            for source_path in entries {
-                let relative = match source_path.strip_prefix(&cwd) {
-                    Ok(relative) => normalize_path(relative),
-                    Err(_) => normalize_path(&source_path),
-                };
+                            let relative = match source_path.strip_prefix(&src_root) {
+                                Ok(relative) => relative,
+                                Err(error) => {
+                                    errors.push(format!(
+                                        "failed to strip src root from {}: {error}",
+                                        source_path.display()
+                                    ));
+                                    failed = true;
+                                    return FileOutcome {
+                                        produced,
+                                        errors,
+                                        failed,
+                                    };
+                                }
+                            };
 
-                if should_skip(&source_path) {
-                    continue;
-                }
-
-                let output_path = if is_transformable(&source_path) {
-                    match output_path_for(&src_root, &out_root, &source_path) {
-                        Ok(output_path) => output_path,
-                        Err(error) => {
-                            let _ = ctx.emit_stderr(error).await;
-                            exit_code = 1;
-                            continue;
-                        }
-                    }
-                } else {
-                    match source_path.strip_prefix(&src_root) {
-                        Ok(relative) => out_root.join(relative),
-                        Err(error) => {
-                            let _ = ctx
-                                .emit_stderr(format!(
-                                    "failed to derive relative path for {}: {error}",
-                                    source_path.display()
-                                ))
-                                .await;
-                            exit_code = 1;
-                            continue;
-                        }
-                    }
-                };
-                if let Some(parent) = output_path.parent() {
-                    if let Err(error) = fs::create_dir_all(parent) {
-                        let _ = ctx
-                            .emit_stderr(format!("failed to create {}: {error}", parent.display()))
-                            .await;
-                        exit_code = 1;
-                        continue;
-                    }
-                }
-
-                if is_transformable(&source_path) {
-                    let source = match fs::read_to_string(&source_path) {
-                        Ok(source) => source,
-                        Err(error) => {
-                            let _ = ctx
-                                .emit_stderr(format!(
-                                    "failed to read {}: {error}",
-                                    source_path.display()
-                                ))
-                                .await;
-                            exit_code = 1;
-                            continue;
-                        }
-                    };
-                    let source_map_path = source_map_output_path(&output_path);
-                    let source_map_source_path =
-                        relative_source_map_source_path(&cwd, &source_path);
-                    let source_mapping_url = match source_mapping_url(&source_map_path) {
-                        Ok(source_mapping_url) => source_mapping_url,
-                        Err(error) => {
-                            let _ = ctx.emit_stderr(error).await;
-                            exit_code = 1;
-                            continue;
-                        }
-                    };
-                    let source_path_for_task = source_path.clone();
-                    let args_for_task = args.clone();
-                    let result = match task::spawn_blocking(move || {
-                        transform_source(
-                            &args_for_task,
-                            &source_path_for_task,
-                            &source,
-                            &source_map_source_path,
-                            &source_mapping_url,
-                        )
-                    })
-                    .await
-                    {
-                        Ok(Ok(result)) => result,
-                        Ok(Err(errors)) => {
-                            for error in errors {
-                                let _ = ctx.emit_stderr(error).await;
+                            if should_skip(relative) {
+                                return FileOutcome {
+                                    produced,
+                                    errors,
+                                    failed,
+                                };
                             }
-                            exit_code = 1;
-                            continue;
-                        }
-                        Err(error) => {
-                            let _ = ctx
-                                .emit_stderr(format!(
-                                    "transform task failed for {relative}: {error}"
-                                ))
-                                .await;
-                            exit_code = 1;
-                            continue;
-                        }
-                    };
-                    if let Err(error) = fs::write(&output_path, &result.code) {
-                        let _ = ctx
-                            .emit_stderr(format!(
-                                "failed to write {}: {error}",
-                                output_path.display()
-                            ))
-                            .await;
-                        exit_code = 1;
-                        continue;
-                    }
-                    produced.insert(normalize_path(
-                        output_path.strip_prefix(&cwd).unwrap_or(&output_path),
-                    ));
-                    if let Some(source_map_json) = result.source_map_json {
-                        if let Err(error) = fs::write(&source_map_path, source_map_json) {
-                            let _ = ctx
-                                .emit_stderr(format!(
-                                    "failed to write {}: {error}",
-                                    source_map_path.display()
-                                ))
-                                .await;
-                            exit_code = 1;
-                            continue;
-                        }
-                        produced.insert(normalize_path(
-                            source_map_path
-                                .strip_prefix(&cwd)
-                                .unwrap_or(&source_map_path),
-                        ));
-                    }
-                } else {
-                    if let Err(error) = fs::copy(&source_path, &output_path) {
-                        let _ = ctx
-                            .emit_stderr(format!(
-                                "failed to copy {} to {}: {error}",
-                                source_path.display(),
-                                output_path.display()
-                            ))
-                            .await;
-                        exit_code = 1;
-                        continue;
-                    }
-                    produced.insert(normalize_path(
-                        output_path.strip_prefix(&cwd).unwrap_or(&output_path),
-                    ));
+
+                            let output_path = if is_transformable(source_path) {
+                                match output_path_for(&src_root, &out_root, source_path) {
+                                    Ok(output_path) => output_path,
+                                    Err(error) => {
+                                        errors.push(error);
+                                        failed = true;
+                                        return FileOutcome {
+                                            produced,
+                                            errors,
+                                            failed,
+                                        };
+                                    }
+                                }
+                            } else {
+                                out_root.join(relative)
+                            };
+                            if let Some(parent) = output_path.parent() {
+                                if let Err(error) = fs::create_dir_all(parent) {
+                                    errors.push(format!(
+                                        "failed to create {}: {error}",
+                                        parent.display()
+                                    ));
+                                    failed = true;
+                                    return FileOutcome {
+                                        produced,
+                                        errors,
+                                        failed,
+                                    };
+                                }
+                            }
+
+                            if is_transformable(source_path) {
+                                let source = match fs::read_to_string(source_path) {
+                                    Ok(source) => source,
+                                    Err(error) => {
+                                        errors.push(format!(
+                                            "failed to read {}: {error}",
+                                            source_path.display()
+                                        ));
+                                        failed = true;
+                                        return FileOutcome {
+                                            produced,
+                                            errors,
+                                            failed,
+                                        };
+                                    }
+                                };
+                                let source_map_path = source_map_output_path(&output_path);
+                                let source_map_source_path =
+                                    relative_source_map_source_path(&cwd, source_path);
+                                let source_mapping_url = match source_mapping_url(&source_map_path)
+                                {
+                                    Ok(source_mapping_url) => source_mapping_url,
+                                    Err(error) => {
+                                        errors.push(error);
+                                        failed = true;
+                                        return FileOutcome {
+                                            produced,
+                                            errors,
+                                            failed,
+                                        };
+                                    }
+                                };
+                                let result = match transform_source(
+                                    &args,
+                                    source_path,
+                                    &source,
+                                    &source_map_source_path,
+                                    &source_mapping_url,
+                                ) {
+                                    Ok(result) => result,
+                                    Err(errors_from_transform) => {
+                                        errors.extend(errors_from_transform);
+                                        failed = true;
+                                        return FileOutcome {
+                                            produced,
+                                            errors,
+                                            failed,
+                                        };
+                                    }
+                                };
+                                if let Err(error) = fs::write(&output_path, &result.code) {
+                                    errors.push(format!(
+                                        "failed to write {}: {error}",
+                                        output_path.display()
+                                    ));
+                                    failed = true;
+                                    return FileOutcome {
+                                        produced,
+                                        errors,
+                                        failed,
+                                    };
+                                }
+                                produced.push(normalize_path(
+                                    output_path.strip_prefix(&cwd).unwrap_or(&output_path),
+                                ));
+                                if let Some(source_map_json) = result.source_map_json {
+                                    if let Err(error) = fs::write(&source_map_path, source_map_json)
+                                    {
+                                        errors.push(format!(
+                                            "failed to write {}: {error}",
+                                            source_map_path.display()
+                                        ));
+                                        failed = true;
+                                        return FileOutcome {
+                                            produced,
+                                            errors,
+                                            failed,
+                                        };
+                                    }
+                                    produced.push(normalize_path(
+                                        source_map_path
+                                            .strip_prefix(&cwd)
+                                            .unwrap_or(&source_map_path),
+                                    ));
+                                }
+                            } else if let Err(error) = fs::copy(source_path, &output_path) {
+                                errors.push(format!(
+                                    "failed to copy {} to {}: {error}",
+                                    source_path.display(),
+                                    output_path.display()
+                                ));
+                                failed = true;
+                                return FileOutcome {
+                                    produced,
+                                    errors,
+                                    failed,
+                                };
+                            } else {
+                                produced.push(normalize_path(
+                                    output_path.strip_prefix(&cwd).unwrap_or(&output_path),
+                                ));
+                            }
+
+                            FileOutcome {
+                                produced,
+                                errors,
+                                failed,
+                            }
+                        },
+                    )
                 }
+            })
+            .await
+            {
+                Ok(Ok(result)) => result,
+                Ok(Err(error)) => {
+                    let _ = ctx.emit_stderr(error).await;
+                    return InProcessOutcome::Done {
+                        exit_code: 1,
+                        outputs: None,
+                    };
+                }
+                Err(error) => {
+                    let _ = ctx
+                        .emit_stderr(format!("swc transform parallel task failed: {error}"))
+                        .await;
+                    return InProcessOutcome::Done {
+                        exit_code: 1,
+                        outputs: None,
+                    };
+                }
+            };
+
+            for outcome in outcomes {
+                for error in outcome.errors {
+                    let _ = ctx.emit_stderr(error).await;
+                }
+                if outcome.failed {
+                    exit_code = 1;
+                }
+                produced.extend(outcome.produced);
             }
 
             if let Err(error) = cleanup_extra_files(&cwd, &out_root, &produced) {

@@ -410,12 +410,78 @@ fn stale_suppression_reports_unused_and_exits_nonzero() {
                 || msg.contains("Unused suppression file entries found")),
         "missing unused suppression log in {unused_logs:?}"
     );
-    assert!(output
-        .iter()
-        .all(|value| value["type"].as_str() != Some("report")));
+    // Unused-suppression diagnostics are findings; a SARIF report must still be
+    // emitted for them (an unused suppression must never suppress SARIF output).
+    assert!(
+        output.iter().any(|value| {
+            value["type"].as_str() == Some("report")
+                && value["filename"].as_str() == Some("oxlint.sarif")
+        }),
+        "missing sarif report for unused suppression, output={output:?}"
+    );
+    // The suppression-derived exit code (1) is preserved.
     assert!(output.iter().any(|value| {
         value["type"].as_str() == Some("done")
             && value["id"].as_str() == Some("job-unused")
+            && value["exitCode"].as_i64() == Some(1)
+    }));
+}
+
+#[test]
+fn unused_suppression_with_active_finding_still_emits_sarif() {
+    let fixture = tempdir().expect("tempdir");
+    write_file(
+        fixture.path().join("package.json"),
+        r#"{"name":"fixture","scripts":{"lint":"oxlint"}}"#,
+    );
+    write_file(
+        fixture.path().join(".oxlintrc.json"),
+        r#"{"rules":{"no-debugger":"error","no-console":"error"}}"#,
+    );
+    // Active finding: this file triggers no-debugger (and no console usage).
+    write_file(fixture.path().join("src/index.js"), "debugger;\n");
+    // Unused suppression: no-console never fires on this file, so this entry is stale.
+    write_file(
+        fixture.path().join("oxlint-suppressions.json"),
+        "{\n  \"src/index.js\": {\n    \"no-console\": {\n      \"count\": 1\n    }\n  }\n}",
+    );
+
+    let input = format!(
+        "{}\n",
+        run_line(
+            WorkerRequest::new("job-mixed", "lint").with_cwd(fixture.path().display().to_string())
+        )
+    );
+    let (output, _stderr) = run_worker(&input);
+
+    // The active no-debugger finding is reported.
+    assert!(
+        output.iter().any(|value| {
+            value["type"].as_str() == Some("log")
+                && value["line"].as_str().is_some_and(|line| {
+                    line.contains("src/index.js:1:1: error [eslint(no-debugger)]")
+                })
+        }),
+        "missing active no-debugger finding, output={output:?}"
+    );
+    // Despite the unused suppression, a SARIF report must be emitted, and it must
+    // contain the active no-debugger finding.
+    let sarif = output
+        .iter()
+        .find(|value| {
+            value["type"].as_str() == Some("report")
+                && value["filename"].as_str() == Some("oxlint.sarif")
+        })
+        .unwrap_or_else(|| panic!("missing sarif report, output={output:?}"));
+    let sarif_content = sarif["content"].as_str().expect("sarif content str");
+    assert!(
+        sarif_content.contains("eslint(no-debugger)"),
+        "sarif must contain the active finding, content={sarif_content}"
+    );
+    // The suppression-derived exit code (1) is preserved.
+    assert!(output.iter().any(|value| {
+        value["type"].as_str() == Some("done")
+            && value["id"].as_str() == Some("job-mixed")
             && value["exitCode"].as_i64() == Some(1)
     }));
 }
@@ -551,6 +617,110 @@ fn eslint_disable_suppresses_type_aware_diagnostic() {
         value["type"].as_str() == Some("done")
             && value["id"].as_str() == Some("job-eslint-disable-221")
             && value["exitCode"].as_i64() == Some(0)
+    }));
+}
+
+#[test]
+fn type_aware_lints_all_files_in_one_batch() {
+    // Regression: the worker batches type-aware (tsgolint) linting over ALL of a
+    // package's files in a single invocation (via oxc's LintRunner), rather than
+    // once per file. This test writes three files each containing a distinct
+    // type-aware `no-base-to-string` violation and asserts findings are reported
+    // for every file — proving the batched pass lints the whole file set.
+    let fixture = tempdir().expect("tempdir");
+    write_file(
+        fixture.path().join("package.json"),
+        r#"{"name":"fixture","scripts":{"lint":"oxlint"}}"#,
+    );
+    write_file(
+        fixture.path().join(".oxlintrc.json"),
+        r#"{"plugins":["typescript-eslint"],"rules":{"@typescript-eslint/no-base-to-string":"error"}}"#,
+    );
+    write_file(
+        fixture.path().join("tsconfig.json"),
+        r#"{"compilerOptions":{"strict":true,"target":"ES2022","module":"ESNext","moduleResolution":"Bundler","noEmit":true},"include":["src/**/*.ts"]}"#,
+    );
+    for name in ["a", "b", "c"] {
+        write_file(
+            fixture.path().join(format!("src/{name}.ts")),
+            &format!(
+                "const value_{name} = {{ hello: 'world' }};\nconst text_{name} = `${{value_{name}}}`;\nconsole.log(text_{name});\n"
+            ),
+        );
+    }
+
+    let input = format!(
+        "{}\n",
+        run_line(
+            WorkerRequest::new("job-type-aware-batch", "lint")
+                .with_cwd(fixture.path().display().to_string())
+                .with_env(env_map([("OXLINT_OPTS", "--type-aware")]))
+        )
+    );
+    let (output, stderr) = run_worker(&input);
+    let tsgolint_unavailable = stderr
+        .contains("type-aware linting requested but tsgolint unavailable")
+        || output.iter().any(|value| {
+            value["type"].as_str() == Some("log")
+                && value["stream"].as_str() == Some("stderr")
+                && value["line"].as_str().is_some_and(|line| {
+                    line.contains("type-aware linting requested but tsgolint unavailable")
+                })
+        });
+    // Gate on tsgolint availability so this stays covered in CI environments
+    // that do not have type-aware linting installed.
+    if tsgolint_unavailable {
+        return;
+    }
+
+    // Collect the source files that produced a no-base-to-string diagnostic.
+    let mut files_with_finding = std::collections::BTreeSet::new();
+    for value in &output {
+        if value["type"].as_str() != Some("log") {
+            continue;
+        }
+        let Some(line) = value["line"].as_str() else {
+            continue;
+        };
+        if line.contains("no-base-to-string") {
+            for name in ["a", "b", "c"] {
+                if line.contains(&format!("src/{name}.ts")) {
+                    files_with_finding.insert(name);
+                }
+            }
+        }
+    }
+    assert_eq!(
+        files_with_finding.len(),
+        3,
+        "expected type-aware findings for all 3 files, got {files_with_finding:?}; output={output:?}"
+    );
+
+    // Diagnostic log lines must use relative paths (src/...), not absolute, and
+    // must be emitted in sorted (deterministic) order by path.
+    let diagnostic_lines: Vec<&str> = output
+        .iter()
+        .filter(|value| value["type"].as_str() == Some("log"))
+        .filter_map(|value| value["line"].as_str())
+        .filter(|line| line.contains("no-base-to-string"))
+        .collect();
+    assert!(
+        diagnostic_lines
+            .iter()
+            .all(|line| !line.starts_with('/') && line.starts_with("src/")),
+        "diagnostic lines must be relative to cwd: {diagnostic_lines:?}"
+    );
+    let mut sorted = diagnostic_lines.clone();
+    sorted.sort_unstable();
+    assert_eq!(
+        diagnostic_lines, sorted,
+        "diagnostic output must be emitted in sorted order"
+    );
+
+    assert!(output.iter().any(|value| {
+        value["type"].as_str() == Some("done")
+            && value["id"].as_str() == Some("job-type-aware-batch")
+            && value["exitCode"].as_i64() == Some(1)
     }));
 }
 

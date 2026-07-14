@@ -21,7 +21,7 @@ use luchta_worker::{
 #[cfg(feature = "oxc")]
 use crate::config::{collect_target_files, discover_config};
 #[cfg(feature = "oxc")]
-use crate::lint::{has_error, initial_suppression_action, lint_files, wrap_message};
+use crate::lint::{has_error, initial_suppression_action, lint_files};
 #[cfg(feature = "oxc")]
 use crate::opts::OxlintOpts;
 #[cfg(feature = "oxc")]
@@ -209,41 +209,28 @@ impl Worker for OxlintWorker {
                 }
             }
 
-            let mut findings = Vec::new();
-            for result in &results.files {
-                for message in &result.active_messages {
-                    let wrapped = match wrap_message(cwd, &result.path, message) {
-                        Ok(wrapped) => wrapped,
-                        Err(error) => {
-                            let _ = ctx.emit_stderr(error).await;
-                            return InProcessOutcome::Done {
-                                exit_code: 1,
-                                outputs: None,
-                            };
-                        }
+            let findings = results.findings.clone();
+            for finding in &findings {
+                let line = format!(
+                    "{}:{}:{}: {} [{}] {}",
+                    finding.relative_uri,
+                    finding.start_line,
+                    finding.start_column,
+                    severity_label(finding.severity),
+                    finding
+                        .rule_id
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_owned()),
+                    finding.message
+                );
+                if let Err(error) = ctx.emit_stdout(line).await {
+                    let _ = ctx
+                        .emit_stderr(format!("failed to emit oxlint log: {error}"))
+                        .await;
+                    return InProcessOutcome::Done {
+                        exit_code: 1,
+                        outputs: None,
                     };
-                    let line = format!(
-                        "{}:{}:{}: {} [{}] {}",
-                        wrapped.relative_uri,
-                        wrapped.start_line,
-                        wrapped.start_column,
-                        severity_label(wrapped.severity),
-                        wrapped
-                            .rule_id
-                            .clone()
-                            .unwrap_or_else(|| "unknown".to_owned()),
-                        wrapped.message
-                    );
-                    if let Err(error) = ctx.emit_stdout(line).await {
-                        let _ = ctx
-                            .emit_stderr(format!("failed to emit oxlint log: {error}"))
-                            .await;
-                        return InProcessOutcome::Done {
-                            exit_code: 1,
-                            outputs: None,
-                        };
-                    }
-                    findings.push(wrapped);
                 }
             }
 
