@@ -315,14 +315,29 @@ fn severity_label(severity: oxc_diagnostics::Severity) -> &'static str {
     }
 }
 
+fn main() {
+    if luchta_worker::version_requested(
+        &std::env::args().collect::<Vec<_>>(),
+        env!("CARGO_PKG_NAME"),
+        env!("CARGO_PKG_VERSION"),
+    ) {
+        return;
+    }
+
+    real_main();
+}
+
 #[cfg(feature = "oxc")]
-#[tokio::main(flavor = "current_thread")]
-async fn main() {
-    run_worker_main(OxlintWorker).await;
+fn real_main() {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build tokio runtime")
+        .block_on(async { run_worker_main(OxlintWorker).await });
 }
 
 #[cfg(not(feature = "oxc"))]
-fn main() {
+fn real_main() {
     eprintln!("this binary was built without the 'oxc' feature; the oxlint worker is unavailable");
     std::process::exit(1);
 }

@@ -8,7 +8,7 @@ use serde::Deserialize;
 
 /// Project automation tasks for the Luchta workspace.
 #[derive(Debug, Parser)]
-#[command(name = "xtask", about = "Luchta project automation tasks", long_about = None)]
+#[command(name = "xtask", about = "Luchta project automation tasks", long_about = None, version)]
 struct Cli {
     #[command(subcommand)]
     command: XtaskCommand,

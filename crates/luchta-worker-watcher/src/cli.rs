@@ -217,3 +217,19 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod version_passthrough_tests {
+    use luchta_worker::split_delegate_argv;
+
+    #[test]
+    fn version_flag_after_double_dash_stays_with_delegate() {
+        let argv = ["--watch", "src/**/*.rs", "--", "node", "--version"]
+            .into_iter()
+            .map(str::to_owned);
+        let split = split_delegate_argv(argv);
+
+        assert_eq!(split.stage_args, vec!["--watch", "src/**/*.rs"]);
+        assert_eq!(split.delegate_command, vec!["node", "--version"]);
+    }
+}

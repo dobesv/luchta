@@ -6,8 +6,8 @@ use std::path::Path;
 
 use ast_grep_config::Severity;
 use luchta_worker::{
-    run_worker_main, InProcessOutcome, JobContext, ResolveResult, ResolveTask, TaskModification,
-    Worker, WorkerRequest,
+    run_worker_main, version_requested, InProcessOutcome, JobContext, ResolveResult, ResolveTask,
+    TaskModification, Worker, WorkerRequest,
 };
 
 use crate::config::{collect_source_files, discover_config, DiscoveredConfig};
@@ -276,6 +276,14 @@ fn severity_label(severity: &Severity) -> &'static str {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    if version_requested(
+        &std::env::args().collect::<Vec<_>>(),
+        env!("CARGO_PKG_NAME"),
+        env!("CARGO_PKG_VERSION"),
+    ) {
+        return;
+    }
+
     run_worker_main(AstGrepWorker).await;
 }
 

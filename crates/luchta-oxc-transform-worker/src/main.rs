@@ -24,7 +24,36 @@ use crate::transform::{
     resolve_target_env, should_skip, source_map_output_path, source_mapping_url, transform_source,
 };
 
+fn main() {
+    if luchta_worker::version_requested(
+        &std::env::args().collect::<Vec<_>>(),
+        env!("CARGO_PKG_NAME"),
+        env!("CARGO_PKG_VERSION"),
+    ) {
+        return;
+    }
+
+    real_main();
+}
+
 #[cfg(feature = "oxc")]
+fn real_main() {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build tokio runtime")
+        .block_on(async { run_worker_main(OxcTransformWorker).await });
+}
+
+#[cfg(not(feature = "oxc"))]
+fn real_main() {
+    eprintln!(
+        "this binary was built without the 'oxc' feature; the oxc transform worker is unavailable"
+    );
+    std::process::exit(1);
+}
+
+#[cfg_attr(not(feature = "oxc"), allow(dead_code))]
 struct OxcTransformWorker;
 
 #[cfg(feature = "oxc")]
@@ -392,20 +421,6 @@ fn cleanup_extra_files(
 #[cfg(feature = "oxc")]
 fn normalize_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
-}
-
-#[cfg(feature = "oxc")]
-#[tokio::main(flavor = "current_thread")]
-async fn main() {
-    run_worker_main(OxcTransformWorker).await;
-}
-
-#[cfg(not(feature = "oxc"))]
-fn main() {
-    eprintln!(
-        "this binary was built without the 'oxc' feature; the oxc transform worker is unavailable"
-    );
-    std::process::exit(1);
 }
 
 #[cfg(all(test, feature = "oxc"))]

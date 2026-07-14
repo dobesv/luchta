@@ -1,8 +1,8 @@
 use std::collections::BTreeSet;
 
 use luchta_worker::{
-    run_worker_main, shell_single_quote, ResolveResult, ResolveTask, TaskModification, Worker,
-    WorkerRequest, WorkerResponse,
+    run_worker_main, shell_single_quote, version_requested, ResolveResult, ResolveTask,
+    TaskModification, Worker, WorkerRequest, WorkerResponse,
 };
 
 struct YarnWorker;
@@ -60,6 +60,14 @@ impl Worker for YarnWorker {
 // failures. current_thread keeps the worker's footprint minimal.
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    if version_requested(
+        &std::env::args().collect::<Vec<_>>(),
+        env!("CARGO_PKG_NAME"),
+        env!("CARGO_PKG_VERSION"),
+    ) {
+        return;
+    }
+
     run_worker_main(YarnWorker).await;
 }
 
