@@ -17,6 +17,10 @@ use crate::sarif::build_sarif;
 struct AstGrepWorker;
 
 impl Worker for AstGrepWorker {
+    fn cache_nonce(&self) -> Option<String> {
+        Some(env!("CARGO_PKG_VERSION").to_owned())
+    }
+
     fn resolve_task(&self, req: &ResolveTask) -> ResolveResult {
         let Some(cwd) = req.cwd.as_deref() else {
             return ResolveResult::reject("ast-grep worker requires cwd");

@@ -87,6 +87,7 @@ pub struct TaskGraph {
     graph: DiGraph<TaskNode, ()>,
     indices_by_id: HashMap<TaskId, NodeIndex>,
     definitions_by_id: HashMap<TaskId, TaskDefinition>,
+    worker_nonces: HashMap<TaskId, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,6 +96,7 @@ struct ResolvedPipeline {
     task_names_by_package: HashMap<PackageName, HashSet<TaskName>>,
     root_task_names: HashSet<TaskName>,
     prune_reasons_by_id: HashMap<TaskId, String>,
+    worker_nonces: HashMap<TaskId, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -259,7 +261,7 @@ impl TaskGraph {
         pipeline: &HashMap<TaskName, TaskDefinition>,
     ) -> Result<Self, EngineError> {
         let resolved_pipeline = ResolvedPipeline::build(package_graph, pipeline)?;
-        Self::from_resolved_pipeline(package_graph, &resolved_pipeline)
+        Self::from_resolved_pipeline(package_graph, resolved_pipeline)
     }
 
     /// Builds the task graph after running the worker-mediated resolution phase.
@@ -288,13 +290,13 @@ impl TaskGraph {
         let pruned = resolved_pipeline.resolve(packages, resolver, mode).await?;
         resolved_pipeline.inject_worker_dependencies(worker_definitions);
         resolved_pipeline.apply_prunes(&pruned);
-        let graph = Self::from_resolved_pipeline(package_graph, &resolved_pipeline)?;
+        let graph = Self::from_resolved_pipeline(package_graph, resolved_pipeline)?;
         Ok((graph, pruned))
     }
 
     fn from_resolved_pipeline(
         package_graph: &PackageGraph,
-        resolved_pipeline: &ResolvedPipeline,
+        resolved_pipeline: ResolvedPipeline,
     ) -> Result<Self, EngineError> {
         let root_package = root_package_name();
         let mut graph = DiGraph::new();
@@ -312,6 +314,7 @@ impl TaskGraph {
             graph,
             indices_by_id,
             definitions_by_id: resolved_pipeline.tasks_by_id.clone(),
+            worker_nonces: resolved_pipeline.worker_nonces.clone(),
         };
 
         for (source_id, definition) in &resolved_pipeline.tasks_by_id {
@@ -319,7 +322,7 @@ impl TaskGraph {
                 for dependency_id in with_edges.expand_dependency(
                     source_id,
                     package_graph,
-                    resolved_pipeline,
+                    &resolved_pipeline,
                     &root_package,
                     dependency,
                 )? {
@@ -555,6 +558,10 @@ impl TaskGraph {
         self.graph.edge_count()
     }
 
+    pub fn worker_nonce(&self, id: &TaskId) -> Option<&str> {
+        self.worker_nonces.get(id).map(String::as_str)
+    }
+
     fn node_index(&self, task_id: &TaskId) -> Option<NodeIndex> {
         self.indices_by_id.get(task_id).copied()
     }
@@ -690,6 +697,7 @@ impl ResolvedPipeline {
             task_names_by_package,
             root_task_names,
             prune_reasons_by_id: HashMap::new(),
+            worker_nonces: HashMap::new(),
         })
     }
 
@@ -789,6 +797,9 @@ impl ResolvedPipeline {
                 task: task_id.clone(),
                 message,
             })?;
+            if let Some(nonce) = result.cache_nonce.clone() {
+                self.worker_nonces.insert(task_id.clone(), nonce);
+            }
             match result.decision {
                 ResolveDecision::Accept => {}
                 ResolveDecision::Modify(modification) => {
@@ -3027,6 +3038,46 @@ mod tests {
         assert!(definition.depends_on.is_empty());
     }
 
+    fn assert_worker_nonce(graph: &TaskGraph, package: &str, task: &str, expected: Option<&str>) {
+        assert_eq!(graph.worker_nonce(&TaskId::new(package, task)), expected);
+    }
+
+    #[tokio::test]
+    async fn resolution_stores_worker_cache_nonces_on_graph_tasks() {
+        let package_graph = package_graph_pair();
+        let pipeline = HashMap::from([
+            (TaskName::from("build"), worker_task(vec![])),
+            (TaskName::from("noop"), TaskDefinition::default()),
+        ]);
+
+        let resolver = StubResolver(|request: &ResolveTask| {
+            if request.package == "@repo/a" && request.name == "build" {
+                ResolveResult {
+                    decision: super::ResolveDecision::Accept,
+                    cache_nonce: Some("worker-v1".to_string()),
+                }
+            } else {
+                ResolveResult::accept()
+            }
+        });
+
+        let (graph, pruned) = TaskGraph::build_resolved(
+            &package_graph,
+            &pipeline,
+            &empty_resolve_info(),
+            &HashMap::new(),
+            &resolver,
+            ResolveMode::Run,
+        )
+        .await
+        .expect("build resolved graph");
+
+        assert!(pruned.is_empty());
+        assert_worker_nonce(&graph, "@repo/a", "build", Some("worker-v1"));
+        assert_worker_nonce(&graph, "@repo/b", "build", None);
+        assert_worker_nonce(&graph, "@repo/a", "noop", None);
+        assert_worker_nonce(&graph, "@repo/missing", "build", None);
+    }
     /// Regression guard for lage issue #881
     /// (<https://github.com/microsoft/lage/issues/881>): "Dependencies not
     /// calculated properly for subtrees of noop tasks".

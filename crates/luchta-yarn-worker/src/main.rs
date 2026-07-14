@@ -16,6 +16,10 @@ fn resolved_inputs_with_package_json(inputs: Option<&[String]>) -> Vec<String> {
 }
 
 impl Worker for YarnWorker {
+    fn cache_nonce(&self) -> Option<String> {
+        Some(env!("CARGO_PKG_VERSION").to_owned())
+    }
+
     fn done_response(&self, req: &WorkerRequest, exit_code: i32) -> WorkerResponse {
         WorkerResponse::done_with_outputs(req.id.clone(), exit_code, req.outputs.clone())
     }
