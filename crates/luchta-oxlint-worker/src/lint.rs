@@ -91,7 +91,10 @@ fn lint_files_blocking(
 
     let linter = Linter::new(LintOptions::default(), store, None);
     let options = LintServiceOptions::new(cwd.clone().into_boxed_path());
-    let service = LintService::new(linter, options);
+    let mut service = LintService::new(linter, options);
+    let disable_directives_map: Arc<Mutex<FxHashMap<PathBuf, DisableDirectives>>> =
+        Arc::new(Mutex::new(FxHashMap::default()));
+    service.set_disable_directives_map(disable_directives_map.clone());
     let os_fs: &(dyn RuntimeFileSystem + Sync + Send) = &OsFileSystem;
 
     let mut warnings = Vec::new();
@@ -114,9 +117,7 @@ fn lint_files_blocking(
         let paths = vec![Arc::<OsStr>::from(file.as_os_str())];
         let mut raw_messages = service.run_source(os_fs, paths.clone());
         if let Some(type_aware_linter) = &type_aware_linter {
-            let directives: Arc<Mutex<FxHashMap<PathBuf, DisableDirectives>>> =
-                Arc::new(Mutex::new(FxHashMap::default()));
-            match type_aware_linter.lint_source(&paths, os_fs, directives) {
+            match type_aware_linter.lint_source(&paths, os_fs, disable_directives_map.clone()) {
                 Ok(tsgo_messages) => raw_messages.extend(tsgo_messages),
                 Err(error) => warnings.push(format!("type-aware lint failed: {error}")),
             }

@@ -46,7 +46,10 @@ impl Worker for OxlintWorker {
         };
 
         let cwd = Path::new(cwd);
-        let loaded = match discover_config(cwd) {
+        // ResolveTask carries command but no env, so resolve can only parse command opts.
+        // Run phase merges command with OXLINT_OPTS for backward compatibility.
+        let opts = OxlintOpts::from_command(&req.command);
+        let loaded = match discover_config(cwd, opts.config.as_deref()) {
             Ok(loaded) => loaded,
             Err(error) => return ResolveResult::reject(error),
         };
@@ -63,7 +66,7 @@ impl Worker for OxlintWorker {
             return ResolveResult::prune(Some("no JS/TS source files found for oxlint".to_owned()));
         }
 
-        let action = initial_suppression_action(cwd, &OxlintOpts::default());
+        let action = initial_suppression_action(cwd, &opts);
         let action_logs = suppression_log_lines(&FinalizeResult {
             action,
             diagnostics: Vec::new(),
@@ -102,7 +105,7 @@ impl Worker for OxlintWorker {
 
             let cwd = Path::new(cwd);
             let opts = OxlintOpts::from_request(req);
-            let loaded = match discover_config(cwd) {
+            let loaded = match discover_config(cwd, opts.config.as_deref()) {
                 Ok(loaded) => loaded,
                 Err(error) => {
                     let _ = ctx.emit_stderr(error).await;

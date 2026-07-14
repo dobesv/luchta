@@ -23,15 +23,39 @@ pub struct LoadedConfig {
     pub warnings: Vec<String>,
 }
 
-pub fn discover_config(cwd: &Path) -> Result<LoadedConfig, String> {
-    let root_config_path = find_root_config_path(cwd);
-    let saw_only_unsupported_ts_config =
-        root_config_path.is_none() && find_root_ts_config_path(cwd).is_some();
-    let ignore_base = root_config_path
-        .as_deref()
-        .and_then(Path::parent)
-        .unwrap_or(cwd)
-        .to_path_buf();
+pub fn discover_config(cwd: &Path, config_override: Option<&Path>) -> Result<LoadedConfig, String> {
+    let (root_config_path, saw_only_unsupported_ts_config, ignore_base) = match config_override {
+        Some(path) => {
+            if path.extension().and_then(OsStr::to_str) == Some("ts") {
+                return Err("oxlint --config supports JSON/JSONC only".to_owned());
+            }
+            let path = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                cwd.join(path)
+            };
+            if !path.is_file() {
+                return Err(format!("oxlint config not found: {}", path.display()));
+            }
+            let ignore_base = path.parent().unwrap_or(cwd).to_path_buf();
+            (Some(path), false, ignore_base)
+        }
+        None => {
+            let root_config_path = find_root_config_path(cwd);
+            let saw_only_unsupported_ts_config =
+                root_config_path.is_none() && find_root_ts_config_path(cwd).is_some();
+            let ignore_base = root_config_path
+                .as_deref()
+                .and_then(Path::parent)
+                .unwrap_or(cwd)
+                .to_path_buf();
+            (
+                root_config_path,
+                saw_only_unsupported_ts_config,
+                ignore_base,
+            )
+        }
+    };
     let oxlintrc = match root_config_path.as_deref() {
         Some(path) => Oxlintrc::from_file(path)
             .map_err(|error| format!("failed to load oxlint config {}: {error}", path.display()))?,
@@ -207,7 +231,7 @@ mod tests {
         fs::write(cwd.join("src/foo.ts"), "export const foo = 1;\n").expect("src file");
         fs::write(cwd.join("generated.ts"), "export const generated = 1;\n").expect("generated");
 
-        let loaded = discover_config(cwd).expect("discover");
+        let loaded = discover_config(cwd, None).expect("discover");
         let (files, warnings) =
             collect_target_files(cwd, &loaded.ignore_patterns, &loaded.ignore_base)
                 .expect("collect");
@@ -231,13 +255,55 @@ mod tests {
         fs::write(pkg.join("src/foo.ts"), "export const foo = 1;\n").expect("src file");
         fs::write(pkg.join("dist/out.js"), "export const out = 1;\n").expect("dist file");
 
-        let loaded = discover_config(&pkg).expect("discover");
+        let loaded = discover_config(&pkg, None).expect("discover");
         let (files, warnings) =
             collect_target_files(&pkg, &loaded.ignore_patterns, &loaded.ignore_base)
                 .expect("collect");
 
         assert!(warnings.is_empty(), "warnings: {warnings:?}");
         assert_eq!(relative_paths(&pkg, files), vec!["src/foo.ts"]);
+    }
+
+    #[test]
+    fn discover_config_uses_explicit_override() {
+        let temp = TempDir::new().expect("tempdir");
+        let cwd = temp.path();
+        let config_dir = cwd.join("configs");
+        let config_path = config_dir.join("custom.oxlintrc.json");
+        fs::create_dir_all(&config_dir).expect("config dir");
+        fs::write(&config_path, r#"{"ignorePatterns":["generated.ts"]}"#).expect("config");
+
+        let loaded = discover_config(cwd, Some(&config_path)).expect("discover");
+
+        assert_eq!(
+            loaded.root_config_path.as_deref(),
+            Some(config_path.as_path())
+        );
+        assert_eq!(loaded.ignore_base, config_dir);
+        assert_eq!(loaded.ignore_patterns, vec!["generated.ts"]);
+    }
+
+    #[test]
+    fn discover_config_rejects_missing_explicit_override() {
+        let temp = TempDir::new().expect("tempdir");
+        let cwd = temp.path();
+        let missing = cwd.join("configs/missing.oxlintrc.json");
+
+        let error = discover_config(cwd, Some(&missing)).expect_err("missing config should fail");
+
+        assert!(error.contains("oxlint config not found"), "error: {error}");
+    }
+
+    #[test]
+    fn discover_config_rejects_ts_explicit_override() {
+        let temp = TempDir::new().expect("tempdir");
+        let cwd = temp.path();
+        let ts_config = cwd.join("oxlint.config.ts");
+        fs::write(&ts_config, "export default {};\n").expect("ts config");
+
+        let error = discover_config(cwd, Some(&ts_config)).expect_err("ts config should fail");
+
+        assert_eq!(error, "oxlint --config supports JSON/JSONC only");
     }
 
     #[test]
