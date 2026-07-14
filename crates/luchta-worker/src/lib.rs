@@ -1,3 +1,4 @@
+pub mod parallel;
 pub mod proxy;
 mod runtime;
 mod version;
@@ -7,6 +8,7 @@ use std::{collections::HashMap, path::Path};
 use luchta_types::{DependsOn, TaskDefinition};
 use serde::{Deserialize, Serialize};
 
+pub use parallel::process_items_in_parallel;
 pub use proxy::{
     split_current_process_argv, split_delegate_argv, DelegateArgvSplit, DelegateHandle, ProxyError,
     RawDelegate, SharedWriter,
