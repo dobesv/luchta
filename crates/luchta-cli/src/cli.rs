@@ -84,6 +84,10 @@ pub enum Commands {
         /// skipped); exit non-zero if any task failed.
         #[arg(long = "continue")]
         continue_on_failure: bool,
+
+        /// Skip all caching: do not restore from cache, do not write to shared cache. Local workspace metadata is still updated.
+        #[arg(long)]
+        no_cache: bool,
     },
     Watch {
         tasks: Vec<String>,
@@ -130,6 +134,10 @@ pub enum Commands {
         /// skipped); exit non-zero if any task failed.
         #[arg(long = "continue")]
         continue_on_failure: bool,
+
+        /// Skip all caching: do not restore from cache, do not write to shared cache. Local workspace metadata is still updated.
+        #[arg(long)]
+        no_cache: bool,
 
         /// Debounce filesystem changes for this many milliseconds before scheduling rebuild.
         #[arg(long, value_name = "MS", default_value_t = 150)]

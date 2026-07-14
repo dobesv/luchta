@@ -487,6 +487,7 @@ impl E2eHarness {
                     config: WatchRunConfig {
                         output: OutputMode::Default,
                         continue_on_failure: false,
+                        no_cache: false,
                         memory_pressure: crate::run::MemoryPressureConfig {
                             usage: None,
                             free: None,
