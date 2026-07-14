@@ -462,15 +462,19 @@ impl TaskModification {
 
 /// Response wrapper for a [`ResolveDecision`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(transparent)]
+#[serde(rename_all = "camelCase")]
 pub struct ResolveResult {
+    #[serde(flatten)]
     pub decision: ResolveDecision,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_nonce: Option<String>,
 }
 
 impl ResolveResult {
     pub fn accept() -> Self {
         Self {
             decision: ResolveDecision::Accept,
+            cache_nonce: None,
         }
     }
 
@@ -478,6 +482,7 @@ impl ResolveResult {
     pub fn modify(modification: TaskModification) -> Self {
         Self {
             decision: ResolveDecision::Modify(modification),
+            cache_nonce: None,
         }
     }
 
@@ -492,6 +497,7 @@ impl ResolveResult {
     pub fn prune(reason: Option<String>) -> Self {
         Self {
             decision: ResolveDecision::Prune { reason },
+            cache_nonce: None,
         }
     }
 
@@ -500,13 +506,17 @@ impl ResolveResult {
             decision: ResolveDecision::Reject {
                 message: message.into(),
             },
+            cache_nonce: None,
         }
     }
 }
 
 impl From<ResolveDecision> for ResolveResult {
     fn from(decision: ResolveDecision) -> Self {
-        Self { decision }
+        Self {
+            decision,
+            cache_nonce: None,
+        }
     }
 }
 
@@ -855,6 +865,30 @@ mod tests {
                 serde_json::from_value(value).expect("result deserializes");
             assert_eq!(decoded, result);
         }
+    }
+
+    #[test]
+    fn resolve_result_deserializes_without_cache_nonce() {
+        let decoded: ResolveResult =
+            serde_json::from_value(json!({ "decision": "accept" })).expect("result deserializes");
+        assert_eq!(decoded, ResolveResult::accept());
+        assert_eq!(decoded.cache_nonce, None);
+    }
+
+    #[test]
+    fn resolve_result_with_cache_nonce_round_trips_as_camel_case() {
+        let result = ResolveResult {
+            decision: super::ResolveDecision::Accept,
+            cache_nonce: Some("1.2.3".to_owned()),
+        };
+        let value = serde_json::to_value(&result).expect("result serializes");
+        assert_eq!(
+            value,
+            json!({ "decision": "accept", "cacheNonce": "1.2.3" })
+        );
+
+        let decoded: ResolveResult = serde_json::from_value(value).expect("result deserializes");
+        assert_eq!(decoded, result);
     }
 
     #[test]

@@ -59,6 +59,10 @@ struct OxfmtWorker;
 
 #[cfg(feature = "oxc")]
 impl Worker for OxfmtWorker {
+    fn cache_nonce(&self) -> Option<String> {
+        Some(env!("CARGO_PKG_VERSION").to_owned())
+    }
+
     fn resolve_task(&self, req: &ResolveTask) -> ResolveResult {
         let mut inputs = BTreeSet::from([
             "package.json".to_owned(),

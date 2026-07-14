@@ -45,6 +45,10 @@ use luchta_worker::{
 struct BashWorker;
 
 impl Worker for BashWorker {
+    fn cache_nonce(&self) -> Option<String> {
+        Some(env!("CARGO_PKG_VERSION").to_owned())
+    }
+
     fn resolve_task(&self, req: &ResolveTask) -> ResolveResult {
         let blank = req.command.trim().is_empty();
         if !blank {
