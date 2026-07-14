@@ -61,8 +61,7 @@ fn write_watch_counter_workspace(workspace_root: &std::path::Path) {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(path, fs::Permissions::from_mode(0o755))
-                .expect("chmod executable");
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("chmod executable");
         }
     }
 
@@ -87,8 +86,11 @@ fn write_watch_counter_workspace(workspace_root: &std::path::Path) {
         }"#,
     )
     .expect("write app package.json");
-    fs::write(workspace_root.join("packages/app/src.txt"), "stable-input\n")
-        .expect("write input file");
+    fs::write(
+        workspace_root.join("packages/app/src.txt"),
+        "stable-input\n",
+    )
+    .expect("write input file");
 
     let worker_script = workspace_root.join("shell-worker.sh");
     fs::write(

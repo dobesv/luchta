@@ -604,7 +604,10 @@ mod tests {
         let _lock = ENV_LOCK.lock().unwrap();
         let _guard = EnvVarGuard::remove(NO_CACHE_ENV);
 
-        assert!(!no_cache_env(), "expected unset LUCHTA_NO_CACHE to return false");
+        assert!(
+            !no_cache_env(),
+            "expected unset LUCHTA_NO_CACHE to return false"
+        );
     }
 
     #[test]
@@ -625,19 +628,34 @@ mod tests {
 
         // Case 1: CLI flag=true always yields true regardless of env
         let _env_guard = EnvVarGuard::set(NO_CACHE_ENV, "0");
-        assert!(effective_no_cache(true), "cli_flag=true should always be true");
+        assert!(
+            effective_no_cache(true),
+            "cli_flag=true should always be true"
+        );
 
         let _env_guard = EnvVarGuard::set(NO_CACHE_ENV, "1");
-        assert!(effective_no_cache(true), "cli_flag=true should always be true");
+        assert!(
+            effective_no_cache(true),
+            "cli_flag=true should always be true"
+        );
 
         // Case 2: CLI flag=false yields the env value
         let _env_guard = EnvVarGuard::set(NO_CACHE_ENV, "1");
-        assert!(effective_no_cache(false), "cli_flag=false, env=true => effective=true");
+        assert!(
+            effective_no_cache(false),
+            "cli_flag=false, env=true => effective=true"
+        );
 
         let _env_guard = EnvVarGuard::set(NO_CACHE_ENV, "0");
-        assert!(!effective_no_cache(false), "cli_flag=false, env=false => effective=false");
+        assert!(
+            !effective_no_cache(false),
+            "cli_flag=false, env=false => effective=false"
+        );
 
         let _env_guard = EnvVarGuard::remove(NO_CACHE_ENV);
-        assert!(!effective_no_cache(false), "cli_flag=false, env unset => effective=false");
+        assert!(
+            !effective_no_cache(false),
+            "cli_flag=false, env unset => effective=false"
+        );
     }
 }
