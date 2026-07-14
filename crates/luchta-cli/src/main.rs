@@ -31,6 +31,7 @@ use miette::IntoDiagnostic;
 use miette::{Report, Result};
 
 use crate::outcome::TasksFailed;
+use crate::run::setup::no_cache_env;
 
 #[tokio::main]
 async fn main() {
@@ -215,6 +216,7 @@ struct RunArgs {
     dry_run: bool,
     output: OutputMode,
     continue_on_failure: bool,
+    no_cache: bool,
     thresholds: ThresholdInputs,
     max_weight_cli: Option<String>,
     since: Option<String>,
@@ -238,6 +240,7 @@ fn command_run_args(command: Commands) -> RunArgs {
             mem_free_threshold,
             since,
             continue_on_failure,
+            no_cache,
         } => RunArgs {
             tasks,
             packages,
@@ -245,6 +248,7 @@ fn command_run_args(command: Commands) -> RunArgs {
             dry_run,
             output,
             continue_on_failure,
+            no_cache,
             thresholds: ThresholdInputs {
                 usage_cli: mem_usage_threshold,
                 free_cli: mem_free_threshold,
@@ -259,7 +263,8 @@ fn command_run_args(command: Commands) -> RunArgs {
 }
 
 async fn run_command(workspace_root: &std::path::Path, command: Commands) -> Result<()> {
-    let args = command_run_args(command);
+    let mut args = command_run_args(command);
+    args.no_cache = args.no_cache || no_cache_env();
     if args.tasks.is_empty() {
         return Err(miette::miette!("no tasks specified for run command"));
     }
@@ -285,6 +290,7 @@ async fn run_command(workspace_root: &std::path::Path, command: Commands) -> Res
             selection: &selection,
             output: args.output,
             continue_on_failure: args.continue_on_failure,
+            no_cache: args.no_cache,
             memory_pressure,
             max_weight_override,
         })
@@ -302,6 +308,7 @@ async fn watch_command(workspace_root: &std::path::Path, command: Commands) -> R
         max_weight,
         mem_free_threshold,
         continue_on_failure,
+        no_cache,
         debounce,
         show_changed_files,
     } = command
@@ -313,6 +320,7 @@ async fn watch_command(workspace_root: &std::path::Path, command: Commands) -> R
         return Err(miette::miette!("no tasks specified for watch command"));
     }
 
+    let no_cache = no_cache || no_cache_env();
     let memory_pressure = resolve_memory_pressure_config(ThresholdInputs {
         usage_cli: mem_usage_threshold,
         free_cli: mem_free_threshold,
@@ -335,6 +343,7 @@ async fn watch_command(workspace_root: &std::path::Path, command: Commands) -> R
     let config = watch::driver::WatchRunConfig {
         output,
         continue_on_failure,
+        no_cache,
         memory_pressure,
         show_changed_files,
     };
@@ -474,6 +483,7 @@ mod tests {
                 mem_free_threshold: None,
                 since: None,
                 continue_on_failure: false,
+                no_cache: false,
             },
         };
 

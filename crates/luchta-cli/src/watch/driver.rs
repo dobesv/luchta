@@ -186,6 +186,7 @@ impl PendingChanges {
 pub struct WatchRunConfig {
     pub output: OutputMode,
     pub continue_on_failure: bool,
+    pub no_cache: bool,
     pub memory_pressure: MemoryPressureConfig,
     /// When true, list the changed files that triggered each rebuild.
     pub show_changed_files: bool,
@@ -631,6 +632,7 @@ fn cycle_request<'a>(
         affected,
         output: config.output,
         continue_on_failure: config.continue_on_failure,
+        no_cache: config.no_cache,
         memory_pressure: config.memory_pressure.clone(),
     }
 }
@@ -685,6 +687,7 @@ struct CycleRequest<'a> {
     affected: Option<&'a HashSet<PackageName>>,
     output: OutputMode,
     continue_on_failure: bool,
+    no_cache: bool,
     memory_pressure: MemoryPressureConfig,
 }
 
@@ -711,6 +714,7 @@ where
             since_affected: request.affected,
             output: request.output,
             continue_on_failure: request.continue_on_failure,
+            no_cache: request.no_cache,
             memory_pressure: request.memory_pressure.clone(),
         },
         cancel.clone(),

@@ -185,6 +185,7 @@ pub(super) fn dispatch_ready_task_async(
         .task_graph
         .task_definition(&task_id)
         .is_some_and(TaskDefinition::cache_enabled);
+    let skip_enabled = cache_enabled && !ctx.no_cache;
 
     // Only the LOCAL cache-skip decision is safe to run concurrently: it is a
     // pure filesystem read (glob + stat) with no side effects. The SHARED-cache
@@ -195,8 +196,8 @@ pub(super) fn dispatch_ready_task_async(
     // result so the caller feeds it straight into the sequential completion path
     // — we deliberately do NOT `tokio::spawn` blocking work onto the async
     // executor or bypass the decision semaphore.
-    if !cache_enabled || ctx.decision_ctx.shared_cache.is_some() {
-        let decision = if cache_enabled {
+    if !skip_enabled || ctx.decision_ctx.shared_cache.is_some() {
+        let decision = if skip_enabled {
             try_cache_skip(&task_id, &ctx.decision_ctx)
         } else {
             None
@@ -383,6 +384,7 @@ pub(super) fn dispatch_decision_result(
 fn build_task_run_context(
     task_id: &TaskId,
     cache_enabled: bool,
+    no_cache: bool,
     ctx: &DispatchContext<'_>,
 ) -> TaskRunContext {
     let output_hash_record =
@@ -390,8 +392,12 @@ fn build_task_run_context(
     let cache_write = match build_cache_write_context(task_id, &ctx.decision_ctx) {
         CacheInputState::Ready(mut cache_ctx) => {
             if cache_enabled {
-                let decision =
-                    build_cache_decision_context(task_id, &ctx.decision_ctx, &mut cache_ctx);
+                let decision = build_cache_decision_context(
+                    task_id,
+                    &ctx.decision_ctx,
+                    no_cache,
+                    &mut cache_ctx,
+                );
                 match decision.action {
                     Decision::Run => {
                         cache_ctx.capture_pre_execution_snapshot();
@@ -433,6 +439,7 @@ struct SpawnedTaskRun<F> {
     on_start: F,
     log_sink: ExecutionLogSink,
     cache_enabled: bool,
+    no_cache: bool,
     repo_root: PathBuf,
     task_ctx: TaskRunContext,
     task_start_unix_ms: u64,
@@ -454,6 +461,7 @@ where
         on_start,
         log_sink,
         cache_enabled,
+        no_cache,
         repo_root,
         task_ctx,
         task_start_unix_ms,
@@ -489,7 +497,7 @@ where
         persist_failure_record,
         end_unix_ms,
         shared_cache: cache_enabled.then_some(shared_cache).flatten(),
-        shared_store_enabled: cache_enabled,
+        shared_store_enabled: cache_enabled && !no_cache,
         repo_root,
     })
     .await;
@@ -987,6 +995,7 @@ fn format_task_error(error: &luchta_engine::ExecutorError) -> String {
 fn build_cache_decision_context(
     task_id: &TaskId,
     ctx: &DecisionContext,
+    no_cache: bool,
     cache_ctx: &mut CacheWriteContext,
 ) -> CacheDecisionContext {
     let task_def = cache_ctx.task_def.clone();
@@ -1008,6 +1017,7 @@ fn build_cache_decision_context(
     cache_ctx.decision = cache_decision_from_result(&decision);
     maybe_mark_shared_cache_hit(
         ctx,
+        no_cache,
         cache_ctx,
         SharedCacheSkipInput {
             task_id,
@@ -1017,6 +1027,9 @@ fn build_cache_decision_context(
         },
         &cache_context.dep_outputs,
     );
+    if no_cache {
+        cache_ctx.decision = cache_run_decision();
+    }
     cache_ctx.decision.clone()
 }
 
@@ -1042,11 +1055,12 @@ fn cache_decision_from_result(decision: &DecisionResult) -> CacheDecisionContext
 
 fn maybe_mark_shared_cache_hit(
     ctx: &DecisionContext,
+    no_cache: bool,
     cache_ctx: &mut CacheWriteContext,
     input: SharedCacheSkipInput<'_>,
     dep_outputs: &BTreeMap<String, [u8; 32]>,
 ) {
-    if !matches!(input.decision.action, Decision::Run) {
+    if no_cache || !matches!(input.decision.action, Decision::Run) {
         return;
     }
 
@@ -1076,7 +1090,7 @@ pub(super) fn try_cache_skip(task_id: &TaskId, ctx: &DecisionContext) -> Option<
     };
     cache_ctx.cache_nonce = nonce;
 
-    Some(build_cache_decision_context(task_id, ctx, &mut cache_ctx).action)
+    Some(build_cache_decision_context(task_id, ctx, false, &mut cache_ctx).action)
 }
 
 fn try_shared_cache_skip(
@@ -1178,7 +1192,7 @@ fn spawn_task_runner(ready: ReadyTask, ctx: &DispatchContext<'_>) {
         cache_enabled,
     } = ready;
     let task_start_unix_ms = now_unix_ms();
-    let task_ctx = build_task_run_context(&task_id, cache_enabled, ctx);
+    let task_ctx = build_task_run_context(&task_id, cache_enabled, ctx.no_cache, ctx);
     let reporter = Arc::clone(ctx.reporter);
     let started_task_id = task_id.clone();
     let repo_root = ctx.workspace_root.to_path_buf();
@@ -1189,6 +1203,7 @@ fn spawn_task_runner(ready: ReadyTask, ctx: &DispatchContext<'_>) {
     let worker_manager = Arc::clone(ctx.worker_manager);
     let owns_worker_manager = ctx.owns_worker_manager;
     let continue_on_failure = ctx.continue_on_failure;
+    let no_cache = ctx.no_cache;
     let log_sink = prepare_task_log_sink(&mut request);
 
     tokio::spawn(async move {
@@ -1207,6 +1222,7 @@ fn spawn_task_runner(ready: ReadyTask, ctx: &DispatchContext<'_>) {
             on_start,
             log_sink: log_sink.clone(),
             cache_enabled,
+            no_cache,
             repo_root,
             task_ctx,
             task_start_unix_ms,
@@ -1886,6 +1902,7 @@ mod tests {
                 any_failed: Box::leak(Box::new(Arc::new(AtomicBool::new(true)))),
                 interrupted: Box::leak(Box::new(Arc::new(AtomicBool::new(false)))),
                 continue_on_failure: false,
+                no_cache: false,
                 owns_worker_manager: true,
                 worker_manager: Box::leak(Box::new(Arc::new(WorkerManager::new(HashMap::new())))),
                 workspace_root: temp_dir.path(),

@@ -131,6 +131,9 @@ const SHARED_CACHE_HISTORY_ENV: &str = "LUCHTA_SHARED_CACHE_HISTORY";
 /// Environment variable overriding shared cache remote sync timeout, in seconds.
 const SHARED_CACHE_SYNC_TIMEOUT_ENV: &str = "LUCHTA_SHARED_CACHE_SYNC_TIMEOUT";
 
+/// Environment variable to disable all caching (no restore, no shared read/write).
+pub(crate) const NO_CACHE_ENV: &str = "LUCHTA_NO_CACHE";
+
 /// Default shared cache size cap in megabytes.
 const DEFAULT_SHARED_CACHE_SIZE_CAP_MB: u64 = 250;
 /// Default shared cache history length (number of commits).
@@ -138,6 +141,10 @@ const DEFAULT_SHARED_CACHE_HISTORY_LEN: usize = 20;
 
 fn parse_truthy_env_value(value: Option<&str>) -> bool {
     matches!(value.map(str::trim), Some(raw) if raw.eq_ignore_ascii_case("1") || raw.eq_ignore_ascii_case("true") || raw.eq_ignore_ascii_case("on"))
+}
+
+pub(crate) fn no_cache_env() -> bool {
+    parse_truthy_env_value(std::env::var(NO_CACHE_ENV).ok().as_deref())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -330,6 +337,45 @@ pub(crate) fn build_execution_resources(
 mod tests {
     use super::*;
     use crate::memory_pressure::MemorySample;
+    use std::sync::Mutex;
+
+    /// Process-wide lock to serialize env-mutating tests.
+    /// Prevents races when multiple tests use set_var/remove_var concurrently.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Guard that restores an environment variable to its prior value on drop.
+    /// Captures the current value on construction (if any) and restores it
+    /// (or removes if it was absent) when dropped, even on panic.
+    struct EnvVarGuard {
+        name: &'static str,
+        prior: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        /// Set an env var and return a guard that will restore the prior value.
+        fn set(name: &'static str, value: &str) -> Self {
+            let prior = std::env::var(name).ok();
+            std::env::set_var(name, value);
+            Self { name, prior }
+        }
+
+        /// Remove an env var and return a guard that will restore the prior value.
+        fn remove(name: &'static str) -> Self {
+            let prior = std::env::var(name).ok();
+            std::env::remove_var(name);
+            Self { name, prior }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(ref value) = self.prior {
+                std::env::set_var(self.name, value);
+            } else {
+                std::env::remove_var(self.name);
+            }
+        }
+    }
 
     #[test]
     fn parse_truthy_env_value_accepts_expected_values() {
@@ -519,5 +565,97 @@ mod tests {
     fn select_summary_rss_falls_back_when_snapshot_missing() {
         let rss = select_summary_rss(None, || Some(789));
         assert_eq!(rss, Some(789));
+    }
+
+    // ---------------------------------------------------------------------------
+    // no_cache_env() tests
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn no_cache_env_returns_true_for_truthy_values() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvVarGuard::remove(NO_CACHE_ENV);
+
+        for value in ["1", "true", "on", "TRUE", "On", " 1 ", " TRUE "] {
+            let _guard = EnvVarGuard::set(NO_CACHE_ENV, value);
+            assert!(
+                no_cache_env(),
+                "expected LUCHTA_NO_CACHE={value:?} to return true"
+            );
+        }
+    }
+
+    #[test]
+    fn no_cache_env_returns_false_for_non_truthy_values() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvVarGuard::remove(NO_CACHE_ENV);
+
+        for value in ["0", "false", "off", "nope", "", "  "] {
+            let _guard = EnvVarGuard::set(NO_CACHE_ENV, value);
+            assert!(
+                !no_cache_env(),
+                "expected LUCHTA_NO_CACHE={value:?} to return false"
+            );
+        }
+    }
+
+    #[test]
+    fn no_cache_env_returns_false_when_unset() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvVarGuard::remove(NO_CACHE_ENV);
+
+        assert!(
+            !no_cache_env(),
+            "expected unset LUCHTA_NO_CACHE to return false"
+        );
+    }
+
+    #[test]
+    fn no_cache_flag_or_env_semantics() {
+        // The effective no_cache value is computed in main.rs as:
+        //   effective = cli_flag || no_cache_env()
+        //
+        // This test verifies the OR semantics using a local helper to avoid
+        // clippy warnings about literal constants in boolean expressions.
+
+        // Models the computation in main.rs: effective = CLI flag OR env var
+        fn effective_no_cache(cli_flag: bool) -> bool {
+            cli_flag || no_cache_env()
+        }
+
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvVarGuard::remove(NO_CACHE_ENV);
+
+        // Case 1: CLI flag=true always yields true regardless of env
+        let _env_guard = EnvVarGuard::set(NO_CACHE_ENV, "0");
+        assert!(
+            effective_no_cache(true),
+            "cli_flag=true should always be true"
+        );
+
+        let _env_guard = EnvVarGuard::set(NO_CACHE_ENV, "1");
+        assert!(
+            effective_no_cache(true),
+            "cli_flag=true should always be true"
+        );
+
+        // Case 2: CLI flag=false yields the env value
+        let _env_guard = EnvVarGuard::set(NO_CACHE_ENV, "1");
+        assert!(
+            effective_no_cache(false),
+            "cli_flag=false, env=true => effective=true"
+        );
+
+        let _env_guard = EnvVarGuard::set(NO_CACHE_ENV, "0");
+        assert!(
+            !effective_no_cache(false),
+            "cli_flag=false, env=false => effective=false"
+        );
+
+        let _env_guard = EnvVarGuard::remove(NO_CACHE_ENV);
+        assert!(
+            !effective_no_cache(false),
+            "cli_flag=false, env unset => effective=false"
+        );
     }
 }
