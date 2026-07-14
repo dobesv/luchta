@@ -2,7 +2,7 @@ use tokio::io::{stdin, stdout, AsyncBufReadExt, AsyncWrite, BufReader};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use luchta_worker::WorkerMessage;
+use luchta_worker::{split_current_process_argv, version_requested, WorkerMessage};
 use luchta_worker_watcher::{
     cli,
     router::{MessageRouter, RouterEvent},
@@ -26,6 +26,15 @@ fn main() {
 }
 
 async fn async_main() -> i32 {
+    let split = split_current_process_argv();
+    if version_requested(
+        &split.stage_args,
+        env!("CARGO_PKG_NAME"),
+        env!("CARGO_PKG_VERSION"),
+    ) {
+        return 0;
+    }
+
     let cli = match cli::parse(std::env::args()) {
         Ok(cli) => cli,
         Err(error) => {

@@ -28,7 +28,31 @@ use crate::transform::{
     source_map_output_path, source_mapping_url, transform_source,
 };
 
+fn main() {
+    if luchta_worker::version_requested(
+        &std::env::args().collect::<Vec<_>>(),
+        env!("CARGO_PKG_NAME"),
+        env!("CARGO_PKG_VERSION"),
+    ) {
+        return;
+    }
+
+    real_main();
+}
+
 #[cfg(feature = "swc")]
+fn real_main() {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build tokio runtime")
+        .block_on(async { run_worker_main(SwcTransformWorker).await });
+}
+
+#[cfg(not(feature = "swc"))]
+fn real_main() {}
+
+#[cfg_attr(not(feature = "swc"), allow(dead_code))]
 struct SwcTransformWorker;
 
 #[cfg(feature = "swc")]
@@ -420,15 +444,6 @@ fn cleanup_extra_files(
 fn normalize_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
-
-#[cfg(feature = "swc")]
-#[tokio::main(flavor = "current_thread")]
-async fn main() {
-    run_worker_main(SwcTransformWorker).await;
-}
-
-#[cfg(not(feature = "swc"))]
-fn main() {}
 
 #[cfg(all(test, feature = "swc"))]
 mod tests {

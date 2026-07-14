@@ -19,6 +19,7 @@ pub enum OutputMode {
 #[derive(Debug, Parser)]
 #[command(name = "luchta")]
 #[command(about = "Rust monorepo build orchestration tool")]
+#[command(version)]
 pub struct Cli {
     #[arg(long, value_name = "PATH", global = true)]
     pub workspace_root: Option<PathBuf>,

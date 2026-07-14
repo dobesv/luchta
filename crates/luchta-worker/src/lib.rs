@@ -1,5 +1,6 @@
 pub mod proxy;
 mod runtime;
+mod version;
 
 use std::{collections::HashMap, path::Path};
 
@@ -14,6 +15,7 @@ pub use runtime::{
     run_worker, run_worker_main, shell_single_quote, InProcessOutcome, JobContext, Worker,
     WorkerError,
 };
+pub use version::version_requested;
 
 /// Built-in passthrough environment variables that are always inherited from
 /// the ambient environment into task execution, even under strict env isolation.

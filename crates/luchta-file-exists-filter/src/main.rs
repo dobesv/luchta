@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use luchta_worker::{
-    split_current_process_argv, DelegateHandle, ProxyError, ResolveResult, WorkerMessage,
-    WorkerResponse,
+    split_current_process_argv, version_requested, DelegateHandle, ProxyError, ResolveResult,
+    WorkerMessage, WorkerResponse,
 };
 use tokio::io::{stdin, stdout, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
@@ -38,6 +38,13 @@ fn main() {
 
 async fn async_main() -> i32 {
     let argv = split_current_process_argv();
+    if version_requested(
+        &argv.stage_args,
+        env!("CARGO_PKG_NAME"),
+        env!("CARGO_PKG_VERSION"),
+    ) {
+        return 0;
+    }
     let usage =
         "usage: luchta-file-exists-filter <pattern> [<pattern>...] -- <delegate command...>";
 

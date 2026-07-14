@@ -38,7 +38,8 @@
 //! ```
 
 use luchta_worker::{
-    run_worker_main, ResolveMode, ResolveResult, ResolveTask, Worker, WorkerRequest,
+    run_worker_main, version_requested, ResolveMode, ResolveResult, ResolveTask, Worker,
+    WorkerRequest,
 };
 
 struct BashWorker;
@@ -76,6 +77,14 @@ impl Worker for BashWorker {
 // failures. current_thread keeps the worker's footprint minimal.
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    if version_requested(
+        &std::env::args().collect::<Vec<_>>(),
+        env!("CARGO_PKG_NAME"),
+        env!("CARGO_PKG_VERSION"),
+    ) {
+        return;
+    }
+
     run_worker_main(BashWorker).await;
 }
 

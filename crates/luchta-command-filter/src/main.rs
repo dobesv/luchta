@@ -3,8 +3,8 @@ use std::process;
 use std::sync::Arc;
 
 use luchta_worker::{
-    split_current_process_argv, DelegateHandle, ProxyError, ResolveResult, ResolveTask,
-    WorkerMessage, WorkerResponse,
+    split_current_process_argv, version_requested, DelegateHandle, ProxyError, ResolveResult,
+    ResolveTask, WorkerMessage, WorkerResponse,
 };
 use tokio::io::{stdin, stdout, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::Command;
@@ -41,6 +41,13 @@ fn main() {
 
 async fn async_main() -> i32 {
     let argv = split_current_process_argv();
+    if version_requested(
+        &argv.stage_args,
+        env!("CARGO_PKG_NAME"),
+        env!("CARGO_PKG_VERSION"),
+    ) {
+        return 0;
+    }
     let usage =
         "usage: luchta-command-filter <predicate-token> [<predicate-token>...] -- <delegate command...>";
 

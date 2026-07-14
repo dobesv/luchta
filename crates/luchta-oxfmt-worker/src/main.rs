@@ -27,7 +27,34 @@ use crate::config::discover_config;
 #[cfg(feature = "oxc")]
 use crate::format::{format_path, relative_display};
 
+fn main() {
+    if luchta_worker::version_requested(
+        &std::env::args().collect::<Vec<_>>(),
+        env!("CARGO_PKG_NAME"),
+        env!("CARGO_PKG_VERSION"),
+    ) {
+        return;
+    }
+
+    real_main();
+}
+
 #[cfg(feature = "oxc")]
+fn real_main() {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build tokio runtime")
+        .block_on(async { run_worker_main(OxfmtWorker).await });
+}
+
+#[cfg(not(feature = "oxc"))]
+fn real_main() {
+    eprintln!("this binary was built without the 'oxc' feature; the oxfmt worker is unavailable");
+    std::process::exit(1);
+}
+
+#[cfg_attr(not(feature = "oxc"), allow(dead_code))]
 struct OxfmtWorker;
 
 #[cfg(feature = "oxc")]
@@ -361,18 +388,6 @@ fn is_formattable_path(path: &Path) -> bool {
 fn write_text_file(path: &Path, contents: &str) -> Result<(), String> {
     fs::write(path, contents)
         .map_err(|error| format!("failed to write {}: {error}", path.display()))
-}
-
-#[cfg(feature = "oxc")]
-#[tokio::main(flavor = "current_thread")]
-async fn main() {
-    run_worker_main(OxfmtWorker).await;
-}
-
-#[cfg(not(feature = "oxc"))]
-fn main() {
-    eprintln!("this binary was built without the 'oxc' feature; the oxfmt worker is unavailable");
-    std::process::exit(1);
 }
 
 #[cfg(all(test, feature = "oxc"))]

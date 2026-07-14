@@ -3,8 +3,8 @@ use std::process;
 use std::sync::Arc;
 
 use luchta_worker::{
-    split_current_process_argv, DelegateHandle, ProxyError, ResolveResult, ResolveTask,
-    WorkerMessage, WorkerResponse,
+    split_current_process_argv, version_requested, DelegateHandle, ProxyError, ResolveResult,
+    ResolveTask, WorkerMessage, WorkerResponse,
 };
 use serde_json::Value;
 use tokio::io::{stdin, stdout, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
@@ -43,6 +43,13 @@ fn main() {
 
 async fn async_main() -> i32 {
     let argv = split_current_process_argv();
+    if version_requested(
+        &argv.stage_args,
+        env!("CARGO_PKG_NAME"),
+        env!("CARGO_PKG_VERSION"),
+    ) {
+        return 0;
+    }
     let stage_args = argv.stage_args.into_iter().skip(1).collect::<Vec<_>>();
     let usage = "usage: luchta-yarn-filter [--script NAME]... [--dependency NAME]... -- <delegate command...>";
 
