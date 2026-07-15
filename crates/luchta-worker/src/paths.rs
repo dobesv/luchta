@@ -20,7 +20,10 @@ mod tests {
     #[test]
     fn repo_relative_strips_root_prefix() {
         assert_eq!(
-            repo_relative(Path::new("/repo/packages/app/src/foo.ts"), Path::new("/repo")),
+            repo_relative(
+                Path::new("/repo/packages/app/src/foo.ts"),
+                Path::new("/repo")
+            ),
             "packages/app/src/foo.ts"
         );
     }

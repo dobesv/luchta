@@ -890,7 +890,8 @@ mod tests {
         let sarif: serde_sarif::sarif::Sarif = serde_json::from_str(sarif_json).unwrap();
         let formatted = format_sarif_pretty(&sarif, Stream::Stdout);
         assert!(
-            formatted.contains("packages/app/src/index.ts:4:3: error: Unexpected console [no-console]"),
+            formatted
+                .contains("packages/app/src/index.ts:4:3: error: Unexpected console [no-console]"),
             "unexpected render: {formatted}"
         );
     }
