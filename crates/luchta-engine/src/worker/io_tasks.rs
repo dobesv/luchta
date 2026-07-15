@@ -388,7 +388,10 @@ pub(crate) fn kill_process_group(pgid: i32) {
     }
 }
 
-pub(crate) fn worker_command(command_line: &str) -> tokio::process::Command {
+pub(crate) fn worker_command(
+    command_line: &str,
+    workspace_root: &std::path::Path,
+) -> tokio::process::Command {
     let mut command = tokio::process::Command::new("sh");
     command
         .arg("-c")
@@ -397,6 +400,11 @@ pub(crate) fn worker_command(command_line: &str) -> tokio::process::Command {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0);
+    // Pin the resident worker's cwd to the workspace root so diagnostic paths
+    // relativize consistently regardless of luchta's invocation directory.
+    if !workspace_root.as_os_str().is_empty() {
+        command.current_dir(workspace_root);
+    }
     command
 }
 
@@ -409,6 +417,21 @@ mod tests {
         },
         time::Duration,
     };
+
+    #[test]
+    fn worker_command_sets_current_dir_when_root_provided() {
+        let command = super::worker_command("echo hi", std::path::Path::new("/repo/root"));
+        assert_eq!(
+            command.as_std().get_current_dir(),
+            Some(std::path::Path::new("/repo/root"))
+        );
+    }
+
+    #[test]
+    fn worker_command_leaves_current_dir_unset_for_empty_root() {
+        let command = super::worker_command("echo hi", std::path::Path::new(""));
+        assert_eq!(command.as_std().get_current_dir(), None);
+    }
 
     use tokio::{
         io::AsyncWriteExt,

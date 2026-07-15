@@ -20,7 +20,7 @@ use tokio::task;
 #[cfg(feature = "oxc")]
 use crate::config::discover_config;
 #[cfg(feature = "oxc")]
-use crate::format::{format_path, relative_display};
+use crate::format::format_path;
 #[cfg(feature = "oxc")]
 use crate::opts::OxfmtOpts;
 
@@ -97,6 +97,7 @@ impl Worker for OxfmtWorker {
             };
 
             let cwd = PathBuf::from(cwd);
+            let repo_root = std::env::current_dir().unwrap_or_else(|_| cwd.clone());
             let opts = OxfmtOpts::from_request(req);
             let loaded_config = match task::spawn_blocking({
                 let cwd = cwd.clone();
@@ -169,14 +170,14 @@ impl Worker for OxfmtWorker {
             let mut exit_code = 0;
             let mut would_reformat = false;
             let outcomes = match task::spawn_blocking({
-                let cwd = cwd.clone();
+                let repo_root = repo_root.clone();
                 let loaded_config = loaded_config.clone();
                 let files = files.clone();
                 move || {
                     process_items_in_parallel(
                         &files,
                         "oxfmt worker parallel format thread panicked",
-                        |path| format_file(path, &cwd, &loaded_config, opts),
+                        |path| format_file(path, &repo_root, &loaded_config, opts),
                     )
                 }
             })
@@ -265,19 +266,19 @@ enum FileOutcome {
 #[cfg(feature = "oxc")]
 fn format_file(
     path: &Path,
-    cwd: &Path,
+    repo_root: &Path,
     loaded_config: &crate::config::LoadedConfig,
     opts: OxfmtOpts,
 ) -> FileOutcome {
-    let relative = relative_display(cwd, path);
+    let relative = luchta_worker::paths::repo_relative(path, repo_root);
     let source = match fs::read_to_string(path) {
         Ok(source) => source,
         Err(error) => {
-            return FileOutcome::ReadError(format!("failed to read {}: {error}", path.display()));
+            return FileOutcome::ReadError(format!("failed to read {relative}: {error}"));
         }
     };
     let options = loaded_config.options_for(path);
-    let result = match format_path(path, &source, &options) {
+    let result = match format_path(path, repo_root, &source, &options) {
         Ok(result) => result,
         Err(error) => return FileOutcome::FormatError(error),
     };
@@ -290,7 +291,7 @@ fn format_file(
         return FileOutcome::WouldReformat { relative };
     }
 
-    if let Err(error) = write_text_file(path, &result.formatted) {
+    if let Err(error) = write_text_file(path, repo_root, &result.formatted) {
         return FileOutcome::WriteError(error);
     }
 
@@ -371,9 +372,13 @@ pub(crate) fn is_formattable_path(path: &Path) -> bool {
     !file_name.ends_with(".d.ts")
 }
 
-fn write_text_file(path: &Path, contents: &str) -> Result<(), String> {
-    fs::write(path, contents)
-        .map_err(|error| format!("failed to write {}: {error}", path.display()))
+fn write_text_file(path: &Path, repo_root: &Path, contents: &str) -> Result<(), String> {
+    fs::write(path, contents).map_err(|error| {
+        format!(
+            "failed to write {}: {error}",
+            luchta_worker::paths::repo_relative(path, repo_root)
+        )
+    })
 }
 
 #[cfg(all(test, feature = "oxc"))]
@@ -384,7 +389,10 @@ mod tests {
     use assert_fs::TempDir;
     use luchta_worker::{InProcessOutcome, JobContext, SharedWriter, Worker, WorkerRequest};
 
-    use super::{collect_formattable_files, is_formattable_path, OxfmtWorker};
+    use super::{
+        collect_formattable_files, format_file, is_formattable_path, FileOutcome, OxfmtWorker,
+    };
+    use crate::opts::OxfmtOpts;
 
     fn relative_paths(cwd: &Path, paths: Vec<PathBuf>) -> Vec<String> {
         let mut out = paths
@@ -512,6 +520,31 @@ mod tests {
 
         assert!(warnings.is_empty(), "warnings: {warnings:?}");
         assert_eq!(relative_paths(&pkg, files), vec!["src/keep.ts"]);
+    }
+
+    #[test]
+    fn format_file_reports_repo_root_relative_path_for_sub_package_file() {
+        let temp = TempDir::new().expect("tempdir");
+        let root = temp.path();
+        let pkg_dir = root.join("packages/app/src");
+        fs::create_dir_all(&pkg_dir).expect("pkg dir");
+        let file = pkg_dir.join("x.ts");
+        fs::write(&file, "export const value={foo:'bar'}\n").expect("fixture");
+
+        let loaded_config = crate::config::discover_config(root).expect("discover config");
+        let opts = OxfmtOpts {
+            check: true,
+            fix: false,
+        };
+
+        let outcome = format_file(&file, root, &loaded_config, opts);
+
+        match outcome {
+            FileOutcome::WouldReformat { relative } => {
+                assert_eq!(relative, "packages/app/src/x.ts");
+            }
+            _ => panic!("expected WouldReformat outcome"),
+        }
     }
 
     #[test]

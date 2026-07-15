@@ -73,6 +73,7 @@ pub struct WorkerManager {
     shutdown_timeout: Duration,
     is_shutdown: Arc<AtomicBool>,
     prefix_width: usize,
+    workspace_root: std::path::PathBuf,
 }
 
 #[cfg(unix)]
@@ -92,11 +93,17 @@ impl WorkerManager {
             shutdown_timeout,
             is_shutdown: Arc::new(AtomicBool::new(false)),
             prefix_width: 0,
+            workspace_root: std::path::PathBuf::new(),
         }
     }
 
     pub fn with_prefix_width(mut self, width: usize) -> Self {
         self.prefix_width = width;
+        self
+    }
+
+    pub fn with_workspace_root(mut self, root: std::path::PathBuf) -> Self {
+        self.workspace_root = root;
         self
     }
 
@@ -367,7 +374,8 @@ impl WorkerManager {
         worker_name: &str,
         definition: &WorkerDefinition,
     ) -> Result<Arc<WorkerHandle>, WorkerError> {
-        let mut child = spawn_worker_process(worker_name, &definition.command).await?;
+        let mut child =
+            spawn_worker_process(worker_name, &definition.command, &self.workspace_root).await?;
         let pgid = child.id().expect("worker pid available") as i32;
         let stdin = child.stdin.take().expect("worker stdin piped");
         let stdout = child.stdout.take().expect("worker stdout piped");
@@ -504,6 +512,7 @@ pub struct WorkerManager {
     definitions: HashMap<String, WorkerDefinition>,
     shutdown_timeout: Duration,
     prefix_width: usize,
+    workspace_root: std::path::PathBuf,
 }
 
 #[cfg(not(unix))]
@@ -520,6 +529,7 @@ impl WorkerManager {
             definitions,
             shutdown_timeout,
             prefix_width: 0,
+            workspace_root: std::path::PathBuf::new(),
         }
     }
 
@@ -528,8 +538,18 @@ impl WorkerManager {
         self
     }
 
+    pub fn with_workspace_root(mut self, root: std::path::PathBuf) -> Self {
+        self.workspace_root = root;
+        self
+    }
+
     fn unsupported<T>(&self, worker_name: &str, id: String) -> Result<T, WorkerError> {
-        let _ = (&self.definitions, self.shutdown_timeout, self.prefix_width);
+        let _ = (
+            &self.definitions,
+            self.shutdown_timeout,
+            self.prefix_width,
+            &self.workspace_root,
+        );
         Err(WorkerError::Unsupported {
             worker: worker_name.to_owned(),
             id,

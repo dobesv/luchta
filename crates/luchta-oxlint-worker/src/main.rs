@@ -186,7 +186,8 @@ impl Worker for OxlintWorker {
                 };
             }
 
-            let results = match lint_files(cwd, loaded.store, files, opts).await {
+            let repo_root = std::env::current_dir().unwrap_or_else(|_| cwd.to_path_buf());
+            let results = match lint_files(cwd, &repo_root, loaded.store, files, opts).await {
                 Ok(results) => results,
                 Err(error) => {
                     let _ = ctx.emit_stderr(error).await;

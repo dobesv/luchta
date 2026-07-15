@@ -55,6 +55,43 @@ async fn check_mode_reports_nonzero_without_writing() {
     assert_eq!(after, original);
 }
 
+/// Guards the wiring in `run_in_process` that computes `repo_root` from the
+/// worker process's own cwd (mirroring the engine spawning workers with
+/// cwd = workspace root) and threads it into `format_file` separately from
+/// `req.cwd`. If a future change reverted the `format_file` closure at
+/// worker.rs to use `&cwd` instead of `&repo_root`, the emitted path would
+/// regress to `src/x.ts` instead of the repo-root-relative
+/// `packages/app/src/x.ts`, and this test would catch it.
+#[tokio::test]
+async fn check_mode_reports_repo_root_relative_path_for_sub_package_cwd() {
+    let temp = TempDir::new().expect("tempdir");
+    let repo_root = temp.path();
+    let package_cwd = repo_root.join("packages/app");
+    tokio::fs::create_dir_all(package_cwd.join("src"))
+        .await
+        .expect("src dir");
+    let file = package_cwd.join("src/x.ts");
+    let original = "export const value={foo:'bar'}\n";
+    tokio::fs::write(&file, original).await.expect("fixture");
+
+    let mut env = HashMap::new();
+    env.insert("OXFMT_OPTS".to_owned(), "--check".to_owned());
+    let response = run_worker_jsonl_in(repo_root, &package_cwd, env).await;
+
+    assert_eq!(response.exit_code, 1);
+    assert_eq!(
+        response.stdout_lines,
+        vec!["would reformat: packages/app/src/x.ts"]
+    );
+    assert!(
+        response.stderr_lines.is_empty(),
+        "stderr: {:?}",
+        response.stderr_lines
+    );
+    let after = tokio::fs::read_to_string(&file).await.expect("after");
+    assert_eq!(after, original);
+}
+
 #[tokio::test]
 async fn formatted_fixture_is_noop_in_both_modes() {
     let temp = TempDir::new().expect("tempdir");
@@ -110,8 +147,21 @@ struct WorkerRun {
 }
 
 async fn run_worker_jsonl(cwd: &std::path::Path, env: HashMap<String, String>) -> WorkerRun {
+    run_worker_jsonl_in(cwd, cwd, env).await
+}
+
+/// Runs the worker with the spawned process's `current_dir` set to
+/// `repo_root` while the `WorkerRequest.cwd` is set to `req_cwd`, mirroring
+/// the engine spawning workers with cwd = workspace root while dispatching
+/// tasks against a package subdirectory. This lets tests exercise the
+/// `repo_root != cwd` case that `run_worker_jsonl` collapses.
+async fn run_worker_jsonl_in(
+    repo_root: &std::path::Path,
+    req_cwd: &std::path::Path,
+    env: HashMap<String, String>,
+) -> WorkerRun {
     let mut child = Command::new(env!("CARGO_BIN_EXE_luchta-oxfmt-worker"))
-        .current_dir(cwd)
+        .current_dir(repo_root)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -121,7 +171,7 @@ async fn run_worker_jsonl(cwd: &std::path::Path, env: HashMap<String, String>) -
         "type": "run",
         "id": "pkg#format",
         "command": "format",
-        "cwd": cwd.to_string_lossy(),
+        "cwd": req_cwd.to_string_lossy(),
         "env": env,
     });
     let mut stdin = child.stdin.take().expect("stdin");

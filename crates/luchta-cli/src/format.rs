@@ -869,6 +869,34 @@ mod tests {
     }
 
     #[test]
+    fn format_sarif_pretty_preserves_repo_root_relative_subpackage_path() {
+        let sarif_json = r#"{
+            "version": "2.1.0",
+            "runs": [{
+                "tool": { "driver": { "name": "oxlint" } },
+                "results": [{
+                    "ruleId": "no-console",
+                    "level": "error",
+                    "message": { "text": "Unexpected console" },
+                    "locations": [{
+                        "physicalLocation": {
+                            "artifactLocation": { "uri": "packages/app/src/index.ts" },
+                            "region": { "startLine": 4, "startColumn": 3 }
+                        }
+                    }]
+                }]
+            }]
+        }"#;
+        let sarif: serde_sarif::sarif::Sarif = serde_json::from_str(sarif_json).unwrap();
+        let formatted = format_sarif_pretty(&sarif, Stream::Stdout);
+        assert!(
+            formatted
+                .contains("packages/app/src/index.ts:4:3: error: Unexpected console [no-console]"),
+            "unexpected render: {formatted}"
+        );
+    }
+
+    #[test]
     fn format_task_log_block_places_reports_before_footer() {
         let meta = LogBlockMeta {
             package: "app",
