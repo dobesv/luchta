@@ -1,5 +1,6 @@
 pub mod parallel;
 pub mod paths;
+pub mod sarif;
 pub mod proxy;
 mod runtime;
 pub mod tokenize;
