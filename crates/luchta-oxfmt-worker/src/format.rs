@@ -1,9 +1,6 @@
 #![cfg(feature = "oxc")]
 
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{path::Path, sync::Arc};
 
 use oxc_allocator::Allocator;
 use oxc_formatter::{format, ExternalCallbacks, JsFormatOptions, QuoteStyle, TrailingCommas};
@@ -20,6 +17,7 @@ pub struct FormatResult {
 
 pub fn format_path(
     path: &Path,
+    repo_root: &Path,
     source: &str,
     options: &JsFormatOptions,
 ) -> Result<FormatResult, String> {
@@ -48,7 +46,7 @@ pub fn format_path(
     let source_type = SourceType::from_path(path).map_err(|error| {
         format!(
             "failed to determine source type for {}: {error}",
-            path.display()
+            luchta_worker::paths::repo_relative(path, repo_root)
         )
     })?;
     let formatted: String = format(
@@ -58,9 +56,9 @@ pub fn format_path(
         options.clone(),
         Some(callbacks),
     )
-    .map_err(|error| format_diagnostic(path, &error.to_string()))?
+    .map_err(|error| format_diagnostic(path, repo_root, &error.to_string()))?
     .print()
-    .map_err(|error| format_diagnostic(path, &error.to_string()))?
+    .map_err(|error| format_diagnostic(path, repo_root, &error.to_string()))?
     .into_code();
 
     Ok(FormatResult {
@@ -85,17 +83,11 @@ fn css_format_options(options: &JsFormatOptions) -> CssFormatOptions {
     }
 }
 
-fn format_diagnostic(path: &Path, message: &str) -> String {
-    format!("{}: {message}", path.display())
-}
-
-pub fn relative_display(cwd: &Path, path: &Path) -> String {
-    normalize_path(path.strip_prefix(cwd).unwrap_or(path))
-}
-
-pub fn normalize_path(path: &Path) -> String {
-    let path_buf: PathBuf = path.iter().collect();
-    path_buf.to_string_lossy().replace('\\', "/")
+fn format_diagnostic(path: &Path, repo_root: &Path, message: &str) -> String {
+    format!(
+        "{}: {message}",
+        luchta_worker::paths::repo_relative(path, repo_root)
+    )
 }
 
 #[cfg(test)]
@@ -104,13 +96,14 @@ mod tests {
 
     use oxc_formatter::JsFormatOptions;
 
-    use super::{css_format_options, format_path, normalize_path, relative_display};
+    use super::{css_format_options, format_path};
 
     #[test]
     fn format_path_reformats_unformatted_ts() {
         let path = Path::new("src/example.ts");
         let result = format_path(
             path,
+            Path::new(""),
             "export const value={foo:'bar'}\n",
             &JsFormatOptions::new(),
         )
@@ -125,7 +118,8 @@ mod tests {
         let input = "const Button = styled.button`color:red;${({ theme }) => css`display:flex;align-items:center;justify-content:space-between;`};padding:8px;`;\n";
         let expected = "const Button = styled.button`\n  color: red;\n  ${({ theme }) =>\n    css`\n      display: flex;\n      align-items: center;\n      justify-content: space-between;\n    `}; padding: 8px;\n`;\n";
 
-        let result = format_path(path, input, &JsFormatOptions::new()).expect("format ok");
+        let result =
+            format_path(path, Path::new(""), input, &JsFormatOptions::new()).expect("format ok");
 
         assert_eq!(result.formatted, expected);
     }
@@ -136,7 +130,8 @@ mod tests {
         let input = "const Card = styled.div`${foo+bar+baz?'display:grid;grid-template-columns:1fr auto;':'display:block;'}\nmargin:0 auto;`;\n";
         let expected = "const Card = styled.div`\n  ${foo + bar + baz ? \"display:grid;grid-template-columns:1fr auto;\" : \"display:block;\"}\n  margin: 0 auto;\n`;\n";
 
-        let result = format_path(path, input, &JsFormatOptions::new()).expect("format ok");
+        let result =
+            format_path(path, Path::new(""), input, &JsFormatOptions::new()).expect("format ok");
 
         assert_eq!(result.formatted, expected);
     }
@@ -159,19 +154,8 @@ mod tests {
         options.indent_style = oxc_formatter_core::IndentStyle::Tab;
         options.quote_style = oxc_formatter::QuoteStyle::Single;
 
-        let result = format_path(path, input, &options).expect("format ok");
+        let result = format_path(path, Path::new(""), input, &options).expect("format ok");
 
         assert_eq!(result.formatted, expected);
-    }
-
-    #[test]
-    fn relative_display_normalizes_separators() {
-        let cwd = Path::new("/repo");
-        let file = Path::new("/repo/src/nested/file.ts");
-        assert_eq!(relative_display(cwd, file), "src/nested/file.ts");
-        assert_eq!(
-            normalize_path(Path::new("src/nested/file.ts")),
-            "src/nested/file.ts"
-        );
     }
 }
