@@ -104,8 +104,11 @@ impl Worker for AstGrepWorker {
                 };
             }
 
+            let repo_root = std::env::current_dir().unwrap_or_else(|_| run.cwd.clone());
             let scan_result =
-                match scan_files_async(&run.cwd, &run.config, run.files, run.opts.fix).await {
+                match scan_files_async(&run.cwd, &repo_root, &run.config, run.files, run.opts.fix)
+                    .await
+                {
                     Ok(findings) => findings,
                     Err(error) => {
                         let _ = ctx.emit_stderr(error).await;

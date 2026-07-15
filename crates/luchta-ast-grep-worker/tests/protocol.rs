@@ -23,7 +23,25 @@ fn run_worker(input: &str) -> (Vec<Value>, String) {
 }
 
 fn run_worker_with_env(input: &str, envs: &[(&str, &str)]) -> (Vec<Value>, String) {
+    run_worker_full(input, None, envs)
+}
+
+/// Runs the worker with the process cwd set to `repo_root`, mirroring the
+/// engine spawning workers with cwd = workspace root so diagnostic output
+/// paths are relative to `repo_root` rather than the test binary's own cwd.
+fn run_worker_in(repo_root: &Path, input: &str) -> (Vec<Value>, String) {
+    run_worker_full(input, Some(repo_root), &[])
+}
+
+fn run_worker_full(
+    input: &str,
+    repo_root: Option<&Path>,
+    envs: &[(&str, &str)],
+) -> (Vec<Value>, String) {
     let mut command = Command::cargo_bin("luchta-ast-grep-worker").expect("binary path");
+    if let Some(repo_root) = repo_root {
+        command.current_dir(repo_root);
+    }
     for (key, value) in envs {
         command.env(key, value);
     }
@@ -252,7 +270,7 @@ fn violation_emits_log_report_and_done_exit_1() {
                 .with_cwd(fixture.path().display().to_string())
         )
     );
-    let (output, _stderr) = run_worker(&input);
+    let (output, _stderr) = run_worker_in(fixture.path(), &input);
 
     assert!(output.iter().any(|value| {
         value["type"].as_str() == Some("log")
@@ -293,7 +311,7 @@ fn language_globs_fixture_emits_violation_for_tsx_rule_on_ts_file() {
                 .with_cwd(fixture.path().display().to_string())
         )
     );
-    let (output, _stderr) = run_worker(&input);
+    let (output, _stderr) = run_worker_in(fixture.path(), &input);
 
     assert!(output.iter().any(|value| {
         value["type"].as_str() == Some("log")
@@ -419,7 +437,7 @@ fn fix_flag_in_command_rewrites_file_end_to_end() {
                 .with_cwd(fixture.path().display().to_string())
         )
     );
-    let (output, _stderr) = run_worker(&input);
+    let (output, _stderr) = run_worker_in(fixture.path(), &input);
 
     // File is rewritten on disk by the fixer.
     assert_eq!(

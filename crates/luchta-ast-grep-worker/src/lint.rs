@@ -28,6 +28,7 @@ pub struct ScanResult {
 #[derive(Clone, Copy)]
 struct ScanContext<'a> {
     cwd: &'a Path,
+    repo_root: &'a Path,
     config_dir: &'a Path,
     language_globs: &'a [LanguageGlobEntry],
 }
@@ -38,7 +39,7 @@ impl<'a> ScanContext<'a> {
     }
 
     fn relative_uri(&self, file: &Path) -> String {
-        normalize_to_forward_slashes(file.strip_prefix(self.cwd).unwrap_or(file))
+        luchta_worker::paths::repo_relative(file, self.repo_root)
     }
 
     fn resolve_language(&self, file: &Path) -> Option<SupportLang> {
@@ -70,6 +71,7 @@ pub fn load_rules(rule_files: &[PathBuf]) -> Result<Vec<RuleConfig<SupportLang>>
 #[cfg(test)]
 pub fn scan_files(
     cwd: &Path,
+    repo_root: &Path,
     config: &DiscoveredConfig,
     files: Vec<PathBuf>,
     fix: bool,
@@ -81,6 +83,7 @@ pub fn scan_files(
     }
     let context = ScanContext {
         cwd,
+        repo_root,
         config_dir: &config.config_dir,
         language_globs: &config.language_globs,
     };
@@ -412,11 +415,13 @@ where
 
 pub async fn scan_files_async(
     cwd: &Path,
+    repo_root: &Path,
     config: &DiscoveredConfig,
     files: Vec<PathBuf>,
     fix: bool,
 ) -> Result<ScanResult, String> {
     let cwd = cwd.to_path_buf();
+    let repo_root = repo_root.to_path_buf();
     let config = config.clone();
     tokio::task::spawn_blocking(move || {
         let rules = load_rules(&config.rule_files)?;
@@ -425,6 +430,7 @@ pub async fn scan_files_async(
         }
         let context = ScanContext {
             cwd: &cwd,
+            repo_root: &repo_root,
             config_dir: &config.config_dir,
             language_globs: &config.language_globs,
         };
@@ -462,7 +468,7 @@ mod tests {
         let config = discover_config(temp.path())
             .expect("discover")
             .expect("config present");
-        scan_files(temp.path(), &config, vec![source], fix).expect("scan")
+        scan_files(temp.path(), temp.path(), &config, vec![source], fix).expect("scan")
     }
 
     #[test]
@@ -724,17 +730,29 @@ mod tests {
         let config = discover_config(temp.path())
             .expect("discover")
             .expect("config present");
-        let findings = scan_files(temp.path(), &config, vec![source.clone()], false)
-            .expect("scan with languageGlobs")
-            .findings;
+        let findings = scan_files(
+            temp.path(),
+            temp.path(),
+            &config,
+            vec![source.clone()],
+            false,
+        )
+        .expect("scan with languageGlobs")
+        .findings;
         fs::write(temp.path().join("sgconfig.yml"), "ruleDirs:\n  - rules\n")
             .expect("control config");
         let control_config = discover_config(temp.path())
             .expect("discover control")
             .expect("control config present");
-        let control = scan_files(temp.path(), &control_config, vec![source], false)
-            .expect("control scan")
-            .findings;
+        let control = scan_files(
+            temp.path(),
+            temp.path(),
+            &control_config,
+            vec![source],
+            false,
+        )
+        .expect("control scan")
+        .findings;
 
         assert_eq!(findings.len(), 1);
         assert!(
@@ -807,6 +825,7 @@ mod tests {
         let collection = ast_grep_config::RuleCollection::try_new(rules).expect("rule collection");
         let context = ScanContext {
             cwd: temp.path(),
+            repo_root: temp.path(),
             config_dir: temp.path(),
             language_globs: &[],
         };
@@ -826,6 +845,7 @@ mod tests {
     fn selection_path_is_config_root_relative() {
         let context = ScanContext {
             cwd: Path::new("/repo"),
+            repo_root: Path::new("/repo"),
             config_dir: Path::new("/repo"),
             language_globs: &[],
         };
@@ -863,13 +883,13 @@ mod tests {
             .expect("discover")
             .expect("config present");
 
-        let matching_findings = scan_files(&pkg, &config, vec![matching], false)
+        let matching_findings = scan_files(&pkg, &pkg, &config, vec![matching], false)
             .expect("matching scan")
             .findings;
-        let ignored_findings = scan_files(&pkg, &config, vec![ignored], false)
+        let ignored_findings = scan_files(&pkg, &pkg, &config, vec![ignored], false)
             .expect("ignored scan")
             .findings;
-        let outside_findings = scan_files(&pkg, &config, vec![outside], false)
+        let outside_findings = scan_files(&pkg, &pkg, &config, vec![outside], false)
             .expect("outside scan")
             .findings;
 
@@ -877,6 +897,35 @@ mod tests {
         assert_eq!(matching_findings[0].relative_uri, "src/index.ts");
         assert!(ignored_findings.is_empty());
         assert!(outside_findings.is_empty());
+    }
+
+    #[test]
+    fn relative_uri_is_repo_root_relative_for_sub_package_scan() {
+        let temp = TempDir::new().expect("tempdir");
+        let root = temp.path();
+        let pkg = root.join("packages/app");
+        fs::create_dir_all(root.join("rules")).expect("rules");
+        fs::create_dir_all(pkg.join("src")).expect("pkg src");
+        fs::write(root.join("sgconfig.yml"), "ruleDirs:\n  - rules\n").expect("config");
+        fs::write(
+            root.join("rules/no-console-log.yml"),
+            "id: no-console-log\nlanguage: TypeScript\nseverity: error\nmessage: No console.log allowed\nrule:\n  pattern: console.log($$$)\n",
+        )
+        .expect("rule");
+        let source = pkg.join("src/index.ts");
+        fs::write(&source, "console.log('hi');\n").expect("source");
+
+        let config = discover_config(&pkg)
+            .expect("discover")
+            .expect("config present");
+
+        let findings = scan_files(&pkg, root, &config, vec![source], false)
+            .expect("scan")
+            .findings;
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].relative_uri, "packages/app/src/index.ts");
+        assert!(findings[0].relative_uri.starts_with("packages/app/"));
     }
 
     #[test]
@@ -900,6 +949,7 @@ mod tests {
         let collection = ast_grep_config::RuleCollection::try_new(rules).expect("rule collection");
         let context = ScanContext {
             cwd: temp.path(),
+            repo_root: temp.path(),
             config_dir: temp.path(),
             language_globs: &[],
         };
