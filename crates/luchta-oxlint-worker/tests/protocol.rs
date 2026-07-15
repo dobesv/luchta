@@ -20,7 +20,21 @@ fn resolve_line(resolve: ResolveTask) -> String {
 }
 
 fn run_worker(input: &str) -> (Vec<Value>, String) {
+    run_worker_full(input, None)
+}
+
+/// Runs the worker with the process cwd set to `repo_root`, mirroring the
+/// engine spawning workers with cwd = workspace root so diagnostic output
+/// paths are relative to `repo_root` rather than the test binary's own cwd.
+fn run_worker_in(repo_root: &Path, input: &str) -> (Vec<Value>, String) {
+    run_worker_full(input, Some(repo_root))
+}
+
+fn run_worker_full(input: &str, repo_root: Option<&Path>) -> (Vec<Value>, String) {
     let mut command = Command::cargo_bin("luchta-oxlint-worker").expect("binary path");
+    if let Some(repo_root) = repo_root {
+        command.current_dir(repo_root);
+    }
     let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -213,7 +227,7 @@ fn lint_violation_emits_log_report_and_done() {
                 .with_cwd(fixture.path().display().to_string())
         )
     );
-    let (output, _stderr) = run_worker(&input);
+    let (output, _stderr) = run_worker_in(fixture.path(), &input);
 
     assert!(output.iter().any(|value| {
         value["type"].as_str() == Some("log")
@@ -657,7 +671,7 @@ fn type_aware_lints_all_files_in_one_batch() {
                 .with_env(env_map([("OXLINT_OPTS", "--type-aware")]))
         )
     );
-    let (output, stderr) = run_worker(&input);
+    let (output, stderr) = run_worker_in(fixture.path(), &input);
     let tsgolint_unavailable = stderr
         .contains("type-aware linting requested but tsgolint unavailable")
         || output.iter().any(|value| {

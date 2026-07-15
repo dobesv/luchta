@@ -33,12 +33,14 @@ pub struct LintRunResult {
 
 pub async fn lint_files(
     cwd: &Path,
+    repo_root: &Path,
     store: ConfigStore,
     files: Vec<PathBuf>,
     opts: OxlintOpts,
 ) -> Result<LintRunResult, String> {
     let cwd = cwd.to_path_buf();
-    tokio::task::spawn_blocking(move || lint_files_blocking(cwd, store, files, opts))
+    let repo_root = repo_root.to_path_buf();
+    tokio::task::spawn_blocking(move || lint_files_blocking(cwd, repo_root, store, files, opts))
         .await
         .map_err(|error| format!("oxlint worker join error: {error}"))?
 }
@@ -62,6 +64,7 @@ pub fn initial_suppression_action(cwd: &Path, opts: &OxlintOpts) -> OxlintSuppre
 
 fn lint_files_blocking(
     cwd: PathBuf,
+    repo_root: PathBuf,
     store: ConfigStore,
     files: Vec<PathBuf>,
     opts: OxlintOpts,
@@ -118,7 +121,7 @@ fn lint_files_blocking(
     let mut findings: Vec<WrappedDiagnostic> = rx_error
         .try_iter()
         .flatten()
-        .map(|error| wrap_error(&error))
+        .map(|error| wrap_error(&error, &cwd, &repo_root))
         .collect();
     findings.sort_by(compare_findings);
 
@@ -133,7 +136,7 @@ fn lint_files_blocking(
     })
 }
 
-pub fn wrap_error(error: &Error) -> WrappedDiagnostic {
+pub fn wrap_error(error: &Error, cwd: &Path, repo_root: &Path) -> WrappedDiagnostic {
     let info = Info::new(error);
     let severity = error.severity().unwrap_or(info.severity);
     let diagnostic_message = if info.message.is_empty() {
@@ -148,7 +151,7 @@ pub fn wrap_error(error: &Error) -> WrappedDiagnostic {
         message: diagnostic_message,
         start_line: info.start.line.max(1),
         start_column: info.start.column.max(1),
-        relative_uri: info.filename.replace('\\', "/"),
+        relative_uri: luchta_worker::paths::repo_relative(&cwd.join(&info.filename), repo_root),
     }
 }
 
@@ -165,4 +168,49 @@ pub fn has_error(findings: &[WrappedDiagnostic]) -> bool {
     findings
         .iter()
         .any(|finding| matches!(finding.severity, Severity::Error))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use assert_fs::TempDir;
+
+    use crate::config::{collect_target_files, discover_config};
+    use crate::opts::OxlintOpts;
+
+    use super::lint_files_blocking;
+
+    #[test]
+    fn relative_uri_is_repo_root_relative_for_sub_package_scan() {
+        let temp = TempDir::new().expect("tempdir");
+        let root = temp.path();
+        let pkg = root.join("packages/app");
+        fs::create_dir_all(pkg.join("src")).expect("pkg src");
+        fs::write(
+            pkg.join(".oxlintrc.json"),
+            r#"{"rules":{"no-debugger":"error"}}"#,
+        )
+        .expect("config");
+        fs::write(pkg.join("src/index.js"), "debugger;\n").expect("source");
+
+        let loaded = discover_config(&pkg, None).expect("discover config");
+        let (files, warnings) =
+            collect_target_files(&pkg, &loaded.ignore_patterns, &loaded.ignore_base)
+                .expect("collect files");
+        assert!(warnings.is_empty(), "warnings: {warnings:?}");
+
+        let result = lint_files_blocking(
+            pkg.clone(),
+            root.to_path_buf(),
+            loaded.store,
+            files,
+            OxlintOpts::default(),
+        )
+        .expect("lint run");
+
+        assert_eq!(result.findings.len(), 1);
+        assert_eq!(result.findings[0].relative_uri, "packages/app/src/index.js");
+        assert!(result.findings[0].relative_uri.starts_with("packages/app/"));
+    }
 }
