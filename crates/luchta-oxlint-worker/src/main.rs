@@ -36,10 +36,6 @@ struct OxlintWorker;
 
 #[cfg(feature = "oxc")]
 impl Worker for OxlintWorker {
-    fn cache_nonce(&self) -> Option<String> {
-        Some(env!("CARGO_PKG_VERSION").to_owned())
-    }
-
     fn resolve_task(&self, req: &ResolveTask) -> ResolveResult {
         let inputs = default_inputs();
         let Some(cwd) = req.cwd.as_deref() else {

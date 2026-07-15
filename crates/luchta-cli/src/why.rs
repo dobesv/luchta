@@ -22,7 +22,7 @@ use miette::Result;
 use crate::cache_ctx::{
     build_current_state, gather_pkg_dep_pairs_filtered, load_lockfile_state, PackageDirResolver,
 };
-use crate::cache_nonce::CacheNonceScopes;
+use crate::cache_nonce::resolve_cache_nonce;
 use crate::env_merge::merge_env;
 use crate::format::package_and_task_display;
 use crate::run::{
@@ -363,7 +363,7 @@ fn print_live_decision(
     prior: &Option<luchta_cache::TaskRunRecord>,
     task_def: TaskDefinition,
 ) {
-    let nonce = resolve_task_nonce(task_id, &task_def, ctx.prepared);
+    let nonce = resolve_task_nonce(&task_def, ctx.prepared);
 
     let Some((package_path, package_name)) =
         get_package_context(task_id, &ctx.prepared.packages, ctx.workspace_root)
@@ -473,21 +473,23 @@ fn build_dep_outputs_from_cache(
         .collect()
 }
 
-fn resolve_task_nonce(
-    task_id: &TaskId,
-    task_def: &TaskDefinition,
-    prepared: &PreparedWorkspace,
-) -> Option<String> {
+fn resolve_task_nonce(task_def: &TaskDefinition, prepared: &PreparedWorkspace) -> Option<String> {
     let env_nonce = std::env::var("LUCHTA_CACHE_NONCE").ok();
+    let global_nonce = prepared.global_cache_nonce.as_deref();
+    // Worker nonce: sparse lookup — missing worker or dangling ref yields None
+    let worker_nonce = task_def
+        .worker
+        .as_deref()
+        .and_then(|w| prepared.workers.get(w))
+        .and_then(|wd| wd.cache.as_ref())
+        .and_then(|c| c.cache_nonce.as_deref());
+    // Task nonce
+    let task_nonce = task_def
+        .cache
+        .as_ref()
+        .and_then(|c| c.cache_nonce.as_deref());
 
-    CacheNonceScopes::for_task(
-        env_nonce.as_deref(),
-        prepared.global_cache_nonce.as_deref(),
-        task_def,
-        &prepared.workers,
-        prepared.task_graph.worker_nonce(task_id),
-    )
-    .resolve()
+    resolve_cache_nonce(env_nonce.as_deref(), global_nonce, worker_nonce, task_nonce)
 }
 
 fn get_package_context(

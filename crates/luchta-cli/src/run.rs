@@ -393,15 +393,21 @@ struct DecisionContext {
 }
 
 impl DecisionContext {
-    fn resolve_task_nonce(&self, task_id: &TaskId, task_def: &TaskDefinition) -> Option<String> {
-        crate::cache_nonce::CacheNonceScopes::for_task(
-            self.env_cache_nonce.as_deref(),
-            self.global_cache_nonce.as_deref(),
-            task_def,
-            &self.workers,
-            self.task_graph.worker_nonce(task_id),
-        )
-        .resolve()
+    fn resolve_task_nonce(&self, task_def: &TaskDefinition) -> Option<String> {
+        let env_nonce = self.env_cache_nonce.as_deref();
+        let global_nonce = self.global_cache_nonce.as_deref();
+        let worker_nonce = task_def
+            .worker
+            .as_deref()
+            .and_then(|w| self.workers.get(w))
+            .and_then(|wd| wd.cache.as_ref())
+            .and_then(|c| c.cache_nonce.as_deref());
+        let task_nonce = task_def
+            .cache
+            .as_ref()
+            .and_then(|c| c.cache_nonce.as_deref());
+
+        crate::cache_nonce::resolve_cache_nonce(env_nonce, global_nonce, worker_nonce, task_nonce)
     }
 }
 

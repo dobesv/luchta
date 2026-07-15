@@ -67,7 +67,11 @@ fn lint_files_blocking(
     opts: OxlintOpts,
 ) -> Result<LintRunResult, String> {
     let (type_aware, type_check) = type_aware_flags(&store, &opts);
-    let fix_kind = FixKind::None;
+    let fix_kind = if opts.fix {
+        FixKind::SafeFix
+    } else {
+        FixKind::None
+    };
     let tsgolint_available = TsGoLintState::try_new(&cwd, store.clone(), fix_kind).is_ok();
     let effective_type_aware = type_aware && tsgolint_available;
 

@@ -24,12 +24,6 @@ pub fn format_path(
     options: &JsFormatOptions,
 ) -> Result<FormatResult, String> {
     let allocator = Allocator::default();
-    let source_type = SourceType::from_path(path).map_err(|error| {
-        format!(
-            "failed to determine source type for {}: {error}",
-            path.display()
-        )
-    })?;
     let css_options = css_format_options(options);
     let dispatcher: FormatDispatcher = Arc::new(move |ctx, language, texts, _parent| {
         let css_options = match language {
@@ -51,6 +45,12 @@ pub fn format_path(
         })
     });
     let callbacks = ExternalCallbacks::new().with_dispatcher(Some(dispatcher));
+    let source_type = SourceType::from_path(path).map_err(|error| {
+        format!(
+            "failed to determine source type for {}: {error}",
+            path.display()
+        )
+    })?;
     let formatted: String = format(
         &allocator,
         source,
@@ -123,9 +123,6 @@ mod tests {
     fn format_path_matches_oxfmt_cli_for_multiline_arrow_interpolation() {
         let path = Path::new("src/example.tsx");
         let input = "const Button = styled.button`color:red;${({ theme }) => css`display:flex;align-items:center;justify-content:space-between;`};padding:8px;`;\n";
-        // Golden verified byte-for-byte against the authoritative `oxfmt` 0.58.0 CLI
-        // (installed from npm: `oxfmt` + `@oxfmt/binding-linux-x64-gnu`, run on this exact
-        // input). The worker output equals the CLI output.
         let expected = "const Button = styled.button`\n  color: red;\n  ${({ theme }) =>\n    css`\n      display: flex;\n      align-items: center;\n      justify-content: space-between;\n    `}; padding: 8px;\n`;\n";
 
         let result = format_path(path, input, &JsFormatOptions::new()).expect("format ok");
@@ -137,9 +134,6 @@ mod tests {
     fn format_path_matches_oxfmt_cli_for_binary_expression_interpolation() {
         let path = Path::new("src/example.tsx");
         let input = "const Card = styled.div`${foo+bar+baz?'display:grid;grid-template-columns:1fr auto;':'display:block;'}\nmargin:0 auto;`;\n";
-        // Golden verified byte-for-byte against the authoritative `oxfmt` 0.58.0 CLI
-        // (installed from npm: `oxfmt` + `@oxfmt/binding-linux-x64-gnu`, run on this exact
-        // input). The worker output equals the CLI output.
         let expected = "const Card = styled.div`\n  ${foo + bar + baz ? \"display:grid;grid-template-columns:1fr auto;\" : \"display:block;\"}\n  margin: 0 auto;\n`;\n";
 
         let result = format_path(path, input, &JsFormatOptions::new()).expect("format ok");
@@ -156,10 +150,6 @@ mod tests {
 
     #[test]
     fn format_path_propagates_non_default_options_into_embedded_css() {
-        // Golden verified byte-for-byte against the authoritative `oxfmt` 0.58.0 CLI
-        // run with `{ "useTabs": true, "singleQuote": true }` on this exact input.
-        // Confirms indent_style (tabs) and single_quote propagate into the embedded
-        // CSS: property lines are tab-indented and `url("x.png")` becomes `url('x.png')`.
         let path = Path::new("src/example.tsx");
         let input = "const Box = styled.div`color:red;background:url(\"x.png\");${foo}`;\n";
         let expected =

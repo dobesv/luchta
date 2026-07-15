@@ -159,70 +159,19 @@ pub struct WorkerDoneFields<'a> {
     pub json_fragment: Option<&'a str>,
 }
 
-pub struct ShellWorkerResolve<'a> {
-    pub cache_nonce: Option<&'a str>,
-}
-
-impl ShellWorkerResolve<'_> {
-    fn resolved_json(&self) -> String {
-        let mut resolved = serde_json::json!({ "decision": "accept" });
-        if let Some(cache_nonce) = self.cache_nonce {
-            resolved["cacheNonce"] = serde_json::Value::String(cache_nonce.to_owned());
-        }
-        resolved.to_string()
-    }
-}
-
 /// Create a shell worker script that handles resolveTask and run messages.
 pub fn shell_worker(temp: &assert_fs::TempDir) -> assert_fs::fixture::ChildPath {
-    shell_worker_with_resolve(temp, ShellWorkerResolve { cache_nonce: None })
-}
-
-/// Create a shell worker script whose resolveTask response includes `cache_nonce`.
-pub fn shell_worker_with_cache_nonce(
-    temp: &assert_fs::TempDir,
-    cache_nonce: &str,
-) -> assert_fs::fixture::ChildPath {
-    shell_worker_with_resolve(
+    shell_worker_with_done_fields(
         temp,
-        ShellWorkerResolve {
-            cache_nonce: Some(cache_nonce),
-        },
-    )
-}
-
-fn shell_worker_with_resolve(
-    temp: &assert_fs::TempDir,
-    resolve: ShellWorkerResolve<'_>,
-) -> assert_fs::fixture::ChildPath {
-    let resolved_json = resolve.resolved_json();
-    shell_worker_with_resolved_json(temp, &resolved_json)
-}
-
-/// Create a shell worker script with optional extra done fields.
-pub fn shell_worker_with_done_fields(
-    temp: &assert_fs::TempDir,
-    done_fields: WorkerDoneFields<'_>,
-) -> assert_fs::fixture::ChildPath {
-    shell_worker_with_resolved_json_and_done_fields(temp, r#"{"decision":"accept"}"#, done_fields)
-}
-
-fn shell_worker_with_resolved_json(
-    temp: &assert_fs::TempDir,
-    resolved_json: &str,
-) -> assert_fs::fixture::ChildPath {
-    shell_worker_with_resolved_json_and_done_fields(
-        temp,
-        resolved_json,
         WorkerDoneFields {
             json_fragment: None,
         },
     )
 }
 
-fn shell_worker_with_resolved_json_and_done_fields(
+/// Create a shell worker script with optional extra done fields.
+pub fn shell_worker_with_done_fields(
     temp: &assert_fs::TempDir,
-    resolved_json: &str,
     done_fields: WorkerDoneFields<'_>,
 ) -> assert_fs::fixture::ChildPath {
     let script = temp.child("shell-worker.sh");
@@ -234,7 +183,7 @@ while IFS= read -r line; do
   id=$(printf '%s\n' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
   case "$line" in
     *'"type":"resolveTask"'*)
-      printf '{{"type":"resolved","id":"%s","result":{}}}\n' "$id"
+      printf '{{"type":"resolved","id":"%s","result":{{"decision":"accept"}}}}\n' "$id"
       ;;
     *'"type":"run"'*)
       cmd=$(printf '%s\n' "$line" | sed -n 's/.*"command":"\([^"]*\)".*/\1/p' | sed 's/\\"/"/g; s/\\\\/\\/g')
@@ -246,7 +195,7 @@ while IFS= read -r line; do
   esac
 done
 "#,
-            resolved_json, done_fields
+            done_fields
         ))
         .unwrap();
     set_executable(script.path());
