@@ -584,7 +584,7 @@ impl TaskGraph {
         }
 
         package_graph
-            .dependencies_of(&source_task_id.package)
+            .dependencies_of(upstream_source_package(package_graph, source_task_id))
             .map(|dependencies| {
                 dependencies
                     .into_iter()
@@ -604,13 +604,16 @@ impl TaskGraph {
             return false;
         }
 
-        transitive_upstream_packages(package_graph, &source_task_id.package)
-            .map(|packages| {
-                packages
-                    .into_iter()
-                    .any(|package_name| package_name == dependency_task_id.package)
-            })
-            .unwrap_or(false)
+        transitive_upstream_packages(
+            package_graph,
+            upstream_source_package(package_graph, source_task_id),
+        )
+        .map(|packages| {
+            packages
+                .into_iter()
+                .any(|package_name| package_name == dependency_task_id.package)
+        })
+        .unwrap_or(false)
     }
 
     fn validate_acyclic(&self) -> Result<(), EngineError> {
@@ -1032,11 +1035,6 @@ pub(crate) fn transitive_upstream_packages(
     package_graph: &PackageGraph,
     package_name: &PackageName,
 ) -> Result<Vec<PackageName>, EngineError> {
-    // Root package has no upstream dependencies
-    if package_name.is_root() {
-        return Ok(Vec::new());
-    }
-
     let mut visited = HashSet::new();
     let mut queue = VecDeque::new();
 
@@ -1061,6 +1059,19 @@ fn enqueue_unvisited_dependencies(
         }
     }
     Ok(())
+}
+
+fn upstream_source_package<'a>(
+    package_graph: &'a PackageGraph,
+    source_task_id: &'a TaskId,
+) -> &'a PackageName {
+    if source_task_id.package.is_root() {
+        package_graph
+            .root_package()
+            .unwrap_or(&source_task_id.package)
+    } else {
+        &source_task_id.package
+    }
 }
 
 fn parse_pipeline_entries(
@@ -1499,6 +1510,65 @@ mod tests {
             &task_graph,
             TaskId::new("@repo/app", "build"),
             root_task_id(TaskName::from("prepare"))
+        ));
+    }
+
+    #[test]
+    fn root_task_direct_upstream_dependency_uses_real_root_package_dependencies() {
+        let package_graph = package_graph_with_root(
+            "repo",
+            &["@repo/app"],
+            &[("@repo/app", &["@repo/lib"]), ("@repo/lib", &[])],
+        );
+        let pipeline = HashMap::from([
+            (
+                TaskName::from("#build-root"),
+                TaskDefinition {
+                    depends_on: vec![DependsOn::DirectUpstream(TaskName::from("build"))],
+                    ..TaskDefinition::default()
+                },
+            ),
+            (TaskName::from("build"), TaskDefinition::default()),
+        ]);
+
+        let task_graph = TaskGraph::build(&package_graph, &pipeline).expect("build task graph");
+
+        assert!(has_edge(
+            &task_graph,
+            root_task_id(TaskName::from("build-root")),
+            TaskId::new("@repo/app", "build")
+        ));
+    }
+
+    #[test]
+    fn root_task_transitive_upstream_dependency_uses_real_root_package_dependencies() {
+        let package_graph = package_graph_with_root(
+            "repo",
+            &["@repo/app"],
+            &[("@repo/app", &["@repo/lib"]), ("@repo/lib", &[])],
+        );
+        let pipeline = HashMap::from([
+            (
+                TaskName::from("#build-root"),
+                TaskDefinition {
+                    depends_on: vec![DependsOn::TransitiveUpstream(TaskName::from("build"))],
+                    ..TaskDefinition::default()
+                },
+            ),
+            (TaskName::from("build"), TaskDefinition::default()),
+        ]);
+
+        let task_graph = TaskGraph::build(&package_graph, &pipeline).expect("build task graph");
+
+        assert!(has_edge(
+            &task_graph,
+            root_task_id(TaskName::from("build-root")),
+            TaskId::new("@repo/app", "build")
+        ));
+        assert!(has_edge(
+            &task_graph,
+            root_task_id(TaskName::from("build-root")),
+            TaskId::new("@repo/lib", "build")
         ));
     }
 
@@ -2161,6 +2231,39 @@ mod tests {
             name,
         )])
         .expect("build package graph")
+    }
+
+    fn package_graph_with_root(
+        root_name: &str,
+        root_dependencies: &[&str],
+        packages: &[(&str, &[&str])],
+    ) -> PackageGraph {
+        let temp_dir = tempdir().expect("create temp dir");
+        write_package(
+            temp_dir.path().join("package.json"),
+            PackageManifest {
+                name: root_name,
+                dependencies: root_dependencies,
+            },
+        );
+
+        let mut nodes = vec![package_node(temp_dir.path(), root_name)];
+
+        for (name, dependencies) in packages {
+            let package_dir = temp_dir
+                .path()
+                .join("packages")
+                .join(name.rsplit('/').next().expect("package segment"));
+            write_package(
+                package_dir.join("package.json"),
+                PackageManifest { name, dependencies },
+            );
+            nodes.push(package_node(package_dir, name));
+        }
+
+        PackageGraph::build(nodes)
+            .expect("build package graph")
+            .with_root_package(PackageName::from(root_name))
     }
 
     fn package_node(path: impl AsRef<Path>, name: &str) -> PackageNode {
