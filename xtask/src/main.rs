@@ -489,6 +489,7 @@ fn crate_dir(manifest_path: &Path) -> Option<PathBuf> {
 fn cargo_install(crate_dir: &Path) -> Result<(), String> {
     let status = Command::new(cargo_bin())
         .arg("install")
+        .arg("--locked")
         .arg("--path")
         .arg(crate_dir)
         .stdout(Stdio::inherit())
