@@ -452,6 +452,68 @@ fn suppress_all_writes_expected_file_and_clean_run_skips_sarif() {
 }
 
 #[test]
+fn suppress_all_with_clean_run_removes_empty_suppressions_file() {
+    let fixture = tempdir().expect("tempdir");
+    write_file(
+        fixture.path().join("package.json"),
+        r#"{"name":"fixture","scripts":{"lint":"oxlint"}}"#,
+    );
+    write_file(
+        fixture.path().join(".oxlintrc.json"),
+        r#"{"rules":{"no-debugger":"error"}}"#,
+    );
+    write_file(fixture.path().join("src/index.js"), "console.log('ok');\n");
+
+    let input = format!(
+        "{}\n",
+        run_line(
+            WorkerRequest::new("job-clean-suppress-all", "lint")
+                .with_cwd(fixture.path().display().to_string())
+                .with_env(env_map([("OXLINT_OPTS", "--suppress-all")]))
+        )
+    );
+    let (output, _stderr) = run_worker(&input);
+
+    assert!(output.iter().any(|value| {
+        value["type"].as_str() == Some("done")
+            && value["id"].as_str() == Some("job-clean-suppress-all")
+            && value["exitCode"].as_i64() == Some(0)
+    }));
+    assert!(!fixture.path().join("oxlint-suppressions.json").exists());
+}
+
+#[test]
+fn clean_run_removes_preexisting_empty_suppressions_file() {
+    let fixture = tempdir().expect("tempdir");
+    write_file(
+        fixture.path().join("package.json"),
+        r#"{"name":"fixture","scripts":{"lint":"oxlint"}}"#,
+    );
+    write_file(
+        fixture.path().join(".oxlintrc.json"),
+        r#"{"rules":{"no-debugger":"error"}}"#,
+    );
+    write_file(fixture.path().join("src/index.js"), "console.log('ok');\n");
+    write_file(fixture.path().join("oxlint-suppressions.json"), "{\n}\n");
+
+    let input = format!(
+        "{}\n",
+        run_line(
+            WorkerRequest::new("job-clean-remove-empty", "lint")
+                .with_cwd(fixture.path().display().to_string())
+        )
+    );
+    let (output, _stderr) = run_worker(&input);
+
+    assert!(output.iter().any(|value| {
+        value["type"].as_str() == Some("done")
+            && value["id"].as_str() == Some("job-clean-remove-empty")
+            && value["exitCode"].as_i64() == Some(0)
+    }));
+    assert!(!fixture.path().join("oxlint-suppressions.json").exists());
+}
+
+#[test]
 fn stale_suppression_reports_unused_and_exits_nonzero() {
     let fixture = tempdir().expect("tempdir");
     write_file(

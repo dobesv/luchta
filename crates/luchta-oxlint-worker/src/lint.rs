@@ -12,7 +12,7 @@ use oxc_linter::{
 };
 
 use crate::opts::OxlintOpts;
-use crate::suppressions::{FinalizeResult, SUPPRESSIONS_FILENAME};
+use crate::suppressions::{remove_empty_suppressions_file, FinalizeResult, SUPPRESSIONS_FILENAME};
 
 #[derive(Clone, Debug)]
 pub struct WrappedDiagnostic {
@@ -116,6 +116,9 @@ fn lint_files_blocking(
     manager
         .finalize(diff, &tx_error, &cwd)
         .map_err(|error| error.to_string())?;
+    let suppressions_path = cwd.join(SUPPRESSIONS_FILENAME);
+    let file_action =
+        remove_empty_suppressions_file(&suppressions_path, manager.file_action.clone())?;
     drop(tx_error);
 
     let mut findings: Vec<WrappedDiagnostic> = rx_error
@@ -128,9 +131,9 @@ fn lint_files_blocking(
     Ok(LintRunResult {
         findings,
         finalize: FinalizeResult {
-            action: manager.file_action.clone(),
+            action: file_action,
             diagnostics: Vec::new(),
-            suppressions_path: cwd.join(SUPPRESSIONS_FILENAME),
+            suppressions_path,
         },
         warnings,
     })
