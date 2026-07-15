@@ -255,6 +255,69 @@ fn lint_violation_emits_log_report_and_done() {
     }));
 }
 
+/// Guards the wiring in `main.rs` that computes `repo_root` from the worker
+/// process's own cwd (mirroring the engine spawning workers with cwd =
+/// workspace root) and threads it into `lint_files` separately from
+/// `req.cwd`. If a future change reverted `main.rs` to pass `&cwd` (the
+/// request cwd) instead of `&repo_root`, the emitted paths would regress to
+/// the package-relative `src/index.js` instead of the repo-root-relative
+/// `packages/app/src/index.js`, and this test would catch it.
+#[test]
+fn lint_violation_emits_repo_root_relative_path_for_sub_package_cwd() {
+    let fixture = tempdir().expect("tempdir");
+    let repo_root = fixture.path();
+    let package_cwd = repo_root.join("packages/app");
+    write_file(
+        package_cwd.join("package.json"),
+        r#"{"name":"app","scripts":{"lint":"oxlint"}}"#,
+    );
+    write_file(
+        package_cwd.join(".oxlintrc.json"),
+        r#"{"rules":{"no-debugger":"error"}}"#,
+    );
+    write_file(package_cwd.join("src/index.js"), "debugger;\n");
+
+    let input = format!(
+        "{}\n",
+        run_line(
+            WorkerRequest::new("job-sub-package", "lint")
+                .with_cwd(package_cwd.display().to_string())
+        )
+    );
+    let (output, _stderr) = run_worker_in(repo_root, &input);
+
+    assert!(
+        output.iter().any(|value| {
+            value["type"].as_str() == Some("log")
+                && value["id"].as_str() == Some("job-sub-package")
+                && value["line"].as_str().is_some_and(|msg| {
+                    msg.contains("packages/app/src/index.js:1:1: error [eslint(no-debugger)]")
+                })
+        }),
+        "expected repo-root-relative log line, got: {output:?}"
+    );
+
+    let report = output
+        .iter()
+        .find(|value| value["type"].as_str() == Some("report"))
+        .expect("sarif report present");
+    let report_body = report["content"].as_str().expect("sarif content str");
+    assert!(
+        report_body.contains("\"uri\": \"packages/app/src/index.js\""),
+        "expected package-prefixed uri, got: {report_body}"
+    );
+    assert!(
+        !report_body.contains("\"uri\": \"src/index.js\""),
+        "uri regressed to package-relative path: {report_body}"
+    );
+
+    assert!(output.iter().any(|value| {
+        value["type"].as_str() == Some("done")
+            && value["id"].as_str() == Some("job-sub-package")
+            && value["exitCode"].as_i64() == Some(1)
+    }));
+}
+
 #[test]
 fn config_option_selects_explicit_config_file() {
     let fixture = tempdir().expect("tempdir");
