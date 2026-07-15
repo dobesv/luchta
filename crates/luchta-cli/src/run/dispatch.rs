@@ -569,7 +569,7 @@ fn build_cache_write_context(task_id: &TaskId, ctx: &DecisionContext) -> CacheIn
     };
 
     // Resolve nonce using the same helper as the read path.
-    let nonce = ctx.resolve_task_nonce(task_id, &task_def);
+    let nonce = ctx.resolve_task_nonce(&task_def);
     let Some(cache_context) = cache_state_context(task_id, ctx) else {
         return CacheInputState::Disabled;
     };
@@ -1082,7 +1082,7 @@ pub(super) fn try_cache_skip(task_id: &TaskId, ctx: &DecisionContext) -> Option<
     let task_def = ctx.task_graph.task_definition(task_id)?;
 
     // Resolve nonce using the same helper as the write path.
-    let nonce = ctx.resolve_task_nonce(task_id, task_def);
+    let nonce = ctx.resolve_task_nonce(task_def);
 
     let mut cache_ctx = match build_cache_write_context(task_id, ctx) {
         CacheInputState::Ready(cache_ctx) => *cache_ctx,

@@ -19,10 +19,6 @@ pub trait Worker: Send + Sync + 'static {
     fn resolve_task(&self, req: &ResolveTask) -> ResolveResult;
     fn build_command(&self, req: &WorkerRequest) -> String;
 
-    fn cache_nonce(&self) -> Option<String> {
-        None
-    }
-
     fn run_in_process(
         &self,
         _req: &WorkerRequest,
@@ -173,8 +169,7 @@ fn spawn_resolve<W: Worker>(
     let writer = Arc::clone(writer);
     jobs.spawn(async move {
         let id = resolve.id.clone();
-        let mut result = worker.resolve_task(&resolve);
-        result.cache_nonce = worker.cache_nonce();
+        let result = worker.resolve_task(&resolve);
         if let Err(error) = write_response(&writer, &WorkerResponse::resolved(id, result)).await {
             if !error.is_pipe_shutdown() {
                 eprintln!("resolve failed: {error}");
@@ -361,7 +356,6 @@ mod tests {
     struct TestWorker {
         command: String,
         resolve_result: ResolveResult,
-        cache_nonce: Option<String>,
         build_calls: Arc<AtomicUsize>,
         in_process: Option<InProcessBehavior>,
     }
@@ -377,15 +371,9 @@ mod tests {
             Self {
                 command: command.into(),
                 resolve_result: ResolveResult::accept(),
-                cache_nonce: None,
                 build_calls: Arc::new(AtomicUsize::new(0)),
                 in_process: None,
             }
-        }
-
-        fn with_cache_nonce(mut self, cache_nonce: impl Into<String>) -> Self {
-            self.cache_nonce = Some(cache_nonce.into());
-            self
         }
 
         fn with_in_process(mut self, behavior: InProcessBehavior) -> Self {
@@ -402,10 +390,6 @@ mod tests {
         fn build_command(&self, _req: &WorkerRequest) -> String {
             self.build_calls.fetch_add(1, Ordering::SeqCst);
             self.command.clone()
-        }
-
-        fn cache_nonce(&self) -> Option<String> {
-            self.cache_nonce.clone()
         }
 
         fn run_in_process(
@@ -479,69 +463,6 @@ mod tests {
                 WorkerResponse::log("job-1", LogStream::Stdout, "alpha"),
                 WorkerResponse::log("job-1", LogStream::Stderr, "beta"),
             ]
-        );
-    }
-
-    #[tokio::test]
-    async fn spawn_resolve_injects_worker_cache_nonce() {
-        let resolve = ResolveTask {
-            id: "pkg#build".to_owned(),
-            name: "build".to_owned(),
-            command: String::new(),
-            package: "pkg".to_owned(),
-            cwd: None,
-            scripts: Vec::new(),
-            inputs: Vec::new(),
-            mode: crate::ResolveMode::Run,
-        };
-
-        let (writer, reader) = writer_pair();
-        let mut jobs = JoinSet::new();
-        spawn_resolve(
-            resolve.clone(),
-            Arc::new(TestWorker::new("echo ignored").with_cache_nonce("v-test")),
-            &writer,
-            &mut jobs,
-        );
-        jobs.join_next()
-            .await
-            .expect("job runs")
-            .expect("job succeeds");
-        drop(writer);
-
-        let responses = read_responses(reader).await;
-        assert_eq!(
-            responses,
-            vec![WorkerResponse::resolved(
-                "pkg#build",
-                ResolveResult {
-                    decision: super::super::ResolveDecision::Accept,
-                    cache_nonce: Some("v-test".to_owned()),
-                },
-            )]
-        );
-
-        let (writer, reader) = writer_pair();
-        let mut jobs = JoinSet::new();
-        spawn_resolve(
-            resolve,
-            Arc::new(TestWorker::new("echo ignored")),
-            &writer,
-            &mut jobs,
-        );
-        jobs.join_next()
-            .await
-            .expect("job runs")
-            .expect("job succeeds");
-        drop(writer);
-
-        let responses = read_responses(reader).await;
-        assert_eq!(
-            responses,
-            vec![WorkerResponse::resolved(
-                "pkg#build",
-                ResolveResult::accept(),
-            )]
         );
     }
 

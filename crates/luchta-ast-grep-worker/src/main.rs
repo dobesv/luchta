@@ -6,21 +6,38 @@ use std::path::Path;
 
 use ast_grep_config::Severity;
 use luchta_worker::{
-    run_worker_main, version_requested, InProcessOutcome, JobContext, ResolveResult, ResolveTask,
-    TaskModification, Worker, WorkerRequest,
+    run_worker_main, tokenize::tokenize_command, version_requested, InProcessOutcome, JobContext,
+    ResolveResult, ResolveTask, TaskModification, Worker, WorkerRequest,
 };
 
 use crate::config::{collect_source_files, discover_config, DiscoveredConfig};
 use crate::lint::scan_files_async;
 use crate::sarif::build_sarif;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct AstGrepOpts {
+    fix: bool,
+}
+
+impl AstGrepOpts {
+    fn from_request(req: &WorkerRequest) -> Self {
+        let mut tokens = tokenize_command(&req.command);
+        if let Some(raw) = req.env.get("AST_GREP_OPTS") {
+            tokens.extend(tokenize_command(raw));
+        }
+        Self::parse_tokens(&tokens)
+    }
+
+    fn parse_tokens(tokens: &[String]) -> Self {
+        Self {
+            fix: tokens.iter().any(|token| token == "--fix"),
+        }
+    }
+}
+
 struct AstGrepWorker;
 
 impl Worker for AstGrepWorker {
-    fn cache_nonce(&self) -> Option<String> {
-        Some(env!("CARGO_PKG_VERSION").to_owned())
-    }
-
     fn resolve_task(&self, req: &ResolveTask) -> ResolveResult {
         let Some(cwd) = req.cwd.as_deref() else {
             return ResolveResult::reject("ast-grep worker requires cwd");
@@ -69,123 +86,27 @@ impl Worker for AstGrepWorker {
                 };
             };
 
-            let cwd = Path::new(cwd);
-            let config = match discover_config(cwd) {
-                Ok(Some(config)) => config,
-                Ok(None) => {
-                    let _ = ctx
-                        .emit_stderr("no sgconfig.yml found; skipping ast-grep".to_owned())
-                        .await;
-                    return InProcessOutcome::Done {
-                        exit_code: 0,
-                        outputs: None,
-                    };
-                }
-                Err(error) => {
-                    let _ = ctx.emit_stderr(error).await;
-                    return InProcessOutcome::Done {
-                        exit_code: 1,
-                        outputs: None,
-                    };
-                }
+            let run = match prepare_run(Path::new(cwd), req) {
+                Ok(run) => run,
+                Err(failure) => return failure.into_outcome(ctx).await,
             };
 
-            if config.rule_files.is_empty() {
-                if let Err(error) = ctx
-                    .emit_stderr(
-                        "sgconfig.yml found but no rule files; skipping ast-grep".to_owned(),
-                    )
-                    .await
-                {
-                    let _ = ctx
-                        .emit_stderr(format!("failed to emit ast-grep log: {error}"))
-                        .await;
-                    return InProcessOutcome::Done {
-                        exit_code: 1,
-                        outputs: None,
-                    };
-                }
-                return InProcessOutcome::Done {
-                    exit_code: 0,
-                    outputs: None,
-                };
+            if let Err(outcome) = emit_warnings(ctx, &run.config.warnings).await {
+                return outcome;
             }
-
-            for warning in &config.warnings {
+            for warning in &run.config.warnings {
                 eprintln!("{warning}");
-                if let Err(error) = ctx.emit_stderr(warning.clone()).await {
-                    let _ = ctx
-                        .emit_stderr(format!("failed to emit ast-grep warning: {error}"))
-                        .await;
-                    return InProcessOutcome::Done {
-                        exit_code: 1,
-                        outputs: None,
-                    };
-                }
             }
-
-            let files = match collect_source_files(cwd, &config.config_dir, &config.language_globs)
-            {
-                Ok(files) => files,
-                Err(error) => {
-                    let _ = ctx.emit_stderr(error).await;
-                    return InProcessOutcome::Done {
-                        exit_code: 1,
-                        outputs: None,
-                    };
-                }
-            };
-            if files.is_empty() {
+            if run.files.is_empty() {
                 return InProcessOutcome::Done {
                     exit_code: 0,
                     outputs: None,
                 };
             }
 
-            let findings = match scan_files_async(cwd, &config, files).await {
-                Ok(findings) => findings,
-                Err(error) => {
-                    let _ = ctx.emit_stderr(error).await;
-                    return InProcessOutcome::Done {
-                        exit_code: 1,
-                        outputs: None,
-                    };
-                }
-            };
-
-            let visible_findings = findings
-                .into_iter()
-                .filter(|finding| !matches!(finding.severity, Severity::Off))
-                .collect::<Vec<_>>();
-
-            for finding in &visible_findings {
-                let line = format!(
-                    "{}:{}:{}: {} [{}] {}",
-                    finding.relative_uri,
-                    finding.start_line,
-                    finding.start_column,
-                    severity_label(&finding.severity),
-                    if finding.rule_id.is_empty() {
-                        "ast-grep-rule"
-                    } else {
-                        &finding.rule_id
-                    },
-                    finding.message
-                );
-                if let Err(error) = ctx.emit_stdout(line).await {
-                    let _ = ctx
-                        .emit_stderr(format!("failed to emit ast-grep log: {error}"))
-                        .await;
-                    return InProcessOutcome::Done {
-                        exit_code: 1,
-                        outputs: None,
-                    };
-                }
-            }
-
-            if !visible_findings.is_empty() {
-                let sarif = match build_sarif(&visible_findings) {
-                    Ok(sarif) => sarif,
+            let scan_result =
+                match scan_files_async(&run.cwd, &run.config, run.files, run.opts.fix).await {
+                    Ok(findings) => findings,
                     Err(error) => {
                         let _ = ctx.emit_stderr(error).await;
                         return InProcessOutcome::Done {
@@ -194,18 +115,19 @@ impl Worker for AstGrepWorker {
                         };
                     }
                 };
-                if let Err(error) = ctx
-                    .emit_report("ast-grep.sarif", "application/sarif+json", sarif)
-                    .await
-                {
-                    let _ = ctx
-                        .emit_stderr(format!("failed to emit ast-grep SARIF report: {error}"))
-                        .await;
-                    return InProcessOutcome::Done {
-                        exit_code: 1,
-                        outputs: None,
-                    };
-                }
+
+            if let Err(outcome) = emit_warnings(ctx, &scan_result.warnings).await {
+                return outcome;
+            }
+            if let Err(outcome) = emit_fixed_files(ctx, &scan_result.fixed_files).await {
+                return outcome;
+            }
+            let visible_findings = visible_findings(scan_result.findings);
+            if let Err(outcome) = emit_findings(ctx, &visible_findings).await {
+                return outcome;
+            }
+            if let Err(outcome) = emit_sarif_if_needed(ctx, &visible_findings).await {
+                return outcome;
             }
 
             InProcessOutcome::Done {
@@ -213,6 +135,156 @@ impl Worker for AstGrepWorker {
                 outputs: None,
             }
         }
+    }
+}
+
+struct PreparedRun {
+    cwd: std::path::PathBuf,
+    opts: AstGrepOpts,
+    config: DiscoveredConfig,
+    files: Vec<std::path::PathBuf>,
+}
+
+fn prepare_run(cwd: &Path, req: &WorkerRequest) -> Result<PreparedRun, PrepareFailure> {
+    let opts = AstGrepOpts::from_request(req);
+    let config = match discover_config(cwd) {
+        Ok(Some(config)) => config,
+        Ok(None) => {
+            return Err(PrepareFailure::new(
+                0,
+                "no sgconfig.yml found; skipping ast-grep".to_owned(),
+            ));
+        }
+        Err(error) => return Err(PrepareFailure::new(1, error)),
+    };
+    if config.rule_files.is_empty() {
+        return Err(PrepareFailure::new(
+            0,
+            "sgconfig.yml found but no rule files; skipping ast-grep".to_owned(),
+        ));
+    }
+    let files = match collect_source_files(cwd, &config.config_dir, &config.language_globs) {
+        Ok(files) => files,
+        Err(error) => return Err(PrepareFailure::new(1, error)),
+    };
+
+    Ok(PreparedRun {
+        cwd: cwd.to_path_buf(),
+        opts,
+        config,
+        files,
+    })
+}
+
+/// A `prepare_run` failure carrying the diagnostic to surface on stderr before
+/// the worker completes.
+struct PrepareFailure {
+    exit_code: i32,
+    line: String,
+}
+
+impl PrepareFailure {
+    fn new(exit_code: i32, line: String) -> Self {
+        Self { exit_code, line }
+    }
+
+    async fn into_outcome(self, ctx: &JobContext) -> InProcessOutcome {
+        let _ = ctx.emit_stderr(self.line).await;
+        InProcessOutcome::Done {
+            exit_code: self.exit_code,
+            outputs: None,
+        }
+    }
+}
+
+async fn emit_warnings(ctx: &JobContext, warnings: &[String]) -> Result<(), InProcessOutcome> {
+    for warning in warnings {
+        if let Err(error) = ctx.emit_stderr(warning.clone()).await {
+            return Err(
+                emit_failure(ctx, format!("failed to emit ast-grep warning: {error}")).await,
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn emit_fixed_files(
+    ctx: &JobContext,
+    fixed_files: &[String],
+) -> Result<(), InProcessOutcome> {
+    for fixed_file in fixed_files {
+        if let Err(error) = ctx.emit_stdout(format!("fixed: {fixed_file}")).await {
+            return Err(emit_failure(ctx, format!("failed to emit ast-grep log: {error}")).await);
+        }
+    }
+    Ok(())
+}
+
+fn visible_findings(findings: Vec<crate::lint::Finding>) -> Vec<crate::lint::Finding> {
+    findings
+        .into_iter()
+        .filter(|finding| !matches!(finding.severity, Severity::Off))
+        .collect()
+}
+
+async fn emit_findings(
+    ctx: &JobContext,
+    findings: &[crate::lint::Finding],
+) -> Result<(), InProcessOutcome> {
+    for finding in findings {
+        let line = format_finding_line(finding);
+        if let Err(error) = ctx.emit_stdout(line).await {
+            return Err(emit_failure(ctx, format!("failed to emit ast-grep log: {error}")).await);
+        }
+    }
+    Ok(())
+}
+
+fn format_finding_line(finding: &crate::lint::Finding) -> String {
+    format!(
+        "{}:{}:{}: {} [{}] {}",
+        finding.relative_uri,
+        finding.start_line,
+        finding.start_column,
+        severity_label(&finding.severity),
+        if finding.rule_id.is_empty() {
+            "ast-grep-rule"
+        } else {
+            &finding.rule_id
+        },
+        finding.message
+    )
+}
+
+async fn emit_sarif_if_needed(
+    ctx: &JobContext,
+    findings: &[crate::lint::Finding],
+) -> Result<(), InProcessOutcome> {
+    if findings.is_empty() {
+        return Ok(());
+    }
+    let sarif = match build_sarif(findings) {
+        Ok(sarif) => sarif,
+        Err(error) => return Err(emit_failure(ctx, error).await),
+    };
+    if let Err(error) = ctx
+        .emit_report("ast-grep.sarif", "application/sarif+json", sarif)
+        .await
+    {
+        return Err(emit_failure(
+            ctx,
+            format!("failed to emit ast-grep SARIF report: {error}"),
+        )
+        .await);
+    }
+    Ok(())
+}
+
+async fn emit_failure(ctx: &JobContext, message: String) -> InProcessOutcome {
+    let _ = ctx.emit_stderr(message).await;
+    InProcessOutcome::Done {
+        exit_code: 1,
+        outputs: None,
     }
 }
 
@@ -295,9 +367,11 @@ async fn main() {
 mod tests {
     use std::fs;
 
-    use luchta_worker::{ResolveDecision, ResolveMode, ResolveTask, TaskModification, Worker};
+    use luchta_worker::{
+        ResolveDecision, ResolveMode, ResolveTask, TaskModification, Worker, WorkerRequest,
+    };
 
-    use super::{declared_inputs, resolve_inputs, AstGrepWorker};
+    use super::{declared_inputs, resolve_inputs, AstGrepOpts, AstGrepWorker};
     use crate::config::discover_config;
 
     fn resolve_task(cwd: Option<String>) -> ResolveTask {
@@ -317,6 +391,17 @@ mod tests {
         let mut req = resolve_task(cwd);
         req.inputs = inputs.into_iter().map(str::to_owned).collect();
         req
+    }
+
+    #[test]
+    fn opts_parse_fix_from_command_and_env() {
+        let req = WorkerRequest::new("lint", "lint --fix");
+        assert_eq!(AstGrepOpts::from_request(&req), AstGrepOpts { fix: true });
+
+        let mut env = std::collections::HashMap::new();
+        env.insert("AST_GREP_OPTS".to_owned(), "--fix".to_owned());
+        let req = WorkerRequest::new("lint", "lint").with_env(env);
+        assert_eq!(AstGrepOpts::from_request(&req), AstGrepOpts { fix: true });
     }
 
     #[test]

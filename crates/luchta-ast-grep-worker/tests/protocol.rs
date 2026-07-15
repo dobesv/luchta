@@ -395,3 +395,63 @@ fn clean_fixture_emits_no_report_done_exit_0() {
             && value["exitCode"].as_i64() == Some(0)
     }));
 }
+
+#[test]
+fn fix_flag_in_command_rewrites_file_end_to_end() {
+    let fixture = tempdir().expect("tempdir");
+    write_file(
+        fixture.path().join("sgconfig.yml"),
+        "ruleDirs:\n  - rules\n",
+    );
+    write_file(
+        fixture.path().join("rules/no-console-log.yml"),
+        "id: no-console-log\nlanguage: TypeScript\nseverity: error\nmessage: \"No console.log allowed\"\nrule:\n  pattern: console.log($ARG)\nfix: logger.info($ARG)\n",
+    );
+    let source = fixture.path().join("src/index.ts");
+    write_file(&source, "console.log('hi');\n");
+
+    // `--fix` is passed in the task command string, mirroring how other
+    // options are set (issue #226).
+    let input = format!(
+        "{}\n",
+        run_line(
+            WorkerRequest::new("job-fix", "lint --fix")
+                .with_cwd(fixture.path().display().to_string())
+        )
+    );
+    let (output, _stderr) = run_worker(&input);
+
+    // File is rewritten on disk by the fixer.
+    assert_eq!(
+        fs::read_to_string(&source).expect("read rewritten source"),
+        "logger.info('hi');\n"
+    );
+    // Worker emits a `fixed:` log for the rewritten file, and after fixing the
+    // violation is gone so the run succeeds (exit 0).
+    assert_log_line_contains(&output, "job-fix", "fixed: src/index.ts");
+    assert_done_with_exit(&output, "job-fix", 0);
+}
+
+fn assert_log_line_contains(output: &[Value], id: &str, substring: &str) {
+    assert!(
+        output.iter().any(|value| {
+            value["type"].as_str() == Some("log")
+                && value["id"].as_str() == Some(id)
+                && value["line"]
+                    .as_str()
+                    .is_some_and(|msg| msg.contains(substring))
+        }),
+        "missing log line containing {substring:?} for {id}"
+    );
+}
+
+fn assert_done_with_exit(output: &[Value], id: &str, exit_code: i64) {
+    assert!(
+        output.iter().any(|value| {
+            value["type"].as_str() == Some("done")
+                && value["id"].as_str() == Some(id)
+                && value["exitCode"].as_i64() == Some(exit_code)
+        }),
+        "missing done(exit={exit_code}) for {id}"
+    );
+}

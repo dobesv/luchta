@@ -725,7 +725,7 @@ fn type_aware_lints_all_files_in_one_batch() {
 }
 
 #[test]
-fn fix_mode_still_reports_active_findings() {
+fn fix_mode_applies_safe_fix_and_clears_findings() {
     let fixture = tempdir().expect("tempdir");
     write_file(
         fixture.path().join("package.json"),
@@ -740,9 +740,8 @@ fn fix_mode_still_reports_active_findings() {
     let input = format!(
         "{}\n",
         run_line(
-            WorkerRequest::new("job-fix", "lint")
+            WorkerRequest::new("job-fix", "lint --fix")
                 .with_cwd(fixture.path().display().to_string())
-                .with_env(env_map([("OXLINT_OPTS", "--fix")]))
         )
     );
     let (output, _stderr) = run_worker(&input);
@@ -754,16 +753,18 @@ fn fix_mode_still_reports_active_findings() {
         .collect();
     assert_eq!(
         done_codes,
-        vec![Some(1)],
+        vec![Some(0)],
         "unexpected done codes: {done_codes:?}"
     );
-    assert_eq!(fixed, "var foo = 1;\n");
+    assert_eq!(fixed, "const foo = 1;\n");
     assert!(output.iter().any(|value| {
         value["type"].as_str() == Some("done")
             && value["id"].as_str() == Some("job-fix")
-            && value["exitCode"].as_i64() == Some(1)
+            && value["exitCode"].as_i64() == Some(0)
     }));
-    assert!(output
+    let reports: Vec<_> = output
         .iter()
-        .any(|value| value["type"].as_str() == Some("report")));
+        .filter(|value| value["type"].as_str() == Some("report"))
+        .collect();
+    assert_eq!(reports.len(), 1, "unexpected reports: {reports:?}");
 }

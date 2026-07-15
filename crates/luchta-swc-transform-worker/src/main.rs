@@ -62,10 +62,6 @@ struct SwcTransformWorker;
 
 #[cfg(feature = "swc")]
 impl Worker for SwcTransformWorker {
-    fn cache_nonce(&self) -> Option<String> {
-        Some(env!("CARGO_PKG_VERSION").to_owned())
-    }
-
     fn resolve_task(&self, req: &ResolveTask) -> ResolveResult {
         // Keep package-local `.swcrc` precise, plus workspace-root glob for any
         // ancestor/root `.swcrc` SWC may crawl into (`find_swcrc` parity; ref note e9b11d7a).

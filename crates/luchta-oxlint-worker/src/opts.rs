@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use luchta_worker::WorkerRequest;
+use luchta_worker::{tokenize::tokenize_command, WorkerRequest};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct OxlintOpts {
@@ -19,15 +19,15 @@ pub struct OxlintOpts {
 
 impl OxlintOpts {
     pub fn from_request(req: &WorkerRequest) -> Self {
-        let mut tokens = tokenize(&req.command);
+        let mut tokens = tokenize_command(&req.command);
         if let Some(raw) = req.env.get("OXLINT_OPTS") {
-            tokens.extend(tokenize(raw));
+            tokens.extend(tokenize_command(raw));
         }
         Self::parse_tokens(&tokens)
     }
 
     pub fn from_command(command: &str) -> Self {
-        Self::parse_tokens(&tokenize(command))
+        Self::parse_tokens(&tokenize_command(command))
     }
 
     fn parse_tokens(tokens: &[String]) -> Self {
@@ -67,56 +67,19 @@ impl OxlintOpts {
     }
 }
 
-fn tokenize(raw: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    let mut quote = None;
-    let mut started = false;
-
-    for ch in raw.chars() {
-        match quote {
-            Some(active_quote) if ch == active_quote => quote = None,
-            Some(_) => {
-                current.push(ch);
-                started = true;
-            }
-            None if ch.is_whitespace() => {
-                if started {
-                    tokens.push(std::mem::take(&mut current));
-                    started = false;
-                }
-            }
-            None if ch == '\'' || ch == '"' => {
-                quote = Some(ch);
-                started = true;
-            }
-            None => {
-                current.push(ch);
-                started = true;
-            }
-        }
-    }
-
-    if started {
-        tokens.push(current);
-    }
-
-    tokens
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
     use std::path::PathBuf;
 
-    use luchta_worker::WorkerRequest;
+    use luchta_worker::{tokenize::tokenize_command, WorkerRequest};
 
-    use super::{tokenize, OxlintOpts};
+    use super::OxlintOpts;
 
     #[test]
     fn tokenize_respects_quoted_segments() {
         assert_eq!(
-            tokenize("--config '/a b/.oxlintrc.json' --fix \"two words\""),
+            tokenize_command("--config '/a b/.oxlintrc.json' --fix \"two words\""),
             vec!["--config", "/a b/.oxlintrc.json", "--fix", "two words",]
         );
     }
@@ -124,7 +87,7 @@ mod tests {
     #[test]
     fn tokenize_keeps_rest_of_unmatched_quote_as_one_token() {
         assert_eq!(
-            tokenize("--config '/a b/.oxlintrc.json --fix"),
+            tokenize_command("--config '/a b/.oxlintrc.json --fix"),
             vec!["--config", "/a b/.oxlintrc.json --fix"]
         );
     }
@@ -132,7 +95,7 @@ mod tests {
     #[test]
     fn tokenize_preserves_empty_quoted_tokens() {
         assert_eq!(
-            tokenize("--config \"\" --fix"),
+            tokenize_command("--config \"\" --fix"),
             vec!["--config", "", "--fix"]
         );
     }
