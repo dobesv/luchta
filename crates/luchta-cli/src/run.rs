@@ -148,7 +148,10 @@ pub async fn prepare_workspace(
         .map(|(name, definition)| (TaskName::from(name), definition))
         .collect::<HashMap<_, _>>();
 
-    let worker_manager = Arc::new(WorkerManager::new(config.workers.clone()));
+    let worker_manager = Arc::new(
+        WorkerManager::new(config.workers.clone())
+            .with_workspace_root(workspace_root.to_path_buf()),
+    );
     let resolve_info = PackageResolveInfo::map_from_packages_with_root(&packages, workspace_root);
     let (task_graph, pruned) = TaskGraph::build_resolved(
         &package_graph,

@@ -10,15 +10,18 @@ const SPAWN_RETRY_DELAY: Duration = Duration::from_millis(5);
 struct SpawnAttempt<'a> {
     worker: &'a str,
     command_line: &'a str,
+    workspace_root: &'a std::path::Path,
 }
 
 pub(crate) async fn spawn_worker_process(
     worker: &str,
     command_line: &str,
+    workspace_root: &std::path::Path,
 ) -> Result<Child, WorkerError> {
     let attempt = SpawnAttempt {
         worker,
         command_line,
+        workspace_root,
     };
     let mut last_error = None;
 
@@ -72,7 +75,7 @@ fn spawn_retry_indices() -> std::ops::Range<usize> {
 }
 
 fn spawn_worker_child(attempt: &SpawnAttempt<'_>) -> io::Result<Child> {
-    worker_command(attempt.command_line).spawn()
+    worker_command(attempt.command_line, attempt.workspace_root).spawn()
 }
 
 fn should_retry_spawn(error: &io::Error) -> bool {
