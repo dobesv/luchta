@@ -94,13 +94,23 @@ pub fn expand_input_patterns(
     graph: &PackageGraph,
     repo_root: &Path,
 ) -> Result<Vec<ResolveRequest>, InputExpansionError> {
-    let direct_upstreams = direct_upstream_packages(graph, source_pkg)?;
-    let transitive_upstreams = transitive_upstream_packages(graph, source_pkg).map_err(|_| {
-        InputExpansionError::UnknownPackage {
-            package: source_pkg.clone(),
-            pattern: String::new(),
-        }
-    })?;
+    let upstream_source = if source_pkg.is_root() {
+        graph.root_package().unwrap_or(source_pkg)
+    } else {
+        source_pkg
+    };
+    let (direct_upstreams, transitive_upstreams) =
+        if source_pkg.is_root() && upstream_source.is_root() {
+            (Vec::new(), Vec::new())
+        } else {
+            let direct_upstreams = direct_upstream_packages(graph, upstream_source)?;
+            let transitive_upstreams = transitive_upstream_packages(graph, upstream_source)
+                .map_err(|_| InputExpansionError::UnknownPackage {
+                    package: source_pkg.clone(),
+                    pattern: String::new(),
+                })?;
+            (direct_upstreams, transitive_upstreams)
+        };
     let ctx = ExpansionCtx {
         source_pkg,
         graph,
@@ -381,11 +391,6 @@ fn direct_upstream_packages(
     graph: &PackageGraph,
     pkg_name: &PackageName,
 ) -> Result<Vec<PackageName>, InputExpansionError> {
-    // Root package has no upstream dependencies
-    if pkg_name.is_root() {
-        return Ok(Vec::new());
-    }
-
     let deps =
         graph
             .dependencies_of(pkg_name)
@@ -451,6 +456,63 @@ mod tests {
         PackageGraph::build(nodes)
             .expect("build graph")
             .with_root_package(PackageName::from("//root"))
+    }
+
+    fn make_graph_with_real_root(
+        root_name: &str,
+        root_deps: &[&str],
+        packages: Vec<(&str, &[&str])>,
+    ) -> PackageGraph {
+        let temp_dir = tempdir().expect("create temp dir");
+
+        let root_deps_json = if root_deps.is_empty() {
+            "{}".to_string()
+        } else {
+            let entries: Vec<String> = root_deps
+                .iter()
+                .map(|dep| format!(r#""{}": "workspace:*""#, dep))
+                .collect();
+            format!("{{ {} }}", entries.join(", "))
+        };
+        let root_content = format!(
+            r#"{{"name": "{}", "scripts": {{}}, "dependencies": {}}}"#,
+            root_name, root_deps_json
+        );
+        fs::write(temp_dir.path().join("package.json"), root_content)
+            .expect("write root package.json");
+
+        for (name, deps) in &packages {
+            let pkg_dir = temp_dir.path().join(name);
+            fs::create_dir_all(&pkg_dir).expect("create package dir");
+
+            let deps_json = if deps.is_empty() {
+                "{}".to_string()
+            } else {
+                let entries: Vec<String> = deps
+                    .iter()
+                    .map(|d| format!(r#""{}": "workspace:*""#, d))
+                    .collect();
+                format!("{{ {} }}", entries.join(", "))
+            };
+
+            let content = format!(
+                r#"{{"name": "{}", "scripts": {{}}, "dependencies": {}}}"#,
+                name, deps_json
+            );
+            fs::write(pkg_dir.join("package.json"), content).expect("write package.json");
+        }
+
+        let mut nodes = vec![PackageNode::new(
+            PackageName::from(root_name),
+            temp_dir.path(),
+        )];
+        nodes.extend(packages.iter().map(|(name, _deps)| {
+            PackageNode::new(PackageName::from(*name), temp_dir.path().join(name))
+        }));
+
+        PackageGraph::build(nodes)
+            .expect("build graph")
+            .with_root_package(PackageName::from(root_name))
     }
 
     #[test]
@@ -740,6 +802,71 @@ mod tests {
             })
             .collect();
         assert_eq!(base_endings.iter().filter(|&&x| x).count(), 3);
+    }
+
+    #[test]
+    fn root_direct_upstream_resolves_against_real_root_package_dependencies() {
+        let graph = make_graph_with_real_root("repo", &["app"], vec![("app", &[])]);
+        let repo_root = PathBuf::from("/repo");
+        let source_pkg = PackageName::from(ROOT_PACKAGE_NAME);
+
+        let requests = expand_input_patterns(
+            &["^src/**/*.ts".to_string()],
+            &source_pkg,
+            &graph,
+            &repo_root,
+        )
+        .expect("expand direct upstream pattern for root task");
+
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].base_dir.ends_with("app"));
+        assert_eq!(requests[0].pattern, "src/**/*.ts");
+        assert_eq!(requests[0].semantics, InputSemantics::Wildcard);
+    }
+
+    #[test]
+    fn root_transitive_upstream_resolves_against_real_root_package_dependencies() {
+        let graph =
+            make_graph_with_real_root("repo", &["app"], vec![("app", &["lib"]), ("lib", &[])]);
+        let repo_root = PathBuf::from("/repo");
+        let source_pkg = PackageName::from(ROOT_PACKAGE_NAME);
+
+        let requests = expand_input_patterns(
+            &["^^src/**/*.ts".to_string()],
+            &source_pkg,
+            &graph,
+            &repo_root,
+        )
+        .expect("expand transitive upstream pattern for root task");
+
+        assert_eq!(requests.len(), 2);
+        let base_dirs: std::collections::HashSet<_> = requests
+            .iter()
+            .map(|request| request.base_dir.clone())
+            .collect();
+        assert!(base_dirs.iter().any(|path| path.ends_with("app")));
+        assert!(base_dirs.iter().any(|path| path.ends_with("lib")));
+        assert!(requests
+            .iter()
+            .all(|request| request.pattern == "src/**/*.ts"
+                && request.semantics == InputSemantics::Wildcard));
+    }
+
+    #[test]
+    fn root_transitive_upstream_without_real_root_tag_returns_empty_requests() {
+        let graph = make_graph_with_deps(vec![("app", &[])]);
+        let repo_root = PathBuf::from("/repo");
+        let source_pkg = PackageName::from(ROOT_PACKAGE_NAME);
+
+        let requests = expand_input_patterns(
+            &["^^src/**/*.ts".to_string()],
+            &source_pkg,
+            &graph,
+            &repo_root,
+        )
+        .expect("root transitive upstream without real root tag should stay empty");
+
+        assert!(requests.is_empty());
     }
 
     #[test]
