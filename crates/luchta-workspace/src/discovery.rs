@@ -18,6 +18,19 @@ pub trait WorkspaceDiscovery: Send + Sync + std::fmt::Debug {
     fn discover(&self) -> Result<Vec<PackageNode>, WorkspaceError>;
 }
 
+/// Reads the `name` field from a `package.json` file at the given path.
+///
+/// The `path` argument must point directly to a `package.json` file.
+/// Returns `Some(name)` if the file exists, parses as valid JSON, and has a
+/// non-empty `name` field. Returns `None` on any error (file not found,
+/// parse error, missing `name` field, or empty name).
+pub fn find_package_name_at(path: &Path) -> Option<String> {
+    read_package_json(path)
+        .ok()
+        .and_then(|pkg| pkg.name)
+        .filter(|name| !name.is_empty())
+}
+
 /// Yarn workspace discovery backend.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct YarnWorkspace {

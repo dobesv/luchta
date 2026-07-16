@@ -8,7 +8,7 @@ pub mod package_graph;
 
 use thiserror::Error;
 
-pub use discovery::{WorkspaceDiscovery, YarnWorkspace};
+pub use discovery::{find_package_name_at, WorkspaceDiscovery, YarnWorkspace};
 pub use package_graph::{PackageGraph, PackageNode};
 
 /// Errors produced by workspace discovery and package graph operations.

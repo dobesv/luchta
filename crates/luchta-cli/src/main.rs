@@ -89,6 +89,7 @@ async fn run(cli: Cli) -> Result<()> {
             show_cache_nonce,
             files,
         } => {
+            let packages = apply_implicit_package(packages, top_level, &workspace_root)?;
             dispatch_logs(
                 &workspace_root,
                 LogsOptions {
@@ -112,6 +113,7 @@ async fn run(cli: Cli) -> Result<()> {
             show_inputs,
             show_outputs,
         } => {
+            let packages = apply_implicit_package(packages, top_level, &workspace_root)?;
             dispatch_why(
                 &workspace_root,
                 why::WhyOptions {
@@ -126,6 +128,21 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Commands::Check => dispatch_check(&workspace_root).await,
     }
+}
+
+fn apply_implicit_package(
+    packages: Vec<String>,
+    top_level: bool,
+    workspace_root: &Path,
+) -> Result<Vec<String>> {
+    if top_level || !packages.is_empty() {
+        return Ok(packages);
+    }
+
+    let cwd = std::env::current_dir().into_diagnostic()?;
+    Ok(run::detect_implicit_package(&cwd, workspace_root)
+        .map(|package| vec![package])
+        .unwrap_or(packages))
 }
 
 async fn dispatch_logs(workspace_root: &Path, options: LogsOptions<'_>) -> Result<()> {
@@ -262,9 +279,10 @@ fn command_run_args(command: Commands) -> RunArgs {
     }
 }
 
-async fn run_command(workspace_root: &std::path::Path, command: Commands) -> Result<()> {
+async fn run_command(workspace_root: &Path, command: Commands) -> Result<()> {
     let mut args = command_run_args(command);
     args.no_cache = args.no_cache || no_cache_env();
+    args.packages = apply_implicit_package(args.packages, args.top_level, workspace_root)?;
     if args.tasks.is_empty() {
         return Err(miette::miette!("no tasks specified for run command"));
     }
@@ -298,7 +316,7 @@ async fn run_command(workspace_root: &std::path::Path, command: Commands) -> Res
     }
 }
 
-async fn watch_command(workspace_root: &std::path::Path, command: Commands) -> Result<()> {
+async fn watch_command(workspace_root: &Path, command: Commands) -> Result<()> {
     let Commands::Watch {
         tasks,
         packages,
@@ -315,6 +333,7 @@ async fn watch_command(workspace_root: &std::path::Path, command: Commands) -> R
     else {
         unreachable!("checked by caller");
     };
+    let packages = apply_implicit_package(packages, top_level, workspace_root)?;
 
     if tasks.is_empty() {
         return Err(miette::miette!("no tasks specified for watch command"));
