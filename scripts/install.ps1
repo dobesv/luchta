@@ -33,19 +33,6 @@ $ErrorActionPreference = 'Stop'
 
 $Script:GitHubRepo = 'dobesv/luchta'
 $Script:LatestReleaseApi = "https://api.github.com/repos/$Script:GitHubRepo/releases/latest"
-$Script:KnownBinaryNames = @(
-    'luchta.exe',
-    'luchta-yarn-worker.exe',
-    'luchta-bash-worker.exe',
-    'luchta-command-filter.exe',
-    'luchta-file-exists-filter.exe',
-    'luchta-lazy-worker.exe',
-    'luchta-yarn-filter.exe',
-    'luchta-tsc-worker.exe',
-    'luchta-oxlint-worker.exe',
-    'luchta-oxc-transform-worker.exe',
-    'luchta-oxfmt-worker.exe'
-)
 
 function Fail([string]$Message) {
     throw $Message
@@ -138,12 +125,9 @@ function Expand-ReleaseArchive {
 function Get-InstalledBinaries {
     param([Parameter(Mandatory)] [string]$InstallDir)
 
-    foreach ($binary in $Script:KnownBinaryNames) {
-        $path = Join-Path $InstallDir $binary
-        if (Test-Path -LiteralPath $path -PathType Leaf) {
-            $binary
-        }
-    }
+    Get-ChildItem -LiteralPath  -Filter 'luchta*.exe' -File |
+        Sort-Object -Property Name |
+        ForEach-Object { $_.Name }
 }
 
 function Assert-CoreBinaryPresent {

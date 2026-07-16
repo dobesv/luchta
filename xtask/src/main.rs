@@ -18,6 +18,8 @@ struct Cli {
 enum XtaskCommand {
     /// Install all workspace binary crates via `cargo install --path`.
     Install,
+    /// Print shipped release binary names, one per line.
+    ListReleaseBins,
     /// Build Go TypeScript worker into target output directory.
     BuildWorker(BuildWorkerArgs),
 }
@@ -36,6 +38,7 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
         XtaskCommand::Install => install_bins(),
+        XtaskCommand::ListReleaseBins => list_release_bins(),
         XtaskCommand::BuildWorker(args) => build_worker(args),
     }
 }
@@ -332,6 +335,27 @@ fn install_bins() -> ExitCode {
     }
 }
 
+fn list_release_bins() -> ExitCode {
+    match try_list_release_bins() {
+        Ok(bins) => {
+            for bin in bins {
+                println!("{bin}");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn try_list_release_bins() -> Result<Vec<String>, String> {
+    let metadata =
+        workspace_metadata().map_err(|error| format!("failed to load cargo metadata: {error}"))?;
+    Ok(workspace_release_bin_names(&metadata))
+}
+
 fn try_install_bins() -> Result<String, String> {
     let metadata =
         workspace_metadata().map_err(|error| format!("failed to load cargo metadata: {error}"))?;
@@ -482,6 +506,23 @@ fn workspace_bin_packages(metadata: &Metadata) -> Vec<WorkspaceBinPackage> {
     packages
 }
 
+fn workspace_release_bin_names(metadata: &Metadata) -> Vec<String> {
+    let mut bins: Vec<_> = metadata
+        .packages
+        .iter()
+        .filter(|package| metadata.workspace_members.contains(&package.id))
+        .flat_map(|package| package.targets.iter())
+        .filter(|target| target.is_bin())
+        .map(|target| target.name.clone())
+        .filter(|name| name == "luchta" || name.starts_with("luchta-"))
+        .collect();
+
+    bins.push("luchta-tsc-worker".to_string());
+    bins.sort();
+    bins.dedup();
+    bins
+}
+
 fn crate_dir(manifest_path: &Path) -> Option<PathBuf> {
     manifest_path.parent().map(Path::to_path_buf)
 }
@@ -527,6 +568,7 @@ struct Package {
 
 #[derive(Debug, Deserialize)]
 struct Target {
+    name: String,
     kind: Vec<String>,
 }
 
@@ -546,61 +588,75 @@ struct WorkspaceBinPackage {
 mod tests {
     use super::*;
 
-    /// Cargo metadata JSON modelling a workspace with two bin crates, one lib
-    /// crate, the xtask crate itself, and a non-member (dependency) bin crate.
+    /// Cargo metadata JSON modelling workspace packages with bin targets,
+    /// including `luchta` CLI target, multi-bin package with one shippable bin
+    /// plus one mock helper, lib-only crate, xtask itself, and non-member bin
+    /// dependency.
     ///
-    /// The bin members are listed out of alphabetical order (`zebra-tool`
-    /// before `luchta-cli`) so the sort-order test actually exercises the
-    /// sorting step rather than passing on pre-ordered input.
+    /// Workspace packages appear out of alphabetical order so sort-order tests
+    /// exercise actual sorting.
     const SAMPLE_METADATA: &str = r#"{
         "packages": [
             {
                 "id": "zebra-tool 0.1.0 (path+file:///repo/crates/zebra-tool)",
                 "name": "zebra-tool",
                 "manifest_path": "/repo/crates/zebra-tool/Cargo.toml",
-                "targets": [{"kind": ["bin"]}]
+                "targets": [{"name": "zebra-tool", "kind": ["bin"]}]
             },
             {
                 "id": "luchta-cli 0.1.0 (path+file:///repo/crates/luchta-cli)",
                 "name": "luchta-cli",
                 "manifest_path": "/repo/crates/luchta-cli/Cargo.toml",
-                "targets": [{"kind": ["bin"]}, {"kind": ["lib"]}]
+                "targets": [
+                    {"name": "luchta", "kind": ["bin"]},
+                    {"name": "luchta_cli", "kind": ["lib"]}
+                ]
             },
             {
                 "id": "luchta-yarn-worker 0.1.0 (path+file:///repo/crates/luchta-yarn-worker)",
                 "name": "luchta-yarn-worker",
                 "manifest_path": "/repo/crates/luchta-yarn-worker/Cargo.toml",
-                "targets": [{"kind": ["bin"]}]
+                "targets": [{"name": "luchta-yarn-worker", "kind": ["bin"]}]
+            },
+            {
+                "id": "luchta-worker-watcher 0.1.0 (path+file:///repo/crates/luchta-worker-watcher)",
+                "name": "luchta-worker-watcher",
+                "manifest_path": "/repo/crates/luchta-worker-watcher/Cargo.toml",
+                "targets": [
+                    {"name": "luchta-worker-watcher", "kind": ["bin"]},
+                    {"name": "mock-worker-delegate", "kind": ["bin"]}
+                ]
             },
             {
                 "id": "luchta-bash-worker 0.1.0 (path+file:///repo/crates/luchta-bash-worker)",
                 "name": "luchta-bash-worker",
                 "manifest_path": "/repo/crates/luchta-bash-worker/Cargo.toml",
-                "targets": [{"kind": ["bin"]}]
+                "targets": [{"name": "luchta-bash-worker", "kind": ["bin"]}]
             },
             {
                 "id": "luchta-types 0.1.0 (path+file:///repo/crates/luchta-types)",
                 "name": "luchta-types",
                 "manifest_path": "/repo/crates/luchta-types/Cargo.toml",
-                "targets": [{"kind": ["lib"]}]
+                "targets": [{"name": "luchta_types", "kind": ["lib"]}]
             },
             {
                 "id": "xtask 0.1.0 (path+file:///repo/xtask)",
                 "name": "xtask",
                 "manifest_path": "/repo/xtask/Cargo.toml",
-                "targets": [{"kind": ["bin"]}]
+                "targets": [{"name": "xtask", "kind": ["bin"]}]
             },
             {
                 "id": "some-dep 1.0.0 (registry+https://example.com)",
                 "name": "some-dep",
                 "manifest_path": "/cache/some-dep/Cargo.toml",
-                "targets": [{"kind": ["bin"]}]
+                "targets": [{"name": "some-dep", "kind": ["bin"]}]
             }
         ],
         "workspace_members": [
             "zebra-tool 0.1.0 (path+file:///repo/crates/zebra-tool)",
             "luchta-cli 0.1.0 (path+file:///repo/crates/luchta-cli)",
             "luchta-yarn-worker 0.1.0 (path+file:///repo/crates/luchta-yarn-worker)",
+            "luchta-worker-watcher 0.1.0 (path+file:///repo/crates/luchta-worker-watcher)",
             "luchta-bash-worker 0.1.0 (path+file:///repo/crates/luchta-bash-worker)",
             "luchta-types 0.1.0 (path+file:///repo/crates/luchta-types)",
             "xtask 0.1.0 (path+file:///repo/xtask)"
@@ -621,14 +677,17 @@ mod tests {
     #[test]
     fn target_is_bin_detects_bin_kind() {
         assert!(Target {
+            name: "example-bin".to_string(),
             kind: vec!["bin".to_string()]
         }
         .is_bin());
         assert!(Target {
+            name: "example-mixed".to_string(),
             kind: vec!["lib".to_string(), "bin".to_string()]
         }
         .is_bin());
         assert!(!Target {
+            name: "example-lib".to_string(),
             kind: vec!["lib".to_string()]
         }
         .is_bin());
@@ -647,6 +706,7 @@ mod tests {
             vec![
                 "luchta-bash-worker",
                 "luchta-cli",
+                "luchta-worker-watcher",
                 "luchta-yarn-worker",
                 "zebra-tool"
             ]
@@ -685,6 +745,29 @@ mod tests {
     }
 
     #[test]
+    fn selects_release_bin_target_names_and_appends_go_worker() {
+        let names = workspace_release_bin_names(&sample());
+        assert_eq!(
+            names,
+            vec![
+                "luchta",
+                "luchta-bash-worker",
+                "luchta-tsc-worker",
+                "luchta-worker-watcher",
+                "luchta-yarn-worker"
+            ]
+        );
+    }
+
+    #[test]
+    fn release_bin_names_exclude_mock_delegate_xtask_and_unmatched_bins() {
+        let names = workspace_release_bin_names(&sample());
+        assert!(!names.contains(&"mock-worker-delegate".to_string()));
+        assert!(!names.contains(&"xtask".to_string()));
+        assert!(!names.contains(&"zebra-tool".to_string()));
+        assert!(!names.contains(&"luchta-cli".to_string()));
+    }
+    #[test]
     fn crate_dir_resolves_from_manifest_parent() {
         let packages = workspace_bin_packages(&sample());
         let cli = packages
@@ -719,13 +802,13 @@ mod tests {
                     "id": "luchta-types 0.1.0 (path+file:///repo/crates/luchta-types)",
                     "name": "luchta-types",
                     "manifest_path": "/repo/crates/luchta-types/Cargo.toml",
-                    "targets": [{"kind": ["lib"]}]
+                    "targets": [{"name": "luchta_types", "kind": ["lib"]}]
                 },
                 {
                     "id": "xtask 0.1.0 (path+file:///repo/xtask)",
                     "name": "xtask",
                     "manifest_path": "/repo/xtask/Cargo.toml",
-                    "targets": [{"kind": ["bin"]}]
+                    "targets": [{"name": "xtask", "kind": ["bin"]}]
                 }
             ],
             "workspace_members": [

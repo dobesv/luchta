@@ -140,18 +140,7 @@ jobs:
     - name: Build
       shell: bash
       run: |
-        $BUILD_CMD build --locked --release --target=${{ matrix.target }} \
-          -p luchta-cli \
-          -p luchta-yarn-worker \
-          -p luchta-bash-worker \
-          -p luchta-command-filter \
-          -p luchta-file-exists-filter \
-          -p luchta-lazy-worker \
-          -p luchta-yarn-filter \
-          -p luchta-oxlint-worker \
-          -p luchta-oxc-transform-worker \
-          -p luchta-swc-transform-worker \
-          -p luchta-oxfmt-worker
+        $BUILD_CMD build --locked --release --target=${{ matrix.target }} --workspace --bins
 
     - name: Build tsc worker
       shell: bash
@@ -192,6 +181,35 @@ jobs:
         fi
         rel="target/${{ matrix.target }}/release"
 
+        probed_bins=(
+          luchta
+          luchta-yarn-worker
+          luchta-bash-worker
+          luchta-command-filter
+          luchta-file-exists-filter
+          luchta-lazy-worker
+          luchta-yarn-filter
+          luchta-tsc-worker
+          luchta-oxlint-worker
+          luchta-oxc-transform-worker
+          luchta-swc-transform-worker
+          luchta-oxfmt-worker
+          luchta-ast-grep-worker
+          luchta-worker-watcher
+        )
+        # Compare as sorted sets so probe order is irrelevant; the only thing
+        # that matters is that every shipped bin has a probe and vice versa.
+        probed_sorted="$(printf '%s\n' "${probed_bins[@]}" | LC_ALL=C sort)"
+        expected_sorted="$(cargo xtask list-release-bins | LC_ALL=C sort)"
+        if [[ "$probed_sorted" != "$expected_sorted" ]]; then
+          echo "::error::Smoke-test probe list drifted from cargo xtask list-release-bins" >&2
+          echo "probed:" >&2
+          printf '  %s\n' "$probed_sorted" >&2
+          echo "expected:" >&2
+          printf '  %s\n' "$expected_sorted" >&2
+          exit 1
+        fi
+
         "$rel/luchta$ext" --help
         printf '' | "$rel/luchta-yarn-worker$ext"
         printf '' | "$rel/luchta-bash-worker$ext"
@@ -204,6 +222,8 @@ jobs:
         printf '' | "$rel/luchta-oxc-transform-worker$ext"
         printf '' | "$rel/luchta-swc-transform-worker$ext"
         printf '' | "$rel/luchta-oxfmt-worker$ext"
+        printf '' | "$rel/luchta-ast-grep-worker$ext"
+        printf '' | "$rel/luchta-worker-watcher$ext" --watch '*' -- true
 
     - name: Build archive
       id: package
@@ -218,28 +238,19 @@ jobs:
         staging="$dist_dir/stage"
         mkdir -p "$staging"
 
-        # Every shipped binary. `luchta` comes from luchta-cli; the rest are
-        # named after their crate. Each is copied into the archive (with the
-        # `.exe` suffix on Windows).
         ext=""
         if [[ "$RUNNER_OS" == "Windows" ]]; then
           ext=".exe"
         fi
-        for bin in \
-          luchta \
-          luchta-yarn-worker \
-          luchta-bash-worker \
-          luchta-command-filter \
-          luchta-file-exists-filter \
-          luchta-lazy-worker \
-          luchta-yarn-filter \
-          luchta-tsc-worker \
-          luchta-oxlint-worker \
-          luchta-oxc-transform-worker \
-          luchta-swc-transform-worker \
-          luchta-oxfmt-worker; do
+        bin_list="$(cargo xtask list-release-bins)"
+        if [[ -z "$bin_list" ]]; then
+          echo "::error::cargo xtask list-release-bins produced no binaries; refusing to build an empty archive" >&2
+          exit 1
+        fi
+        while IFS= read -r bin; do
+          [[ -n "$bin" ]] || continue
           cp "target/$target/release/$bin$ext" "$staging/"
-        done
+        done <<< "$bin_list"
 
         name="luchta-$version-$target"
         if [[ "$RUNNER_OS" == "Windows" ]]; then
