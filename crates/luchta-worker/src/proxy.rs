@@ -753,11 +753,12 @@ async fn signal_delegate(
     }
     #[cfg(not(unix))]
     {
+        let _ = child_pid;
+        let _ = signaler;
         let mut child_guard = child.lock().await;
         let Some(child) = child_guard.as_mut() else {
             return Ok(());
         };
-        let _ = child_pid;
         child.start_kill()?;
         Ok(())
     }
