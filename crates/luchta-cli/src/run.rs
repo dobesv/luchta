@@ -23,9 +23,12 @@ use luchta_engine::{
     TaskGraph, TaskNode, TaskRunOutcome, Walker, WeightedExecutor, WorkerManager,
 };
 use luchta_types::{EnvSpec, PackageName, TaskDefinition, TaskId, TaskName, WorkerDefinition};
-use luchta_workspace::{PackageGraph, PackageNode, WorkspaceDiscovery, YarnWorkspace};
+use luchta_workspace::{
+    find_package_name_at, PackageGraph, PackageNode, WorkspaceDiscovery, YarnWorkspace,
+};
 use miette::{bail, Context, IntoDiagnostic, Result};
 use owo_colors::{OwoColorize, Stream};
+use serde::Deserialize;
 
 use crate::build_lock;
 use crate::cache_ctx::{
@@ -108,9 +111,82 @@ enum SinceSelection {
     Proceed(Option<HashSet<PackageName>>),
 }
 
+#[derive(Deserialize)]
+struct WorkspaceRootPackageJson {
+    workspaces: Option<serde_json::Value>,
+}
+
+/// Resolves the workspace root directory.
+///
+/// If `workspace_root` is explicitly provided (via `--workspace-root`), returns it as-is.
+/// Otherwise, walks upward from the current working directory using `Path::ancestors()`,
+/// looking for the first `package.json` with a non-None `workspaces` field.
+///
+/// If no workspace `package.json` is found during the walk, falls back to the current
+/// working directory.
 pub fn resolve_workspace_root(workspace_root: Option<PathBuf>) -> Result<PathBuf> {
+    if let Some(workspace_root) = workspace_root {
+        return Ok(workspace_root);
+    }
+
     let cwd = std::env::current_dir().into_diagnostic()?;
-    Ok(workspace_root.unwrap_or(cwd))
+    for ancestor in cwd.ancestors() {
+        if has_workspaces_field(ancestor) {
+            return Ok(ancestor.to_path_buf());
+        }
+    }
+
+    Ok(cwd)
+}
+
+fn has_workspaces_field(path: &Path) -> bool {
+    let package_json = match std::fs::read_to_string(path.join("package.json")) {
+        Ok(package_json) => package_json,
+        Err(_) => return false,
+    };
+
+    match serde_json::from_str::<WorkspaceRootPackageJson>(&package_json) {
+        Ok(package_json) => package_json.workspaces.is_some(),
+        Err(_) => false,
+    }
+}
+
+/// Detects the implicit package filter based on the current working directory.
+///
+/// Walks upward from `cwd` toward `workspace_root`, looking for the first
+/// `package.json` with a non-empty `name` field. Returns that name if found,
+/// enabling CLI commands to automatically scope to the nearest package when
+/// run from within a package subdirectory.
+///
+/// Returns `None` when:
+/// - `cwd` equals `workspace_root` (at workspace root, no implicit filter)
+/// - `cwd` is outside `workspace_root` (walk bounded by workspace root)
+/// - No `package.json` with a valid `name` exists between `cwd` and `workspace_root`
+///
+/// Both paths are canonicalized before comparison to handle relative paths
+/// correctly. If canonicalization fails on either path, returns `None`.
+pub fn detect_implicit_package(cwd: &Path, workspace_root: &Path) -> Option<String> {
+    // Canonicalize both paths to handle cases where workspace_root was passed
+    // as a relative path. If either fails to canonicalize, return None gracefully.
+    let cwd = cwd.canonicalize().ok()?;
+    let workspace_root = workspace_root.canonicalize().ok()?;
+
+    if cwd == workspace_root || !cwd.starts_with(&workspace_root) {
+        return None;
+    }
+
+    for ancestor in cwd.ancestors() {
+        if ancestor == workspace_root {
+            break;
+        }
+
+        let package_name = find_package_name_at(&ancestor.join("package.json"));
+        if package_name.is_some() {
+            return package_name;
+        }
+    }
+
+    None
 }
 
 /// Discovers the workspace, loads config, and builds the task graph after
@@ -2127,6 +2203,74 @@ mod tests {
         // Verify call count.
         assert_eq!(pause_count.load(Ordering::SeqCst), 3);
     }
+
+    #[test]
+    fn resolve_workspace_root_returns_explicit_path_without_walk() {
+        let explicit = PathBuf::from("/tmp/explicit-workspace-root");
+        let resolved =
+            resolve_workspace_root(Some(explicit.clone())).expect("resolve explicit root");
+
+        assert_eq!(resolved, explicit);
+    }
+
+    #[test]
+    fn resolve_workspace_root_falls_back_to_cwd_without_workspace_package_json() {
+        let temp_dir = tempfile::tempdir().expect("create tempdir");
+        let original_cwd = std::env::current_dir().expect("read current dir");
+        std::env::set_current_dir(temp_dir.path()).expect("set cwd to tempdir");
+
+        let resolved = resolve_workspace_root(None).expect("resolve fallback cwd");
+
+        std::env::set_current_dir(&original_cwd).expect("restore current dir");
+        assert_eq!(resolved, temp_dir.path());
+    }
+
+    #[test]
+    fn resolve_workspace_root_walks_to_nearest_workspace_ancestor() {
+        let temp_dir = tempfile::tempdir().expect("create tempdir");
+        let workspace_root = temp_dir.path();
+        std::fs::write(
+            workspace_root.join("package.json"),
+            r#"{"workspaces":["packages/*"]}"#,
+        )
+        .expect("write root package.json");
+
+        let package_dir = workspace_root.join("packages").join("app").join("src");
+        std::fs::create_dir_all(&package_dir).expect("create package subdir");
+
+        let original_cwd = std::env::current_dir().expect("read current dir");
+        std::env::set_current_dir(&package_dir).expect("set cwd to package subdir");
+
+        let resolved = resolve_workspace_root(None).expect("resolve workspace root");
+
+        std::env::set_current_dir(&original_cwd).expect("restore current dir");
+        assert_eq!(resolved, workspace_root);
+    }
+
+    #[test]
+    fn resolve_workspace_root_skips_invalid_package_json_and_continues_walk() {
+        let temp_dir = tempfile::tempdir().expect("create tempdir");
+        let workspace_root = temp_dir.path();
+        std::fs::write(
+            workspace_root.join("package.json"),
+            r#"{"workspaces":{"packages":["packages/*"]}}"#,
+        )
+        .expect("write root package.json");
+
+        let invalid_ancestor = workspace_root.join("packages").join("app");
+        let nested_dir = invalid_ancestor.join("src");
+        std::fs::create_dir_all(&nested_dir).expect("create nested dir");
+        std::fs::write(invalid_ancestor.join("package.json"), "{ invalid json")
+            .expect("write invalid package.json");
+
+        let original_cwd = std::env::current_dir().expect("read current dir");
+        std::env::set_current_dir(&nested_dir).expect("set cwd to nested dir");
+
+        let resolved = resolve_workspace_root(None).expect("resolve workspace root");
+
+        std::env::set_current_dir(&original_cwd).expect("restore current dir");
+        assert_eq!(resolved, workspace_root);
+    }
 }
 
 fn compute_cycle_outcome(
@@ -2444,6 +2588,125 @@ async fn finalize_and_report(inputs: FinalizeCycle<'_>) -> Result<(CycleOutcome,
     }
 
     Ok((outcome, was_interrupted))
+}
+
+#[cfg(test)]
+mod detect_implicit_package_tests {
+    use super::detect_implicit_package;
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+    };
+    use tempfile::TempDir;
+
+    fn canonical(path: &Path) -> PathBuf {
+        path.canonicalize().expect("canonical path")
+    }
+
+    fn write_package_json(dir: &Path, contents: &str) {
+        fs::write(dir.join("package.json"), contents).expect("write package.json");
+    }
+
+    fn create_workspace_root(temp_dir: &TempDir) -> PathBuf {
+        let workspace_root = temp_dir.path().join("workspace");
+        fs::create_dir_all(&workspace_root).expect("create workspace root");
+        write_package_json(
+            &workspace_root,
+            r#"{
+  "name": "@scope/root",
+  "workspaces": ["packages/*"]
+}"#,
+        );
+        canonical(&workspace_root)
+    }
+
+    #[test]
+    fn detect_implicit_package_returns_none_at_workspace_root() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let workspace_root = create_workspace_root(&temp_dir);
+
+        assert_eq!(
+            detect_implicit_package(&workspace_root, &workspace_root),
+            None,
+        );
+    }
+
+    #[test]
+    fn detect_implicit_package_returns_package_name_for_direct_child_package_dir() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let workspace_root = create_workspace_root(&temp_dir);
+        let package_dir = workspace_root.join("packages/pkg");
+        fs::create_dir_all(&package_dir).expect("create package dir");
+        write_package_json(&package_dir, r#"{ "name": "@scope/pkg" }"#);
+        let package_dir = canonical(&package_dir);
+
+        assert_eq!(
+            detect_implicit_package(&package_dir, &workspace_root),
+            Some("@scope/pkg".to_string()),
+        );
+    }
+
+    #[test]
+    fn detect_implicit_package_walks_up_from_nested_subdir_to_package_dir() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let workspace_root = create_workspace_root(&temp_dir);
+        let package_dir = workspace_root.join("packages/pkg");
+        let nested_dir = package_dir.join("src/components/button");
+        fs::create_dir_all(&nested_dir).expect("create nested dir");
+        write_package_json(&package_dir, r#"{ "name": "@scope/pkg" }"#);
+        let nested_dir = canonical(&nested_dir);
+
+        assert_eq!(
+            detect_implicit_package(&nested_dir, &workspace_root),
+            Some("@scope/pkg".to_string()),
+        );
+    }
+
+    #[test]
+    fn detect_implicit_package_returns_none_when_no_package_json_exists_below_root() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let workspace_root = create_workspace_root(&temp_dir);
+        let nested_dir = workspace_root.join("tools/scripts/bin");
+        fs::create_dir_all(&nested_dir).expect("create nested dir");
+        let nested_dir = canonical(&nested_dir);
+
+        assert_eq!(detect_implicit_package(&nested_dir, &workspace_root), None);
+    }
+
+    #[test]
+    fn detect_implicit_package_returns_none_when_cwd_is_outside_workspace_root() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let workspace_root = create_workspace_root(&temp_dir);
+        let outside_dir = temp_dir.path().join("outside");
+        fs::create_dir_all(&outside_dir).expect("create outside dir");
+        let outside_dir = canonical(&outside_dir);
+
+        assert_eq!(detect_implicit_package(&outside_dir, &workspace_root), None);
+    }
+
+    #[test]
+    fn detect_implicit_package_returns_none_when_nearest_package_json_has_no_name() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let workspace_root = create_workspace_root(&temp_dir);
+        let package_dir = workspace_root.join("packages/unnamed");
+        let nested_dir = package_dir.join("src");
+        fs::create_dir_all(&nested_dir).expect("create nested dir");
+        write_package_json(&package_dir, r#"{ "private": true }"#);
+        let nested_dir = canonical(&nested_dir);
+
+        assert_eq!(detect_implicit_package(&nested_dir, &workspace_root), None);
+    }
+
+    #[test]
+    fn detect_implicit_package_excludes_named_workspace_root() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let workspace_root = create_workspace_root(&temp_dir);
+
+        assert_eq!(
+            detect_implicit_package(&workspace_root, &workspace_root),
+            None,
+        );
+    }
 }
 
 #[cfg(test)]
