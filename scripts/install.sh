@@ -4,7 +4,6 @@ set -euo pipefail
 readonly GITHUB_REPO="dobesv/luchta"
 readonly GITHUB_API_LATEST="https://api.github.com/repos/${GITHUB_REPO}/releases/latest"
 readonly DEFAULT_INSTALL_DIR="${HOME}/.luchta/bin"
-readonly KNOWN_BINARY_NAMES="luchta luchta-yarn-worker luchta-bash-worker luchta-command-filter luchta-file-exists-filter luchta-lazy-worker luchta-yarn-filter luchta-tsc-worker luchta-oxlint-worker luchta-oxc-transform-worker luchta-oxfmt-worker"
 
 usage() {
     cat <<'EOF'
@@ -230,17 +229,7 @@ extract_archive() {
 
 collect_installed_binaries() {
     install_dir="$1"
-    INSTALLED_BINARIES=""
-
-    for binary in $KNOWN_BINARY_NAMES; do
-        if [ -f "$install_dir/$binary" ]; then
-            if [ -n "$INSTALLED_BINARIES" ]; then
-                INSTALLED_BINARIES="$INSTALLED_BINARIES $binary"
-            else
-                INSTALLED_BINARIES="$binary"
-            fi
-        fi
-    done
+    INSTALLED_BINARIES="$(find "" -maxdepth 1 -type f -name 'luchta*' -exec basename {} \; | LC_ALL=C sort)"
 }
 
 ensure_core_binary_present() {
@@ -250,9 +239,12 @@ ensure_core_binary_present() {
 
 chmod_binaries() {
     install_dir="$1"
-    for binary in $INSTALLED_BINARIES; do
+    while IFS= read -r binary; do
+        [ -n "$binary" ] || continue
         chmod +x "$install_dir/$binary"
-    done
+    done <<EOF
+$INSTALLED_BINARIES
+EOF
 }
 
 path_contains_dir() {
@@ -269,9 +261,12 @@ print_success() {
 
     printf 'Installed luchta %s for %s into %s\n' "$version" "$triple" "$install_dir"
     printf 'Installed binaries:\n'
-    for binary in $INSTALLED_BINARIES; do
+    while IFS= read -r binary; do
+        [ -n "$binary" ] || continue
         printf '  - %s\n' "$binary"
-    done
+    done <<EOF
+$INSTALLED_BINARIES
+EOF
 
     if path_contains_dir "$install_dir"; then
         printf 'PATH already contains %s\n' "$install_dir"
