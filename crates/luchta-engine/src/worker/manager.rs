@@ -31,9 +31,10 @@ use crate::CollectedReport;
 pub enum WorkerError {
     #[error("worker '{worker}' not defined in config")]
     Undefined { worker: String },
-    #[error("failed to spawn worker '{worker}': {source}")]
+    #[error("failed to spawn worker '{worker}' with command '{command}': {source}")]
     Spawn {
         worker: String,
+        command: String,
         #[source]
         source: io::Error,
     },
@@ -387,7 +388,9 @@ impl WorkerManager {
         let (writer_sender, writer_rx) = tokio::sync::mpsc::channel(64);
         let writer_tx = Arc::new(Mutex::new(Some(writer_sender)));
         let is_shutdown = Arc::new(AtomicBool::new(false));
-        let crash_state = Arc::new(Mutex::new(WorkerCrashState::default()));
+        let mut crash_state = WorkerCrashState::default();
+        crash_state.set_command_line(format!("sh -c {}", definition.command));
+        let crash_state = Arc::new(Mutex::new(crash_state));
 
         let reader_task = spawn_reader_task(
             ReaderContext {

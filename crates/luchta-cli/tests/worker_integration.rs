@@ -500,14 +500,19 @@ fn worker_crash_renders_single_wrapped_failure_block() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     let detail =
-        "failed: task app#build worker error: worker 'crash-worker' crashed during job 'app#build': exited with code 1";
+        "failed: task app#build worker error: worker 'crash-worker' crashed during job 'app#build': command: sh -c ";
+    let exit_detail = "exited with code 1";
     assert!(
         stderr.contains("╭─ app#build"),
         "missing failure header: {stderr}"
     );
     assert!(
         stderr.contains(detail),
-        "missing worker crash detail in block: {stderr}"
+        "missing worker crash command detail in block: {stderr}"
+    );
+    assert!(
+        stderr.contains(exit_detail),
+        "missing worker crash exit detail in block: {stderr}"
     );
     assert!(
         stderr.contains("╰─") && stderr.contains("exit unknown") && stderr.contains("cache "),
@@ -516,7 +521,12 @@ fn worker_crash_renders_single_wrapped_failure_block() {
     assert_eq!(
         stderr.matches(detail).count(),
         1,
-        "worker crash detail should print once: {stderr}"
+        "worker crash command detail should print once: {stderr}"
+    );
+    assert_eq!(
+        stderr.matches(exit_detail).count(),
+        1,
+        "worker crash exit detail should print once: {stderr}"
     );
 
     temp.close().expect("cleanup temp dir");

@@ -55,7 +55,10 @@ async fn async_main() -> i32 {
     {
         Ok(router) => router,
         Err(error) => {
-            eprintln!("failed to create router: {error}");
+            eprintln!(
+                "failed to create router: command={:?}, {error}",
+                cli.delegate_command
+            );
             return 1;
         }
     };

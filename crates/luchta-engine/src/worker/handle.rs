@@ -31,6 +31,7 @@ pub(crate) struct WorkerCrashState {
     pub(crate) status: Option<ExitStatus>,
     pub(crate) wait_error: Option<String>,
     pub(crate) stderr_tail: VecDeque<String>,
+    pub(crate) command_line: String,
 }
 
 impl Default for WorkerCrashState {
@@ -39,11 +40,16 @@ impl Default for WorkerCrashState {
             status: None,
             wait_error: None,
             stderr_tail: VecDeque::with_capacity(STDERR_TAIL_LIMIT),
+            command_line: String::new(),
         }
     }
 }
 
 impl WorkerCrashState {
+    pub(crate) fn set_command_line(&mut self, command_line: String) {
+        self.command_line = command_line;
+    }
+
     pub(crate) fn record_stderr_line(&mut self, line: String) {
         if self.stderr_tail.len() == STDERR_TAIL_LIMIT {
             self.stderr_tail.pop_front();
@@ -83,6 +89,9 @@ impl WorkerCrashState {
         if detail.is_empty() {
             None
         } else {
+            if !self.command_line.is_empty() {
+                detail = format!("command: {}\n{detail}", self.command_line);
+            }
             Some(WorkerCrashInfo { detail })
         }
     }
@@ -284,9 +293,13 @@ mod tests {
     #[test]
     fn crash_info_renders_exit_code() {
         let mut state = WorkerCrashState::default();
+        state.set_command_line("sh -c echo hi".to_owned());
         state.set_status(exit_status_from_code(1));
 
-        assert_eq!(crash_detail(state, "yarn"), "exited with code 1");
+        assert_eq!(
+            crash_detail(state, "yarn"),
+            "command: sh -c echo hi\nexited with code 1"
+        );
     }
 
     #[cfg(unix)]
@@ -295,9 +308,13 @@ mod tests {
         use std::os::unix::process::ExitStatusExt;
 
         let mut state = WorkerCrashState::default();
+        state.set_command_line("sh -c echo hi".to_owned());
         state.set_status(ExitStatus::from_raw(9));
 
-        assert_eq!(crash_detail(state, "yarn"), "killed by signal SIGKILL (9)");
+        assert_eq!(
+            crash_detail(state, "yarn"),
+            "command: sh -c echo hi\nkilled by signal SIGKILL (9)"
+        );
     }
 
     #[cfg(unix)]
@@ -306,31 +323,40 @@ mod tests {
         use std::os::unix::process::ExitStatusExt;
 
         let mut state = WorkerCrashState::default();
+        state.set_command_line("sh -c echo hi".to_owned());
         state.set_status(ExitStatus::from_raw(31));
 
-        assert_eq!(crash_detail(state, "yarn"), "killed by signal 31");
+        assert_eq!(
+            crash_detail(state, "yarn"),
+            "command: sh -c echo hi\nkilled by signal 31"
+        );
     }
 
     #[test]
     fn crash_info_includes_stderr_block_when_tail_present() {
         let mut state = WorkerCrashState::default();
+        state.set_command_line("sh -c cargo build".to_owned());
         state.set_status(exit_status_from_code(1));
         state.record_stderr_line("line 1".to_owned());
         state.record_stderr_line("line 2".to_owned());
 
         assert_eq!(
             crash_detail(state, "builder"),
-            "exited with code 1\n--- worker 'builder' stderr (last 2 lines) ---\nline 1\nline 2\n--- end worker 'builder' stderr ---"
+            "command: sh -c cargo build\nexited with code 1\n--- worker 'builder' stderr (last 2 lines) ---\nline 1\nline 2\n--- end worker 'builder' stderr ---"
         );
     }
 
     #[test]
     fn crash_info_omits_stderr_block_when_tail_empty() {
         let mut state = WorkerCrashState::default();
+        state.set_command_line("sh -c cargo test".to_owned());
         state.set_wait_error(std::io::Error::other("wait blew up"));
 
         let detail = crash_detail(state, "builder");
-        assert_eq!(detail, "wait error: wait blew up");
+        assert_eq!(
+            detail,
+            "command: sh -c cargo test\nwait error: wait blew up"
+        );
         assert!(!detail.contains("stderr"));
     }
 }

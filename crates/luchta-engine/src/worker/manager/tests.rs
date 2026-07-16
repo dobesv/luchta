@@ -706,7 +706,15 @@ exit 0
     // were missing, the retry would run, `dispatch_message` would refuse work
     // while shutting down, and the surfaced error would be a bare
     // detail-less `Crashed` — so this detail assertion fails on regression.
-    assert_crash_detail_contains(&error, &["worker 'fake'", "pkg#shutdown-crash", "signal"]);
+    assert_crash_detail_contains(
+        &error,
+        &[
+            "worker 'fake'",
+            "pkg#shutdown-crash",
+            "signal",
+            &format!("command: sh -c {}", worker_path.display()),
+        ],
+    );
     let spawn_count = fs::read_to_string(&spawn_count_file).expect("spawn count recorded");
     assert_eq!(
         spawn_count.trim(),
@@ -839,6 +847,7 @@ exit 19
     assert_crash_detail_contains(
         &error,
         &[
+            &format!("command: sh -c {}", worker_path.display()),
             "exited with code 19",
             "--- worker 'fake' stderr (last 1 lines) ---",
             "worker error: io error: Resource temporarily unavailable (os error 11)",

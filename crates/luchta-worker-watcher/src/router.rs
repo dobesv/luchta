@@ -34,7 +34,12 @@ impl MessageRouter {
         let stderr_writer = shared_stderr_writer();
         let (current, stdout_rx) =
             Generation::new(0, command.clone(), std::sync::Arc::clone(&stderr_writer))?;
-        spawn_stdout_reader(0, stdout_rx, events_tx.clone());
+        spawn_stdout_reader(
+            0,
+            stdout_rx,
+            events_tx.clone(),
+            std::sync::Arc::clone(&stderr_writer),
+        );
         Ok(Self {
             current: Some(current),
             draining: Vec::new(),
@@ -78,11 +83,14 @@ impl MessageRouter {
 
         if let Some(current) = self.current.as_mut() {
             if let Err(error) = current.send(&message) {
-                log_router_error(format!(
-                    "router failed to send inbound message {} to generation {}: {error}",
-                    message.id(),
-                    current.id()
-                ))
+                log_router_error(
+                    &self.stderr_writer,
+                    format!(
+                        "router failed to send inbound message {} to generation {}: {error}",
+                        message.id(),
+                        current.id()
+                    ),
+                )
                 .await;
                 self.synthesize_terminal_for_failed_send(message.id(), in_flight_kind(&message))
                     .await?;
@@ -126,6 +134,7 @@ impl MessageRouter {
             return Ok(());
         };
 
+        log_generation_exit(&current, &self.stderr_writer).await;
         self.synthesize_terminals_for(&current).await?;
         current.shutdown().await?;
 
@@ -138,7 +147,12 @@ impl MessageRouter {
             self.command.clone(),
             std::sync::Arc::clone(&self.stderr_writer),
         )?;
-        spawn_stdout_reader(self.next_gen_id, stdout_rx, self.events_tx.clone());
+        spawn_stdout_reader(
+            self.next_gen_id,
+            stdout_rx,
+            self.events_tx.clone(),
+            std::sync::Arc::clone(&self.stderr_writer),
+        );
         self.current = Some(next);
         self.next_gen_id += 1;
         Ok(())
@@ -168,7 +182,12 @@ impl MessageRouter {
             std::sync::Arc::clone(&self.stderr_writer),
         )?;
         let next_id = next.id();
-        spawn_stdout_reader(next_id, stdout_rx, self.events_tx.clone());
+        spawn_stdout_reader(
+            next_id,
+            stdout_rx,
+            self.events_tx.clone(),
+            std::sync::Arc::clone(&self.stderr_writer),
+        );
         let old_current = self.current.replace(next);
         self.next_gen_id += 1;
 
@@ -288,6 +307,7 @@ pub fn spawn_stdout_reader(
     gen_id: u64,
     mut rx: mpsc::Receiver<String>,
     events_tx: mpsc::Sender<RouterEvent>,
+    stderr_writer: SharedWriter,
 ) {
     tokio::spawn(async move {
         while let Some(line) = rx.recv().await {
@@ -302,9 +322,12 @@ pub fn spawn_stdout_reader(
                     }
                 }
                 Err(error) => {
-                    log_router_error(format!(
-                        "router failed to parse generation {gen_id} stdout line as worker response: {error}"
-                    ))
+                    log_router_error(
+                        &stderr_writer,
+                        format!(
+                            "router failed to parse generation {gen_id} stdout line as worker response: {error}"
+                        ),
+                    )
                     .await;
                 }
             }
@@ -314,11 +337,34 @@ pub fn spawn_stdout_reader(
     });
 }
 
-async fn log_router_error(message: String) {
-    let mut stderr = stderr();
+async fn log_router_error(stderr_writer: &SharedWriter, message: String) {
+    let mut stderr = stderr_writer.lock().await;
     let _ = stderr.write_all(message.as_bytes()).await;
     let _ = stderr.write_all(b"\n").await;
     let _ = stderr.flush().await;
+}
+
+async fn log_generation_exit(generation: &Generation, stderr_writer: &SharedWriter) {
+    let exit_status = generation.exit_status().await;
+    let has_in_flight = !generation.drain_in_flight().is_empty();
+    let dirty = !generation.is_draining() || has_in_flight;
+    if !dirty {
+        return;
+    }
+
+    let exit = exit_status
+        .map(|status| status.to_string())
+        .unwrap_or_else(|| "<unknown>".to_owned());
+    let prefix = if generation.is_draining() {
+        "delegate exited during drain"
+    } else {
+        "delegate failed"
+    };
+    log_router_error(
+        stderr_writer,
+        format!("{prefix}: command={:?}, exit={exit}", generation.command()),
+    )
+    .await;
 }
 
 #[cfg(test)]

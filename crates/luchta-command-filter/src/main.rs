@@ -108,7 +108,16 @@ async fn async_main() -> i32 {
                             )
                             .await
                         {
-                            eprintln!("delegate failed before resolve decision: {error}");
+                            let exit = match delegate.exit_status().await {
+                                Some(status) => status.to_string(),
+                                None => "<unknown>".to_owned(),
+                            };
+                            eprintln!(
+                                "delegate failed before resolve decision: command={:?}, exit={}, error={}",
+                                delegate.delegate_command(),
+                                exit,
+                                error
+                            );
                             let response =
                                 WorkerResponse::resolved(request_id, ResolveResult::prune(None));
                             if let Err(write_error) =
@@ -143,7 +152,16 @@ async fn async_main() -> i32 {
             }
             WorkerMessage::Run(request) => {
                 if let Err(error) = delegate.send(WorkerMessage::Run(request)).await {
-                    eprintln!("delegate failed: {error}");
+                    let exit = match delegate.exit_status().await {
+                        Some(status) => status.to_string(),
+                        None => "<unknown>".to_owned(),
+                    };
+                    eprintln!(
+                        "delegate failed: command={:?}, exit={}, error={}",
+                        delegate.delegate_command(),
+                        exit,
+                        error
+                    );
                     exit_code = 1;
                     break;
                 }
@@ -152,7 +170,11 @@ async fn async_main() -> i32 {
     }
 
     if let Err(error) = delegate.shutdown().await {
-        eprintln!("failed to shut down delegate: {error}");
+        eprintln!(
+            "failed to shut down delegate: command={:?}, error={}",
+            delegate.delegate_command(),
+            error
+        );
         exit_code = 1;
     }
 
