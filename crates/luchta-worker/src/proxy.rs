@@ -1,21 +1,33 @@
 use std::collections::HashMap;
-use std::process::Stdio;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::process::{ExitStatus, Stdio};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex as StdMutex,
+};
 use std::time::Duration;
 
 use thiserror::Error;
 use tokio::io::{stderr, stdout, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot, watch, Mutex};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
 use crate::{WorkerMessage, WorkerResponse};
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(not(unix))]
+const REAPER_POLL_WAIT: Duration = Duration::from_millis(25);
+/// Give exit-status monitor brief window to publish child exit before logging.
+const EXIT_STATUS_POLL_WAIT: Duration = Duration::from_millis(25);
+const EXIT_STATUS_POLL_ATTEMPTS: usize = 3;
 
 pub type SharedWriter = Arc<Mutex<Box<dyn AsyncWrite + Unpin + Send>>>;
 type SharedChildStdin = Arc<Mutex<ChildStdin>>;
+type ChildSignaler =
+    fn(
+        Option<u32>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ProxyError>> + Send>>;
 type ResponseResult = Result<WorkerResponse, String>;
 /// In-flight requests keyed by correlation id. Each entry holds the
 /// `oneshot::Sender` half whose receiver the calling `send` future awaits, so a
@@ -23,6 +35,12 @@ type ResponseResult = Result<WorkerResponse, String>;
 /// buffers the single value). The reader task removes and fires the sender when
 /// the matching response arrives.
 type ResponseWaiters = Arc<Mutex<HashMap<String, oneshot::Sender<ResponseResult>>>>;
+
+#[derive(Clone)]
+struct DelegateLifecycle {
+    exit_status: Arc<Mutex<Option<ExitStatus>>>,
+    shutting_down: Arc<AtomicBool>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DelegateArgvSplit {
@@ -66,27 +84,35 @@ pub struct DelegateHandle {
     stdout_writer: SharedWriter,
     stderr_writer: SharedWriter,
     stderr_prefix: Option<String>,
+    exit_status: Arc<Mutex<Option<ExitStatus>>>,
+    shutting_down: Arc<AtomicBool>,
 }
 
 struct DelegateState {
-    child: Child,
+    child: Arc<Mutex<Option<Child>>>,
+    child_pid: Option<u32>,
     stdin: SharedChildStdin,
     waiters: ResponseWaiters,
     stdout_task: tokio::task::JoinHandle<Result<(), ProxyError>>,
     stderr_task: tokio::task::JoinHandle<Result<(), ProxyError>>,
+    reaper_task: tokio::task::JoinHandle<()>,
 }
 
 pub struct RawDelegate {
     state: Arc<Mutex<Option<RawDelegateState>>>,
     stdin_tx: StdMutex<Option<mpsc::UnboundedSender<String>>>,
     stdout_rx: Option<mpsc::Receiver<String>>,
+    exit_status: Arc<Mutex<Option<ExitStatus>>>,
+    shutting_down: Arc<AtomicBool>,
 }
 
 struct RawDelegateState {
-    child: Child,
+    child: Arc<Mutex<Option<Child>>>,
+    child_pid: Option<u32>,
     stdin_task: JoinHandle<Result<(), ProxyError>>,
     stdout_task: JoinHandle<Result<(), ProxyError>>,
     stderr_task: JoinHandle<Result<(), ProxyError>>,
+    reaper_task: tokio::task::JoinHandle<()>,
 }
 
 impl DelegateHandle {
@@ -120,6 +146,8 @@ impl DelegateHandle {
             stdout_writer,
             stderr_writer,
             stderr_prefix,
+            exit_status: Arc::new(Mutex::new(None)),
+            shutting_down: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -175,10 +203,15 @@ impl DelegateHandle {
         }
         .await;
 
-        if let Err(error) = send_result {
+        if let Err(_error) = send_result {
             // Drop our registration so the reader doesn't try to deliver later.
             state.waiters.lock().await.remove(&id);
-            return Err(ProxyError::Io(error));
+            let message = if let Some(status) = self.exit_status().await {
+                format!("delegate stdout closed (delegate exit: {status})")
+            } else {
+                "delegate stdout closed".to_owned()
+            };
+            return Err(ProxyError::DelegateClosed(message));
         }
 
         // The oneshot buffers the single value, so a response delivered by the
@@ -214,7 +247,11 @@ impl DelegateHandle {
             });
         }
 
+        *self.exit_status.lock().await = None;
+        self.shutting_down.store(false, Ordering::SeqCst);
+
         let mut child = spawn_delegate_child(&self.delegate_command)?;
+        let child_pid = child.id();
         let stdin = Arc::new(Mutex::new(
             child.stdin.take().ok_or(ProxyError::MissingPipe("stdin"))?,
         ));
@@ -226,33 +263,61 @@ impl DelegateHandle {
             .stderr
             .take()
             .ok_or(ProxyError::MissingPipe("stderr"))?;
+        let child = Arc::new(Mutex::new(Some(child)));
         let waiters: ResponseWaiters = Arc::new(Mutex::new(HashMap::new()));
+        let lifecycle = DelegateLifecycle {
+            exit_status: Arc::clone(&self.exit_status),
+            shutting_down: Arc::clone(&self.shutting_down),
+        };
         let stdout_task = tokio::spawn(read_delegate_stdout(
             BufReader::new(stdout).lines(),
             Arc::clone(&waiters),
             Arc::clone(&self.stdout_writer),
+            Arc::clone(&self.stderr_writer),
+            self.stderr_prefix.clone(),
+            self.delegate_command.clone(),
+            lifecycle,
         ));
         let stderr_task = tokio::spawn(forward_delegate_stderr(
             BufReader::new(stderr).lines(),
             Arc::clone(&self.stderr_writer),
             self.stderr_prefix.clone(),
         ));
+        let reaper_task = tokio::spawn(reap_delegate_child(
+            Arc::clone(&child),
+            Arc::clone(&self.exit_status),
+        ));
 
         *state_guard = Some(DelegateState {
             child,
+            child_pid,
             stdin: Arc::clone(&stdin),
             waiters: Arc::clone(&waiters),
             stdout_task,
             stderr_task,
+            reaper_task,
         });
 
         Ok(SpawnedDelegate { stdin, waiters })
     }
 
+    pub fn delegate_command(&self) -> &[String] {
+        &self.delegate_command
+    }
+
+    pub async fn exit_status(&self) -> Option<ExitStatus> {
+        self.exit_status.lock().await.as_ref().copied()
+    }
+
     pub async fn shutdown(&self) -> Result<(), ProxyError> {
         let state = self.state.lock().await.take();
         if let Some(state) = state {
-            shutdown_delegate(state).await?;
+            shutdown_delegate(
+                state,
+                Arc::clone(&self.exit_status),
+                Arc::clone(&self.shutting_down),
+            )
+            .await?;
         }
         Ok(())
     }
@@ -268,6 +333,7 @@ impl RawDelegate {
         stderr_writer: SharedWriter,
     ) -> Result<Self, ProxyError> {
         let mut child = spawn_delegate_child(&command)?;
+        let child_pid = child.id();
         let stdin = child.stdin.take().ok_or(ProxyError::MissingPipe("stdin"))?;
         let stdout = child
             .stdout
@@ -280,51 +346,71 @@ impl RawDelegate {
 
         let (stdin_tx, stdin_rx) = mpsc::unbounded_channel();
         let (stdout_tx, stdout_rx) = mpsc::channel(64);
+        let child = Arc::new(Mutex::new(Some(child)));
+        let exit_status = Arc::new(Mutex::new(None));
+        let shutting_down = Arc::new(AtomicBool::new(false));
         let stdin_task = tokio::spawn(drain_raw_stdin(stdin, stdin_rx));
         let stdout_task = tokio::spawn(read_raw_stdout(stdout, stdout_tx));
         let stderr_task = tokio::spawn(forward_raw_stderr(stderr, stderr_writer));
+        let reaper_task = tokio::spawn(reap_delegate_child(
+            Arc::clone(&child),
+            Arc::clone(&exit_status),
+        ));
 
         Ok(Self {
             state: Arc::new(Mutex::new(Some(RawDelegateState {
                 child,
+                child_pid,
                 stdin_task,
                 stdout_task,
                 stderr_task,
+                reaper_task,
             }))),
             stdin_tx: StdMutex::new(Some(stdin_tx)),
             stdout_rx: Some(stdout_rx),
+            exit_status,
+            shutting_down,
         })
-    }
-
-    pub fn send_line(&self, line: String) -> Result<(), ProxyError> {
-        let sender = self
-            .stdin_tx
-            .lock()
-            .expect("raw delegate stdin mutex poisoned")
-            .as_ref()
-            .cloned()
-            .ok_or_else(|| ProxyError::DelegateClosed("delegate stdin closed".to_owned()))?;
-        sender
-            .send(line)
-            .map_err(|_| ProxyError::DelegateClosed("delegate stdin closed".to_owned()))
     }
 
     pub fn take_stdout(&mut self) -> Option<mpsc::Receiver<String>> {
         self.stdout_rx.take()
     }
 
-    pub async fn close_stdin(&self) {
-        self.stdin_tx
+    pub fn send_line(&self, line: String) -> Result<(), ProxyError> {
+        let Some(stdin_tx) = self
+            .stdin_tx
             .lock()
-            .expect("raw delegate stdin mutex poisoned")
-            .take();
+            .map_err(|_| ProxyError::StdinChannelPoisoned)?
+            .as_ref()
+            .cloned()
+        else {
+            return Err(ProxyError::StdinClosed);
+        };
+
+        stdin_tx.send(line).map_err(|_| ProxyError::StdinClosed)
+    }
+
+    pub async fn close_stdin(&self) {
+        if let Ok(mut guard) = self.stdin_tx.lock() {
+            guard.take();
+        }
+    }
+
+    pub async fn exit_status(&self) -> Option<ExitStatus> {
+        self.exit_status.lock().await.as_ref().copied()
     }
 
     pub async fn shutdown(self) -> Result<(), ProxyError> {
         self.close_stdin().await;
         let state = self.state.lock().await.take();
         if let Some(state) = state {
-            shutdown_raw_delegate(state).await?;
+            shutdown_raw_delegate(
+                state,
+                Arc::clone(&self.exit_status),
+                Arc::clone(&self.shutting_down),
+            )
+            .await?;
         }
         Ok(())
     }
@@ -342,10 +428,9 @@ fn spawn_delegate_child(delegate_command: &[String]) -> Result<Child, ProxyError
         .ok_or(ProxyError::MissingDelegateCommand)?;
     let mut command = Command::new(program);
     command.args(delegate_command.iter().skip(1));
-    command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    command.stdin(Stdio::piped());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
 
     #[cfg(unix)]
     {
@@ -359,15 +444,40 @@ async fn read_delegate_stdout(
     mut lines: tokio::io::Lines<BufReader<ChildStdout>>,
     waiters: ResponseWaiters,
     writer: SharedWriter,
+    stderr_writer: SharedWriter,
+    stderr_prefix: Option<String>,
+    delegate_command: Vec<String>,
+    lifecycle: DelegateLifecycle,
 ) -> Result<(), ProxyError> {
     loop {
         let line = match lines.next_line().await {
             Ok(Some(line)) => line,
             Ok(None) => {
+                let status = best_effort_exit_status(&lifecycle.exit_status).await;
+                let has_in_flight_waiters = !waiters.lock().await.is_empty();
+                let shutting_down = lifecycle.shutting_down.load(Ordering::SeqCst);
+                let dirty = has_in_flight_waiters
+                    || (!shutting_down && status.is_none_or(|s| !s.success()));
+                if dirty {
+                    log_delegate_failure(
+                        &stderr_writer,
+                        stderr_prefix.as_deref(),
+                        &delegate_command,
+                        status,
+                    )
+                    .await?;
+                }
                 fail_all_waiters(&waiters, "delegate stdout closed".to_owned()).await;
                 return Ok(());
             }
             Err(error) => {
+                log_delegate_failure(
+                    &stderr_writer,
+                    stderr_prefix.as_deref(),
+                    &delegate_command,
+                    best_effort_exit_status(&lifecycle.exit_status).await,
+                )
+                .await?;
                 fail_all_waiters(&waiters, format!("delegate stdout read failed: {error}")).await;
                 return Err(error.into());
             }
@@ -376,6 +486,13 @@ async fn read_delegate_stdout(
         let response: WorkerResponse = match serde_json::from_str(&line) {
             Ok(response) => response,
             Err(error) => {
+                log_delegate_failure(
+                    &stderr_writer,
+                    stderr_prefix.as_deref(),
+                    &delegate_command,
+                    best_effort_exit_status(&lifecycle.exit_status).await,
+                )
+                .await?;
                 fail_all_waiters(
                     &waiters,
                     format!("delegate stdout contained invalid JSON: {error}"),
@@ -395,6 +512,95 @@ async fn read_delegate_stdout(
             let _ = waiter.send(Ok(response));
         }
     }
+}
+
+#[cfg(unix)]
+async fn reap_delegate_child(
+    child: Arc<Mutex<Option<Child>>>,
+    exit_status: Arc<Mutex<Option<ExitStatus>>>,
+) {
+    let child = {
+        let mut child_guard = child.lock().await;
+        child_guard.take()
+    };
+    let Some(mut child) = child else {
+        return;
+    };
+
+    if let Ok(status) = child.wait().await {
+        *exit_status.lock().await = Some(status);
+    }
+}
+
+#[cfg(not(unix))]
+async fn reap_delegate_child(
+    child: Arc<Mutex<Option<Child>>>,
+    exit_status: Arc<Mutex<Option<ExitStatus>>>,
+) {
+    loop {
+        let status = {
+            let mut child_guard = child.lock().await;
+            let Some(child) = child_guard.as_mut() else {
+                return;
+            };
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    child_guard.take();
+                    Some(status)
+                }
+                Ok(None) => None,
+                Err(_) => None,
+            }
+        };
+
+        if let Some(status) = status {
+            *exit_status.lock().await = Some(status);
+            return;
+        }
+
+        tokio::time::sleep(REAPER_POLL_WAIT).await;
+    }
+}
+
+async fn log_delegate_failure(
+    writer: &SharedWriter,
+    prefix: Option<&str>,
+    delegate_command: &[String],
+    status: Option<ExitStatus>,
+) -> Result<(), ProxyError> {
+    let exit = match status {
+        Some(status) => status.to_string(),
+        None => "<unknown>".to_owned(),
+    };
+    let rendered = match prefix {
+        Some(prefix) => {
+            format!("{prefix}delegate process failed: command={delegate_command:?} exit={exit}")
+        }
+        None => format!("delegate process failed: command={delegate_command:?} exit={exit}"),
+    };
+    let mut writer = writer.lock().await;
+    writer.write_all(rendered.as_bytes()).await?;
+    writer.write_all(b"\n").await?;
+    writer.flush().await?;
+    Ok(())
+}
+
+async fn best_effort_exit_status(
+    exit_status: &Arc<Mutex<Option<ExitStatus>>>,
+) -> Option<ExitStatus> {
+    for attempt in 0..=EXIT_STATUS_POLL_ATTEMPTS {
+        if let Ok(status_guard) = exit_status.try_lock() {
+            if let Some(status) = *status_guard {
+                return Some(status);
+            }
+        }
+
+        if attempt < EXIT_STATUS_POLL_ATTEMPTS {
+            tokio::time::sleep(EXIT_STATUS_POLL_WAIT).await;
+        }
+    }
+
+    exit_status.lock().await.as_ref().copied()
 }
 
 async fn drain_raw_stdin(
@@ -463,205 +669,357 @@ async fn write_response(
     Ok(())
 }
 
-async fn shutdown_delegate(mut state: DelegateState) -> Result<(), ProxyError> {
+async fn shutdown_delegate(
+    state: DelegateState,
+    exit_status: Arc<Mutex<Option<ExitStatus>>>,
+    shutting_down: Arc<AtomicBool>,
+) -> Result<(), ProxyError> {
     drop(state.stdin);
 
-    let wait_result = timeout(SHUTDOWN_TIMEOUT, state.child.wait()).await;
-    match wait_result {
-        Ok(status_result) => {
-            status_result?;
-        }
-        Err(_) => {
-            terminate_child(&mut state.child).await?;
-            match timeout(SHUTDOWN_TIMEOUT, state.child.wait()).await {
-                Ok(status_result) => {
-                    status_result?;
-                }
-                Err(_) => {
-                    kill_child(&mut state.child).await?;
-                    state.child.wait().await?;
-                }
-            }
-        }
-    }
+    shutting_down.store(true, Ordering::SeqCst);
+    shutdown_delegate_process(
+        &state.child,
+        state.child_pid,
+        Arc::clone(&exit_status),
+        state.reaper_task,
+    )
+    .await?;
 
     state.stdout_task.await??;
     state.stderr_task.await??;
     Ok(())
 }
 
-async fn shutdown_raw_delegate(mut state: RawDelegateState) -> Result<(), ProxyError> {
-    let wait_result = timeout(SHUTDOWN_TIMEOUT, state.child.wait()).await;
-    match wait_result {
-        Ok(status_result) => {
-            status_result?;
+async fn wait_for_delegate_exit(
+    exit_status: Arc<Mutex<Option<ExitStatus>>>,
+    mut exit_status_rx: watch::Receiver<Option<ExitStatus>>,
+    timeout_duration: Duration,
+) -> Result<Option<ExitStatus>, tokio::time::error::Elapsed> {
+    timeout(timeout_duration, async move {
+        if let Some(status) = *exit_status_rx.borrow() {
+            return Some(status);
         }
-        Err(_) => {
-            terminate_child(&mut state.child).await?;
-            match timeout(SHUTDOWN_TIMEOUT, state.child.wait()).await {
-                Ok(status_result) => {
-                    status_result?;
-                }
-                Err(_) => {
-                    kill_child(&mut state.child).await?;
-                    state.child.wait().await?;
-                }
+        if let Some(status) = *exit_status.lock().await {
+            return Some(status);
+        }
+
+        loop {
+            if exit_status_rx.changed().await.is_err() {
+                return *exit_status_rx.borrow();
+            }
+            if let Some(status) = *exit_status_rx.borrow() {
+                return Some(status);
             }
         }
-    }
+    })
+    .await
+}
 
-    state.stdin_task.await??;
+async fn shutdown_delegate_process(
+    child: &Arc<Mutex<Option<Child>>>,
+    child_pid: Option<u32>,
+    exit_status: Arc<Mutex<Option<ExitStatus>>>,
+    reaper_task: tokio::task::JoinHandle<()>,
+) -> Result<(), ProxyError> {
+    let (exit_status_tx, exit_status_rx) = watch::channel(None);
+    let monitor_task = tokio::spawn(monitor_delegate_exit(
+        Arc::clone(&exit_status),
+        exit_status_tx,
+        reaper_task,
+    ));
+
+    signal_delegate(child, child_pid, terminate_child).await?;
+    let timed_out =
+        wait_for_delegate_exit(Arc::clone(&exit_status), exit_status_rx, SHUTDOWN_TIMEOUT)
+            .await
+            .is_err();
+    if timed_out {
+        signal_delegate(child, child_pid, kill_child).await?;
+    }
+    await_delegate_exit_monitor(monitor_task).await;
+
+    Ok(())
+}
+
+async fn signal_delegate(
+    child: &Arc<Mutex<Option<Child>>>,
+    child_pid: Option<u32>,
+    signaler: ChildSignaler,
+) -> Result<(), ProxyError> {
+    #[cfg(unix)]
+    {
+        let _ = child;
+        signaler(child_pid).await
+    }
+    #[cfg(not(unix))]
+    {
+        let mut child_guard = child.lock().await;
+        let Some(child) = child_guard.as_mut() else {
+            return Ok(());
+        };
+        let _ = child_pid;
+        child.start_kill()?;
+        Ok(())
+    }
+}
+
+async fn monitor_delegate_exit(
+    exit_status: Arc<Mutex<Option<ExitStatus>>>,
+    exit_status_tx: watch::Sender<Option<ExitStatus>>,
+    reaper_task: tokio::task::JoinHandle<()>,
+) {
+    let _ = reaper_task.await;
+    let status = *exit_status.lock().await;
+    let _ = exit_status_tx.send(status);
+}
+
+async fn await_delegate_exit_monitor(monitor_task: tokio::task::JoinHandle<()>) {
+    let _ = monitor_task.await;
+}
+
+async fn shutdown_raw_delegate(
+    state: RawDelegateState,
+    exit_status: Arc<Mutex<Option<ExitStatus>>>,
+    shutting_down: Arc<AtomicBool>,
+) -> Result<(), ProxyError> {
+    state.stdin_task.abort();
+    shutting_down.store(true, Ordering::SeqCst);
+    shutdown_delegate_process(
+        &state.child,
+        state.child_pid,
+        Arc::clone(&exit_status),
+        state.reaper_task,
+    )
+    .await?;
+
     state.stdout_task.await??;
     state.stderr_task.await??;
     Ok(())
 }
 
 #[cfg(unix)]
-async fn terminate_child(child: &mut Child) -> Result<(), ProxyError> {
-    let id = child.id().ok_or(ProxyError::MissingChildId)? as i32;
-    nix_killpg(id, libc::SIGTERM)?;
-    Ok(())
+fn terminate_child(
+    child_pid: Option<u32>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ProxyError>> + Send>> {
+    Box::pin(async move {
+        let id = child_pid.ok_or(ProxyError::MissingChildId)? as i32;
+        nix_killpg(id, libc::SIGTERM)?;
+        Ok(())
+    })
 }
 
 #[cfg(unix)]
-async fn kill_child(child: &mut Child) -> Result<(), ProxyError> {
-    let id = child.id().ok_or(ProxyError::MissingChildId)? as i32;
-    nix_killpg(id, libc::SIGKILL)?;
-    Ok(())
+fn kill_child(
+    child_pid: Option<u32>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ProxyError>> + Send>> {
+    Box::pin(async move {
+        let id = child_pid.ok_or(ProxyError::MissingChildId)? as i32;
+        nix_killpg(id, libc::SIGKILL)?;
+        Ok(())
+    })
 }
 
 #[cfg(unix)]
 fn nix_killpg(pgid: i32, signal: i32) -> Result<(), ProxyError> {
     let result = unsafe { libc::kill(-pgid, signal) };
     if result == 0 {
+        return Ok(());
+    }
+
+    let error = std::io::Error::last_os_error();
+    if matches!(error.raw_os_error(), Some(libc::ESRCH)) {
         Ok(())
     } else {
-        Err(ProxyError::Io(std::io::Error::last_os_error()))
+        Err(ProxyError::Io(error))
     }
 }
 
 // Windows has no process-group signalling equivalent to SIGTERM/SIGKILL, so both
 // the graceful and forceful paths fall back to `Child::start_kill`, which issues
-// a `TerminateProcess`. The caller already awaits `child.wait()` afterwards to
-// reap the process.
+// a direct termination request to the child process itself.
 #[cfg(windows)]
-async fn terminate_child(child: &mut Child) -> Result<(), ProxyError> {
-    child.start_kill()?;
-    Ok(())
+fn terminate_child(
+    child_pid: Option<u32>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ProxyError>> + Send>> {
+    let _ = child_pid;
+    Box::pin(async move { Ok(()) })
 }
 
 #[cfg(windows)]
-async fn kill_child(child: &mut Child) -> Result<(), ProxyError> {
-    child.start_kill()?;
-    Ok(())
+fn kill_child(
+    child_pid: Option<u32>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ProxyError>> + Send>> {
+    let _ = child_pid;
+    Box::pin(async move { Ok(()) })
 }
 
 async fn fail_all_waiters(waiters: &ResponseWaiters, message: String) {
-    let waiters = {
-        let mut guard = waiters.lock().await;
-        guard.drain().map(|(_, waiter)| waiter).collect::<Vec<_>>()
+    let senders = {
+        let mut waiters = waiters.lock().await;
+        waiters.drain().map(|(_, tx)| tx).collect::<Vec<_>>()
     };
-    for waiter in waiters {
-        // Receiver may already be gone; ignore the resulting send error.
-        let _ = waiter.send(Err(message.clone()));
-    }
-}
 
-impl Drop for DelegateHandle {
-    fn drop(&mut self) {
-        if let Ok(mut state) = self.state.try_lock() {
-            if let Some(mut state) = state.take() {
-                if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-                    runtime.spawn(async move {
-                        let _ = shutdown_delegate(state).await;
-                    });
-                } else {
-                    let _ = state.child.start_kill();
-                    state.stdout_task.abort();
-                    state.stderr_task.abort();
-                }
-            }
-        }
-    }
-}
-
-impl Drop for RawDelegate {
-    fn drop(&mut self) {
-        if let Ok(mut state) = self.state.try_lock() {
-            if let Some(mut state) = state.take() {
-                if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-                    self.stdin_tx
-                        .lock()
-                        .expect("raw delegate stdin mutex poisoned")
-                        .take();
-                    runtime.spawn(async move {
-                        let _ = shutdown_raw_delegate(state).await;
-                    });
-                } else {
-                    let _ = state.child.start_kill();
-                    state.stdin_task.abort();
-                    state.stdout_task.abort();
-                    state.stderr_task.abort();
-                }
-            }
-        }
+    for sender in senders {
+        let _ = sender.send(Err(message.clone()));
     }
 }
 
 #[derive(Debug, Error)]
 pub enum ProxyError {
-    #[error("io error: {0}")]
+    #[error("delegate command missing after -- separator")]
+    MissingDelegateCommand,
+    #[error("missing child pipe: {0}")]
+    MissingPipe(&'static str),
+    #[error("missing child id")]
+    MissingChildId,
+    #[error("duplicate in-flight id: {0}")]
+    DuplicateInflightId(String),
+    #[error("delegate closed before responding: {0}")]
+    DelegateClosed(String),
+    #[error("delegate response timed out: {0}")]
+    ResponseTimeout(String),
+    #[error("stdin forwarding channel already closed")]
+    StdinClosed,
+    #[error("stdin forwarding channel mutex poisoned")]
+    StdinChannelPoisoned,
+    #[error(transparent)]
     Io(#[from] std::io::Error),
-    #[error("json error: {0}")]
+    #[error(transparent)]
     Json(#[from] serde_json::Error),
     #[error("join error: {0}")]
     Join(#[from] tokio::task::JoinError),
-    #[error("missing delegate command")]
-    MissingDelegateCommand,
-    #[error("missing {0} pipe")]
-    MissingPipe(&'static str),
-    #[error("duplicate in-flight delegate id: {0}")]
-    DuplicateInflightId(String),
-    #[error("delegate closed before response: {0}")]
-    DelegateClosed(String),
-    #[error("delegate did not respond before timeout for id: {0}")]
-    ResponseTimeout(String),
-    #[cfg(unix)]
-    #[error("delegate child missing pid")]
-    MissingChildId,
+}
+
+impl Drop for DelegateHandle {
+    fn drop(&mut self) {
+        let Ok(mut guard) = self.state.try_lock() else {
+            return;
+        };
+        let Some(state) = guard.take() else {
+            return;
+        };
+
+        // Best-effort cleanup in Drop: never await, never panic, never block.
+        if let Ok(mut child_guard) = state.child.try_lock() {
+            if let Some(child) = child_guard.as_mut() {
+                let _ = child.start_kill();
+            }
+        }
+        state.stdout_task.abort();
+        state.stderr_task.abort();
+        state.reaper_task.abort();
+    }
+}
+
+impl Drop for RawDelegate {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.stdin_tx.lock() {
+            guard.take();
+        }
+
+        let Ok(mut state_guard) = self.state.try_lock() else {
+            return;
+        };
+        let Some(state) = state_guard.take() else {
+            return;
+        };
+
+        // Best-effort cleanup only: no await in Drop.
+        if let Ok(mut child_guard) = state.child.try_lock() {
+            if let Some(child) = child_guard.as_mut() {
+                let _ = child.start_kill();
+            }
+        }
+        state.stdin_task.abort();
+        state.stdout_task.abort();
+        state.stderr_task.abort();
+        state.reaper_task.abort();
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
 
     use serde_json::Value;
-    use tokio::io::{duplex, AsyncBufReadExt, BufReader, DuplexStream};
+    use tokio::io::{self, AsyncReadExt, DuplexStream};
+    use tokio::sync::mpsc;
 
     use crate::{ResolveResult, ResolveTask, WorkerRequest};
 
     use super::*;
 
+    struct SharedBufferWriter {
+        stream: DuplexStream,
+    }
+
+    impl AsyncWrite for SharedBufferWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.stream).poll_write(cx, buf)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.stream).poll_flush(cx)
+        }
+
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.stream).poll_shutdown(cx)
+        }
+    }
+
     fn writer_pair() -> (SharedWriter, DuplexStream) {
-        let (writer_stream, reader) = duplex(16 * 1024);
-        let writer: SharedWriter = Arc::new(Mutex::new(Box::new(writer_stream)));
-        (writer, reader)
+        let (writer, reader) = io::duplex(8192);
+        (
+            Arc::new(Mutex::new(Box::new(SharedBufferWriter { stream: writer }))),
+            reader,
+        )
     }
 
     async fn read_json_lines(reader: DuplexStream) -> Vec<Value> {
-        let mut lines = BufReader::new(reader).lines();
-        let mut values = Vec::new();
-        while let Some(line) = lines.next_line().await.expect("read line") {
-            values.push(serde_json::from_str(&line).expect("json line"));
+        let mut buffer = Vec::new();
+        let mut reader = reader;
+        reader
+            .read_to_end(&mut buffer)
+            .await
+            .expect("read writer output");
+        if buffer.is_empty() {
+            return Vec::new();
         }
-        values
+        String::from_utf8(buffer)
+            .expect("utf8")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("valid JSON line"))
+            .collect()
+    }
+
+    async fn read_text_lines(reader: DuplexStream) -> Vec<String> {
+        let mut buffer = Vec::new();
+        let mut reader = reader;
+        reader
+            .read_to_end(&mut buffer)
+            .await
+            .expect("read writer output");
+        if buffer.is_empty() {
+            return Vec::new();
+        }
+        String::from_utf8(buffer)
+            .expect("utf8")
+            .lines()
+            .map(str::to_owned)
+            .collect()
     }
 
     fn loopback_delegate_command() -> Vec<String> {
         vec![
             "sh".to_owned(),
             "-c".to_owned(),
-            r#"while IFS= read -r line; do
+            r#"
+while IFS= read -r line; do
     id=$(printf '%s\n' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
     case $line in
         *'"type":"run"'*)
@@ -753,12 +1111,15 @@ done
         // the reader sees EOF (otherwise read_json_lines blocks forever).
         drop(handle);
         let stdout_values = read_json_lines(stdout_reader).await;
-        let stderr_values = read_json_lines(stderr_reader).await;
+        let stderr_values = read_text_lines(stderr_reader).await;
 
         assert_eq!(stdout_values.len(), 2);
         assert_eq!(stdout_values[0]["type"], "done");
         assert_eq!(stdout_values[1]["type"], "resolved");
-        assert!(stderr_values.is_empty());
+        assert!(
+            stderr_values.is_empty(),
+            "clean exit should not log delegate failure: {stderr_values:?}"
+        );
     }
 
     #[tokio::test]
@@ -844,6 +1205,47 @@ wait
             }
             other => panic!("unexpected error: {other}"),
         }
+    }
+
+    #[tokio::test]
+    async fn delegate_stdout_close_logs_failure_on_nonzero_exit() {
+        let (stdout_writer, _stdout_reader) = writer_pair();
+        let (stderr_writer, stderr_reader) = writer_pair();
+        let handle = DelegateHandle::with_writers(
+            vec![
+                "python3".to_owned(),
+                "-c".to_owned(),
+                "import sys; sys.exit(1)".to_owned(),
+            ],
+            stdout_writer,
+            stderr_writer,
+            Some("delegate: ".to_owned()),
+        );
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            handle.send(WorkerMessage::Run(WorkerRequest::new(
+                "job-exit-1",
+                "build",
+            ))),
+        )
+        .await
+        .expect("must not hang")
+        .expect_err("delegate should fail");
+
+        match error {
+            ProxyError::DelegateClosed(message) => {
+                assert!(message.contains("delegate stdout closed"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+
+        handle.shutdown().await.expect("shutdown ok");
+        drop(handle);
+        let stderr_values = read_text_lines(stderr_reader).await;
+        assert_eq!(stderr_values.len(), 1);
+        assert!(stderr_values[0].starts_with("delegate: delegate process failed: command="));
+        assert!(stderr_values[0].contains("exit=exit status: 1"));
     }
 
     #[tokio::test]
@@ -942,6 +1344,39 @@ wait
     }
 
     #[tokio::test]
+    async fn raw_delegate_exit_status_captured_after_process_exit() {
+        let (handle, mut stdout) = spawn_raw_delegate(raw_delegate_command(&[
+            "sh",
+            "-c",
+            "printf 'ready\n'; exit 7",
+        ]));
+
+        let line = tokio::time::timeout(Duration::from_secs(2), stdout.recv())
+            .await
+            .expect("recv should complete")
+            .expect("stdout line");
+        assert_eq!(line, "ready");
+
+        let closed = tokio::time::timeout(Duration::from_secs(2), stdout.recv())
+            .await
+            .expect("recv should complete after exit");
+        assert!(closed.is_none());
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(status) = handle.exit_status().await {
+                    assert_eq!(status.code(), Some(7));
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("exit status should resolve");
+
+        handle.shutdown().await.expect("shutdown ok");
+    }
+    #[tokio::test]
     async fn raw_delegate_exits_on_stdin_close() {
         let (handle, _stdout) =
             spawn_raw_delegate(raw_delegate_command(&["sh", "-c", "cat >/dev/null"]));
@@ -949,6 +1384,42 @@ wait
         tokio::time::timeout(Duration::from_secs(2), handle.shutdown())
             .await
             .expect("shutdown should finish quickly")
+            .expect("shutdown ok");
+    }
+
+    #[tokio::test]
+    async fn send_line_from_sync_context_round_trips() {
+        assert_raw_line_round_trip("sync-context").await;
+    }
+
+    #[tokio::test]
+    async fn raw_delegate_shutdown_closes_clean_child() {
+        let (handle, _stdout) = spawn_cat_raw_delegate();
+        tokio::time::timeout(Duration::from_secs(2), handle.shutdown())
+            .await
+            .expect("shutdown should finish quickly")
+            .expect("shutdown ok");
+    }
+
+    #[tokio::test]
+    async fn delegate_shutdown_kills_stuck_child() {
+        let handle = DelegateHandle::new(vec![
+            "sh".to_owned(),
+            "-c".to_owned(),
+            "trap \"\" TERM; cat >/dev/null & wait".to_owned(),
+        ]);
+
+        handle
+            .send_with_timeout(
+                WorkerMessage::Run(WorkerRequest::new("job-stuck", "build")),
+                Duration::from_millis(100),
+            )
+            .await
+            .expect_err("delegate should stay silent");
+
+        tokio::time::timeout(Duration::from_secs(12), handle.shutdown())
+            .await
+            .expect("shutdown should complete via kill path")
             .expect("shutdown ok");
     }
 

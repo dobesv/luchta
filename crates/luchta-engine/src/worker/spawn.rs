@@ -34,6 +34,7 @@ pub(crate) async fn spawn_worker_process(
 
     Err(spawn_error(
         worker,
+        command_line,
         last_error.unwrap_or_else(etxtbsy_error),
     ))
 }
@@ -56,7 +57,7 @@ async fn handle_spawn_failure(
     source: io::Error,
 ) -> Result<Option<Child>, WorkerError> {
     if !should_retry_spawn(&source) {
-        return Err(spawn_error(attempt.worker, source));
+        return Err(spawn_error(attempt.worker, attempt.command_line, source));
     }
 
     *last_error = Some(source);
@@ -82,9 +83,10 @@ fn should_retry_spawn(error: &io::Error) -> bool {
     error.raw_os_error() == Some(libc::ETXTBSY)
 }
 
-fn spawn_error(worker: &str, source: io::Error) -> WorkerError {
+fn spawn_error(worker: &str, command_line: &str, source: io::Error) -> WorkerError {
     WorkerError::Spawn {
         worker: worker.to_owned(),
+        command: command_line.to_owned(),
         source,
     }
 }

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::process::ExitStatus;
 
 use luchta_worker::{ProxyError, RawDelegate, SharedWriter, WorkerMessage, WorkerResponse};
 use tokio::sync::mpsc;
@@ -11,6 +12,7 @@ pub enum InFlightKind {
 
 pub struct Generation {
     id: u64,
+    command: Vec<String>,
     delegate: RawDelegate,
     in_flight: HashMap<String, InFlightKind>,
     draining: bool,
@@ -22,13 +24,14 @@ impl Generation {
         command: Vec<String>,
         stderr_writer: SharedWriter,
     ) -> Result<(Self, mpsc::Receiver<String>), ProxyError> {
-        let mut delegate = RawDelegate::spawn_with_stderr(command, stderr_writer)?;
+        let mut delegate = RawDelegate::spawn_with_stderr(command.clone(), stderr_writer)?;
         let stdout = delegate
             .take_stdout()
             .ok_or(ProxyError::MissingPipe("stdout"))?;
         Ok((
             Self {
                 id,
+                command,
                 delegate,
                 in_flight: HashMap::new(),
                 draining: false,
@@ -39,6 +42,14 @@ impl Generation {
 
     pub fn id(&self) -> u64 {
         self.id
+    }
+
+    pub fn command(&self) -> &[String] {
+        &self.command
+    }
+
+    pub async fn exit_status(&self) -> Option<ExitStatus> {
+        self.delegate.exit_status().await
     }
 
     pub fn send(&mut self, msg: &WorkerMessage) -> Result<(), ProxyError> {
@@ -214,6 +225,47 @@ mod tests {
                 ("b".to_owned(), InFlightKind::Resolve),
             ]
         );
+
+        generation.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn generation_exposes_command_and_exit_status() {
+        let (generation, mut stdout) = Generation::new(
+            8,
+            vec![
+                "sh".to_owned(),
+                "-c".to_owned(),
+                "printf 'ready\n'; exit 9".to_owned(),
+            ],
+            test_stderr_writer(),
+        )
+        .expect("spawn generation");
+        assert_eq!(
+            generation.command(),
+            &[
+                "sh".to_owned(),
+                "-c".to_owned(),
+                "printf 'ready\n'; exit 9".to_owned()
+            ]
+        );
+
+        let line = tokio::time::timeout(Duration::from_secs(2), stdout.recv())
+            .await
+            .expect("recv should complete")
+            .expect("stdout line");
+        assert_eq!(line, "ready");
+        let closed = tokio::time::timeout(Duration::from_secs(2), stdout.recv())
+            .await
+            .expect("recv should complete after exit");
+        assert!(closed.is_none());
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let status = generation
+            .exit_status()
+            .await
+            .expect("exit status should be captured");
+        assert_eq!(status.code(), Some(9));
 
         generation.shutdown().await.expect("shutdown succeeds");
     }
