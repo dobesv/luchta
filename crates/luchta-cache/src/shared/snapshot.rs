@@ -221,7 +221,7 @@ impl SnapshotStore {
         visible_shards: &[SnapshotShard],
     ) -> MergeEntryOutcome {
         let shard_dir = self.shard_dir_path(commit_key);
-        let encoded = bincode::serde::encode_to_vec(consolidated, bincode_config())
+        let encoded = bincode::serde::encode_to_vec(consolidated, snapshot_bincode_config())
             .expect("snapshot serialization should succeed");
         let shard_id = blake3::hash(&encoded).to_hex().to_string();
         let shard_path = shard_dir.join(format!("{shard_id}.{SNAPSHOT_FILE_EXTENSION}"));
@@ -530,7 +530,14 @@ pub fn combined_dep_outputs_hash(dep_outputs_hashes: &BTreeMap<String, [u8; 32]>
     *hasher.finalize().as_bytes()
 }
 
-fn bincode_config() -> impl bincode::config::Config {
+/// Bincode configuration for on-disk snapshot shards.
+///
+/// Snapshots intentionally use the default variable-length integer encoding —
+/// distinct from the fixed-int cache-record config in `crate::serialization` —
+/// to preserve the existing on-disk snapshot format. Exposed to sibling test
+/// modules so snapshot fixtures serialize with the same encoding
+/// `Snapshot::load` expects.
+pub(crate) fn snapshot_bincode_config() -> impl bincode::config::Config {
     bincode::config::standard()
 }
 
@@ -541,7 +548,7 @@ fn decode_snapshot(
     let raw = decompress_snapshot_bytes(bytes)
         .map_err(|err| bincode::error::DecodeError::OtherString(err.to_string()))?;
     let (snapshot, _): (Snapshot, usize) =
-        bincode::serde::decode_from_slice(&raw, bincode_config())?;
+        bincode::serde::decode_from_slice(&raw, snapshot_bincode_config())?;
     if snapshot.schema_version != SNAPSHOT_SCHEMA_VERSION {
         return Err(bincode::error::DecodeError::OtherString(
             "unsupported snapshot schema version".to_owned(),
@@ -630,7 +637,7 @@ mod tests {
     #[test]
     fn snapshot_round_trip_serialization() {
         let snapshot = sample_snapshot();
-        let encoded = bincode::serde::encode_to_vec(&snapshot, bincode_config()).unwrap();
+        let encoded = bincode::serde::encode_to_vec(&snapshot, snapshot_bincode_config()).unwrap();
         let decoded = decode_snapshot(&encoded, "commit").unwrap();
         assert_eq!(decoded, snapshot);
     }
@@ -639,7 +646,7 @@ mod tests {
     fn snapshot_decode_rejects_schema_mismatch() {
         let mut snapshot = sample_snapshot();
         snapshot.schema_version = SNAPSHOT_SCHEMA_VERSION + 1;
-        let encoded = bincode::serde::encode_to_vec(&snapshot, bincode_config()).unwrap();
+        let encoded = bincode::serde::encode_to_vec(&snapshot, snapshot_bincode_config()).unwrap();
         let err = decode_snapshot(&encoded, "commit").unwrap_err();
         assert!(err
             .to_string()
@@ -692,7 +699,8 @@ mod tests {
         let commit_key = "commit-raw";
         let entry = sample_entry_with_seed(21, [11; 32]);
         let snapshot = snapshot_with_entries([entry.clone()]);
-        let raw_bytes = bincode::serde::encode_to_vec(&snapshot, bincode_config()).unwrap();
+        let raw_bytes =
+            bincode::serde::encode_to_vec(&snapshot, snapshot_bincode_config()).unwrap();
         let shard_id = blake3::hash(&raw_bytes).to_hex().to_string();
         let shard_path = store
             .shard_dir_path(commit_key)
@@ -897,7 +905,8 @@ mod tests {
 
         for entry in &seeded {
             let snapshot = snapshot_with_entries([entry.clone()]);
-            let bytes = bincode::serde::encode_to_vec(&snapshot, bincode_config()).unwrap();
+            let bytes =
+                bincode::serde::encode_to_vec(&snapshot, snapshot_bincode_config()).unwrap();
             let shard_id = blake3::hash(&bytes).to_hex().to_string();
             write_snapshot_file(
                 &store
@@ -951,7 +960,8 @@ mod tests {
         let new_entry = sample_entry_with_seed(18, [7; 32]);
 
         let seen_snapshot = snapshot_with_entries([seen_entry.clone()]);
-        let seen_bytes = bincode::serde::encode_to_vec(&seen_snapshot, bincode_config()).unwrap();
+        let seen_bytes =
+            bincode::serde::encode_to_vec(&seen_snapshot, snapshot_bincode_config()).unwrap();
         let seen_shard_id = blake3::hash(&seen_bytes).to_hex().to_string();
         write_snapshot_file(
             &store
@@ -968,7 +978,7 @@ mod tests {
             .entries
             .insert(input_key_hex(new_entry.input_key), new_entry.clone());
         let consolidated_bytes =
-            bincode::serde::encode_to_vec(&consolidated, bincode_config()).unwrap();
+            bincode::serde::encode_to_vec(&consolidated, snapshot_bincode_config()).unwrap();
         let consolidated_id = blake3::hash(&consolidated_bytes).to_hex().to_string();
         let consolidated_path = store
             .shard_dir_path(commit_key)
@@ -980,7 +990,7 @@ mod tests {
 
         let unseen_snapshot = snapshot_with_entries([unseen_entry.clone()]);
         let unseen_bytes =
-            bincode::serde::encode_to_vec(&unseen_snapshot, bincode_config()).unwrap();
+            bincode::serde::encode_to_vec(&unseen_snapshot, snapshot_bincode_config()).unwrap();
         let unseen_shard_id = blake3::hash(&unseen_bytes).to_hex().to_string();
         write_snapshot_file(
             &store
@@ -1023,7 +1033,7 @@ mod tests {
         let commit_key = "commit-delete-noop";
         let entry = sample_entry_with_seed(19, [8; 32]);
         let snapshot = snapshot_with_entries([entry.clone()]);
-        let bytes = bincode::serde::encode_to_vec(&snapshot, bincode_config()).unwrap();
+        let bytes = bincode::serde::encode_to_vec(&snapshot, snapshot_bincode_config()).unwrap();
         let shard_id = blake3::hash(&bytes).to_hex().to_string();
         let shard_path = store
             .shard_dir_path(commit_key)
@@ -1217,7 +1227,8 @@ mod tests {
             snapshot_with_entries([present_entry.clone()]),
             snapshot_with_entries([missing_entry.clone()]),
         ] {
-            let bytes = bincode::serde::encode_to_vec(&snapshot, bincode_config()).unwrap();
+            let bytes =
+                bincode::serde::encode_to_vec(&snapshot, snapshot_bincode_config()).unwrap();
             let shard_id = blake3::hash(&bytes).to_hex().to_string();
             write_snapshot_file(
                 &store
@@ -1234,7 +1245,7 @@ mod tests {
         assert_eq!(shards.len(), 2);
         let missing_bytes = bincode::serde::encode_to_vec(
             snapshot_with_entries([missing_entry.clone()]),
-            bincode_config(),
+            snapshot_bincode_config(),
         )
         .unwrap();
         let missing_shard_id = blake3::hash(&missing_bytes).to_hex().to_string();
@@ -1260,7 +1271,7 @@ mod tests {
 
     fn write_snapshot_file(path: &Path, snapshot: Snapshot) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let bytes = bincode::serde::encode_to_vec(&snapshot, bincode_config()).unwrap();
+        let bytes = bincode::serde::encode_to_vec(&snapshot, snapshot_bincode_config()).unwrap();
         let on_disk = compress_snapshot_bytes(&bytes).unwrap();
         fs::write(path, on_disk).unwrap();
     }
