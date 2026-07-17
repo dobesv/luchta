@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use crate::record::{TaskRunRecord, SCHEMA_VERSION_V4};
+use crate::serialization::bincode_config;
 use crate::shared::atomic_write;
 use crate::{CacheError, Result};
 
@@ -18,10 +19,6 @@ pub const CACHE_DIR_NAME: &str = "cache";
 pub const GITIGNORE_FILE_NAME: &str = ".gitignore";
 pub const GITIGNORE_CONTENTS: &str = "*\n";
 const TMP_FILE_MAX_AGE: Duration = Duration::from_secs(60 * 60);
-
-fn bincode_config() -> impl bincode::config::Config {
-    bincode::config::standard().with_fixed_int_encoding()
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReportInput {

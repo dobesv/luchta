@@ -3,6 +3,8 @@ use std::{collections::BTreeMap, fs::File, io::Read, path::Path};
 use luchta_types::{DependsOn, EnvSpec, TaskDefinition};
 use serde::Serialize;
 
+use crate::serialization::bincode_config;
+
 pub fn blake3_file(path: &Path) -> crate::Result<[u8; 32]> {
     let mut file = File::open(path)?;
     let mut hasher = blake3::Hasher::new();
@@ -70,10 +72,6 @@ pub fn pkg_dep_hash(pairs: &[(String, String)]) -> [u8; 32] {
         .expect("package dependency canonical bincode serialization should succeed");
 
     *blake3::hash(&bytes).as_bytes()
-}
-
-fn bincode_config() -> impl bincode::config::Config {
-    bincode::config::standard().with_fixed_int_encoding()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

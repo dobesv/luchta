@@ -43,6 +43,7 @@ use std::sync::OnceLock;
 use tokio::task::JoinSet;
 
 use crate::record::TaskRunRecord;
+use crate::serialization::bincode_config;
 
 /// Reserved prefix for metadata files inside blobs.
 pub const META_DIR_NAME: &str = ".luchta-meta";
@@ -406,17 +407,15 @@ impl SharedCache {
         };
 
         // Decode record.
-        let record: TaskRunRecord = match bincode::serde::decode_from_slice(
-            &staged.meta.record,
-            bincode::config::standard().with_fixed_int_encoding(),
-        ) {
-            Ok((record, _)) => record,
-            Err(_) => {
-                // Discard staging on decode failure
-                let _ = staged.discard();
-                return None;
-            }
-        };
+        let record: TaskRunRecord =
+            match bincode::serde::decode_from_slice(&staged.meta.record, bincode_config()) {
+                Ok((record, _)) => record,
+                Err(_) => {
+                    // Discard staging on decode failure
+                    let _ = staged.discard();
+                    return None;
+                }
+            };
 
         let meta = staged.meta.clone();
         Some(StagedCandidate {
@@ -634,11 +633,8 @@ impl SharedCache {
         }
 
         // Prepare meta files.
-        let meta_record = bincode::serde::encode_to_vec(
-            record,
-            bincode::config::standard().with_fixed_int_encoding(),
-        )
-        .map_err(io::Error::other)?;
+        let meta_record =
+            bincode::serde::encode_to_vec(record, bincode_config()).map_err(io::Error::other)?;
 
         let meta = MetaFiles {
             stdout: stdout.to_vec(),
@@ -730,10 +726,6 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::thread;
     use tempfile::TempDir;
-
-    pub(crate) fn bincode_config() -> impl bincode::config::Config {
-        bincode::config::standard().with_fixed_int_encoding()
-    }
 
     pub(crate) fn setup_git_repo(repo_root: &Path) {
         use std::process::Command;
@@ -1363,7 +1355,11 @@ mod tests {
         snapshot
             .entries
             .insert(input_key_hex(entry.input_key), entry);
-        let encoded = bincode::serde::encode_to_vec(&snapshot, bincode_config()).unwrap();
+        let encoded = bincode::serde::encode_to_vec(
+            &snapshot,
+            crate::shared::snapshot::snapshot_bincode_config(),
+        )
+        .unwrap();
         fs::create_dir_all(snapshot_dir.join(commit)).unwrap();
         fs::write(snapshot_dir.join(commit).join("a.bincode"), encoded).unwrap();
     }

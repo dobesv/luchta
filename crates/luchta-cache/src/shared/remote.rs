@@ -383,7 +383,8 @@ impl RemoteSync {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shared::tests::{bincode_config, create_commit, sample_record, setup_git_repo};
+    use crate::shared::snapshot::snapshot_bincode_config;
+    use crate::shared::tests::{create_commit, sample_record, setup_git_repo};
     use crate::shared::{
         derive_input_key, input_key_hex, OpenExtras, SharedCache, Snapshot, SnapshotEntry,
         StoreOutcome, SNAPSHOT_SCHEMA_VERSION,
@@ -846,7 +847,7 @@ mod tests {
         fs::create_dir_all(&remote_commit_dir).unwrap();
         fs::write(
             remote_commit_dir.join(format!("missing.{SNAPSHOT_FILE_EXTENSION}")),
-            bincode::serde::encode_to_vec(&snapshot, bincode_config()).unwrap(),
+            bincode::serde::encode_to_vec(&snapshot, snapshot_bincode_config()).unwrap(),
         )
         .unwrap();
 

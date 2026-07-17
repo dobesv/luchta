@@ -3,6 +3,7 @@ mod hashing;
 mod reason;
 mod record;
 mod resolve;
+mod serialization;
 pub mod shared;
 mod store;
 
