@@ -5,6 +5,8 @@ mod format;
 #[cfg(feature = "oxc")]
 mod opts;
 #[cfg(feature = "oxc")]
+mod sort_imports;
+#[cfg(feature = "oxc")]
 mod worker;
 
 #[cfg(feature = "oxc")]

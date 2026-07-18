@@ -49,30 +49,34 @@ impl Worker for OxfmtWorker {
         };
 
         let cwd = Path::new(cwd);
-        let config = match discover_config(cwd) {
-            Ok(config) => config,
-            Err(error) => return ResolveResult::reject(error),
-        };
-        if !config.warnings.is_empty() {
-            return ResolveResult::reject(config.warnings.join("; "));
-        }
-        let (files, warnings) = match collect_formattable_files(cwd, config.ignore_matcher.as_ref())
-        {
-            Ok(result) => result,
-            Err(error) => return ResolveResult::reject(error),
-        };
-        if !warnings.is_empty() {
-            return ResolveResult::reject(warnings.join("; "));
-        }
+        let modify = ResolveResult::modify(TaskModification {
+            inputs: Some(inputs.into_iter().collect()),
+            ..TaskModification::default()
+        });
 
+        // Resolution's job is to compute file inputs and detect the legitimate
+        // "nothing to format" case. Config problems (an unparseable `.oxfmtrc`,
+        // a bad ignore pattern, unsupported keys) are NOT resolution failures —
+        // pruning/rejecting here would silently hide the task ("nothing to
+        // run"). Instead we let the task run; `run_in_process` re-discovers the
+        // config, emits any diagnostics, and fails the task (non-zero exit) if
+        // the config is genuinely broken. So on any config error we simply keep
+        // the task and defer to execution.
+        let Ok(config) = discover_config(cwd) else {
+            return modify;
+        };
+        let Ok((files, _warnings)) = collect_formattable_files(cwd, config.ignore_matcher.as_ref())
+        else {
+            return modify;
+        };
+
+        // The only legitimate resolve-time prune: there is genuinely no JS/TS
+        // source to format in this package.
         if files.is_empty() {
             return ResolveResult::prune(Some("no JS/TS source files found for oxfmt".to_owned()));
         }
 
-        ResolveResult::modify(TaskModification {
-            inputs: Some(inputs.into_iter().collect()),
-            ..TaskModification::default()
-        })
+        modify
     }
 
     fn build_command(&self, _req: &WorkerRequest) -> String {
@@ -123,7 +127,10 @@ impl Worker for OxfmtWorker {
                     };
                 }
             };
-            let warnings = loaded_config.warnings.clone();
+            // Config warnings + unsupported-key notices are surfaced to stderr
+            // during execution; neither aborts the run (a genuinely broken
+            // config already failed above via the `discover_config` error path).
+            let warnings = loaded_config.diagnostics();
             let (files, collection_warnings) = match task::spawn_blocking({
                 let cwd = cwd.clone();
                 let ignore_matcher = loaded_config.ignore_matcher.clone();
