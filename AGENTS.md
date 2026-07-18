@@ -63,21 +63,42 @@ here.
 
 ## Changeset Files
 
-When making a user-visible change, add a changeset file under `.changeset/`:
+When making a user-visible change, add a changeset file under `.changeset/`. The
+YAML front matter specifies the version bump level, which Knope maps to
+`CHANGELOG.md` sections:
+- `patch` → **Fixes**
+- `minor` → **Features**
+- `major` → **Breaking Changes**
 
+The key **must** be `luchta` — the whole workspace shares one version
+(`version.workspace = true`), so individual crate names are not valid keys and
+will cause `knope release` to error.
+
+### Examples
+
+**Simple:**
+```markdown
+---
+luchta: patch
+---
+Fix oxfmt output truncation when buffer is full.
+```
+
+**Multi-line:**
 ```markdown
 ---
 luchta: minor
 ---
-Brief description of the change.
+# Support for custom build targets
+
+Allow users to specify `--target` in the configuration file.
 ```
 
-The YAML front matter specifies the version bump: `patch`, `minor`, or `major`.
-The key on the left **must** be `luchta` — the whole workspace shares one
-version (`version.workspace = true`), so individual crate names are not valid
-keys and will cause `knope release` to error.
+> [!IMPORTANT]
+> Use a single `#` for headers. Knope re-levels them automatically. Do **not**
+> use `####` as it produces mis-leveled output.
 
-The filename should be a short kebab-case slug of the change, e.g.
+The filename should be a short kebab-case slug, e.g.
 `.changeset/add-blake3-caching.md`.
 
 ## Releasing
