@@ -4,7 +4,7 @@ date: 2026-07-12
 category: "integration-issues"
 problem_type: integration_issue
 component: "luchta-oxfmt-worker"
-root_cause: "Config mapping code silently dropped Prettier-compatible options; override options not validated at load time causing runtime panics"
+root_cause: "Hand-maintained serde config struct silently drops unknown keys; override inheritance clobbers inherited values"
 resolution_type: code_fix
 severity: high
 tags:
@@ -13,7 +13,10 @@ tags:
   - config-override
   - eager-validation
   - glob-matching
+  - serde-silent-drop
+  - sort-imports
 plan_ref: "oxfmt-opts-gaps"
+last_updated: 2026-07-17
 ---
 
 # Problem
@@ -177,8 +180,154 @@ let options_for_blocking = loaded_config.options_for(&path);
 - `oxc_formatter/src/options.rs` for available `JsFormatOptions` fields
 - `apps/oxfmt/src/core/options/to_oxc_formatter.rs` for canonical Prettier→enum mappings
 
-# Related Issues
+---
 
+# Addendum: sortImports and Systematic Unknown-Key Detection (2026-07-17)
+
+GitHub issue #242 added `sortImports` support and systematic unknown-key warnings.
+
+## Problem: Serde Silent Drop Pattern
+
+`OxfmtRc` in `config.rs` is a hand-maintained subset of prettier-compatible options. Without `#[serde(deny_unknown_fields)]`, serde silently drops unknown keys — `sortImports`, `sortTailwindcss`, `jsdoc`, experimental options all vanished without warning.
+
+## Solution: Warning-Based Unknown Key Strategy
+
+Chose warnings over hard-errors for forward-compat. A newer or shared `.oxfmtrc` degrades gracefully (warn + ignore) rather than hard-failing formatting for the whole repo.
+
+Implementation in `config.rs`:
+- `KNOWN_FORMAT_OPTION_KEYS` — single source of truth for valid formatter options
+- `KNOWN_TOP_LEVEL_ONLY_KEYS` — `["overrides", "ignorePatterns", "$schema"]`
+- `KNOWN_OVERRIDE_ENTRY_KEYS` — `["files", "excludeFiles", "options"]`
+- `collect_unknown_options()` — scans raw JSON before serde deserialization
+- Notices surfaced via `LoadedConfig.unsupported_option_notices` (NOT `warnings` —
+  see "Two Diagnostic Channels" below). These are informational and never affect
+  task resolution.
+
+```rust
+let unknown = collect_unknown_options(&json)?;
+for key in unknown.top_level {
+    unsupported_option_notices.push(format!(
+        "warning: unsupported .oxfmtrc option `{key}` in {}; ignoring",
+        path.display()
+    ));
+}
+```
+
+Unsupported experimental options (`experimentalOperatorPosition`, `experimentalTernaries`) are ignored and surfaced as unsupported-key notices instead of hard-failing. They're absent from `KNOWN_FORMAT_OPTION_KEYS`, so they flow through the same generic notice path.
+
+## Override Scanner Subtlety
+
+Override entry shape is `{files, excludeFiles, options}`. Formatter options live under nested `options`, not at entry root. The scanner must:
+1. Warn on formatter keys misplaced at override root (serde silently ignores them)
+2. Recurse into `overrides[].options` for typos there — reusing the shared
+   `unknown_format_option_keys` helper, which ALSO descends into a nested
+   `sortImports` / `experimentalSortImports` object (so typos like
+   `sortImports.custmGroups` inside an override are surfaced too).
+
+```rust
+fn unknown_override_entry_keys(entry: &Value) -> Vec<String> {
+    // Unknown at root (e.g. "singleQuote" at root instead of under "options")
+    let mut unknown: Vec<String> = object
+        .keys()
+        .filter(|key| !is_known(KNOWN_OVERRIDE_ENTRY_KEYS, key))
+        .cloned()
+        .collect();
+    // Unknown inside nested options — including nested sortImports sub-keys,
+    // via the same helper used for the top-level scan.
+    if let Some(options) = object.get("options").and_then(Value::as_object) {
+        unknown.extend(unknown_format_option_keys(options));
+    }
+    unknown
+}
+```
+
+## Override Inheritance Bug
+
+`apply_oxfmtrc_to_options` is used for both base config and per-override merge. Unconditional assignment of `options.sort_imports = resolve(...)` meant an override omitting `sortImports` overwrote inherited top-level value with `None` — silently disabling sorting.
+
+Fix: guard with presence check:
+
+```rust
+// config.rs:243-245
+if config.sort_imports.is_some() {
+    options.sort_imports = sort_imports::resolve_sort_imports(config.sort_imports.clone())?;
+}
+```
+
+Explicit `sortImports: false` still resolves to `None` (intended disable). Pattern matches every scalar option's `if let Some(...)` guard.
+
+## Where to Find the Upstream Schema
+
+`apps/oxfmt` is a binary crate (not a publishable library), so luchta cannot depend on it. But these are authoritative sources to MIRROR:
+
+- `apps/oxfmt/src/core/oxfmtrc.rs` — `FormatConfig`, `SortImportsUserConfig`, `SortImportsConfig` serde schema
+- `apps/oxfmt/src/core/options/to_oxc_formatter.rs::to_sort_imports` — canonical mapping
+- Vendored at `~/.cargo/git/checkouts/oxc-*/<rev>/` — rev pinned in workspace root Cargo.toml
+
+`oxc_formatter::JsFormatOptions` supports: `sort_imports: Option<SortImportsOptions>`, `sort_tailwindcss`, `jsdoc`, `experimental_operator_position`, `experimental_ternaries`.
+
+## CodeScene Refactoring Notes
+
+Faithfully mirroring upstream's group/customGroups parsing produces high cyclomatic complexity. Decompose into `map_*`/`apply_*` helpers. Caveats:
+
+- `if let Some(x) { options.y = match x {...} }` triggers "Bumpy Road" (nesting depth 2) — extract inner match into free `map_*` fn
+- Over-extracting tiny helpers into one file triggers "Low Cohesion" — move cohesive cluster into its own module (`sort_imports.rs`)
+
+Worker-level E2E tests belong in `tests/protocol.rs` (spawns real binary) rather than inflating the unit-test module's LCOM4 responsibility count.
+
+## Verification Gotchas
+
+- `SortImportsOptions::validate()` rejects `partitionByNewline: true` + `newlinesBetween: true` together
+- `ignore` crate accepts `"["` as gitignore pattern (no error) but rejects `"\\"` (dangling escape)
+- `ImportSelector` has no `Value` variant — catch-all selector string is `"import"`
+
+## Related Issues
+
+- **GitHub:** [#242](https://github.com/dobesv/luchta/issues/242) — Honor sortImports + systematically surface unmapped options
 - **GitHub:** [#211](https://github.com/dobesv/luchta/issues/211) — Support configuration overrides in oxfmt worker
 - **Related Solution:** [logic-errors/ignore-pattern-worker-file-selection-2026-07-11.md](../logic-errors/ignore-pattern-worker-file-selection-2026-07-11.md) — Config-anchored pattern matching using same `ignore::Gitignore` crate
 - **Related Solution:** [integration-issues/oxc-worker-in-process-integration-2026-07-08.md](../integration-issues/oxc-worker-in-process-integration-2026-07-08.md) — Original `.oxfmtrc` config discovery implementation
+
+---
+
+# POST-MERGE REGRESSION: Warnings Pruned Tasks Silently (2026-07-17)
+
+## Regression
+
+After #242 merged, `luchta run oxfmt` reported `note: task 'oxfmt' was pruned from every package during resolution; nothing to run` for any `.oxfmtrc` containing an unrecognized key (e.g. `plugins`).
+
+**Root cause:** `OxfmtWorker::resolve_task` (`crates/luchta-oxfmt-worker/src/worker.rs`) treated ANY `config.warnings` — and any `discover_config`/`collect_formattable_files` error — as `ResolveResult::reject`. In run mode, the engine downgrades `Reject` to `Prune` (see `PruneOutcome::Rejected` in luchta-engine). The CLI then reports "nothing to run" (`luchta-cli/src/run.rs` `report_unmatched_request`).
+
+**Trigger:** #242 added "unsupported .oxfmtrc key" notices into `config.warnings`. Any config with an unknown key pruned the task. Symptom appeared intermittent ("worked once, pruned later") but was actually config-content dependent.
+
+## Design Principle
+
+Config errors must FAIL at execution, not PRUNE at resolve. Pruning hides problems as "nothing to run" — the opposite of useful. The resolve phase's job is computing file inputs and detecting the legitimate "no source files" case.
+
+**Fix:** `resolve_task` now returns `Modify` (keep the task) on ANY config discovery/collection error or warning. Only `Prune`s when genuinely no JS/TS source files exist. `run_in_process` re-discovers config at execution, emits diagnostics to stderr, and returns exit_code 1 on real parse errors.
+
+**Rule:** A worker's resolve verdict should never turn a config/tooling problem into a silent prune.
+
+## Two Diagnostic Channels
+
+`LoadedConfig` now separates:
+- `warnings` — genuine problems (unparseable ignore pattern)
+- `unsupported_option_notices` — unknown-key notices
+
+Both informational at execution via `LoadedConfig::diagnostics()`; neither affects resolution.
+
+## Unknown-Key Scanning Must Recurse and Cover Aliases
+
+The scanner must descend into nested objects (`overrides[].options`, and the `sortImports` object) AND check alias spellings (`sortImports` + `experimentalSortImports`). Typos nested inside `sortImports` or its alias are silently dropped otherwise — recreating the exact bug class in the new feature surface.
+
+See `KNOWN_SORT_IMPORTS_KEYS` / `SORT_IMPORTS_KEYS` / `unknown_sort_imports_keys` in `config.rs`.
+
+## Bound the FILE Read
+
+`load_config_from_path` originally capped only the comment-stripped output; the raw `read_to_string` was unbounded (OOM vector).
+
+**Fix:** `file.take(MAX_CONFIG_BYTES).read_to_string(...)` bounds the input itself, not just derived buffers.
+
+## Testing Resolve-Phase Behavior
+
+Worker binary handles `resolveTask` JSONL message (`WorkerMessage::ResolveTask`, tag `resolveTask`) and responds `{"type":"resolved","result":{"decision":"modify"|"prune"|...}}`. Integration tests can drive this directly (`tests/protocol.rs` `resolve_decision` helper) to assert the decision — stronger than unit-testing the pub(crate) fn.

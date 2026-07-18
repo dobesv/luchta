@@ -94,7 +94,7 @@ fn format_diagnostic(path: &Path, repo_root: &Path, message: &str) -> String {
 mod tests {
     use std::path::Path;
 
-    use oxc_formatter::JsFormatOptions;
+    use oxc_formatter::{JsFormatOptions, SortImportsOptions};
 
     use super::{css_format_options, format_path};
 
@@ -134,6 +134,21 @@ mod tests {
             format_path(path, Path::new(""), input, &JsFormatOptions::new()).expect("format ok");
 
         assert_eq!(result.formatted, expected);
+    }
+
+    #[test]
+    fn format_path_sorts_imports_when_enabled() {
+        let path = Path::new("src/example.ts");
+        let input = "import z from 'z';\nimport a from 'a';\n\nexport { z, a };\n";
+        let expected = "import a from \"a\";\nimport z from \"z\";\n\nexport { z, a };\n";
+
+        let mut options = JsFormatOptions::new();
+        options.sort_imports = Some(SortImportsOptions::default());
+
+        let result = format_path(path, Path::new(""), input, &options).expect("format ok");
+
+        assert_eq!(result.formatted, expected);
+        assert!(result.changed);
     }
 
     #[test]
