@@ -186,21 +186,46 @@ problems) for a change to be considered done.
 ### Releasing
 
 Releases are managed by [knope](https://knope.tech/) and driven by changeset
-files in `.changeset/`. Add a changeset for every user-visible change:
+files in `.changeset/`. Add a changeset for every user-visible change.
 
+The front-matter key is always `luchta` — the whole workspace shares one
+version (`version.workspace = true`), so individual crate names are not valid
+keys and will cause `knope release` to error. The bump level determines the
+section in `CHANGELOG.md`:
+- `patch` → **Fixes**
+- `minor` → **Features**
+- `major` → **Breaking Changes**
+
+#### Format
+
+**Simple:**
+```markdown
+---
+luchta: patch
+---
+Fix oxfmt output truncation when buffer is full.
+```
+
+**Multi-line:**
 ```markdown
 ---
 luchta: minor
 ---
-Brief description of the change.
+# Support for custom build targets
+
+Allow users to specify `--target` in the configuration file.
 ```
 
-The front-matter key is always `luchta`, and the bump level is one of `patch`,
-`minor`, or `major`. To cut a release, run the **Prepare Release** GitHub
-Action (or `knope release` locally); knope bumps the version, updates
-`CHANGELOG.md`, and pushes a `luchta/v<version>` tag. The tag push triggers the **Release** workflow, which cross-builds platform binaries for Linux, macOS, and Windows and attaches the archives to the GitHub Release. The Release
-workflow can also be run on demand (`workflow_dispatch`) to build binaries
-without cutting a version.
+> [!IMPORTANT]
+> When using a header, use a single `#`. Knope automatically re-levels it for
+> the changelog. Do not use `####`.
+
+To cut a release, run the **Prepare Release** GitHub Action (or `knope release`
+locally); knope bumps the version, updates `CHANGELOG.md`, and pushes a
+`luchta/v<version>` tag. The tag push triggers the **Release** workflow, which
+cross-builds platform binaries for Linux, macOS, and Windows and attaches the
+archives to the GitHub Release. The Release workflow can also be run on demand
+(`workflow_dispatch`) to build binaries without cutting a version.
 
 ## Usage Sketch
 
