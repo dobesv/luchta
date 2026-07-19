@@ -73,7 +73,11 @@ impl PackageDirResolver {
 }
 
 fn format_expansion_error(error: &InputExpansionError) -> String {
-    error.to_string()
+    // The wrapped `error`'s Display already names the offending pattern and a
+    // user-safe package label (root renders as "the workspace root", never the
+    // internal `//root` sentinel), so we only add the `input` prefix here. This
+    // read/skip path has no task context to include.
+    format!("input \"{}\": {}", error.pattern(), error)
 }
 
 impl FileStateResolver for PackageDirResolver {

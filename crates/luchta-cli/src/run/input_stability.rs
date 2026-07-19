@@ -19,16 +19,40 @@
 use super::*;
 use luchta_cache::files_diff;
 
+/// Borrowed inputs for resolving a task's pre-execution snapshot.
+///
+/// Encapsulates the resolution context so the diagnostics can name the task and
+/// its input provenance without exposing the internal `//root` package sentinel.
+pub(crate) struct PreExecutionSnapshotRequest<'a> {
+    pub input_patterns: &'a [String],
+    pub source_pkg: &'a PackageName,
+    pub package_graph: &'a PackageGraph,
+    pub repo_root: &'a Path,
+    pub task_id: &'a TaskId,
+    pub inputs_from_worker: bool,
+}
+
 /// Resolve a pre-execution input snapshot for stability checking.
 ///
 /// Captures the declared input patterns (with content hashes) BEFORE task
 /// execution so a concurrent edit during the run can be detected afterwards.
 pub(crate) fn resolve_pre_execution_inputs(
-    input_patterns: &[String],
-    source_pkg: &PackageName,
-    package_graph: &PackageGraph,
-    repo_root: &Path,
+    request: PreExecutionSnapshotRequest<'_>,
 ) -> Vec<FileEntry> {
+    let PreExecutionSnapshotRequest {
+        input_patterns,
+        source_pkg,
+        package_graph,
+        repo_root,
+        task_id,
+        inputs_from_worker,
+    } = request;
+
+    // Identify the task by its user-facing `task_id` (root tasks render as
+    // `#task`, never the internal `//root` sentinel) and state where its inputs
+    // originated, matching the fatal cache-write path. We deliberately do NOT
+    // print `source_pkg` — that would leak the `//root` sentinel for root tasks.
+    let origin = input_origin_clause(inputs_from_worker);
     let requests = match expand_input_patterns(input_patterns, source_pkg, package_graph, repo_root)
     {
         Ok(reqs) => reqs,
@@ -38,7 +62,7 @@ pub(crate) fn resolve_pre_execution_inputs(
             // resolution then succeeds, the diff would otherwise look like inputs
             // appeared mid-run and spuriously skip the cache write.
             eprintln!(
-                "warning: failed to expand input patterns for pre-execution snapshot in package '{source_pkg}': {error} — skipping concurrent-change detection for this run"
+                "warning: failed to expand input patterns for pre-execution snapshot of task '{task_id}' ({origin}): {error} — skipping concurrent-change detection for this run"
             );
             return Vec::new();
         }
@@ -48,7 +72,7 @@ pub(crate) fn resolve_pre_execution_inputs(
         Ok(entries) => entries,
         Err(error) => {
             eprintln!(
-                "warning: failed to resolve inputs for pre-execution snapshot in package '{source_pkg}': {error} — skipping concurrent-change detection for this run"
+                "warning: failed to resolve inputs for pre-execution snapshot of task '{task_id}' ({origin}): {error} — skipping concurrent-change detection for this run"
             );
             Vec::new()
         }
@@ -110,6 +134,15 @@ pub(crate) enum CacheInputResult {
     IoError,
 }
 
+/// Human-readable clause describing where a task's input patterns originated.
+pub(crate) fn input_origin_clause(inputs_from_worker: bool) -> &'static str {
+    if inputs_from_worker {
+        "returned by the worker"
+    } else {
+        "declared in the task spec"
+    }
+}
+
 /// Resolve the (post-execution) input entries for a task's cache record.
 pub(crate) fn resolve_cache_inputs(
     cache_ctx: &CacheWriteContext,
@@ -123,10 +156,16 @@ pub(crate) fn resolve_cache_inputs(
     ) {
         Ok(reqs) => reqs,
         Err(error) => {
+            // NOTE: the offending package is already conveyed by `task_id`
+            // (root tasks render as `#task`, never the internal `//root`
+            // sentinel) and by the wrapped `error`'s own Display, so we do not
+            // print `source_pkg` separately — that would both duplicate the
+            // package and leak the `//root` sentinel for root tasks.
             return CacheInputResult::ExpansionError(format!(
-                "input \"{}\" in package \"{}\": {}",
+                "input \"{}\" for task \"{}\" ({}): {}",
                 error.pattern(),
-                cache_ctx.source_pkg,
+                cache_ctx.task_id,
+                input_origin_clause(cache_ctx.inputs_from_worker),
                 error
             ));
         }
@@ -164,6 +203,54 @@ pub(crate) fn resolve_cache_outputs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{collections::BTreeMap, sync::Arc};
+
+    use crate::{
+        run::{CacheDecisionContext, CacheWriteContext},
+        watch::registry::empty_task_watch_registry,
+    };
+    use luchta_cache::{Decision, RunReason};
+    use luchta_workspace::PackageNode;
+
+    fn sample_cache_write_context(task_id: TaskId) -> CacheWriteContext {
+        let root = tempfile::tempdir().expect("tempdir").keep();
+        let package_path = root.join("packages/pkg");
+        std::fs::create_dir_all(&package_path).expect("create package path");
+        std::fs::write(
+            package_path.join("package.json"),
+            r#"{"name":"pkg","version":"1.0.0"}"#,
+        )
+        .expect("write package manifest");
+        let package_graph = Arc::new(
+            PackageGraph::build(vec![PackageNode::new(
+                PackageName::from("pkg"),
+                &package_path,
+            )])
+            .expect("build package graph"),
+        );
+
+        CacheWriteContext {
+            task_id,
+            task_def: TaskDefinition::default(),
+            inputs_from_worker: false,
+            package_path,
+            dep_outputs: BTreeMap::new(),
+            task_spec_hash: [1; 32],
+            env_hash: [2; 32],
+            pkg_dep_hash: [3; 32],
+            start_unix_ms: 10,
+            repo_root: root,
+            source_pkg: PackageName::from("pkg"),
+            package_graph,
+            cache_nonce: None,
+            decision: CacheDecisionContext {
+                action: Decision::Run,
+                run_reason: RunReason::NoPriorRecord,
+            },
+            task_watch_registry: empty_task_watch_registry(),
+            pre_snapshot: Some(Vec::new()),
+        }
+    }
 
     #[test]
     fn check_input_stability_detects_change() {
@@ -289,6 +376,57 @@ mod tests {
         assert!(
             result.unwrap_err().contains("new file"),
             "mismatch reason should mention the new file"
+        );
+    }
+
+    fn assert_expansion_error_origin(inputs_from_worker: bool, origin: &str) {
+        let mut cache_ctx = sample_cache_write_context(TaskId::new("pkg", "build"));
+        cache_ctx.inputs_from_worker = inputs_from_worker;
+
+        let result = resolve_cache_inputs(&cache_ctx, &["/".to_owned()]);
+        let CacheInputResult::ExpansionError(message) = result else {
+            panic!("expected expansion error");
+        };
+
+        assert!(message.contains(&format!("input \"/\" for task \"pkg#build\" ({origin})")));
+        assert!(message.contains("resolved path escapes base directory"));
+    }
+
+    #[test]
+    fn resolve_cache_inputs_expansion_error_names_task_and_task_spec_origin() {
+        assert_expansion_error_origin(false, "declared in the task spec");
+    }
+
+    #[test]
+    fn resolve_cache_inputs_expansion_error_names_worker_origin() {
+        assert_expansion_error_origin(true, "returned by the worker");
+    }
+
+    #[test]
+    fn resolve_cache_inputs_expansion_error_never_leaks_root_sentinel() {
+        // Regression for issue #83 review: a root-task input escape must render
+        // the task as `#task` and MUST NOT expose the internal `//root`
+        // package sentinel to the user.
+        let mut cache_ctx =
+            sample_cache_write_context(TaskId::new(luchta_types::ROOT_PACKAGE_NAME, "build"));
+        cache_ctx.source_pkg = PackageName::from(luchta_types::ROOT_PACKAGE_NAME);
+
+        let result = resolve_cache_inputs(&cache_ctx, &["/".to_owned()]);
+        let CacheInputResult::ExpansionError(message) = result else {
+            panic!("expected expansion error");
+        };
+
+        assert!(
+            !message.contains(luchta_types::ROOT_PACKAGE_NAME),
+            "root sentinel must never appear in user-facing message: {message}"
+        );
+        assert!(
+            message.contains("for task \"#build\""),
+            "root task should render as #build: {message}"
+        );
+        assert!(
+            message.contains("the workspace root"),
+            "root package should render with the friendly label: {message}"
         );
     }
 }

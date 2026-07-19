@@ -18,11 +18,23 @@ use luchta_workspace::PackageGraph;
 use crate::task_graph::transitive_upstream_packages;
 use thiserror::Error;
 
+/// Renders a package name for user-facing error text, mapping the synthetic
+/// workspace-root sentinel (`//root`) to a friendly label so the internal
+/// identifier is never shown to users. Non-root packages render as
+/// `package '<name>'`; the root renders as `the workspace root`.
+fn display_package(package: &PackageName) -> String {
+    if package.as_str() == ROOT_PACKAGE_NAME {
+        "the workspace root".to_string()
+    } else {
+        format!("package '{}'", package.as_str())
+    }
+}
+
 /// Errors from input-pattern expansion.
 #[derive(Debug, Error)]
 pub enum InputExpansionError {
     /// Referenced package not found in workspace graph.
-    #[error("unknown package '{package}' in input pattern '{pattern}'")]
+    #[error("unknown {} in input pattern '{pattern}'", display_package(package))]
     UnknownPackage {
         /// Package name that was not found.
         package: PackageName,
@@ -31,7 +43,10 @@ pub enum InputExpansionError {
     },
 
     /// Pattern would resolve outside its allowed directory.
-    #[error("path escape in input pattern '{pattern}' from package '{source_pkg}': resolved path escapes base directory")]
+    #[error(
+        "path escape in input pattern '{pattern}' from {}: resolved path escapes base directory",
+        display_package(source_pkg)
+    )]
     PathEscape {
         /// Source package that declared the input.
         source_pkg: PackageName,
@@ -40,7 +55,10 @@ pub enum InputExpansionError {
     },
 
     /// Invalid input pattern syntax (parse failure).
-    #[error("invalid input pattern '{pattern}' from package '{source_pkg}': {reason}")]
+    #[error(
+        "invalid input pattern '{pattern}' from {}: {reason}",
+        display_package(source_pkg)
+    )]
     InvalidPattern {
         /// Source package that declared the input.
         source_pkg: PackageName,
