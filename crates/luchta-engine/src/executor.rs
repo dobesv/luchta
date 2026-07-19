@@ -307,8 +307,11 @@ impl WeightedExecutor {
                         source,
                     });
                 drop(permit);
-                return result.map(|(code, outputs, _logs)| {
-                    TaskRunOutcome::worker(synthesize_exit_status(code), outputs)
+                return result.map(|done| {
+                    TaskRunOutcome::worker(
+                        synthesize_exit_status(done.exit_code),
+                        done.detected_outputs,
+                    )
                 });
             }
             (Some(worker_name), None) => {

@@ -50,9 +50,9 @@ async fn single_job_happy_path() {
 
     let outcome = run_one_job(&manager).await.expect("job succeeds");
 
-    assert_eq!(outcome.0, 7);
-    assert_eq!(outcome.1, None);
-    assert!(outcome.2.is_empty());
+    assert_eq!(outcome.exit_code, 7);
+    assert_eq!(outcome.detected_outputs, None);
+    assert!(outcome.logs.is_empty());
     manager.shutdown().await;
 }
 
@@ -141,7 +141,7 @@ wait
                 .await
                 .expect("job succeeds");
             counter.fetch_add(1, Ordering::SeqCst);
-            outcome.0
+            outcome.exit_code
         })
     };
 
@@ -204,7 +204,7 @@ done
         )
         .await
         .expect("job succeeds");
-    assert_eq!(outcome.0, 0);
+    assert_eq!(outcome.exit_code, 0);
 
     let lines = sink.lines();
     assert_eq!(
@@ -263,7 +263,7 @@ done
                     )
                     .await
                     .expect("job succeeds")
-                    .0
+                    .exit_code
             })
         })
         .collect::<Vec<_>>();
@@ -315,7 +315,7 @@ done
         .await
         .expect("job succeeds");
 
-    assert_eq!(outcome.0, 0);
+    assert_eq!(outcome.exit_code, 0);
     assert_eq!(
         sink.reports(),
         vec![crate::CollectedReport {
@@ -354,7 +354,7 @@ done
         .await
         .expect("job succeeds");
 
-    assert_eq!(outcome.0, 0);
+    assert_eq!(outcome.exit_code, 0);
     assert!(sink.reports().is_empty());
 
     manager.shutdown().await;
@@ -387,7 +387,7 @@ done
         .await
         .expect("job succeeds");
 
-    assert_eq!(outcome.0, 0);
+    assert_eq!(outcome.exit_code, 0);
     assert_eq!(
         sink.reports(),
         vec![crate::CollectedReport {
@@ -535,7 +535,7 @@ done
     .await
     .expect("crash-then-retry job must not hang")
     .expect("job should succeed after retry");
-    assert_eq!(outcome.0, 0);
+    assert_eq!(outcome.exit_code, 0);
 
     let spawn_count = fs::read_to_string(&crash_count_file).expect("spawn count recorded");
     assert_eq!(
@@ -586,7 +586,7 @@ done
         .run_job("fake", WorkerRequest::new("pkg#crash", "echo hi"), None)
         .await
         .expect("job should transparently succeed after respawn");
-    assert_eq!(outcome.0, 0);
+    assert_eq!(outcome.exit_code, 0);
 
     let spawn_count = fs::read_to_string(&spawn_count_file).expect("spawn count recorded");
     assert_eq!(spawn_count.trim(), "2");
@@ -758,7 +758,7 @@ done
         .await
         .expect("nonzero exit code is successful protocol completion");
 
-    assert_eq!(outcome.0, 5);
+    assert_eq!(outcome.exit_code, 5);
     let spawn_count = fs::read_to_string(&spawn_count_file).expect("spawn count recorded");
     assert_eq!(spawn_count.trim(), "1", "task failure must not retry");
 
