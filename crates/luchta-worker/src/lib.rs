@@ -192,7 +192,15 @@ pub fn is_valid_report_filename(name: &str) -> bool {
     !matches!(name, "stdout.log" | "stderr.log" | "meta.bincode")
 }
 
-pub type WorkerDonePayload = (i32, Option<Vec<String>>, Vec<CapturedLogLine>);
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerDonePayload {
+    /// Process exit code reported by the worker.
+    pub exit_code: i32,
+    /// Output patterns discovered during the run, if any.
+    pub detected_outputs: Option<Vec<String>>,
+    /// Captured log lines produced during the run.
+    pub logs: Vec<CapturedLogLine>,
+}
 
 impl WorkerResponse {
     pub fn log(id: impl Into<String>, stream: LogStream, line: impl Into<String>) -> Self {
@@ -276,7 +284,11 @@ impl WorkerResponse {
         match self {
             Self::Done {
                 exit_code, outputs, ..
-            } => Some((exit_code, outputs, Vec::new())),
+            } => Some(WorkerDonePayload {
+                exit_code,
+                detected_outputs: outputs,
+                logs: Vec::new(),
+            }),
             _ => None,
         }
     }
