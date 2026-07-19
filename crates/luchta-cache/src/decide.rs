@@ -114,13 +114,6 @@ fn check_patterns_unchanged(prior: &TaskRunRecord, current: &CurrentState<'_>) -
     let input_patterns = effective_input_patterns(prior, current);
     let output_patterns = effective_output_patterns(prior, current);
 
-    if prior.detected_output_patterns && prior.output_patterns != output_patterns {
-        return DecisionResult {
-            action: Decision::Run,
-            reason: output_pattern_mismatch_reason(prior, current),
-        };
-    }
-
     if let Some(reason) = change_reason(
         current.resolver,
         &output_patterns,
@@ -261,23 +254,6 @@ fn patterns_unchanged(
     !files_changed(prior_entries, &resolved_entries)
 }
 
-fn output_pattern_mismatch_reason(prior: &TaskRunRecord, current: &CurrentState<'_>) -> RunReason {
-    let (changed, truncated, change_count) = files_diff(
-        &prior.outputs,
-        &resolve_or_empty(
-            current.resolver,
-            current.declared_output_patterns,
-            FileEntryKind::Outputs,
-        ),
-        DECIDE_FILES_DIFF_LIMIT,
-    );
-    RunReason::OutputChanged {
-        changed,
-        truncated,
-        change_count,
-    }
-}
-
 fn change_reason(
     resolver: &dyn FileStateResolver,
     patterns: &[String],
@@ -319,18 +295,6 @@ fn change_reason(
             change_count,
         },
     })
-}
-
-fn resolve_or_empty(
-    resolver: &dyn FileStateResolver,
-    patterns: &[String],
-    kind: FileEntryKind,
-) -> Vec<FileEntry> {
-    let resolved = match kind {
-        FileEntryKind::Inputs => resolver.resolve_inputs(patterns, &[]),
-        FileEntryKind::Outputs => resolver.resolve_outputs(patterns, &[]),
-    };
-    resolved.unwrap_or_default()
 }
 
 fn files_changed(prior_entries: &[FileEntry], current_entries: &[FileEntry]) -> bool {
