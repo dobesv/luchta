@@ -590,6 +590,7 @@ fn build_cache_write_context(task_id: &TaskId, ctx: &DecisionContext) -> CacheIn
 
     CacheInputState::Ready(Box::new(CacheWriteContext {
         task_id: task_id.clone(),
+        inputs_from_worker: ctx.task_graph.inputs_from_worker(task_id),
         task_def,
         package_path: cache_context.cache_package.package_path.clone(),
         dep_outputs: cache_context.dep_outputs,
@@ -1647,13 +1648,19 @@ pub(super) fn build_command_map(
                 if let Err(error) =
                     expand_input_patterns(&def.inputs, &source_pkg, graph, workspace_root)
                 {
+                    // Mirror the cache-write path message: name the task and the
+                    // origin of the inputs. The offending package + pattern are
+                    // already conveyed by `task_id` and the wrapped `error`, so
+                    // they are not repeated here (and `task_id` never exposes the
+                    // internal `//root` sentinel).
+                    let origin = super::input_stability::input_origin_clause(
+                        task_graph.inputs_from_worker(task_id),
+                    );
                     invalid.insert(
                         task_id.clone(),
                         format!(
-                            "input \"{}\" in package \"{}\": {}",
+                            "input \"{}\" for task \"{task_id}\" ({origin}): {error}",
                             error.pattern(),
-                            source_pkg,
-                            error
                         ),
                     );
                     continue;
@@ -2018,6 +2025,7 @@ mod tests {
         CacheWriteContext {
             task_id,
             task_def: TaskDefinition::default(),
+            inputs_from_worker: false,
             package_path: package.path.to_path_buf(),
             dep_outputs: BTreeMap::new(),
             task_spec_hash: [1; 32],
@@ -2134,12 +2142,14 @@ mod tests {
 
         // Pre-run state H1, captured into the pre-snapshot.
         std::fs::write(&input_path, "H1\n").expect("write input");
-        cache_ctx.pre_snapshot = Some(resolve_pre_execution_inputs(
-            &cache_ctx.task_def.inputs,
-            &cache_ctx.source_pkg,
-            &cache_ctx.package_graph,
-            &cache_ctx.repo_root,
-        ));
+        cache_ctx.pre_snapshot = Some(resolve_pre_execution_inputs(PreExecutionSnapshotRequest {
+            input_patterns: &cache_ctx.task_def.inputs,
+            source_pkg: &cache_ctx.source_pkg,
+            package_graph: &cache_ctx.package_graph,
+            repo_root: &cache_ctx.repo_root,
+            task_id: &cache_ctx.task_id,
+            inputs_from_worker: cache_ctx.inputs_from_worker,
+        }));
         assert!(
             cache_ctx
                 .pre_snapshot
@@ -2201,12 +2211,14 @@ mod tests {
         let input_path = cache_ctx.package_path.join("src.txt");
 
         std::fs::write(&input_path, "H1\n").expect("write input");
-        cache_ctx.pre_snapshot = Some(resolve_pre_execution_inputs(
-            &cache_ctx.task_def.inputs,
-            &cache_ctx.source_pkg,
-            &cache_ctx.package_graph,
-            &cache_ctx.repo_root,
-        ));
+        cache_ctx.pre_snapshot = Some(resolve_pre_execution_inputs(PreExecutionSnapshotRequest {
+            input_patterns: &cache_ctx.task_def.inputs,
+            source_pkg: &cache_ctx.source_pkg,
+            package_graph: &cache_ctx.package_graph,
+            repo_root: &cache_ctx.repo_root,
+            task_id: &cache_ctx.task_id,
+            inputs_from_worker: cache_ctx.inputs_from_worker,
+        }));
         // Concurrent edit before the record is written.
         std::fs::write(&input_path, "H2-changed\n").expect("edit input");
 

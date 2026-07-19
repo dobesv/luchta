@@ -87,6 +87,7 @@ pub struct TaskGraph {
     graph: DiGraph<TaskNode, ()>,
     indices_by_id: HashMap<TaskId, NodeIndex>,
     definitions_by_id: HashMap<TaskId, TaskDefinition>,
+    inputs_from_worker_by_id: HashMap<TaskId, bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,6 +96,7 @@ struct ResolvedPipeline {
     task_names_by_package: HashMap<PackageName, HashSet<TaskName>>,
     root_task_names: HashSet<TaskName>,
     prune_reasons_by_id: HashMap<TaskId, String>,
+    inputs_from_worker_by_id: HashMap<TaskId, bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -312,6 +314,7 @@ impl TaskGraph {
             graph,
             indices_by_id,
             definitions_by_id: resolved_pipeline.tasks_by_id.clone(),
+            inputs_from_worker_by_id: resolved_pipeline.inputs_from_worker_by_id.clone(),
         };
 
         for (source_id, definition) in &resolved_pipeline.tasks_by_id {
@@ -526,6 +529,13 @@ impl TaskGraph {
         self.definitions_by_id.get(task_id)
     }
 
+    pub fn inputs_from_worker(&self, task_id: &TaskId) -> bool {
+        self.inputs_from_worker_by_id
+            .get(task_id)
+            .copied()
+            .unwrap_or(false)
+    }
+
     pub fn task_node(&self, task_id: &TaskId) -> Option<&TaskNode> {
         self.node_index(task_id).map(|index| &self.graph[index])
     }
@@ -635,6 +645,7 @@ impl ResolvedPipeline {
         let mut tasks_by_id = HashMap::new();
         let mut task_names_by_package = HashMap::new();
         let mut root_task_names = HashSet::new();
+        let inputs_from_worker_by_id = HashMap::new();
         let mut global_tasks = HashMap::new();
         let mut package_tasks = HashMap::new();
         let mut root_tasks = HashMap::new();
@@ -693,6 +704,7 @@ impl ResolvedPipeline {
             task_names_by_package,
             root_task_names,
             prune_reasons_by_id: HashMap::new(),
+            inputs_from_worker_by_id,
         })
     }
 
@@ -795,6 +807,9 @@ impl ResolvedPipeline {
             match result.decision {
                 ResolveDecision::Accept => {}
                 ResolveDecision::Modify(modification) => {
+                    if modification.inputs.is_some() {
+                        self.inputs_from_worker_by_id.insert(task_id.clone(), true);
+                    }
                     if let Some(definition) = self.tasks_by_id.get_mut(&task_id) {
                         modification.apply_to(definition);
                     }
@@ -2577,6 +2592,11 @@ mod tests {
             vec![DependsOn::DirectUpstream(TaskName::from("build"))],
             7,
         );
+        let task_id = TaskId::new("@repo/a", "build");
+        assert!(
+            !graph.inputs_from_worker(&task_id),
+            "non-input worker modifications must not mark inputs as worker-provided"
+        );
     }
 
     #[tokio::test]
@@ -2969,6 +2989,7 @@ mod tests {
         let task_id = TaskId::new("@repo/a", "build");
         let definition = graph.task_definition(&task_id).expect("task exists");
         assert_eq!(definition.inputs, vec!["generated/**".to_owned()]);
+        assert!(graph.inputs_from_worker(&task_id));
     }
 
     #[tokio::test]

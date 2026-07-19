@@ -48,7 +48,7 @@ use dispatch::{
 };
 use input_stability::{
     check_input_stability, resolve_cache_inputs, resolve_cache_outputs,
-    resolve_pre_execution_inputs, CacheInputResult,
+    resolve_pre_execution_inputs, CacheInputResult, PreExecutionSnapshotRequest,
 };
 use pause::dispatch_loop;
 
@@ -535,6 +535,7 @@ struct CacheDecisionContext {
 struct CacheWriteContext {
     task_id: TaskId,
     task_def: TaskDefinition,
+    inputs_from_worker: bool,
     package_path: PathBuf,
     dep_outputs: BTreeMap<String, [u8; 32]>,
     task_spec_hash: [u8; 32],
@@ -569,12 +570,14 @@ impl CacheWriteContext {
             return;
         }
 
-        self.pre_snapshot = Some(resolve_pre_execution_inputs(
-            &self.task_def.inputs,
-            &self.source_pkg,
-            &self.package_graph,
-            &self.repo_root,
-        ));
+        self.pre_snapshot = Some(resolve_pre_execution_inputs(PreExecutionSnapshotRequest {
+            input_patterns: &self.task_def.inputs,
+            source_pkg: &self.source_pkg,
+            package_graph: &self.package_graph,
+            repo_root: &self.repo_root,
+            task_id: &self.task_id,
+            inputs_from_worker: self.inputs_from_worker,
+        }));
     }
 
     fn pre_snapshot(&self) -> &[FileEntry] {
