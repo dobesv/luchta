@@ -130,6 +130,34 @@ const SHARED_CACHE_MAX_OUTPUT_MB_ENV: &str = "LUCHTA_SHARED_CACHE_MAX_OUTPUT_MB"
 const SHARED_CACHE_HISTORY_ENV: &str = "LUCHTA_SHARED_CACHE_HISTORY";
 /// Environment variable overriding shared cache remote sync timeout, in seconds.
 const SHARED_CACHE_SYNC_TIMEOUT_ENV: &str = "LUCHTA_SHARED_CACHE_SYNC_TIMEOUT";
+/// Environment variable controlling how many consecutive rclone timeouts disable remote.
+const SHARED_CACHE_TIMEOUT_DISABLE_THRESHOLD_ENV: &str =
+    "LUCHTA_SHARED_CACHE_TIMEOUT_DISABLE_THRESHOLD";
+/// Environment variable capping in-flight rclone operations against rcd.
+const SHARED_CACHE_RCLONE_CONCURRENCY_ENV: &str = "LUCHTA_SHARED_CACHE_RCLONE_CONCURRENCY";
+
+/// Default consecutive-timeout threshold before the remote cache is disabled.
+///
+/// Declared locally (not imported) because the authoritative constant lives in
+/// the `#[cfg(unix)]`-only remote-cache modules, and `shared_cache_settings()`
+/// compiles on all platforms. On unix a compile-time assertion below keeps this
+/// in sync with `luchta_cache::shared::DEFAULT_TIMEOUT_DISABLE_THRESHOLD`.
+const DEFAULT_TIMEOUT_DISABLE_THRESHOLD: usize = 8;
+/// Default cap on in-flight rclone operations. See the note above re: unix.
+const DEFAULT_RCLONE_CONCURRENCY: usize = 16;
+
+#[cfg(unix)]
+const _: () = {
+    assert!(
+        DEFAULT_TIMEOUT_DISABLE_THRESHOLD
+            == luchta_cache::shared::DEFAULT_TIMEOUT_DISABLE_THRESHOLD,
+        "CLI default timeout-disable threshold drifted from luchta-cache",
+    );
+    assert!(
+        DEFAULT_RCLONE_CONCURRENCY == luchta_cache::shared::DEFAULT_RCLONE_CONCURRENCY,
+        "CLI default rclone concurrency drifted from luchta-cache",
+    );
+};
 
 /// Environment variable to disable all caching (no restore, no shared read/write).
 pub(crate) const NO_CACHE_ENV: &str = "LUCHTA_NO_CACHE";
@@ -158,6 +186,8 @@ enum SharedCacheMode {
 struct SharedCacheSettings {
     mode: SharedCacheMode,
     sync_timeout: Duration,
+    timeout_disable_threshold: usize,
+    rclone_concurrency: usize,
 }
 
 fn parse_shared_cache_mode(value: Option<&str>) -> SharedCacheMode {
@@ -190,9 +220,29 @@ fn shared_cache_settings() -> SharedCacheSettings {
         std::env::var(SHARED_CACHE_SYNC_TIMEOUT_ENV).ok().as_deref(),
         30,
     );
+    // A `0` (or invalid/unset) value falls back to the default: a 0 threshold
+    // would disable the remote on the very first queued timeout — exactly the
+    // behavior this policy exists to prevent — and a 0 concurrency limit would
+    // stall all remote I/O.
+    let timeout_disable_threshold = non_zero_env_u64_or(
+        SHARED_CACHE_TIMEOUT_DISABLE_THRESHOLD_ENV,
+        std::env::var(SHARED_CACHE_TIMEOUT_DISABLE_THRESHOLD_ENV)
+            .ok()
+            .as_deref(),
+        DEFAULT_TIMEOUT_DISABLE_THRESHOLD as u64,
+    ) as usize;
+    let rclone_concurrency = non_zero_env_u64_or(
+        SHARED_CACHE_RCLONE_CONCURRENCY_ENV,
+        std::env::var(SHARED_CACHE_RCLONE_CONCURRENCY_ENV)
+            .ok()
+            .as_deref(),
+        DEFAULT_RCLONE_CONCURRENCY as u64,
+    ) as usize;
     SharedCacheSettings {
         mode,
         sync_timeout: Duration::from_secs(sync_timeout_secs),
+        timeout_disable_threshold,
+        rclone_concurrency,
     }
 }
 
@@ -209,6 +259,16 @@ fn parse_env_u64_or(var: &str, value: Option<&str>, default: u64) -> u64 {
                 default
             }
         },
+    }
+}
+
+/// Like [`parse_env_u64_or`], but treats an explicit `0` as "use the default"
+/// rather than a literal zero. Used for knobs where 0 is nonsensical/harmful
+/// (a 0 disable-threshold or 0 concurrency limit).
+fn non_zero_env_u64_or(var: &str, value: Option<&str>, default: u64) -> u64 {
+    match parse_env_u64_or(var, value, default) {
+        0 => default,
+        n => n,
     }
 }
 
@@ -278,6 +338,9 @@ pub(crate) fn build_execution_resources(
                         remote: Some(RemoteConfig {
                             fs_base: fs_base.clone(),
                             sync_timeout: shared_cache_settings.sync_timeout,
+                            timeout_disable_threshold: shared_cache_settings
+                                .timeout_disable_threshold,
+                            rclone_concurrency: shared_cache_settings.rclone_concurrency,
                         }),
                     },
                 )
@@ -443,6 +506,8 @@ mod tests {
                 None,
                 30,
             )),
+            timeout_disable_threshold: DEFAULT_TIMEOUT_DISABLE_THRESHOLD,
+            rclone_concurrency: DEFAULT_RCLONE_CONCURRENCY,
         };
         assert_eq!(settings.sync_timeout, Duration::from_secs(30));
     }
@@ -456,6 +521,8 @@ mod tests {
                 Some("5"),
                 30,
             )),
+            timeout_disable_threshold: DEFAULT_TIMEOUT_DISABLE_THRESHOLD,
+            rclone_concurrency: DEFAULT_RCLONE_CONCURRENCY,
         };
         assert_eq!(settings.sync_timeout, Duration::from_secs(5));
         assert_eq!(
@@ -496,6 +563,20 @@ mod tests {
             14
         );
         assert_eq!(Duration::from_secs(14 * 24 * 60 * 60), DEFAULT_GC_RETENTION);
+    }
+
+    #[test]
+    fn non_zero_env_u64_or_maps_zero_and_invalid_to_default() {
+        // Unset (None) → default
+        assert_eq!(non_zero_env_u64_or("TEST_VAR", None, 42), 42);
+        // Empty string → default
+        assert_eq!(non_zero_env_u64_or("TEST_VAR", Some(""), 42), 42);
+        // "0" maps to default (key behavior: 0 is nonsensical for threshold/concurrency)
+        assert_eq!(non_zero_env_u64_or("TEST_VAR", Some("0"), 42), 42);
+        // Valid non-zero → parsed value
+        assert_eq!(non_zero_env_u64_or("TEST_VAR", Some("5"), 42), 5);
+        // Invalid → default
+        assert_eq!(non_zero_env_u64_or("TEST_VAR", Some("abc"), 42), 42);
     }
 
     #[test]

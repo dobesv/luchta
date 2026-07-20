@@ -6,8 +6,13 @@
 
 use std::fs;
 use std::io;
+
+/// Default threshold for consecutive timeouts before disabling remote sync.
+/// A 0 threshold would disable remote on the first queued timeout, defeating
+/// the backpressure policy's purpose.
+pub const DEFAULT_TIMEOUT_DISABLE_THRESHOLD: usize = 8;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,6 +26,8 @@ use super::{
 pub struct RemoteConfig {
     pub fs_base: String,
     pub sync_timeout: Duration,
+    pub timeout_disable_threshold: usize,
+    pub rclone_concurrency: usize,
 }
 
 /// Run-wide remote state shared across all `RemoteSync` clones.
@@ -34,13 +41,21 @@ struct RemoteState {
     disabled: AtomicBool,
     /// Ensures the "remote cache disabled" warning is emitted only once.
     warned: AtomicBool,
+    /// Consecutive timeout streak; queued rcd backpressure can time out transiently.
+    consecutive_timeouts: AtomicUsize,
+    timeout_disable_threshold: usize,
 }
 
 impl RemoteState {
-    fn new() -> Self {
+    fn new(timeout_disable_threshold: usize) -> Self {
         Self {
             disabled: AtomicBool::new(false),
             warned: AtomicBool::new(false),
+            consecutive_timeouts: AtomicUsize::new(0),
+            // A threshold of 0 would disable the remote on the first queued
+            // timeout, defeating the point of the backpressure policy. Clamp to
+            // at least 1 so the invariant holds regardless of the caller.
+            timeout_disable_threshold: timeout_disable_threshold.max(1),
         }
     }
 
@@ -50,9 +65,21 @@ impl RemoteState {
 
     fn disable_with_warning(&self, reason: &str) {
         self.disabled.store(true, Ordering::Release);
+        self.consecutive_timeouts.store(0, Ordering::Release);
         if !self.warned.swap(true, Ordering::AcqRel) {
             eprintln!("warning: remote cache disabled: {reason}");
         }
+    }
+
+    fn record_timeout(&self, reason: &str) {
+        let streak = self.consecutive_timeouts.fetch_add(1, Ordering::AcqRel) + 1;
+        if streak >= self.timeout_disable_threshold {
+            self.disable_with_warning(reason);
+        }
+    }
+
+    fn record_success(&self) {
+        self.consecutive_timeouts.store(0, Ordering::Release);
     }
 }
 
@@ -87,21 +114,36 @@ pub(crate) struct PushArtifacts<'a> {
 
 impl RemoteSync {
     #[must_use]
-    pub(crate) fn new(rclone: Arc<RcloneRcd>, remote_base_fs: impl Into<String>) -> Self {
+    pub(crate) fn new(
+        rclone: Arc<RcloneRcd>,
+        remote_base_fs: impl Into<String>,
+        timeout_disable_threshold: usize,
+    ) -> Self {
         Self {
             rclone,
             remote_base_fs: remote_base_fs.into(),
-            state: Arc::new(RemoteState::new()),
+            state: Arc::new(RemoteState::new(timeout_disable_threshold)),
         }
     }
 
     pub(crate) fn from_config(config: RemoteConfig) -> Result<Self, rclone::RcloneError> {
-        let rclone = Arc::new(RcloneRcd::new(config.sync_timeout)?);
-        Ok(Self::new(rclone, config.fs_base))
+        let rclone = Arc::new(RcloneRcd::with_concurrency_limit(
+            config.sync_timeout,
+            config.rclone_concurrency,
+        )?);
+        Ok(Self::new(
+            rclone,
+            config.fs_base,
+            config.timeout_disable_threshold,
+        ))
     }
 
     fn is_disabled(&self) -> bool {
         self.state.is_disabled()
+    }
+
+    fn record_remote_success(&self) {
+        self.state.record_success();
     }
 
     /// Flip the run-wide disable flag from a typed rclone error and warn once.
@@ -116,7 +158,20 @@ impl RemoteSync {
         {
             return;
         }
-        self.state.disable_with_warning(&remote_disable_reason(err));
+        match err {
+            rclone::RcloneError::Timeout { .. } => {
+                self.state.record_timeout(&remote_disable_reason(err));
+            }
+            rclone::RcloneError::RemoteUnavailable { .. }
+            | rclone::RcloneError::Process { .. }
+            | rclone::RcloneError::HttpStatus { .. }
+            | rclone::RcloneError::Rc { .. }
+            | rclone::RcloneError::Request { .. }
+            | rclone::RcloneError::Decode(_)
+            | rclone::RcloneError::Io(_) => {
+                self.state.disable_with_warning(&remote_disable_reason(err));
+            }
+        }
     }
 
     /// Shut the rclone daemon down at run end (best-effort).
@@ -182,6 +237,8 @@ impl RemoteSync {
         {
             self.record_remote_error(&err);
             eprintln!("debug: remote snapshot copy failed for commit={commit_key}: {err}");
+        } else {
+            self.record_remote_success();
         }
     }
 
@@ -199,6 +256,7 @@ impl RemoteSync {
             return Ok(());
         }
         self.copy_remote_file_down(&self.blobs_fs(), &file_name, &local_path)
+            .inspect(|_| self.record_remote_success())
             .inspect_err(|err| self.record_remote_error(err))
     }
 
@@ -257,16 +315,23 @@ impl RemoteSync {
 
         self.push_blob_if_missing(paths, outputs_hash);
 
+        if self.is_disabled() {
+            return;
+        }
+
         let uploaded_new_shard = match merge.new_snapshot_upload.as_ref() {
             Some(upload) => self.push_snapshot_upload(commit_key, upload),
             None => false,
         };
 
-        if !uploaded_new_shard {
+        if !uploaded_new_shard || self.is_disabled() {
             return;
         }
 
         for shard_id in &merge.subsumed_shard_ids {
+            if self.is_disabled() {
+                break;
+            }
             self.delete_remote_snapshot_file(commit_key, shard_id, SNAPSHOT_FILE_EXTENSION);
             self.delete_remote_snapshot_file(commit_key, shard_id, SNAPSHOT_MERGED_EXTENSION);
         }
@@ -279,8 +344,13 @@ impl RemoteSync {
             .rclone
             .stat(&remote_fs, &blob_name, self.rclone.default_timeout())
         {
-            Ok(Some(_)) => return,
-            Ok(None) => {}
+            Ok(Some(_)) => {
+                self.record_remote_success();
+                return;
+            }
+            Ok(None) => {
+                self.record_remote_success();
+            }
             Err(err) => {
                 self.record_remote_error(&err);
                 eprintln!("warn: shared cache remote blob stat failed for {blob_name}: {err}");
@@ -292,6 +362,8 @@ impl RemoteSync {
         if let Err(err) = self.copy_local_file_up(&local_path, &remote_fs, &blob_name) {
             self.record_remote_error(&err);
             eprintln!("warn: shared cache remote blob upload failed for {blob_name}: {err}");
+        } else {
+            self.record_remote_success();
         }
     }
 
@@ -305,6 +377,7 @@ impl RemoteSync {
             );
             return false;
         }
+        self.record_remote_success();
 
         let merged_name = format!("{}.{SNAPSHOT_MERGED_EXTENSION}", upload.shard_id);
         if let Err(err) = self.copy_bytes_up(&upload.merged_bytes, &remote_fs, &merged_name) {
@@ -314,11 +387,15 @@ impl RemoteSync {
             );
             return false;
         }
+        self.record_remote_success();
 
         true
     }
 
     fn delete_remote_snapshot_file(&self, commit_key: &str, shard_id: &str, extension: &str) {
+        if self.is_disabled() {
+            return;
+        }
         let remote_fs = self.snapshots_fs(commit_key);
         let remote_name = format!("{shard_id}.{extension}");
         if let Err(err) =
@@ -326,12 +403,15 @@ impl RemoteSync {
                 .deletefile(&remote_fs, &remote_name, self.rclone.default_timeout())
         {
             if matches!(err, rclone::RcloneError::HttpStatus { status: 404, .. }) {
+                self.record_remote_success();
                 return;
             }
             self.record_remote_error(&err);
             eprintln!(
                 "warn: shared cache remote snapshot delete failed for commit={commit_key} file={remote_name}: {err}"
             );
+        } else {
+            self.record_remote_success();
         }
     }
 
@@ -386,8 +466,8 @@ mod tests {
     use crate::shared::snapshot::snapshot_bincode_config;
     use crate::shared::tests::{create_commit, sample_record, setup_git_repo};
     use crate::shared::{
-        derive_input_key, input_key_hex, OpenExtras, SharedCache, Snapshot, SnapshotEntry,
-        StoreOutcome, SNAPSHOT_SCHEMA_VERSION,
+        derive_input_key, input_key_hex, MergeResult, OpenExtras, SharedCache, Snapshot,
+        SnapshotEntry, StoreOutcome, SNAPSHOT_SCHEMA_VERSION,
     };
     use std::collections::BTreeMap;
     use std::fs;
@@ -426,6 +506,8 @@ mod tests {
                     remote: Some(RemoteConfig {
                         fs_base: ":local:/tmp/luchta-async-drop-test".to_string(),
                         sync_timeout: std::time::Duration::from_secs(1),
+                        timeout_disable_threshold: 8,
+                        rclone_concurrency: 16,
                     }),
                 },
             )
@@ -481,6 +563,8 @@ mod tests {
                 remote: Some(RemoteConfig {
                     fs_base: remote.remote_base_fs.clone(),
                     sync_timeout: remote.rclone.default_timeout(),
+                    timeout_disable_threshold: 8,
+                    rclone_concurrency: 16,
                 }),
             },
         )
@@ -513,6 +597,7 @@ mod tests {
             let remote = RemoteSync::new(
                 Arc::new(RcloneRcd::new(Duration::from_secs(10)).unwrap()),
                 format!(":local:{}", remote_root.path().display()),
+                8,
             );
             Self {
                 temp_repo,
@@ -648,6 +733,7 @@ mod tests {
         let remote_seed = RemoteSync::new(
             Arc::new(RcloneRcd::new(Duration::from_secs(10)).unwrap()),
             format!(":local:{}", remote_root.display()),
+            8,
         );
         let merge1_id = seed_snapshot_entry(
             &seed_cache,
@@ -691,6 +777,7 @@ mod tests {
         let remote = RemoteSync::new(
             Arc::new(RcloneRcd::new(Duration::from_secs(1)).unwrap()),
             ":local:/tmp/nonexistent-remote".to_string(),
+            8,
         );
         let err = rclone::RcloneError::HttpStatus {
             status: 500,
@@ -699,6 +786,101 @@ mod tests {
 
         remote.record_remote_error(&err);
 
+        assert!(!remote.is_disabled_for_test());
+    }
+
+    #[test]
+    fn timeout_below_threshold_does_not_disable() {
+        let remote = RemoteSync::new(
+            Arc::new(RcloneRcd::new(Duration::from_secs(1)).unwrap()),
+            ":local:/tmp/nonexistent-remote".to_string(),
+            3,
+        );
+        let timeout = rclone::RcloneError::Timeout {
+            timeout: Duration::from_secs(30),
+        };
+
+        remote.record_remote_error(&timeout);
+        remote.record_remote_error(&timeout);
+
+        assert!(!remote.is_disabled_for_test());
+    }
+
+    #[test]
+    fn timeout_reaching_threshold_disables() {
+        let remote = RemoteSync::new(
+            Arc::new(RcloneRcd::new(Duration::from_secs(1)).unwrap()),
+            ":local:/tmp/nonexistent-remote".to_string(),
+            3,
+        );
+        let timeout = rclone::RcloneError::Timeout {
+            timeout: Duration::from_secs(30),
+        };
+
+        remote.record_remote_error(&timeout);
+        remote.record_remote_error(&timeout);
+        assert!(!remote.is_disabled_for_test());
+        remote.record_remote_error(&timeout);
+
+        assert!(remote.is_disabled_for_test());
+    }
+
+    #[test]
+    fn success_resets_timeout_counter() {
+        let remote = RemoteSync::new(
+            Arc::new(RcloneRcd::new(Duration::from_secs(1)).unwrap()),
+            ":local:/tmp/nonexistent-remote".to_string(),
+            3,
+        );
+        let timeout = rclone::RcloneError::Timeout {
+            timeout: Duration::from_secs(30),
+        };
+
+        remote.record_remote_error(&timeout);
+        remote.record_remote_error(&timeout);
+        remote.record_remote_success();
+        remote.record_remote_error(&timeout);
+        remote.record_remote_error(&timeout);
+
+        assert!(!remote.is_disabled_for_test());
+        remote.record_remote_error(&timeout);
+        assert!(remote.is_disabled_for_test());
+    }
+
+    #[test]
+    fn unavailable_and_process_disable_immediately() {
+        let unavailable = RemoteSync::new(
+            Arc::new(RcloneRcd::new(Duration::from_secs(1)).unwrap()),
+            ":local:/tmp/nonexistent-remote".to_string(),
+            3,
+        );
+        unavailable.record_remote_error(&rclone::RcloneError::RemoteUnavailable {
+            reason: "down".to_string(),
+        });
+        assert!(unavailable.is_disabled_for_test());
+
+        let process = RemoteSync::new(
+            Arc::new(RcloneRcd::new(Duration::from_secs(1)).unwrap()),
+            ":local:/tmp/nonexistent-remote".to_string(),
+            3,
+        );
+        process.record_remote_error(&rclone::RcloneError::Process {
+            reason: "dead".to_string(),
+        });
+        assert!(process.is_disabled_for_test());
+    }
+
+    #[test]
+    fn not_found_does_not_disable_remote() {
+        let remote = RemoteSync::new(
+            Arc::new(RcloneRcd::new(Duration::from_secs(1)).unwrap()),
+            ":local:/tmp/nonexistent-remote".to_string(),
+            3,
+        );
+        remote.record_remote_error(&rclone::RcloneError::HttpStatus {
+            status: 404,
+            body: "missing".to_string(),
+        });
         assert!(!remote.is_disabled_for_test());
     }
 
@@ -818,6 +1000,8 @@ mod tests {
                 remote: Some(RemoteConfig {
                     fs_base: ":local:/definitely/missing/luchta-remote".to_string(),
                     sync_timeout: Duration::from_secs(2),
+                    timeout_disable_threshold: 8,
+                    rclone_concurrency: 16,
                 }),
             },
         )
@@ -878,6 +1062,8 @@ mod tests {
                 remote: Some(RemoteConfig {
                     fs_base: "nonexistent-luchta-remote-xyz:".to_string(),
                     sync_timeout: Duration::from_secs(2),
+                    timeout_disable_threshold: 8,
+                    rclone_concurrency: 16,
                 }),
             },
         )
@@ -1159,6 +1345,96 @@ mod tests {
             .join(&seed.harness.commit)
             .join(&shard_name)
             .exists());
+    }
+
+    #[test]
+    fn remote_store_stops_deleting_subsumed_shards_once_remote_disables_mid_push() {
+        if !should_run_rclone_test() {
+            eprintln!("skipping rclone-gated shared-cache mid-push disable delete guard test; rclone not on PATH or LUCHTA_TEST_RCLONE disabled");
+            return;
+        }
+
+        let harness = RemoteHarness::new("console.log('compact-mid-push');\n");
+        let (seed_cache, _merge1_id, surviving_shard_id) = seed_remote_snapshot_entries(
+            harness.temp_repo.path(),
+            &harness.commit,
+            harness.remote_root.path(),
+        );
+        let remote_before = remote_snapshot_files(harness.remote_root.path(), &harness.commit);
+        assert_eq!(remote_before.len(), 2);
+        seed_guard_blob(&harness.local_cache, [0x66; 32], b"blob-66");
+
+        let upload_shard_id = "subsuming-shard-mid-push".to_string();
+        let upload_shard_bytes = b"synthetic-shard".to_vec();
+        let upload_merged_bytes = b"synthetic-merged".to_vec();
+        let merge3 = MergeEntryOutcome {
+            result: MergeResult::Inserted,
+            new_snapshot_upload: Some(SnapshotUpload {
+                shard_id: upload_shard_id.clone(),
+                shard_bytes: upload_shard_bytes.clone(),
+                merged_bytes: upload_merged_bytes.clone(),
+            }),
+            subsumed_shard_ids: vec![
+                "disabling-shard-mid-push".to_string(),
+                surviving_shard_id.clone(),
+            ],
+        };
+        let remote_commit_dir = harness
+            .remote_root
+            .path()
+            .join("snapshots")
+            .join(&harness.commit);
+        fs::write(
+            remote_commit_dir.join(format!("{}.{}", upload_shard_id, SNAPSHOT_FILE_EXTENSION)),
+            &upload_shard_bytes,
+        )
+        .unwrap();
+        fs::write(
+            remote_commit_dir.join(format!("{}.{}", upload_shard_id, SNAPSHOT_MERGED_EXTENSION)),
+            &upload_merged_bytes,
+        )
+        .unwrap();
+
+        let disabling_shard_id = "disabling-shard-mid-push";
+        let poisoned_file =
+            remote_commit_dir.join(format!("{disabling_shard_id}.{SNAPSHOT_FILE_EXTENSION}"));
+        fs::create_dir_all(&poisoned_file).unwrap();
+        fs::write(
+            remote_commit_dir.join(format!("{disabling_shard_id}.{SNAPSHOT_MERGED_EXTENSION}")),
+            b"disabling-merged",
+        )
+        .unwrap();
+
+        harness.remote.push_store_artifacts(PushArtifacts {
+            paths: seed_cache.paths(),
+            commit_key: &harness.commit,
+            outputs_hash: &[0x66; 32],
+            merge: merge3,
+        });
+        assert!(harness.remote.is_disabled_for_test());
+        fs::remove_dir(&poisoned_file).unwrap();
+        drop(seed_cache);
+
+        let snapshot_files = remote_snapshot_files(harness.remote_root.path(), &harness.commit);
+        assert_eq!(snapshot_files.len(), 5);
+        assert!(snapshot_files
+            .iter()
+            .any(|name| name == &format!("{disabling_shard_id}.{SNAPSHOT_MERGED_EXTENSION}")));
+        assert!(snapshot_files
+            .iter()
+            .any(|name| name == &format!("{surviving_shard_id}.{SNAPSHOT_FILE_EXTENSION}")));
+        assert!(snapshot_files
+            .iter()
+            .any(|name| name == &format!("{surviving_shard_id}.{SNAPSHOT_MERGED_EXTENSION}")));
+        assert!(!snapshot_files
+            .iter()
+            .any(|name| name == &format!("{disabling_shard_id}.{SNAPSHOT_FILE_EXTENSION}")));
+        assert!(snapshot_files
+            .iter()
+            .any(|name| name == &format!("{}.{}", upload_shard_id, SNAPSHOT_FILE_EXTENSION)));
+        assert!(snapshot_files
+            .iter()
+            .any(|name| name == &format!("{}.{}", upload_shard_id, SNAPSHOT_MERGED_EXTENSION)));
     }
 
     #[test]

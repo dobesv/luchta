@@ -2,7 +2,7 @@ use std::fmt;
 use std::io;
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::{BufMut, Bytes, BytesMut};
@@ -22,6 +22,7 @@ use tokio::time::{timeout, MissedTickBehavior};
 const RCLONE_READY_TIMEOUT: Duration = Duration::from_secs(3);
 const RCLONE_READY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 pub const DEFAULT_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
+pub const DEFAULT_RCLONE_CONCURRENCY: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Entry {
@@ -96,12 +97,59 @@ impl RcloneError {
 }
 
 #[derive(Debug)]
+struct OpLimiter {
+    state: Mutex<OpLimiterState>,
+    ready: Condvar,
+}
+
+#[derive(Debug)]
+struct OpLimiterState {
+    max_in_flight: usize,
+    in_flight: usize,
+}
+
+#[derive(Debug)]
+struct OpPermit<'a> {
+    limiter: &'a OpLimiter,
+}
+
+impl OpLimiter {
+    fn new(max_in_flight: usize) -> Self {
+        Self {
+            state: Mutex::new(OpLimiterState {
+                max_in_flight,
+                in_flight: 0,
+            }),
+            ready: Condvar::new(),
+        }
+    }
+
+    fn acquire(&self) -> OpPermit<'_> {
+        let mut state = self.state.lock().unwrap();
+        while state.in_flight >= state.max_in_flight {
+            state = self.ready.wait(state).unwrap();
+        }
+        state.in_flight += 1;
+        OpPermit { limiter: self }
+    }
+}
+
+impl Drop for OpPermit<'_> {
+    fn drop(&mut self) {
+        let mut state = self.limiter.state.lock().unwrap();
+        state.in_flight -= 1;
+        self.limiter.ready.notify_one();
+    }
+}
+
+#[derive(Debug)]
 pub struct RcloneRcd {
     /// Owned so it can be torn down off the async context on Drop (see below).
     /// Always `Some` until `Drop`/`shutdown` takes it.
     runtime: Option<Runtime>,
     state: Mutex<State>,
     default_timeout: Duration,
+    limiter: OpLimiter,
 }
 
 #[derive(Debug)]
@@ -120,11 +168,19 @@ struct DaemonState {
 
 impl RcloneRcd {
     pub fn new(default_timeout: Duration) -> Result<Self, RcloneError> {
+        Self::with_concurrency_limit(default_timeout, DEFAULT_RCLONE_CONCURRENCY)
+    }
+
+    pub fn with_concurrency_limit(
+        default_timeout: Duration,
+        max_in_flight: usize,
+    ) -> Result<Self, RcloneError> {
         let runtime = Builder::new_multi_thread().enable_all().build()?;
         Ok(Self {
             runtime: Some(runtime),
             state: Mutex::new(State { daemon: None }),
             default_timeout,
+            limiter: OpLimiter::new(max_in_flight.max(1)),
         })
     }
 
@@ -163,6 +219,7 @@ impl RcloneRcd {
     }
 
     pub fn noop(&self, timeout: Duration) -> Result<(), RcloneError> {
+        let _permit = self.limiter.acquire();
         self.call::<_, NoopResponse>("rc/noop", json!({}), timeout)
             .map(|_| ())
     }
@@ -170,6 +227,7 @@ impl RcloneRcd {
     /// `src_remote` and `dst_remote` must be paths relative to `src_fs` and `dst_fs`.
     /// Callers own fs/root split, e.g. `:local:/abs/dir` + `file.txt`, not `:local:` + `/abs/dir/file.txt`.
     pub fn copyfile(&self, copy: CopyFile<'_>, timeout: Duration) -> Result<(), RcloneError> {
+        let _permit = self.limiter.acquire();
         self.call::<_, EmptyResponse>(
             "operations/copyfile",
             json!({
@@ -197,6 +255,7 @@ impl RcloneRcd {
         upload: UploadFile<'_>,
         timeout: Duration,
     ) -> Result<(), RcloneError> {
+        let _permit = self.limiter.acquire();
         let runtime = self.runtime();
         let socket_path = self.ensure_daemon_socket(timeout)?;
         let query = format!(
@@ -232,6 +291,7 @@ impl RcloneRcd {
         dst_fs: &str,
         timeout: Duration,
     ) -> Result<(), RcloneError> {
+        let _permit = self.limiter.acquire();
         self.call::<_, EmptyResponse>(
             "sync/copy",
             json!({
@@ -250,6 +310,7 @@ impl RcloneRcd {
         remote: &str,
         timeout: Duration,
     ) -> Result<Vec<Entry>, RcloneError> {
+        let _permit = self.limiter.acquire();
         let response: ListResponse = self.call(
             "operations/list",
             json!({
@@ -263,6 +324,7 @@ impl RcloneRcd {
 
     /// `remote` must be path relative to `fs`.
     pub fn deletefile(&self, fs: &str, remote: &str, timeout: Duration) -> Result<(), RcloneError> {
+        let _permit = self.limiter.acquire();
         self.call::<_, EmptyResponse>(
             "operations/deletefile",
             json!({
@@ -281,6 +343,7 @@ impl RcloneRcd {
         remote: &str,
         timeout: Duration,
     ) -> Result<Option<StatInfo>, RcloneError> {
+        let _permit = self.limiter.acquire();
         let response: StatResponse = self.call(
             "operations/stat",
             json!({
@@ -832,6 +895,67 @@ mod tests {
         }
     }
 
+    #[test]
+    fn op_limiter_caps_max_in_flight_and_unblocks_after_release() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::mpsc;
+        use std::sync::Arc;
+        use std::thread;
+
+        let limiter = Arc::new(OpLimiter::new(2));
+        let current = Arc::new(AtomicUsize::new(0));
+        let max_seen = Arc::new(AtomicUsize::new(0));
+        let mut threads = Vec::new();
+
+        for _ in 0..6 {
+            let limiter = Arc::clone(&limiter);
+            let current = Arc::clone(&current);
+            let max_seen = Arc::clone(&max_seen);
+            threads.push(thread::spawn(move || {
+                let _permit = limiter.acquire();
+                let now = current.fetch_add(1, Ordering::SeqCst) + 1;
+                loop {
+                    let observed = max_seen.load(Ordering::SeqCst);
+                    if now <= observed
+                        || max_seen
+                            .compare_exchange(observed, now, Ordering::SeqCst, Ordering::SeqCst)
+                            .is_ok()
+                    {
+                        break;
+                    }
+                }
+                thread::sleep(Duration::from_millis(20));
+                current.fetch_sub(1, Ordering::SeqCst);
+            }));
+        }
+
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert!(max_seen.load(Ordering::SeqCst) <= 2);
+
+        let blocker = Arc::new(OpLimiter::new(1));
+        let held = blocker.acquire();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (passed_tx, passed_rx) = mpsc::channel();
+        let proceeded = Arc::new(AtomicBool::new(false));
+        thread::scope(|scope| {
+            let blocker_in_thread = Arc::clone(&blocker);
+            let proceeded_in_thread = Arc::clone(&proceeded);
+            scope.spawn(move || {
+                ready_tx.send(()).unwrap();
+                let _permit = blocker_in_thread.acquire();
+                proceeded_in_thread.store(true, Ordering::SeqCst);
+                passed_tx.send(()).unwrap();
+            });
+            ready_rx.recv().unwrap();
+            assert!(passed_rx.recv_timeout(Duration::from_millis(50)).is_err());
+            assert!(!proceeded.load(Ordering::SeqCst));
+            drop(held);
+            passed_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert!(proceeded.load(Ordering::SeqCst));
+        });
+    }
     #[tokio::test(flavor = "current_thread")]
     async fn noop_from_runtime_context_returns_result_instead_of_panicking() {
         let timeout = Duration::from_millis(50);
