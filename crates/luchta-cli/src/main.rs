@@ -6,6 +6,7 @@ mod config;
 mod env_conflict;
 mod env_merge;
 mod format;
+mod list;
 mod logs;
 mod memory_pressure;
 mod outcome;
@@ -125,6 +126,15 @@ async fn run(cli: Cli) -> Result<()> {
                 },
             )
             .await
+        }
+        Commands::List {
+            tasks,
+            packages,
+            top_level,
+            json,
+        } => {
+            let packages = apply_implicit_package(packages, top_level, &workspace_root)?;
+            list::execute_list(&workspace_root, tasks, packages, top_level, json).await
         }
         Commands::Check => dispatch_check(&workspace_root).await,
     }
@@ -273,9 +283,11 @@ fn command_run_args(command: Commands) -> RunArgs {
             max_weight_cli: max_weight,
             since,
         },
-        Commands::Watch { .. } | Commands::Logs { .. } | Commands::Why { .. } | Commands::Check => {
-            unreachable!("checked by caller")
-        }
+        Commands::Watch { .. }
+        | Commands::Logs { .. }
+        | Commands::Why { .. }
+        | Commands::List { .. }
+        | Commands::Check => unreachable!("checked by caller"),
     }
 }
 

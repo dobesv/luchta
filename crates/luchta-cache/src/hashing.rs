@@ -592,6 +592,7 @@ mod tests {
             ],
             weight: 2,
             command: Some("pnpm run build".to_owned()),
+            description: None,
             worker: Some("node".to_owned()),
             cache: Some(CacheConfig::default()),
             inputs: vec!["src/**/*.ts".to_owned(), "package.json".to_owned()],

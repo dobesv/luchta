@@ -211,6 +211,9 @@ pub struct TaskDefinition {
     /// Tasks are never resolved from `package.json` scripts.
     #[serde(default)]
     pub command: Option<String>,
+    /// Optional human-readable description for task.
+    #[serde(default)]
+    pub description: Option<String>,
     /// Named worker used to execute this task. A task without a worker (and
     /// without a command) is a no-op ordering node.
     #[serde(default)]
@@ -247,6 +250,7 @@ impl TaskDefinition {
             depends_on,
             weight,
             command: None,
+            description: None,
             worker: None,
             cache: None,
             inputs: Vec::new(),
@@ -298,6 +302,7 @@ impl Default for TaskDefinition {
             depends_on: Vec::new(),
             weight: default_task_weight(),
             command: None,
+            description: None,
             worker: None,
             cache: None,
             inputs: Vec::new(),

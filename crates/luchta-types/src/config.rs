@@ -202,6 +202,38 @@ mod tests {
     }
 
     #[test]
+    fn task_definition_description_deserializes_when_present_or_missing() {
+        let with_description = r#"
+            [tasks.build]
+            description = "some text"
+        "#;
+        let without_description = r#"
+            [tasks.build]
+            weight = 2
+        "#;
+
+        let with_description: LuchtaConfig =
+            toml::from_str(with_description).expect("config with description should deserialize");
+        let without_description: LuchtaConfig = toml::from_str(without_description)
+            .expect("config without description should deserialize");
+
+        assert_eq!(
+            with_description
+                .tasks
+                .get("build")
+                .and_then(|task| task.description.as_deref()),
+            Some("some text")
+        );
+        assert_eq!(
+            without_description
+                .tasks
+                .get("build")
+                .and_then(|task| task.description.as_deref()),
+            None
+        );
+    }
+
+    #[test]
     fn rejects_zero_max_weight_in_config() {
         let sample = r#"
             [concurrency]
