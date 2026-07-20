@@ -24,9 +24,13 @@ pub use paths::{
 #[cfg(unix)]
 pub use rclone::RcloneRcd;
 #[cfg(unix)]
+pub use rclone::DEFAULT_RCLONE_CONCURRENCY;
+#[cfg(unix)]
 pub use remote::RemoteConfig;
 #[cfg(unix)]
 pub(crate) use remote::RemoteSync;
+#[cfg(unix)]
+pub use remote::DEFAULT_TIMEOUT_DISABLE_THRESHOLD;
 pub use scope::{classify_outputs, OutputScope, ScopeError};
 pub use snapshot::{
     combined_dep_outputs_hash, derive_input_key, input_key_hex, MergeEntryOutcome, MergeResult,
