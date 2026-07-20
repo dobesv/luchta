@@ -216,5 +216,23 @@ pub enum Commands {
         #[arg(long = "show-outputs")]
         show_outputs: bool,
     },
+    /// List runnable tasks and their metadata.
+    List {
+        /// Task names to match; supports glob wildcards.
+        tasks: Vec<String>,
+
+        /// Match package NAMEs (not paths); supports glob wildcards. Repeat to target multiple packages.
+        #[arg(short = 'p', long = "package")]
+        packages: Vec<String>,
+
+        /// Match the given task names as top-level (workspace-root) tasks
+        /// instead of package tasks.
+        #[arg(short = 'T', long = "top-level")]
+        top_level: bool,
+
+        /// Emit machine-readable JSON output.
+        #[arg(long = "json")]
+        json: bool,
+    },
     Check,
 }
