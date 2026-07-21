@@ -1,6 +1,7 @@
 ---
 title: "Remote cache delete flood after run-wide disable — missing guard in push path"
 date: 2026-07-20
+last_updated: 2026-07-21
 category: logic-errors
 problem_type: logic_error
 component: luchta-cache/shared/remote
@@ -193,6 +194,194 @@ fn acquire(&self) -> OpPermit {
 - **Background push queue:** Fire-and-forget push off the task-completion critical path.
 - **rcd tuning:** `--transfers`, `--checkers`, `--rc-job-expire-duration`.
 - **Pre-existing flaky tests:** Parallel test isolation race in `shared::git` / luchta-cli suites (TempDir/cwd contention) — unrelated, separate follow-up.
+
+---
+
+## Round 4: Async Jobs + Background Push Queue (Issue #251)
+
+The Round 3 fixes treated symptoms pragmatically. This round implements the oracle-recommended semantic fix: separate submit-timeout from execution-timeout via rclone's `_async=true` + `job/status` polling, plus a background push queue to decouple push from the task-completion critical path.
+
+### Problem Summary
+
+Even with OpLimiter bounding submissions, the sync path's `tokio::time::timeout` still covered submit + execution combined. Long-running operations (large copyfile, slow S3 multipart) could still trip the 30s timeout even when the remote was healthy. Additionally, push operations blocked task-completion, adding latency to build critical path.
+
+### Solution: Async Job Submit/Poll
+
+**1. `_async=true` + `job/status` polling:**
+
+Add `"_async": true` to rclone RC payload; submit returns `{jobid, executeId}` immediately. Poll `job/status` in a loop with adaptive backoff (50ms → 500ms max). Client timer now measures POLLING progress, not queue-wait.
+
+```rust
+pub(super) async fn submit_async_job(
+    client: &Client<...>,
+    socket_path: &std::path::Path,
+    endpoint: &str,
+    mut payload: Value,
+    submit_timeout: Duration,
+) -> Result<SubmittedAsyncJob, RcloneError> {
+    let object = payload.as_object_mut().ok_or_else(...)?;
+    object.insert("_async".to_string(), Value::Bool(true));
+    let response: AsyncJobSubmitResponse =
+        post_json_with_client(client, socket_path, endpoint, payload, submit_timeout).await?;
+    Ok(SubmittedAsyncJob { jobid: response.jobid, execute_id: response.execute_id })
+}
+```
+
+**2. Permit held ONLY during submit, released before poll:**
+
+OpLimiter bounds concurrent SUBMISSIONS (default 16), not executions. rclone's own `--transfers`/`--checkers` bound real execution parallelism. This prevents permits stuck polling long jobs.
+
+```rust
+// In call_async_job: acquire permit, submit, drop permit, then poll
+let permit = self.limiter.acquire();
+let submitted = submit_async_job(..., submit_timeout).await?;
+drop(permit);  // Release BEFORE poll loop
+poll_async_job(..., execution_timeout).await
+```
+
+**3. Uploadfile MUST stay synchronous:**
+
+`operations/uploadfile` is `needsRequest:true` — streaming multipart body consumed during handler. Cannot use `_async=true`. Keep uploadfile on sync path, bounded by OpLimiter.
+
+Only copyfile/stat/deletefile/noop go async.
+
+### Critical Bug: `job/status` Returns Top-Level `"error"` Field
+
+`job/status` returns `{finished, success, error, output}`. A generic RC helper that short-circuits any top-level `error` into `RcloneError::Rc` will mis-handle failed async jobs. Fix: dedicated raw poll helper that does NOT short-circuit; deserialize into `AsyncJobStatusResponse` struct, then classify.
+
+```rust
+#[derive(Debug, Deserialize)]
+pub(super) struct AsyncJobStatusResponse {
+    pub(super) finished: bool,
+    pub(super) success: bool,
+    #[serde(default)]
+    pub(super) error: String,
+    #[serde(default)]
+    pub(super) output: Value,
+    #[serde(rename = "executeId")]
+    pub(super) execute_id: Option<String>,
+}
+```
+
+### Preserving Error-Classification Semantics Across Sync→Async
+
+**Sync path:** missing-object copyfile/deletefile → HTTP 404 → `RcloneError::HttpStatus{404}` → non-fatal cache miss.
+
+**Async path:** same miss → HTTP 200 `{success:false, error:"object not found", output:{}}`. Must map back to `HttpStatus{404}` else remote falsely DISABLED.
+
+Live-probed rclone v1.74.3 responses:
+- `stat` miss → `success:true, output:{item:null}` (already handled → None miss)
+- `deletefile` miss → `success:false, error:"object not found"`
+- `copyfile` miss → `success:false, error:"object not found"`
+
+Classification rule for async failures:
+
+```rust
+fn classify_async_job_failure(message: String) -> RcloneError {
+    let lower = message.to_ascii_lowercase();
+    let is_not_found = lower.contains("object not found")
+        || lower.contains("directory not found")
+        || lower.contains("not found");
+    RcloneError::HttpStatus {
+        status: if is_not_found { 404 } else { 500 },
+        body: message,
+    }
+}
+```
+
+This preserves: (a) not-found → 404 → non-fatal miss, (b) missing-local-source pattern detection via body substring match, (c) genuine errors → 500 → fatal.
+
+### Background Push Queue
+
+**OS thread + bounded `std::sync::mpsc::sync_channel`:**
+
+Plain OS thread (NOT tokio task) because push is `block_on`-per-op — avoids tokio-in-tokio hazards. `PushMsg::{Push, Flush(ack)}` gives non-destructive drain.
+
+```rust
+enum PushMsg {
+    Push(OwnedPushArtifacts),
+    #[cfg(any(test, doctest))]
+    Flush(std::sync::mpsc::Sender<()>),
+}
+
+// Worker loop
+let worker = std::thread::spawn(move || {
+    for msg in rx {
+        match msg {
+            PushMsg::Push(push) => worker_remote.push_store_artifacts_owned(push),
+            PushMsg::Flush(ack) => { let _ = ack.send(()); }
+        }
+    }
+});
+```
+
+**Bounded backpressure:**
+
+Enqueue blocks when queue full — cache correctness > throughput. Never drop cache writes.
+
+```rust
+if tx.send(PushMsg::Push(push)).is_err() {
+    eprintln!("debug: remote push queue closed before enqueue completed");
+}
+```
+
+**Teardown deadlock-safe:**
+
+`flush_push_queue()` drops Sender → worker drains → OS-thread join. Safe even when Drop runs inside tokio runtime (no `block_on`-in-async hazard).
+
+```rust
+pub(crate) fn flush_push_queue(&self) {
+    self.push_queue.tx.lock().expect("...").take();  // Drop sender
+    if let Some(worker) = self.push_queue.worker.lock().expect("...").take() {
+        let _ = worker.join();  // Safe: OS thread, not tokio task
+    }
+}
+```
+
+Flush queue BEFORE `rclone.shutdown()` so queued pushes complete against live daemon.
+
+### rcd Daemon Tuning
+
+Add to spawn args:
+- `--transfers 4` — max parallel file transfers
+- `--checkers 8` — max parallel directory checks
+- `--rc-job-expire-duration 10m` — ≥2× execution timeout, prevents job reaped before poll
+
+### Module Cohesion Refactor
+
+Split growing `rclone.rs` (responsibilities 10 → 4 modules):
+- `rclone/mod.rs` — `RcloneRcd` struct + op methods
+- `rclone/async_job.rs` — submit/poll logic, `AsyncJobStatusResponse`, classification
+- `rclone/daemon.rs` — spawn_daemon, wait_until_ready, quit/shutdown, `DaemonState`
+- `rclone/transport.rs` — HTTP helpers: post_json_raw, post_multipart, detect_rc_error
+
+Resolved CodeScene Low Cohesion flag. Watch for Bumpy Road / duplication smells when adding optimizations — flatten with guard clauses + table-driven tests.
+
+### Tooling Gotcha: `cs delta` Needs Changes Staged
+
+`cs delta` reported false "No issues found!" when rclone/ dir was untracked. Always `git add -A` before trusting cs delta output.
+
+### Environment Variables
+
+- `LUCHTA_SHARED_CACHE_RCLONE_TRANSFERS` — rcd transfers (default 4)
+- `LUCHTA_SHARED_CACHE_RCLONE_CHECKERS` — rcd checkers (default 8)
+- `LUCHTA_SHARED_CACHE_RCLONE_JOB_EXPIRE_DURATION` — job expire (default 10m)
+- `LUCHTA_SHARED_CACHE_RCLONE_SUBMIT_TIMEOUT` — async submit timeout (default 5s)
+- `LUCHTA_SHARED_CACHE_PUSH_QUEUE_CAPACITY` — push queue depth (default 256)
+
+### Files Changed
+
+- `crates/luchta-cache/src/shared/rclone/mod.rs` — RcloneRcd, op dispatch, async routing
+- `crates/luchta-cache/src/shared/rclone/async_job.rs` — submit_async_job, poll_async_job, classify_async_job_failure
+- `crates/luchta-cache/src/shared/rclone/daemon.rs` — spawn_daemon, shutdown, DaemonState
+- `crates/luchta-cache/src/shared/rclone/transport.rs` — post_json_raw_with_client, post_multipart_with_client
+- `crates/luchta-cache/src/shared/remote.rs` — PushMsg enum, OwnedPushArtifacts, enqueue_push_store_artifacts, flush_push_queue, drain_push_queue
+
+### Related Issues
+
+- **Plan:** `rclone-async-jobs-issue-251`
+- **GitHub:** Issue #251
+- **Prior doc:** [logic-errors/remote-cache-delete-flood-after-disable-2026-07-20.md](./remote-cache-delete-flood-after-disable-2026-07-20.md) — Rounds 1-3 (delete guard, timeout threshold, OpLimiter)
 
 ---
 
