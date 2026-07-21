@@ -6,14 +6,17 @@
 
 use std::fs;
 use std::io;
+use std::sync::mpsc::{self, SyncSender};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 
 /// Default threshold for consecutive timeouts before disabling remote sync.
 /// A 0 threshold would disable remote on the first queued timeout, defeating
 /// the backpressure policy's purpose.
 pub const DEFAULT_TIMEOUT_DISABLE_THRESHOLD: usize = 8;
+pub const DEFAULT_PUSH_QUEUE_CAPACITY: usize = 256;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
 use std::time::Duration;
 
 use super::snapshot::{SnapshotUpload, SNAPSHOT_FILE_EXTENSION, SNAPSHOT_MERGED_EXTENSION};
@@ -102,6 +105,28 @@ pub struct RemoteSync {
     pub(crate) rclone: Arc<RcloneRcd>,
     pub(crate) remote_base_fs: String,
     state: Arc<RemoteState>,
+    push_queue: Arc<PushQueue>,
+}
+
+#[derive(Debug)]
+struct PushQueue {
+    tx: Mutex<Option<SyncSender<PushMsg>>>,
+    worker: Mutex<Option<JoinHandle<()>>>,
+}
+
+#[derive(Debug)]
+enum PushMsg {
+    Push(OwnedPushArtifacts),
+    #[cfg(any(test, doctest))]
+    Flush(std::sync::mpsc::Sender<()>),
+}
+
+#[derive(Debug)]
+pub(crate) struct OwnedPushArtifacts {
+    pub(crate) paths: Arc<SharedCachePaths>,
+    pub(crate) commit_key: String,
+    pub(crate) outputs_hash: [u8; 32],
+    pub(crate) merge: MergeEntryOutcome,
 }
 
 /// Inputs for [`RemoteSync::push_store_artifacts`].
@@ -119,11 +144,18 @@ impl RemoteSync {
         remote_base_fs: impl Into<String>,
         timeout_disable_threshold: usize,
     ) -> Self {
-        Self {
+        let state = Arc::new(RemoteState::new(timeout_disable_threshold));
+        let mut remote = Self {
             rclone,
             remote_base_fs: remote_base_fs.into(),
-            state: Arc::new(RemoteState::new(timeout_disable_threshold)),
-        }
+            state,
+            push_queue: Arc::new(PushQueue {
+                tx: Mutex::new(None),
+                worker: Mutex::new(None),
+            }),
+        };
+        remote.start_push_queue();
+        remote
     }
 
     pub(crate) fn from_config(config: RemoteConfig) -> Result<Self, rclone::RcloneError> {
@@ -138,7 +170,7 @@ impl RemoteSync {
         ))
     }
 
-    fn is_disabled(&self) -> bool {
+    pub(crate) fn is_disabled(&self) -> bool {
         self.state.is_disabled()
     }
 
@@ -220,6 +252,99 @@ fn remote_disable_reason(err: &rclone::RcloneError) -> String {
 }
 
 impl RemoteSync {
+    fn start_push_queue(&mut self) {
+        let capacity = std::env::var("LUCHTA_SHARED_CACHE_PUSH_QUEUE_CAPACITY")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .map(|value| value.max(1))
+            .unwrap_or(DEFAULT_PUSH_QUEUE_CAPACITY);
+        let (tx, rx) = mpsc::sync_channel(capacity);
+        let worker_remote = self.clone();
+        let worker = std::thread::spawn(move || {
+            for msg in rx {
+                match msg {
+                    PushMsg::Push(push) => worker_remote.push_store_artifacts_owned(push),
+                    #[cfg(any(test, doctest))]
+                    PushMsg::Flush(ack) => {
+                        let _ = ack.send(());
+                    }
+                }
+            }
+        });
+        *self
+            .push_queue
+            .tx
+            .lock()
+            .expect("push queue tx mutex poisoned") = Some(tx);
+        *self
+            .push_queue
+            .worker
+            .lock()
+            .expect("push queue worker mutex poisoned") = Some(worker);
+    }
+
+    pub(crate) fn enqueue_push_store_artifacts(&self, push: OwnedPushArtifacts) {
+        let Some(tx) = self
+            .push_queue
+            .tx
+            .lock()
+            .expect("push queue tx mutex poisoned")
+            .as_ref()
+            .cloned()
+        else {
+            self.push_store_artifacts_owned(push);
+            return;
+        };
+        if tx.send(PushMsg::Push(push)).is_err() {
+            eprintln!("debug: remote push queue closed before enqueue completed");
+        }
+    }
+
+    #[cfg(any(test, doctest))]
+    pub(crate) fn drain_push_queue(&self) {
+        let Some(tx) = self
+            .push_queue
+            .tx
+            .lock()
+            .expect("push queue tx mutex poisoned")
+            .as_ref()
+            .cloned()
+        else {
+            return;
+        };
+        let (ack_tx, ack_rx) = mpsc::channel();
+        if tx.send(PushMsg::Flush(ack_tx)).is_err() {
+            return;
+        }
+        let _ = ack_rx.recv();
+    }
+
+    pub(crate) fn flush_push_queue(&self) {
+        self.push_queue
+            .tx
+            .lock()
+            .expect("push queue tx mutex poisoned")
+            .take();
+        if let Some(worker) = self
+            .push_queue
+            .worker
+            .lock()
+            .expect("push queue worker mutex poisoned")
+            .take()
+        {
+            let _ = worker.join();
+        }
+    }
+
+    fn push_store_artifacts_owned(&self, push: OwnedPushArtifacts) {
+        self.push_store_artifacts(PushArtifacts {
+            paths: &push.paths,
+            commit_key: &push.commit_key,
+            outputs_hash: &push.outputs_hash,
+            merge: push.merge,
+        });
+    }
+
     pub(crate) fn pull_snapshot_commit(&self, snapshot_store: &SnapshotStore, commit_key: &str) {
         if self.is_disabled() {
             return;
@@ -645,6 +770,7 @@ mod tests {
                 harness.temp_repo.path(),
             )
             .unwrap();
+        cache.flush_push_queue();
         assert!(matches!(outcome, StoreOutcome::Stored));
         StoredRemoteCase {
             harness,
@@ -884,6 +1010,118 @@ mod tests {
         assert!(!remote.is_disabled_for_test());
     }
 
+    #[test]
+    fn flush_push_queue_drains_enqueued_pushes() {
+        if !should_run_rclone_test() {
+            eprintln!("skipping rclone queue flush test; rclone not on PATH or LUCHTA_TEST_RCLONE disabled");
+            return;
+        }
+
+        let harness = RemoteHarness::new("queue-body");
+        let input_key = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32]);
+        let outputs_hash = [0x31; 32];
+        let cache = harness.cache();
+        cache
+            .store(
+                "pkg#build",
+                &input_key,
+                &outputs_hash,
+                &harness.package_dir,
+                &[PathBuf::from("dist/main.js")],
+                &sample_record(true, 240),
+                b"stdout-queue",
+                b"stderr-queue",
+                &[],
+                harness.temp_repo.path(),
+            )
+            .unwrap();
+
+        let remote_blob = harness
+            .remote_root
+            .path()
+            .join("blobs")
+            .join(format!("{}.tar.zst", hex_hash(outputs_hash)));
+        assert!(!remote_blob.exists());
+
+        cache.flush_push_queue();
+        assert!(remote_blob.exists());
+    }
+
+    #[test]
+    fn push_queue_full_blocks_instead_of_dropping() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::mpsc::channel;
+        use std::thread;
+
+        let (tx, rx) = mpsc::sync_channel::<PushMsg>(1);
+        let (started_tx, started_rx) = channel();
+        let (release_tx, release_rx) = channel();
+        let (processed_tx, processed_rx) = channel();
+        let processed = Arc::new(AtomicUsize::new(0));
+        let processed_in_worker = Arc::clone(&processed);
+        let worker = thread::spawn(move || {
+            for msg in rx {
+                match msg {
+                    PushMsg::Push(_) => {
+                        let count = processed_in_worker.fetch_add(1, Ordering::SeqCst);
+                        started_tx.send(count).unwrap();
+                        release_rx.recv().unwrap();
+                        processed_tx.send(()).unwrap();
+                    }
+                    PushMsg::Flush(ack) => {
+                        let _ = ack.send(());
+                    }
+                }
+            }
+        });
+
+        let make_push = |n| OwnedPushArtifacts {
+            paths: Arc::new(SharedCachePaths {
+                root: PathBuf::from(format!("/tmp/luchta-test-{n}")),
+                blobs_dir: PathBuf::from(format!("/tmp/luchta-test-{n}/blobs")),
+                snapshots_dir: PathBuf::from(format!("/tmp/luchta-test-{n}/snapshots")),
+            }),
+            commit_key: format!("commit-{n}"),
+            outputs_hash: [n as u8; 32],
+            merge: MergeEntryOutcome {
+                result: MergeResult::Inserted,
+                new_snapshot_upload: None,
+                subsumed_shard_ids: Vec::new(),
+            },
+        };
+
+        tx.send(PushMsg::Push(make_push(1))).unwrap();
+        started_rx.recv().unwrap();
+        tx.send(PushMsg::Push(make_push(2))).unwrap();
+
+        let (send_result_tx, send_result_rx) = channel();
+        let send_third = {
+            let tx = tx.clone();
+            thread::spawn(move || {
+                let sent = tx.send(PushMsg::Push(make_push(3))).is_ok();
+                send_result_tx.send(sent).unwrap();
+            })
+        };
+
+        assert!(processed_rx
+            .recv_timeout(Duration::from_millis(50))
+            .is_err());
+        release_tx.send(()).unwrap();
+        processed_rx.recv().unwrap();
+        started_rx.recv().unwrap();
+        send_third.join().unwrap();
+        assert!(send_result_rx.recv().unwrap());
+
+        release_tx.send(()).unwrap();
+        processed_rx.recv().unwrap();
+        started_rx.recv().unwrap();
+        release_tx.send(()).unwrap();
+        processed_rx.recv().unwrap();
+
+        drop(tx);
+        worker.join().unwrap();
+        assert_eq!(processed.load(Ordering::SeqCst), 3);
+    }
     fn seed_guard_blob(local_cache: &TempDir, outputs_hash: [u8; 32], body: &[u8]) {
         let local_blob_dir = local_cache.path().join("blobs");
         fs::create_dir_all(&local_blob_dir).unwrap();
@@ -1092,6 +1330,7 @@ mod tests {
                 temp_repo.path(),
             )
             .unwrap();
+        cache.flush_push_queue();
         assert!(matches!(outcome, StoreOutcome::Stored));
     }
 
@@ -1240,6 +1479,7 @@ mod tests {
                 harness.temp_repo.path(),
             )
             .unwrap();
+        cache.flush_push_queue();
         assert!(matches!(outcome, StoreOutcome::Stored));
 
         let after_mtime = fs::metadata(&blob_path).unwrap().modified().unwrap();
@@ -1477,6 +1717,7 @@ mod tests {
                 harness.temp_repo.path(),
             )
             .unwrap();
+        cache.flush_push_queue();
         assert!(matches!(outcome, StoreOutcome::Stored));
         drop(seed_cache);
 

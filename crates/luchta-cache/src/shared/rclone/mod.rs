@@ -1,28 +1,32 @@
 use std::fmt;
 use std::io;
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::sync::{Condvar, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
-use bytes::{BufMut, Bytes, BytesMut};
-use http_body_util::{BodyExt, Full};
-use hyper::header::CONTENT_TYPE;
-use hyper::Request;
+mod async_job;
+mod daemon;
+mod transport;
+
+use async_job::{poll_async_job, submit_async_job, DEFAULT_RCLONE_SUBMIT_TIMEOUT};
+use bytes::Bytes;
+use daemon::{quit_and_wait, spawn_daemon, State};
 use hyper_util::client::legacy::Client;
-use hyperlocal::{UnixClientExt, Uri};
+use hyperlocal::UnixClientExt;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tempfile::TempDir;
-use tokio::process::{Child, Command};
 use tokio::runtime::{Builder, Runtime};
-use tokio::time::{timeout, MissedTickBehavior};
+use transport::{
+    build_upload_multipart_body, multipart_boundary, post_json_with_client,
+    post_multipart_with_client, url_encode_query_value,
+};
 
-const RCLONE_READY_TIMEOUT: Duration = Duration::from_secs(3);
-const RCLONE_READY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 pub const DEFAULT_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 pub const DEFAULT_RCLONE_CONCURRENCY: usize = 16;
+const DEFAULT_RCLONE_TRANSFERS: usize = 4;
+const DEFAULT_RCLONE_CHECKERS: usize = 8;
+const DEFAULT_RCLONE_JOB_EXPIRE_DURATION: &str = "10m";
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Entry {
@@ -48,9 +52,6 @@ pub struct StatInfo {
     pub size: i64,
 }
 
-/// Source/destination for an `operations/copyfile` call.
-///
-/// `src_remote`/`dst_remote` are paths relative to `src_fs`/`dst_fs`.
 pub struct CopyFile<'a> {
     pub src_fs: &'a str,
     pub src_remote: &'a str,
@@ -58,9 +59,6 @@ pub struct CopyFile<'a> {
     pub dst_remote: &'a str,
 }
 
-/// Destination for an `operations/uploadfile` call. The bytes land at
-/// `<fs>/<remote_dir>/<file_name>`; `file_name` must be a plain file name (the
-/// multipart part's `filename`).
 pub struct UploadFile<'a> {
     pub fs: &'a str,
     pub remote_dir: &'a str,
@@ -144,26 +142,11 @@ impl Drop for OpPermit<'_> {
 
 #[derive(Debug)]
 pub struct RcloneRcd {
-    /// Owned so it can be torn down off the async context on Drop (see below).
-    /// Always `Some` until `Drop`/`shutdown` takes it.
     runtime: Option<Runtime>,
     state: Mutex<State>,
     default_timeout: Duration,
+    submit_timeout: Duration,
     limiter: OpLimiter,
-}
-
-#[derive(Debug)]
-struct State {
-    daemon: Option<DaemonState>,
-}
-
-#[derive(Debug)]
-struct DaemonState {
-    _temp_dir: TempDir,
-    socket_path: PathBuf,
-    client: Client<hyperlocal::UnixConnector, Full<Bytes>>,
-    child: Child,
-    pid: u32,
 }
 
 impl RcloneRcd {
@@ -180,12 +163,14 @@ impl RcloneRcd {
             runtime: Some(runtime),
             state: Mutex::new(State { daemon: None }),
             default_timeout,
+            submit_timeout: env_duration_secs(
+                "LUCHTA_SHARED_CACHE_RCLONE_SUBMIT_TIMEOUT",
+                DEFAULT_RCLONE_SUBMIT_TIMEOUT,
+            ),
             limiter: OpLimiter::new(max_in_flight.max(1)),
         })
     }
 
-    /// The owned tokio runtime. Present for the whole lifetime except during the
-    /// final teardown in `shutdown`/`drop`.
     fn runtime(&self) -> &Runtime {
         self.runtime
             .as_ref()
@@ -219,16 +204,12 @@ impl RcloneRcd {
     }
 
     pub fn noop(&self, timeout: Duration) -> Result<(), RcloneError> {
-        let _permit = self.limiter.acquire();
-        self.call::<_, NoopResponse>("rc/noop", json!({}), timeout)
+        self.call_async::<_, NoopResponse>("rc/noop", json!({}), timeout)
             .map(|_| ())
     }
 
-    /// `src_remote` and `dst_remote` must be paths relative to `src_fs` and `dst_fs`.
-    /// Callers own fs/root split, e.g. `:local:/abs/dir` + `file.txt`, not `:local:` + `/abs/dir/file.txt`.
     pub fn copyfile(&self, copy: CopyFile<'_>, timeout: Duration) -> Result<(), RcloneError> {
-        let _permit = self.limiter.acquire();
-        self.call::<_, EmptyResponse>(
+        self.call_async::<_, EmptyResponse>(
             "operations/copyfile",
             json!({
                 "srcFs": copy.src_fs,
@@ -241,15 +222,6 @@ impl RcloneRcd {
         .map(|_| ())
     }
 
-    /// Streams `bytes` straight to the remote via `operations/uploadfile`
-    /// (multipart/form-data) instead of staging a local temp file and calling
-    /// `operations/copyfile`. This avoids a race where the temp source file is
-    /// removed before rclone stats it, which surfaced as a spurious
-    /// `404 object not found` (on the SOURCE) under concurrent stores.
-    ///
-    /// The file lands at `<fs>/<remote_dir>/<file_name>`. `file_name` must be a
-    /// plain file name (no path separators); rclone takes it from the multipart
-    /// part's `filename`.
     pub fn upload_bytes(
         &self,
         upload: UploadFile<'_>,
@@ -303,7 +275,6 @@ impl RcloneRcd {
         .map(|_| ())
     }
 
-    /// `remote` must be path relative to `fs`.
     pub fn list(
         &self,
         fs: &str,
@@ -322,10 +293,8 @@ impl RcloneRcd {
         Ok(response.list.unwrap_or_default())
     }
 
-    /// `remote` must be path relative to `fs`.
     pub fn deletefile(&self, fs: &str, remote: &str, timeout: Duration) -> Result<(), RcloneError> {
-        let _permit = self.limiter.acquire();
-        self.call::<_, EmptyResponse>(
+        self.call_async::<_, EmptyResponse>(
             "operations/deletefile",
             json!({
                 "fs": fs,
@@ -336,15 +305,13 @@ impl RcloneRcd {
         .map(|_| ())
     }
 
-    /// `remote` must be path relative to `fs`.
     pub fn stat(
         &self,
         fs: &str,
         remote: &str,
         timeout: Duration,
     ) -> Result<Option<StatInfo>, RcloneError> {
-        let _permit = self.limiter.acquire();
-        let response: StatResponse = self.call(
+        let response: StatResponse = self.call_async(
             "operations/stat",
             json!({
                 "fs": fs,
@@ -360,10 +327,6 @@ impl RcloneRcd {
         let Some(daemon) = state.daemon.take() else {
             return Ok(());
         };
-        // Run the blocking teardown on a dedicated OS thread. `block_on` must
-        // never be called from within an async context (e.g. when the owning
-        // `SharedCache` Arc is dropped inside the build's tokio runtime), so we
-        // borrow the runtime into a scoped thread instead of blocking here.
         let runtime = self.runtime();
         std::thread::scope(|scope| {
             scope
@@ -403,17 +366,53 @@ impl RcloneRcd {
         serde_json::from_value(response).map_err(RcloneError::from)
     }
 
-    /// Spawns the rclone daemon once (under the state lock) if needed and returns
-    /// a clone of its unix socket path. The lock is held ONLY for the spawn and
-    /// path read, never for in-flight requests, so concurrent RC calls run
-    /// against the daemon without serializing behind this mutex.
+    fn call_async<P, T>(
+        &self,
+        endpoint: &str,
+        payload: P,
+        timeout: Duration,
+    ) -> Result<T, RcloneError>
+    where
+        P: Serialize,
+        T: DeserializeOwned + Send,
+    {
+        let payload = serde_json::to_value(payload)?;
+        let runtime = self.runtime();
+        let socket_path = self.ensure_daemon_socket(timeout)?;
+        let submit_timeout = self.submit_timeout;
+        std::thread::scope(|scope| {
+            scope
+                .spawn(move || -> Result<T, RcloneError> {
+                    let client = Client::unix();
+                    runtime.block_on(async move {
+                        let submitted = {
+                            let _permit = self.limiter.acquire();
+                            submit_async_job(
+                                &client,
+                                &socket_path,
+                                endpoint,
+                                payload,
+                                submit_timeout,
+                            )
+                            .await?
+                        };
+                        poll_async_job::<T>(&client, &socket_path, submitted, timeout).await
+                    })
+                })
+                .join()
+                .map_err(|_| RcloneError::Process {
+                    reason: "rclone async call thread panicked".to_string(),
+                })?
+        })
+    }
+
     fn ensure_daemon_socket(&self, timeout: Duration) -> Result<PathBuf, RcloneError> {
         let runtime = self.runtime();
         let mut state = self.lock_state()?;
         if state.daemon.is_none() {
             state.daemon = Some(std::thread::scope(|scope| {
                 scope
-                    .spawn(move || runtime.block_on(RcloneRcd::spawn_daemon(timeout)))
+                    .spawn(move || runtime.block_on(spawn_daemon(timeout)))
                     .join()
                     .map_err(|_| RcloneError::Process {
                         reason: "rclone spawn thread panicked".to_string(),
@@ -433,242 +432,6 @@ impl RcloneRcd {
             reason: "rclone state mutex poisoned".to_string(),
         })
     }
-
-    async fn spawn_daemon(timeout: Duration) -> Result<DaemonState, RcloneError> {
-        let temp_dir = TempDir::new()?;
-        let socket_path = temp_dir.path().join("rclone.rcd.sock");
-        let socket_addr = format!("unix://{}", socket_path.display());
-
-        let mut command = Command::new("rclone");
-        command
-            .arg("rcd")
-            .arg("--rc-addr")
-            .arg(&socket_addr)
-            .arg("--rc-no-auth")
-            .arg("--log-format")
-            .arg("date,time")
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .stdin(Stdio::null());
-
-        let child = match command.spawn() {
-            Ok(child) => child,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                return Err(RcloneError::remote_unavailable(
-                    "`rclone` not found on PATH",
-                ));
-            }
-            Err(err) => {
-                return Err(RcloneError::remote_unavailable(format!(
-                    "failed to spawn `rclone rcd`: {err}`"
-                )));
-            }
-        };
-
-        let pid = child.id().ok_or_else(|| RcloneError::Process {
-            reason: "spawned rclone missing child pid".to_string(),
-        })?;
-        let client = Client::unix();
-        let mut daemon = DaemonState {
-            _temp_dir: temp_dir,
-            socket_path,
-            client,
-            child,
-            pid,
-        };
-        daemon
-            .wait_until_ready(timeout.min(RCLONE_READY_TIMEOUT))
-            .await?;
-        Ok(daemon)
-    }
-}
-
-async fn post_json_with_client<P, T>(
-    client: &Client<hyperlocal::UnixConnector, Full<Bytes>>,
-    socket_path: &std::path::Path,
-    endpoint: &str,
-    payload: P,
-    timeout_duration: Duration,
-) -> Result<T, RcloneError>
-where
-    P: Serialize,
-    T: DeserializeOwned,
-{
-    let uri: hyper::Uri = Uri::new(socket_path, &format!("/{endpoint}")).into();
-    let body = serde_json::to_vec(&payload)?;
-    let request = Request::builder()
-        .method("POST")
-        .uri(uri)
-        .header(CONTENT_TYPE, "application/json")
-        .body(Full::new(Bytes::from(body)))
-        .map_err(|err| RcloneError::Request {
-            reason: err.to_string(),
-        })?;
-
-    let response = timeout(timeout_duration, client.request(request))
-        .await
-        .map_err(|_| RcloneError::Timeout {
-            timeout: timeout_duration,
-        })
-        .and_then(|result| {
-            result.map_err(|err| RcloneError::Request {
-                reason: err.to_string(),
-            })
-        })?;
-
-    let status = response.status();
-    let bytes = timeout(timeout_duration, response.into_body().collect())
-        .await
-        .map_err(|_| RcloneError::Timeout {
-            timeout: timeout_duration,
-        })?
-        .map_err(|err| RcloneError::Request {
-            reason: err.to_string(),
-        })?
-        .to_bytes();
-    if !status.is_success() {
-        let body = String::from_utf8_lossy(&bytes).into_owned();
-        return Err(RcloneError::HttpStatus {
-            status: status.as_u16(),
-            body,
-        });
-    }
-
-    let value: Value = serde_json::from_slice(&bytes)?;
-    if let Some(error) = value.get("error").and_then(Value::as_str) {
-        return Err(RcloneError::Rc {
-            message: error.to_string(),
-        });
-    }
-    serde_json::from_value(value).map_err(RcloneError::from)
-}
-
-/// POSTs a multipart/form-data body to `operations/uploadfile` (with the
-/// `fs`/`remote` query string already built) over the rcd unix socket. Mirrors
-/// `post_json_with_client` for status/error handling but carries the file as a
-/// streamed multipart part rather than a JSON payload.
-async fn post_multipart_with_client(
-    client: &Client<hyperlocal::UnixConnector, Full<Bytes>>,
-    socket_path: &std::path::Path,
-    query: &str,
-    boundary: &str,
-    body: Bytes,
-    timeout_duration: Duration,
-) -> Result<(), RcloneError> {
-    let path = format!("/operations/uploadfile?{query}");
-    let uri: hyper::Uri = Uri::new(socket_path, &path).into();
-    let request = Request::builder()
-        .method("POST")
-        .uri(uri)
-        .header(
-            CONTENT_TYPE,
-            format!("multipart/form-data; boundary={boundary}"),
-        )
-        .body(Full::new(body))
-        .map_err(|err| RcloneError::Request {
-            reason: err.to_string(),
-        })?;
-
-    let response = timeout(timeout_duration, client.request(request))
-        .await
-        .map_err(|_| RcloneError::Timeout {
-            timeout: timeout_duration,
-        })
-        .and_then(|result| {
-            result.map_err(|err| RcloneError::Request {
-                reason: err.to_string(),
-            })
-        })?;
-
-    let status = response.status();
-    let bytes = timeout(timeout_duration, response.into_body().collect())
-        .await
-        .map_err(|_| RcloneError::Timeout {
-            timeout: timeout_duration,
-        })?
-        .map_err(|err| RcloneError::Request {
-            reason: err.to_string(),
-        })?
-        .to_bytes();
-    if !status.is_success() {
-        let body = String::from_utf8_lossy(&bytes).into_owned();
-        return Err(RcloneError::HttpStatus {
-            status: status.as_u16(),
-            body,
-        });
-    }
-
-    // uploadfile returns 200 with an (empty) JSON object on success, but may
-    // still carry an `error` field; surface it like the JSON path does, reusing
-    // the shared `detect_rc_error` helper.
-    if !bytes.is_empty() {
-        let body = String::from_utf8_lossy(&bytes);
-        if let Some(message) = detect_rc_error(&body)? {
-            return Err(RcloneError::Rc { message });
-        }
-    }
-    Ok(())
-}
-
-fn build_upload_multipart_body(boundary: &str, file_name: &str, bytes: &[u8]) -> Bytes {
-    let mut body =
-        BytesMut::with_capacity(boundary.len() * 2 + file_name.len() + bytes.len() + 160);
-    body.put(format!("--{boundary}\r\n").as_bytes());
-    body.put(
-        format!(
-            "Content-Disposition: form-data; name=\"file0\"; filename=\"{}\"\r\n",
-            escape_multipart_header_value(file_name)
-        )
-        .as_bytes(),
-    );
-    body.put(b"Content-Type: application/octet-stream\r\n\r\n".as_slice());
-    body.put(bytes);
-    body.put(format!("\r\n--{boundary}--\r\n").as_bytes());
-    body.freeze()
-}
-
-fn escape_multipart_header_value(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
-fn multipart_boundary() -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0_u128, |duration| duration.as_nanos());
-    format!("luchta-rclone-upload-{nanos:x}")
-}
-
-fn url_encode_query_value(value: &str) -> String {
-    let mut encoded = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                encoded.push(char::from(byte));
-            }
-            _ => encoded.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    encoded
-}
-
-/// Sends `core/quit` and waits for the daemon to exit, on the given runtime.
-/// Intended to run on a dedicated OS thread, never inside an async context.
-fn quit_and_wait(
-    runtime: &Runtime,
-    mut daemon: DaemonState,
-    timeout: Duration,
-) -> Result<(), RcloneError> {
-    runtime.block_on(async move {
-        let quit_result = daemon
-            .post_json::<_, EmptyResponse>("core/quit", json!({}), timeout)
-            .await;
-        let wait_result = daemon.wait_for_exit(timeout).await;
-        match (quit_result, wait_result) {
-            (Err(err), _) => Err(err),
-            (_, Err(err)) => Err(err),
-            _ => Ok(()),
-        }
-    })
 }
 
 impl Drop for RcloneRcd {
@@ -678,12 +441,6 @@ impl Drop for RcloneRcd {
             .get_mut()
             .ok()
             .and_then(|state| state.daemon.take());
-        // Move the runtime OUT of `self` so it is dropped on the teardown thread
-        // below, NOT here. Dropping a tokio runtime from within an async context
-        // (e.g. when this Arc is released inside the build's runtime) panics
-        // with "Cannot drop a runtime in a context where blocking is not
-        // allowed". Running the teardown — and the runtime's own drop — on a
-        // dedicated OS thread sidesteps that entirely.
         let Some(runtime) = self.runtime.take() else {
             return;
         };
@@ -701,151 +458,30 @@ impl Drop for RcloneRcd {
                     let _ = daemon.kill_force().await;
                 });
             }
-            // `runtime` (and its background threads) is dropped here, on this
-            // dedicated thread, outside any async context.
             drop(runtime);
         });
-        // Join so the daemon is fully reaped before this drop returns; ignore a
-        // panic in the teardown thread (best-effort cleanup, never fatal).
         let _ = handle.join();
     }
 }
 
-impl DaemonState {
-    async fn wait_until_ready(&mut self, timeout_duration: Duration) -> Result<(), RcloneError> {
-        let deadline = Instant::now() + timeout_duration;
-        let mut ticker = tokio::time::interval(RCLONE_READY_POLL_INTERVAL);
-        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-
-        loop {
-            match self
-                .post_json::<_, NoopResponse>("rc/noop", json!({}), RCLONE_READY_POLL_INTERVAL)
-                .await
-            {
-                Ok(_) => return Ok(()),
-                Err(err @ RcloneError::RemoteUnavailable { .. }) => return Err(err),
-                Err(err @ RcloneError::Process { .. }) => return Err(err),
-                Err(_) => {}
-            }
-
-            if Instant::now() >= deadline {
-                self.kill_force().await?;
-                return Err(RcloneError::Timeout {
-                    timeout: timeout_duration,
-                });
-            }
-            ticker.tick().await;
-        }
-    }
-
-    async fn post_json<P, T>(
-        &mut self,
-        endpoint: &str,
-        payload: P,
-        timeout_duration: Duration,
-    ) -> Result<T, RcloneError>
-    where
-        P: Serialize,
-        T: DeserializeOwned,
-    {
-        self.ensure_running()?;
-        let body = serde_json::to_vec(&payload)?;
-        let path = format!("/{endpoint}");
-        let uri: hyper::Uri = Uri::new(&self.socket_path, &path).into();
-        let request = Request::post(uri)
-            .header(CONTENT_TYPE, "application/json")
-            .body(Full::new(Bytes::from(body)))
-            .map_err(|err| RcloneError::Request {
-                reason: err.to_string(),
-            })?;
-
-        let response = timeout(timeout_duration, self.client.request(request))
-            .await
-            .map_err(|_| RcloneError::Timeout {
-                timeout: timeout_duration,
-            })?
-            .map_err(|err| RcloneError::Request {
-                reason: err.to_string(),
-            })?;
-
-        let status = response.status();
-        let bytes = timeout(timeout_duration, response.into_body().collect())
-            .await
-            .map_err(|_| RcloneError::Timeout {
-                timeout: timeout_duration,
-            })?
-            .map_err(|err| RcloneError::Request {
-                reason: err.to_string(),
-            })?
-            .to_bytes();
-        let text = String::from_utf8_lossy(&bytes).into_owned();
-
-        if !status.is_success() {
-            return Err(RcloneError::HttpStatus {
-                status: status.as_u16(),
-                body: text,
-            });
-        }
-
-        let rc_error = detect_rc_error(&text)?;
-        if let Some(message) = rc_error {
-            return Err(RcloneError::Rc { message });
-        }
-
-        serde_json::from_slice(&bytes).map_err(RcloneError::Decode)
-    }
-
-    async fn wait_for_exit(&mut self, timeout_duration: Duration) -> Result<(), RcloneError> {
-        match timeout(timeout_duration, self.child.wait()).await {
-            Ok(Ok(status)) if status.success() => Ok(()),
-            Ok(Ok(status)) => Err(RcloneError::Process {
-                reason: format!("rclone exited with status {status}"),
-            }),
-            Ok(Err(err)) => Err(RcloneError::Io(err)),
-            Err(_) => {
-                self.kill_force().await?;
-                Err(RcloneError::Timeout {
-                    timeout: timeout_duration,
-                })
-            }
-        }
-    }
-
-    async fn kill_force(&mut self) -> Result<(), RcloneError> {
-        match self.child.try_wait() {
-            Ok(Some(_)) => Ok(()),
-            Ok(None) => {
-                self.child.start_kill()?;
-                let _ = self.child.wait().await;
-                Ok(())
-            }
-            Err(err) => Err(RcloneError::Io(err)),
-        }
-    }
-
-    fn ensure_running(&mut self) -> Result<(), RcloneError> {
-        match self.child.try_wait() {
-            Ok(Some(status)) => Err(RcloneError::Process {
-                reason: format!("rclone exited before request with status {status}"),
-            }),
-            Ok(None) => Ok(()),
-            Err(err) => Err(RcloneError::Io(err)),
-        }
-    }
+fn env_duration_secs(name: &str, default: Duration) -> Duration {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(default)
 }
 
-fn detect_rc_error(body: &str) -> Result<Option<String>, RcloneError> {
-    let value: Value = serde_json::from_str(body)?;
-    let Some(error) = value.get("error") else {
-        return Ok(None);
-    };
-    if error.is_null() {
-        return Ok(None);
-    }
-    Ok(Some(match error {
-        Value::String(message) => message.clone(),
-        other => other.to_string(),
-    }))
+pub(super) fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .map(|value| value.max(1))
+        .unwrap_or(default)
+}
+
+pub(super) fn env_string(name: &str, default: &str) -> String {
+    std::env::var(name).unwrap_or_else(|_| default.to_string())
 }
 
 #[derive(Debug, Deserialize)]
@@ -855,7 +491,7 @@ struct NoopResponse {
 }
 
 #[derive(Debug, Deserialize)]
-struct EmptyResponse {}
+pub(super) struct EmptyResponse {}
 
 #[derive(Debug, Deserialize)]
 struct ListResponse {
@@ -864,14 +500,14 @@ struct ListResponse {
 }
 
 #[derive(Debug, Deserialize)]
-struct StatResponse {
+pub(super) struct StatResponse {
     #[serde(rename = "item")]
     item: Option<StatInfo>,
 }
 
 impl fmt::Display for Entry {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.path)
+        transport::display_entry(self, f)
     }
 }
 
@@ -880,7 +516,11 @@ mod tests {
     use super::*;
     use luchta_test_support::require_nextest;
     use std::fs;
-
+    use std::process::Stdio;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::mpsc;
+    use std::sync::Arc;
+    use std::thread;
     use tempfile::TempDir;
 
     fn should_run_rclone_test() -> bool {
@@ -898,11 +538,6 @@ mod tests {
 
     #[test]
     fn op_limiter_caps_max_in_flight_and_unblocks_after_release() {
-        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-        use std::sync::mpsc;
-        use std::sync::Arc;
-        use std::thread;
-
         let limiter = Arc::new(OpLimiter::new(2));
         let current = Arc::new(AtomicUsize::new(0));
         let max_seen = Arc::new(AtomicUsize::new(0));
@@ -957,6 +592,7 @@ mod tests {
             assert!(proceeded.load(Ordering::SeqCst));
         });
     }
+
     #[tokio::test(flavor = "current_thread")]
     async fn noop_from_runtime_context_returns_result_instead_of_panicking() {
         let timeout = Duration::from_millis(50);
@@ -1108,11 +744,6 @@ mod tests {
             return;
         }
 
-        // We always pass a plain file name; the destination subdir is supplied
-        // via `remote_dir` (the `remote` query param), which rclone joins under
-        // `fs`. Verify the bytes land at `<fs>/<remote_dir>/<file_name>` exactly,
-        // including creating the nested dir on a fresh prefix (the empty-prefix
-        // case that previously surfaced spurious 404s on the copyfile path).
         let timeout = Duration::from_secs(10);
         let remote_dir = TempDir::new().unwrap();
         let rclone = RcloneRcd::new(timeout).unwrap();

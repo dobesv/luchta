@@ -41,7 +41,7 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 #[cfg(unix)]
 use tokio::task::JoinSet;
@@ -148,7 +148,7 @@ impl MergedIndex {
 #[derive(Debug)]
 pub struct SharedCache {
     /// Resolved paths for the cache.
-    paths: SharedCachePaths,
+    paths: Arc<SharedCachePaths>,
     /// Write commit key for the current repo state (None if dirty/unavailable).
     write_commit_key: Option<String>,
     /// Candidate commit keys for lookup (newest-first).
@@ -182,6 +182,10 @@ impl Drop for SharedCache {
         // socket path that is never reused by a later run.
         #[cfg(unix)]
         if let Some(remote) = &self.remote {
+            // Flush queued synchronous remote pushes before stopping the rclone
+            // daemon. The queue worker is a plain OS thread, so joining it here
+            // is safe even if Drop runs inside build runtime async context.
+            remote.flush_push_queue();
             remote.shutdown();
         }
     }
@@ -248,7 +252,7 @@ impl SharedCache {
             .cache_dir
             .map(|p| p.to_path_buf())
             .unwrap_or_else(resolve_shared_cache_dir);
-        let paths = open_shared_paths(&cache_path).ok()?;
+        let paths = Arc::new(open_shared_paths(&cache_path).ok()?);
 
         let write_commit_key = match resolve_commit_key(repo_root) {
             CommitKey::Clean(key) => Some(key),
@@ -258,7 +262,7 @@ impl SharedCache {
 
         let candidate_keys = candidate_commit_keys(repo_root, history_len);
 
-        let snapshot_store = SnapshotStore::new(paths.clone());
+        let snapshot_store = SnapshotStore::new((*paths).clone());
         #[cfg(unix)]
         let remote = match extras.remote {
             Some(config) => match RemoteSync::from_config(config) {
@@ -305,7 +309,7 @@ impl SharedCache {
         let candidate_keys = candidate_commit_keys(repo_root, history_len);
 
         Some(Self {
-            paths,
+            paths: Arc::new(paths),
             write_commit_key,
             candidate_keys,
             snapshot_store,
@@ -690,20 +694,41 @@ impl SharedCache {
                     return Ok(StoreOutcome::SkippedLockUnavailable);
                 }
                 #[cfg(unix)]
-                if let Some(remote) = &self.remote {
-                    remote.push_store_artifacts(remote::PushArtifacts {
-                        paths: &self.paths,
-                        commit_key: write_key,
-                        outputs_hash: &outputs_hash,
-                        merge,
-                    });
-                }
+                self.enqueue_remote_push(write_key, outputs_hash, merge);
                 Ok(StoreOutcome::Stored)
             }
             BlobWriteResult::SkippedTooLarge { bytes } => {
                 Ok(StoreOutcome::SkippedTooLarge { bytes })
             }
             BlobWriteResult::NoOutputs => Ok(StoreOutcome::Stored), // Empty outputs are cacheable.
+        }
+    }
+
+    #[cfg(unix)]
+    fn enqueue_remote_push(
+        &self,
+        write_key: &str,
+        outputs_hash: [u8; 32],
+        merge: MergeEntryOutcome,
+    ) {
+        let Some(remote) = &self.remote else {
+            return;
+        };
+        if remote.is_disabled() {
+            return;
+        }
+        remote.enqueue_push_store_artifacts(remote::OwnedPushArtifacts {
+            paths: Arc::clone(&self.paths),
+            commit_key: write_key.to_string(),
+            outputs_hash,
+            merge,
+        });
+    }
+
+    #[cfg(any(test, doctest))]
+    pub(crate) fn flush_push_queue(&self) {
+        if let Some(remote) = &self.remote {
+            remote.drain_push_queue();
         }
     }
 
