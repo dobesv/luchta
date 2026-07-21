@@ -36,6 +36,12 @@ type ResponseResult = Result<WorkerResponse, String>;
 /// the matching response arrives.
 type ResponseWaiters = Arc<Mutex<HashMap<String, oneshot::Sender<ResponseResult>>>>;
 
+fn is_terminal_response(response: &WorkerResponse) -> bool {
+    matches!(
+        response,
+        WorkerResponse::Resolved { .. } | WorkerResponse::Done { .. }
+    )
+}
 #[derive(Clone)]
 struct DelegateLifecycle {
     exit_status: Arc<Mutex<Option<ExitStatus>>>,
@@ -269,14 +275,17 @@ impl DelegateHandle {
             exit_status: Arc::clone(&self.exit_status),
             shutting_down: Arc::clone(&self.shutting_down),
         };
+        let stdout_ctx = DelegateStdoutCtx {
+            waiters: Arc::clone(&waiters),
+            writer: Arc::clone(&self.stdout_writer),
+            stderr_writer: Arc::clone(&self.stderr_writer),
+            stderr_prefix: self.stderr_prefix.clone(),
+            delegate_command: self.delegate_command.clone(),
+            lifecycle,
+        };
         let stdout_task = tokio::spawn(read_delegate_stdout(
             BufReader::new(stdout).lines(),
-            Arc::clone(&waiters),
-            Arc::clone(&self.stdout_writer),
-            Arc::clone(&self.stderr_writer),
-            self.stderr_prefix.clone(),
-            self.delegate_command.clone(),
-            lifecycle,
+            stdout_ctx,
         ));
         let stderr_task = tokio::spawn(forward_delegate_stderr(
             BufReader::new(stderr).lines(),
@@ -421,6 +430,15 @@ struct SpawnedDelegate {
     waiters: ResponseWaiters,
 }
 
+struct DelegateStdoutCtx {
+    waiters: ResponseWaiters,
+    writer: SharedWriter,
+    stderr_writer: SharedWriter,
+    stderr_prefix: Option<String>,
+    delegate_command: Vec<String>,
+    lifecycle: DelegateLifecycle,
+}
+
 fn spawn_delegate_child(delegate_command: &[String]) -> Result<Child, ProxyError> {
     let program = delegate_command
         .first()
@@ -442,70 +460,95 @@ fn spawn_delegate_child(delegate_command: &[String]) -> Result<Child, ProxyError
 
 async fn read_delegate_stdout(
     mut lines: tokio::io::Lines<BufReader<ChildStdout>>,
-    waiters: ResponseWaiters,
-    writer: SharedWriter,
-    stderr_writer: SharedWriter,
-    stderr_prefix: Option<String>,
-    delegate_command: Vec<String>,
-    lifecycle: DelegateLifecycle,
+    ctx: DelegateStdoutCtx,
 ) -> Result<(), ProxyError> {
     loop {
         let line = match lines.next_line().await {
             Ok(Some(line)) => line,
             Ok(None) => {
-                let status = best_effort_exit_status(&lifecycle.exit_status).await;
-                let has_in_flight_waiters = !waiters.lock().await.is_empty();
-                let shutting_down = lifecycle.shutting_down.load(Ordering::SeqCst);
-                let dirty = has_in_flight_waiters
-                    || (!shutting_down && status.is_none_or(|s| !s.success()));
-                if dirty {
-                    log_delegate_failure(
-                        &stderr_writer,
-                        stderr_prefix.as_deref(),
-                        &delegate_command,
-                        status,
-                    )
-                    .await?;
-                }
-                fail_all_waiters(&waiters, "delegate stdout closed".to_owned()).await;
+                handle_delegate_stdout_eof(&ctx).await?;
                 return Ok(());
             }
-            Err(error) => {
-                log_delegate_failure(
-                    &stderr_writer,
-                    stderr_prefix.as_deref(),
-                    &delegate_command,
-                    best_effort_exit_status(&lifecycle.exit_status).await,
-                )
-                .await?;
-                fail_all_waiters(&waiters, format!("delegate stdout read failed: {error}")).await;
-                return Err(error.into());
-            }
+            Err(error) => return handle_delegate_stdout_read_error(&ctx, error).await,
         };
 
-        let response: WorkerResponse = match serde_json::from_str(&line) {
-            Ok(response) => response,
-            Err(error) => {
-                log_delegate_failure(
-                    &stderr_writer,
-                    stderr_prefix.as_deref(),
-                    &delegate_command,
-                    best_effort_exit_status(&lifecycle.exit_status).await,
-                )
-                .await?;
-                fail_all_waiters(
-                    &waiters,
-                    format!("delegate stdout contained invalid JSON: {error}"),
-                )
-                .await;
-                return Err(error.into());
-            }
-        };
+        process_delegate_line(line, &ctx).await?;
+    }
+}
 
-        if let Err(error) = write_response(&writer, &response).await {
-            fail_all_waiters(&waiters, format!("proxy stdout write failed: {error}")).await;
-            return Err(error);
+async fn handle_delegate_stdout_eof(ctx: &DelegateStdoutCtx) -> Result<(), ProxyError> {
+    let status = best_effort_exit_status(&ctx.lifecycle.exit_status).await;
+    let has_in_flight_waiters = !ctx.waiters.lock().await.is_empty();
+    let shutting_down = ctx.lifecycle.shutting_down.load(Ordering::SeqCst);
+    let dirty = has_in_flight_waiters || (!shutting_down && status.is_none_or(|s| !s.success()));
+    if dirty {
+        log_delegate_failure(
+            &ctx.stderr_writer,
+            ctx.stderr_prefix.as_deref(),
+            &ctx.delegate_command,
+            status,
+        )
+        .await?;
+    }
+    fail_all_waiters(&ctx.waiters, "delegate stdout closed".to_owned()).await;
+    Ok(())
+}
+
+async fn handle_delegate_stdout_read_error(
+    ctx: &DelegateStdoutCtx,
+    error: std::io::Error,
+) -> Result<(), ProxyError> {
+    log_delegate_failure(
+        &ctx.stderr_writer,
+        ctx.stderr_prefix.as_deref(),
+        &ctx.delegate_command,
+        best_effort_exit_status(&ctx.lifecycle.exit_status).await,
+    )
+    .await?;
+    fail_all_waiters(
+        &ctx.waiters,
+        format!("delegate stdout read failed: {error}"),
+    )
+    .await;
+    Err(error.into())
+}
+
+async fn process_delegate_line(line: String, ctx: &DelegateStdoutCtx) -> Result<(), ProxyError> {
+    let response = parse_delegate_response(&line, ctx).await?;
+    if let Err(error) = write_response(&ctx.writer, &response).await {
+        fail_all_waiters(&ctx.waiters, format!("proxy stdout write failed: {error}")).await;
+        return Err(error);
+    }
+    deliver_terminal_response(&ctx.waiters, response).await;
+    Ok(())
+}
+
+async fn parse_delegate_response(
+    line: &str,
+    ctx: &DelegateStdoutCtx,
+) -> Result<WorkerResponse, ProxyError> {
+    match serde_json::from_str(line) {
+        Ok(response) => Ok(response),
+        Err(error) => {
+            log_delegate_failure(
+                &ctx.stderr_writer,
+                ctx.stderr_prefix.as_deref(),
+                &ctx.delegate_command,
+                best_effort_exit_status(&ctx.lifecycle.exit_status).await,
+            )
+            .await?;
+            fail_all_waiters(
+                &ctx.waiters,
+                format!("delegate stdout contained invalid JSON: {error}"),
+            )
+            .await;
+            Err(error.into())
         }
+    }
+}
+
+async fn deliver_terminal_response(waiters: &ResponseWaiters, response: WorkerResponse) {
+    if is_terminal_response(&response) {
         let waiter = { waiters.lock().await.remove(response.id()) };
         if let Some(waiter) = waiter {
             // Receiver may have gone away (caller cancelled); ignore that.
@@ -1277,6 +1320,64 @@ wait
         }
 
         handle.shutdown().await.expect("shutdown ok");
+    }
+
+    #[tokio::test]
+    async fn send_with_timeout_waits_for_terminal_response_after_log() {
+        let (stdout_writer, stdout_reader) = writer_pair();
+        let (stderr_writer, _stderr_reader) = writer_pair();
+        let handle = DelegateHandle::with_writers(
+            vec![
+                "python3".to_owned(),
+                "-c".to_owned(),
+                r#"import sys, json
+for line in sys.stdin:
+    message = json.loads(line)
+    ident = message["id"]
+    sys.stdout.write(json.dumps({"type":"log","id":ident,"stream":"stdout","line":"before resolved"}) + "\n")
+    sys.stdout.flush()
+    sys.stdout.write(json.dumps({"type":"resolved","id":ident,"result":{"decision":"accept"}}) + "\n")
+    sys.stdout.flush()
+"#
+                .to_owned(),
+            ],
+            stdout_writer,
+            stderr_writer,
+            Some("delegate: ".to_owned()),
+        );
+
+        let response = handle
+            .send_with_timeout(
+                WorkerMessage::ResolveTask(ResolveTask {
+                    id: "pkg#build-log-first".to_owned(),
+                    name: "build".to_owned(),
+                    command: String::new(),
+                    package: "pkg".to_owned(),
+                    cwd: None,
+                    scripts: Vec::new(),
+                    inputs: Vec::new(),
+                    mode: crate::ResolveMode::Run,
+                }),
+                Duration::from_secs(2),
+            )
+            .await
+            .expect("resolve should wait for terminal response");
+
+        assert_eq!(
+            response,
+            WorkerResponse::resolved("pkg#build-log-first", ResolveResult::accept())
+        );
+
+        handle.shutdown().await.expect("shutdown ok");
+        drop(handle);
+        let stdout_values = read_json_lines(stdout_reader).await;
+        assert_eq!(stdout_values.len(), 2);
+        assert_eq!(stdout_values[0]["type"], "log");
+        assert_eq!(stdout_values[0]["id"], "pkg#build-log-first");
+        assert_eq!(stdout_values[0]["line"], "before resolved");
+        assert_eq!(stdout_values[1]["type"], "resolved");
+        assert_eq!(stdout_values[1]["id"], "pkg#build-log-first");
+        assert_eq!(stdout_values[1]["result"]["decision"], "accept");
     }
 
     #[tokio::test]
