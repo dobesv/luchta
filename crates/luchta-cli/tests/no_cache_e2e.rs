@@ -9,6 +9,7 @@ use std::fs;
 
 use assert_cmd::Command;
 use assert_fs::prelude::*;
+use luchta_test_support::require_nextest;
 
 mod common;
 
@@ -117,6 +118,7 @@ fn no_cache_flag_forces_rerun() {
 
 #[test]
 fn no_cache_env_var_forces_rerun() {
+    require_nextest();
     let _lock = ENV_LOCK.lock().unwrap();
 
     let temp = assert_fs::TempDir::new().unwrap();

@@ -31,6 +31,7 @@ hyper-util = { version = "0.1.18", features = ["client-legacy", "http1", "tokio"
 
 [dev-dependencies]
 filetime = "0.2"
+luchta-test-support = { path = "../luchta-test-support" }
 
 [target.'cfg(unix)'.dependencies]
 hyperlocal = { version = "0.9.1", default-features = false, features = ["client"] }

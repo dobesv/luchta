@@ -2,6 +2,7 @@ use std::fs;
 
 use assert_cmd::Command;
 use assert_fs::prelude::*;
+use luchta_test_support::require_nextest;
 use predicates::prelude::*;
 
 mod common;
@@ -390,6 +391,7 @@ fn cache_deleted_output_reruns_task() {
 
 #[test]
 fn cache_significant_env_change_reruns_but_input_false_change_skips() {
+    require_nextest();
     let _lock = ENV_LOCK.lock().unwrap();
     let _guard = EnvVarGuard::set("BAR", "first");
     let temp = assert_fs::TempDir::new().unwrap();

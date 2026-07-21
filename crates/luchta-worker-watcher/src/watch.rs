@@ -280,6 +280,7 @@ pub async fn run(
 mod tests {
     use std::fs;
 
+    use luchta_test_support::require_nextest;
     use tempfile::TempDir;
 
     use super::*;
@@ -328,6 +329,7 @@ mod tests {
 
     #[test]
     fn watch_roots_finds_existing_src_dir() {
+        require_nextest();
         let temp = TempDir::new().expect("create temp dir");
         let temp_path = temp.path();
 
@@ -348,6 +350,7 @@ mod tests {
 
     #[test]
     fn watch_roots_deduplicates_common_ancestors() {
+        require_nextest();
         let temp = TempDir::new().expect("create temp dir");
         let temp_path = temp.path();
 
@@ -367,6 +370,7 @@ mod tests {
 
     #[test]
     fn watch_roots_fallback_to_current_dir() {
+        require_nextest();
         // For a glob that doesn't exist, should fallback to "."
         let temp = TempDir::new().expect("create temp dir");
         let temp_path = temp.path();

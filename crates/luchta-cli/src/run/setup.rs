@@ -400,6 +400,7 @@ pub(crate) fn build_execution_resources(
 mod tests {
     use super::*;
     use crate::memory_pressure::MemorySample;
+    use luchta_test_support::require_nextest;
     use std::sync::Mutex;
 
     /// Process-wide lock to serialize env-mutating tests.
@@ -654,6 +655,7 @@ mod tests {
 
     #[test]
     fn no_cache_env_returns_true_for_truthy_values() {
+        require_nextest();
         let _lock = ENV_LOCK.lock().unwrap();
         let _guard = EnvVarGuard::remove(NO_CACHE_ENV);
 
@@ -668,6 +670,7 @@ mod tests {
 
     #[test]
     fn no_cache_env_returns_false_for_non_truthy_values() {
+        require_nextest();
         let _lock = ENV_LOCK.lock().unwrap();
         let _guard = EnvVarGuard::remove(NO_CACHE_ENV);
 
@@ -682,6 +685,7 @@ mod tests {
 
     #[test]
     fn no_cache_env_returns_false_when_unset() {
+        require_nextest();
         let _lock = ENV_LOCK.lock().unwrap();
         let _guard = EnvVarGuard::remove(NO_CACHE_ENV);
 
@@ -693,6 +697,7 @@ mod tests {
 
     #[test]
     fn no_cache_flag_or_env_semantics() {
+        require_nextest();
         // The effective no_cache value is computed in main.rs as:
         //   effective = cli_flag || no_cache_env()
         //
