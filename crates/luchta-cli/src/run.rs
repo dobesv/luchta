@@ -1277,6 +1277,7 @@ fn compute_prefix_width(task_graph: &TaskGraph, tasks_to_run: &HashSet<TaskId>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use luchta_test_support::require_nextest;
     use luchta_types::{DependsOn, EnvSpec};
     use std::sync::Mutex;
 
@@ -2061,6 +2062,7 @@ mod tests {
 
     #[test]
     fn resolve_task_env_inherits_from_process_env_when_value_is_none() {
+        require_nextest();
         let _lock = ENV_LOCK.lock().unwrap();
         let _guard = EnvVarGuard::set("LUCHTA_TEST_INHERIT_VAR", "inherited_value");
 
@@ -2084,6 +2086,7 @@ mod tests {
 
     #[test]
     fn resolve_task_env_omits_missing_process_env() {
+        require_nextest();
         let _lock = ENV_LOCK.lock().unwrap();
         let _guard = EnvVarGuard::remove("LUCHTA_TEST_UNDEF_VAR");
 
@@ -2104,6 +2107,7 @@ mod tests {
 
     #[test]
     fn resolve_task_env_input_false_vars_are_still_present() {
+        require_nextest();
         let _lock = ENV_LOCK.lock().unwrap();
         let _guard = EnvVarGuard::set("LUCHTA_TEST_INPUT_FALSE_VAR", "still_present");
 
@@ -2128,6 +2132,7 @@ mod tests {
 
     #[test]
     fn resolve_task_env_explicit_value_overrides_process_env() {
+        require_nextest();
         let _lock = ENV_LOCK.lock().unwrap();
         let _guard = EnvVarGuard::set("LUCHTA_TEST_OVERRIDE_VAR", "process_value");
 
@@ -2218,6 +2223,7 @@ mod tests {
 
     #[test]
     fn resolve_workspace_root_falls_back_to_cwd_without_workspace_package_json() {
+        require_nextest();
         let temp_dir = tempfile::tempdir().expect("create tempdir");
         let original_cwd = std::env::current_dir().expect("read current dir");
         std::env::set_current_dir(temp_dir.path()).expect("set cwd to tempdir");
@@ -2230,6 +2236,7 @@ mod tests {
 
     #[test]
     fn resolve_workspace_root_walks_to_nearest_workspace_ancestor() {
+        require_nextest();
         let temp_dir = tempfile::tempdir().expect("create tempdir");
         let workspace_root = temp_dir.path();
         std::fs::write(
@@ -2252,6 +2259,7 @@ mod tests {
 
     #[test]
     fn resolve_workspace_root_skips_invalid_package_json_and_continues_walk() {
+        require_nextest();
         let temp_dir = tempfile::tempdir().expect("create tempdir");
         let workspace_root = temp_dir.path();
         std::fs::write(

@@ -55,6 +55,16 @@ If `cargo nextest` is not installed: `cargo install cargo-nextest --locked`
 suite five times — flaky tests that pass once but fail intermittently surface
 here.
 
+**`cargo nextest run --workspace` is the canonical test command.** Do not use
+plain `cargo test` — it runs the whole suite in one process with shared
+threads, so tests that mutate process-global state (cwd, real environment
+variables, temp dirs coupled to cwd) race and fail nondeterministically.
+Nextest runs each test in its own process, isolating that state. Such tests
+call `require_nextest()` (from the `luchta-test-support` crate) as their first
+line; when run under `cargo test` they panic with guidance instead of failing
+spuriously. When adding a test that mutates process-global state, call
+`require_nextest()` first and add `luchta-test-support` as a `[dev-dependency]`.
+
 ## Conventions
 - **No `target/`:** Never commit `target/` directories.
 - **Error Types:** Library errors should be clear and descriptive using `thiserror`.

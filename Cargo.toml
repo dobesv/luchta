@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/luchta-types",
     "crates/luchta-lockfiles",
+    "crates/luchta-test-support",
     "crates/luchta-workspace",
     "crates/luchta-engine",
     "crates/luchta-worker",

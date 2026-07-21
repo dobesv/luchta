@@ -98,12 +98,14 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
+    use luchta_test_support::require_nextest;
     use tempfile::TempDir;
 
     use super::{candidate_commit_keys, resolve_commit_key, CommitKey};
 
     #[test]
     fn clean_repo_returns_clean_commit_key() {
+        require_nextest();
         let repo = TestRepo::new();
         repo.write_file("tracked.txt", "hello\n");
         repo.git_add_and_commit_all();
@@ -114,6 +116,7 @@ mod tests {
 
     #[test]
     fn modified_tracked_file_returns_dirty_commit_key() {
+        require_nextest();
         let repo = TestRepo::new();
         repo.write_file("tracked.txt", "hello\n");
         repo.git_add_and_commit_all();
@@ -129,6 +132,7 @@ mod tests {
 
     #[test]
     fn ignored_file_only_keeps_repo_clean() {
+        require_nextest();
         let repo = TestRepo::new();
         repo.write_file("tracked.txt", "hello\n");
         repo.write_file(".gitignore", "ignored.log\n");
@@ -142,6 +146,7 @@ mod tests {
 
     #[test]
     fn candidate_commit_keys_returns_newest_first_bare_then_dirty_pairs() {
+        require_nextest();
         let repo = TestRepo::new();
         let commits = repo.create_linear_history(4);
 
@@ -153,6 +158,7 @@ mod tests {
 
     #[test]
     fn candidate_commit_keys_returns_short_history_when_history_len_exceeds_reachable_commits() {
+        require_nextest();
         let repo = TestRepo::new();
         let commits = repo.create_linear_history(2);
 
@@ -164,18 +170,21 @@ mod tests {
 
     #[test]
     fn candidate_commit_keys_returns_empty_for_non_git_dir() {
+        require_nextest();
         let dir = TempDir::new().unwrap();
         assert!(candidate_commit_keys(dir.path(), 5).is_empty());
     }
 
     #[test]
     fn candidate_commit_keys_returns_empty_for_unborn_head() {
+        require_nextest();
         let repo = TestRepo::new();
         assert!(candidate_commit_keys(repo.path(), 5).is_empty());
     }
 
     #[test]
     fn non_git_dir_is_unavailable() {
+        require_nextest();
         let dir = TempDir::new().unwrap();
         assert_eq!(resolve_commit_key(dir.path()), CommitKey::Unavailable);
     }

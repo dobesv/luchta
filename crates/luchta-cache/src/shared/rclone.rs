@@ -878,6 +878,7 @@ impl fmt::Display for Entry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use luchta_test_support::require_nextest;
     use std::fs;
 
     use tempfile::TempDir;
@@ -972,6 +973,7 @@ mod tests {
 
     #[test]
     fn remote_unavailable_when_rclone_missing() {
+        require_nextest();
         let rclone = RcloneRcd::new(Duration::from_secs(1)).unwrap();
         let original_path = std::env::var_os("PATH");
         std::env::set_var("PATH", "");

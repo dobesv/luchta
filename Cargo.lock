@@ -2643,6 +2643,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "hyperlocal",
+ "luchta-test-support",
  "luchta-types",
  "serde",
  "serde_json",
@@ -2673,6 +2674,7 @@ dependencies = [
  "luchta-cache",
  "luchta-engine",
  "luchta-lockfiles",
+ "luchta-test-support",
  "luchta-types",
  "luchta-worker",
  "luchta-workspace",
@@ -2843,6 +2845,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "luchta-test-support"
+version = "0.1.25"
+
+[[package]]
 name = "luchta-types"
 version = "0.1.26"
 dependencies = [
@@ -2869,6 +2875,7 @@ version = "0.1.26"
 dependencies = [
  "assert_cmd",
  "globset",
+ "luchta-test-support",
  "luchta-worker",
  "notify",
  "notify-debouncer-full",

@@ -170,7 +170,9 @@ git diff --no-color --binary e578159b7ae473127056a65748d7b3a4daa9a93f..9ed9a7d05
 
 ### Verification
 
-Before committing, run the full pipeline (see `AGENTS.md` for details):
+`cargo nextest run --workspace` is canonical test command for this workspace. Some tests call `require_nextest()` because they touch process-global state like cwd or real environment variables and rely on nextest's per-test process isolation. Plain `cargo test` will make those tests panic with guidance instead of failing nondeterministically.
+
+Before committing, run full pipeline (see `AGENTS.md` for details):
 
 ```bash
 cargo build --workspace

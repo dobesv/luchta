@@ -2,6 +2,7 @@ use std::fs;
 
 use assert_cmd::Command;
 use assert_fs::prelude::*;
+use luchta_test_support::require_nextest;
 use predicates::prelude::*;
 
 mod common;
@@ -133,6 +134,7 @@ fn task_scope_nonce_busts_cache() {
 
 #[test]
 fn env_nonce_busts_cache() {
+    require_nextest();
     let _lock = ENV_LOCK.lock().unwrap();
     let _guard = EnvVarGuard::remove("LUCHTA_CACHE_NONCE");
 
