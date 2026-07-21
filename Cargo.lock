@@ -2727,6 +2727,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "luchta-extra-resolve-worker"
+version = "0.1.25"
+dependencies = [
+ "assert_cmd",
+ "luchta-worker",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "luchta-file-exists-filter"
 version = "0.1.25"
 dependencies = [
