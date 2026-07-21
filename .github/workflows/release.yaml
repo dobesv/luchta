@@ -170,7 +170,9 @@ jobs:
     #   spawned (it spawns lazily on the first forwarded message), so the
     #   placeholder `true` delegate is never executed — it only satisfies arg
     #   validation. command-filter needs a predicate token; file-exists-filter
-    #   needs a glob pattern.
+    #   needs a glob pattern. extra-resolve-worker needs
+    #   `<resolve-command...> -- <delegate-command...>`; empty stdin hits EOF and
+    #   exits 0 before either the resolve or delegate command is spawned.
     - name: Smoke test binaries
       if: ${{ !matrix.use-cross }}
       shell: bash
@@ -186,6 +188,7 @@ jobs:
           luchta-yarn-worker
           luchta-bash-worker
           luchta-command-filter
+          luchta-extra-resolve-worker
           luchta-file-exists-filter
           luchta-lazy-worker
           luchta-yarn-filter
@@ -214,6 +217,7 @@ jobs:
         printf '' | "$rel/luchta-yarn-worker$ext"
         printf '' | "$rel/luchta-bash-worker$ext"
         printf '' | "$rel/luchta-command-filter$ext" true -- true
+        printf '' | "$rel/luchta-extra-resolve-worker$ext" true -- true
         printf '' | "$rel/luchta-file-exists-filter$ext" '*' -- true
         printf '' | "$rel/luchta-lazy-worker$ext" -- true
         printf '' | "$rel/luchta-yarn-filter$ext" -- true
