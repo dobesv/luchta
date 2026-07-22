@@ -199,7 +199,10 @@ fn list_json_output_is_parseable_and_contains_expected_fields() {
     assert_eq!(task["inputs"], serde_json::json!(["src.txt"]));
     assert_eq!(task["outputs"], serde_json::json!(["out.txt"]));
     assert_eq!(task["weight"], 1);
-    assert_eq!(task["cache"], serde_json::json!({"nonce": null}));
+    assert_eq!(
+        task["cache"],
+        serde_json::json!({"nonce": null, "sharing": "remote"})
+    );
 }
 
 #[test]

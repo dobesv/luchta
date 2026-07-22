@@ -122,8 +122,8 @@ mod tests {
 
     use super::{ConcurrencyConfig, LuchtaConfig};
     use crate::{
-        CacheConfig, DependsOn, EnvSpec, PackageName, TaskDefinition, TaskId, TaskName,
-        WorkerDefinition,
+        CacheConfig, CacheSharing, DependsOn, EnvSpec, PackageName, TaskDefinition, TaskId,
+        TaskName, WorkerDefinition,
     };
 
     #[test]
@@ -357,6 +357,7 @@ mod tests {
             config.cache,
             Some(CacheConfig {
                 cache_nonce: Some("g1".to_owned()),
+                sharing: CacheSharing::default(),
             })
         );
     }
@@ -377,6 +378,7 @@ mod tests {
                 depends_on: vec![],
                 cache: Some(CacheConfig {
                     cache_nonce: Some("w1".to_owned()),
+                    sharing: CacheSharing::default(),
                 }),
                 env: BTreeMap::new(),
             },

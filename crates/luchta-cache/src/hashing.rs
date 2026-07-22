@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, fs::File, io::Read, path::Path};
 
-use luchta_types::{DependsOn, EnvSpec, TaskDefinition};
+use luchta_types::{CacheSharing, DependsOn, EnvSpec, TaskDefinition};
 use serde::Serialize;
 
 use crate::serialization::bincode_config;
@@ -32,6 +32,11 @@ pub fn task_spec_hash(task_def: &TaskDefinition, nonce: Option<&str>) -> [u8; 32
         inputs: &task_def.inputs,
         outputs: &task_def.outputs,
         nonce,
+        sharing: task_def
+            .cache
+            .as_ref()
+            .map(|c| c.sharing)
+            .unwrap_or_default(),
     };
     let bytes = bincode::serde::encode_to_vec(spec, bincode_config())
         .expect("task spec canonical bincode serialization should succeed");
@@ -95,6 +100,12 @@ struct TaskSpecHashInput<'a> {
     // discriminant byte, so on-disk hashes invalidate once on upgrade; accepted by
     // plan decision.
     nonce: Option<&'a str>,
+    // Cache sharing policy belongs in task_spec_hash for the same reason as nonce:
+    // it is cache-control that affects which cache tiers (local vs remote) a task
+    // may use, and changing the policy must invalidate task-spec identity. Changing
+    // this enum value also changes bincode layout, so on-disk hashes invalidate once
+    // on upgrade; accepted by plan decision. See plan luchta-cache-sharing / issue #103.
+    sharing: CacheSharing,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -115,7 +126,8 @@ mod tests {
     use std::{collections::BTreeMap, fs};
 
     use luchta_types::{
-        CacheConfig, DependsOn, EnvSpec, PackageName, TaskDefinition, TaskId, TaskName,
+        CacheConfig, CacheSharing, DependsOn, EnvSpec, PackageName, TaskDefinition, TaskId,
+        TaskName,
     };
     use tempfile::TempDir;
 
@@ -257,11 +269,13 @@ mod tests {
         // Pinned after cacheNonce feature landed. Value changed once at feature
         // introduction because bincode encodes Option with discriminant byte even
         // for None, so future changes here should be deliberate.
+        // Updated again after cacheSharing feature: adding `sharing` to TaskSpecHashInput
+        // changes bincode layout (enum discriminant byte), causing one-time invalidation.
         assert_eq!(
             task_spec_hash(&task, None),
             [
-                201, 120, 202, 56, 231, 47, 51, 49, 237, 176, 254, 210, 159, 66, 141, 128, 16, 179,
-                43, 250, 104, 128, 87, 241, 7, 85, 210, 63, 25, 128, 83, 172,
+                156, 137, 202, 68, 166, 105, 242, 120, 72, 35, 223, 54, 124, 94, 58, 58, 171, 210,
+                216, 144, 153, 241, 170, 61, 144, 74, 49, 1, 100, 127, 227, 99,
             ]
         );
     }
@@ -600,5 +614,71 @@ mod tests {
             dependencies: vec!["**/*".to_string()],
             env,
         }
+    }
+
+    #[test]
+    fn task_spec_hash_changes_when_sharing_changes() {
+        let mut task = sample_task_definition();
+        let baseline = task_spec_hash(&task, None);
+
+        // Change sharing from default (Remote) to None
+        task.cache = Some(CacheConfig {
+            sharing: CacheSharing::None,
+            ..CacheConfig::default()
+        });
+
+        assert_ne!(baseline, task_spec_hash(&task, None));
+    }
+
+    #[test]
+    fn task_spec_hash_is_stable_for_identical_sharing() {
+        let task = sample_task_definition();
+        let first = task_spec_hash(&task, None);
+        let second = task_spec_hash(&task, None);
+
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn task_spec_hash_distinguishes_all_sharing_variants() {
+        let base_task = sample_task_definition();
+
+        let hash_none = task_spec_hash(
+            &TaskDefinition {
+                cache: Some(CacheConfig {
+                    sharing: CacheSharing::None,
+                    ..CacheConfig::default()
+                }),
+                ..base_task.clone()
+            },
+            None,
+        );
+
+        let hash_local = task_spec_hash(
+            &TaskDefinition {
+                cache: Some(CacheConfig {
+                    sharing: CacheSharing::Local,
+                    ..CacheConfig::default()
+                }),
+                ..base_task.clone()
+            },
+            None,
+        );
+
+        let hash_remote = task_spec_hash(
+            &TaskDefinition {
+                cache: Some(CacheConfig {
+                    sharing: CacheSharing::Remote,
+                    ..CacheConfig::default()
+                }),
+                ..base_task.clone()
+            },
+            None,
+        );
+
+        // All three variants should produce distinct hashes
+        assert_ne!(hash_none, hash_local);
+        assert_ne!(hash_local, hash_remote);
+        assert_ne!(hash_none, hash_remote);
     }
 }

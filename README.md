@@ -261,6 +261,8 @@ interface EnvSpec {
 interface CacheConfig {
   /** Optional nonce; change to force-bust this scope's cache. */
   nonce?: string;
+  /** Limits caching tiers: "remote" (default), "local", or "none". */
+  sharing?: "none" | "local" | "remote";
 }
 
 interface TaskDefinition {
@@ -371,7 +373,7 @@ The top-level `tasks` map defines the pipeline. Each task may set:
   from the package's `package.json` is used.
 - `worker`: name of a long-lived worker (from the `workers` map) that should
   execute this task. The named worker **must** be defined or the run fails.
-- `cache`: opt-in build cache. Provide an object (e.g. `cache: {}`) to enable change-detection skips for successful prior runs; omit the field to disable. Set the `nonce` field (e.g. `cache: { nonce: "v1" }`) to force-bust this task's cache. See [Cache Nonce](#cache-nonce-force-busting-stale-cache) for details.
+- `cache`: opt-in build cache. Provide an object (e.g. `cache: {}`) to enable change-detection skips for successful prior runs; omit the field or set to `null` to disable. Set the `nonce` field to force-bust the cache. Set `sharing` (`"none" | "local" | "remote"`, default `"remote"`) to limit caching tiers; `"local"`/`"none"` disable shared cache interaction for the task without affecting local skips. See [Cache Nonce](#cache-nonce-force-busting-stale-cache) and [Cache Sharing](#cache-sharing) for details.
 - `inputs`: relative input paths/globs. Literal paths and glob matches are hashed from git-tracked files, so `.gitignore` is respected. See [Input Pattern Prefixes](#input-pattern-prefixes).
 - `outputs`: relative output paths/globs. These are checked on disk, so missing/deleted outputs invalidate cache entries even if ignored by git.
 - `dependencies`: optional filter for external package dependencies (from `yarn.lock`). Reuses the [Input Pattern Prefixes](#input-pattern-prefixes) grammar (`^`, `^^`, `pkg#`, `#`, globs).
@@ -901,6 +903,17 @@ Nonces are available at four scopes and are **additive**:
 
 #### Inspection
 Use `luchta logs --show-cache-nonce` to view the resolved nonce string persisted per task (shows `(none)` when no nonce is applied).
+
+### Cache Sharing
+
+The `sharing` knob controls which caching tiers a task may use. This is independent of local skip behavior; a task with `sharing: "none"` will still skip execution if its local cache entry matches.
+
+Valid values:
+- `"remote"` (default): Use both local FS cache and shared/remote cache.
+- `"local"`: Use local FS cache only; disable shared/remote cache reads and writes.
+- `"none"`: Same as `"local"`.
+
+The `sharing` field is part of the task's cache hash, so changing it will bust the cache for that task once.
 
 ### Shared Build Cache
 

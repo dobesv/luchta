@@ -485,6 +485,17 @@ where
         .as_ref()
         .map(|cache_ctx| cache_ctx.start_unix_ms)
         .unwrap_or(task_start_unix_ms);
+    let sharing = cache_write
+        .as_ref()
+        .map(|cache_ctx| {
+            cache_ctx
+                .task_def
+                .cache
+                .as_ref()
+                .map(|cache| cache.sharing)
+                .unwrap_or_default()
+        })
+        .unwrap_or_default();
     let persist_failure_record = succeeded || !interrupted.load(Ordering::SeqCst);
     let expansion_error = persist_cache_state(CachePersistInputs {
         cache,
@@ -497,7 +508,7 @@ where
         persist_failure_record,
         end_unix_ms,
         shared_cache: cache_enabled.then_some(shared_cache).flatten(),
-        shared_store_enabled: cache_enabled && !no_cache,
+        shared_store_enabled: cache_enabled && !no_cache && sharing.allows_shared_write(),
         repo_root,
     })
     .await;
@@ -1061,7 +1072,14 @@ fn maybe_mark_shared_cache_hit(
     input: SharedCacheSkipInput<'_>,
     dep_outputs: &BTreeMap<String, [u8; 32]>,
 ) {
-    if no_cache || !matches!(input.decision.action, Decision::Run) {
+    let sharing = input
+        .task_def
+        .cache
+        .as_ref()
+        .map(|cache| cache.sharing)
+        .unwrap_or_default();
+    if no_cache || !sharing.allows_shared_read() || !matches!(input.decision.action, Decision::Run)
+    {
         return;
     }
 

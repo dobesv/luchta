@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
 use luchta_engine::{PrunedTask, ResolveMode, TaskGraph};
-use luchta_types::{CacheConfig, DependsOn, EnvSpec, TaskDefinition, TaskId};
+use luchta_types::{CacheConfig, CacheSharing, DependsOn, EnvSpec, TaskDefinition, TaskId};
 use miette::{IntoDiagnostic, Result};
 use serde::Serialize;
 
@@ -223,9 +223,24 @@ fn format_env_spec(spec: &EnvSpec) -> String {
 }
 
 fn format_cache_config(cache: &CacheConfig) -> String {
-    match &cache.cache_nonce {
-        Some(cache_nonce) => format!("{{cache_nonce: {cache_nonce}}}"),
-        None => "{}".to_string(),
+    let mut fields = Vec::new();
+
+    if let Some(cache_nonce) = &cache.cache_nonce {
+        fields.push(format!("cache_nonce: {cache_nonce}"));
+    }
+    if cache.sharing != CacheSharing::Remote {
+        let sharing_str = match cache.sharing {
+            CacheSharing::None => "none",
+            CacheSharing::Local => "local",
+            CacheSharing::Remote => unreachable!(),
+        };
+        fields.push(format!("sharing: {sharing_str}"));
+    }
+
+    if fields.is_empty() {
+        "{}".to_string()
+    } else {
+        format!("{{{}}}", fields.join(", "))
     }
 }
 
@@ -233,7 +248,9 @@ fn format_cache_config(cache: &CacheConfig) -> String {
 mod tests {
     use std::collections::BTreeMap;
 
-    use luchta_types::{CacheConfig, DependsOn, EnvSpec, TaskDefinition, TaskId, TaskName};
+    use luchta_types::{
+        CacheConfig, CacheSharing, DependsOn, EnvSpec, TaskDefinition, TaskId, TaskName,
+    };
 
     use super::format_non_default_fields;
 
@@ -284,6 +301,7 @@ mod tests {
             ],
             cache: Some(CacheConfig {
                 cache_nonce: Some("abc".to_string()),
+                sharing: CacheSharing::default(),
             }),
             inputs: vec!["src/**/*".to_string()],
             outputs: vec!["dist/**/*".to_string()],
@@ -308,6 +326,49 @@ mod tests {
                 ),
                 ("cache".to_string(), "{cache_nonce: abc}".to_string()),
             ]
+        );
+    }
+
+    #[test]
+    fn format_cache_config_default_sharing_no_nonce_returns_empty_braces() {
+        let cache = CacheConfig {
+            cache_nonce: None,
+            sharing: CacheSharing::Remote,
+        };
+
+        assert_eq!(super::format_cache_config(&cache), "{}");
+    }
+
+    #[test]
+    fn format_cache_config_sharing_none_renders_sharing() {
+        let cache = CacheConfig {
+            cache_nonce: None,
+            sharing: CacheSharing::None,
+        };
+
+        assert_eq!(super::format_cache_config(&cache), "{sharing: none}");
+    }
+
+    #[test]
+    fn format_cache_config_sharing_local_renders_sharing() {
+        let cache = CacheConfig {
+            cache_nonce: None,
+            sharing: CacheSharing::Local,
+        };
+
+        assert_eq!(super::format_cache_config(&cache), "{sharing: local}");
+    }
+
+    #[test]
+    fn format_cache_config_nonce_and_non_default_sharing_renders_both() {
+        let cache = CacheConfig {
+            cache_nonce: Some("xyz".to_string()),
+            sharing: CacheSharing::None,
+        };
+
+        assert_eq!(
+            super::format_cache_config(&cache),
+            "{cache_nonce: xyz, sharing: none}"
         );
     }
 }

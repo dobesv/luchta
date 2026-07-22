@@ -188,11 +188,33 @@ impl EnvSpec {
     }
 }
 
+/// Controls which cache tiers task may use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum CacheSharing {
+    None,
+    Local,
+    #[default]
+    Remote,
+}
+
+impl CacheSharing {
+    pub fn allows_shared_read(self) -> bool {
+        matches!(self, CacheSharing::Remote)
+    }
+
+    pub fn allows_shared_write(self) -> bool {
+        matches!(self, CacheSharing::Remote)
+    }
+}
+
 /// Task configuration shared across package graph and execution layers.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub struct CacheConfig {
     #[serde(default, rename = "nonce", alias = "cache_nonce")]
     pub cache_nonce: Option<String>,
+    #[serde(default)]
+    pub sharing: CacheSharing,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -656,8 +678,9 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        classify_pattern, resolve_script_name, CacheConfig, DependsOn, EnvSpec, InputPattern,
-        InputSemantics, PackageName, TaskDefinition, TaskId, TaskName, ROOT_PACKAGE_NAME,
+        classify_pattern, resolve_script_name, CacheConfig, CacheSharing, DependsOn, EnvSpec,
+        InputPattern, InputSemantics, PackageName, TaskDefinition, TaskId, TaskName,
+        ROOT_PACKAGE_NAME,
     };
 
     #[test]
@@ -972,6 +995,7 @@ mod tests {
             cache,
             CacheConfig {
                 cache_nonce: Some("abc".to_owned()),
+                sharing: CacheSharing::default(),
             }
         );
     }
@@ -981,7 +1005,61 @@ mod tests {
         let cache: CacheConfig =
             serde_json::from_str("{}").expect("deserialize empty cache config");
 
-        assert_eq!(cache, CacheConfig { cache_nonce: None });
+        assert_eq!(
+            cache,
+            CacheConfig {
+                cache_nonce: None,
+                sharing: CacheSharing::default(),
+            }
+        );
+    }
+
+    #[test]
+    fn cache_config_deserializes_sharing_none() {
+        let cache: CacheConfig =
+            serde_json::from_str(r#"{"sharing":"none"}"#).expect("deserialize none sharing");
+
+        assert_eq!(cache.sharing, CacheSharing::None);
+    }
+
+    #[test]
+    fn cache_config_deserializes_sharing_local() {
+        let cache: CacheConfig =
+            serde_json::from_str(r#"{"sharing":"local"}"#).expect("deserialize local sharing");
+
+        assert_eq!(cache.sharing, CacheSharing::Local);
+    }
+
+    #[test]
+    fn cache_config_deserializes_sharing_remote() {
+        let cache: CacheConfig =
+            serde_json::from_str(r#"{"sharing":"remote"}"#).expect("deserialize remote sharing");
+
+        assert_eq!(cache.sharing, CacheSharing::Remote);
+    }
+
+    #[test]
+    fn cache_config_deserializes_sharing_remote_by_default() {
+        let cache: CacheConfig =
+            serde_json::from_str("{}").expect("deserialize empty cache config");
+
+        assert_eq!(cache.sharing, CacheSharing::Remote);
+    }
+
+    #[test]
+    fn cache_sharing_serializes_to_lowercase_single_words() {
+        assert_eq!(
+            serde_json::to_string(&CacheSharing::None).expect("serialize none sharing"),
+            r#""none""#
+        );
+        assert_eq!(
+            serde_json::to_string(&CacheSharing::Local).expect("serialize local sharing"),
+            r#""local""#
+        );
+        assert_eq!(
+            serde_json::to_string(&CacheSharing::Remote).expect("serialize remote sharing"),
+            r#""remote""#
+        );
     }
 
     #[test]
