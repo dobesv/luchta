@@ -1498,7 +1498,7 @@ new file mode 100644
 index 000000000..55eeb8c0e
 --- /dev/null
 +++ b/internal/luchta/compile_test.go
-@@ -0,0 +1,262 @@
+@@ -0,0 +1,316 @@
 +package luchta
 +
 +import (
@@ -1524,10 +1524,10 @@ index 000000000..55eeb8c0e
 +
 +	res := CompilePackage(context.Background(), cwd)
 +	if res.ExitCode != 0 {
-+		t.Fatalf("exitCode=%d sarif=%s", res.ExitCode, DiagnosticsToSARIF(res.Diagnostics))
++		t.Fatalf("exitCode=%d sarif=%s", res.ExitCode, DiagnosticsToSARIF(cwd, res.Diagnostics))
 +	}
 +	if len(res.Diagnostics) != 0 {
-+		t.Fatalf("expected no diagnostics on success, got %s", DiagnosticsToSARIF(res.Diagnostics))
++		t.Fatalf("expected no diagnostics on success, got %s", DiagnosticsToSARIF(cwd, res.Diagnostics))
 +	}
 +	if !fileExists(filepath.Join(cwd, "dist", "index.js")) {
 +		t.Fatalf("expected dist/index.js emitted; outputs=%v", res.Outputs)
@@ -1538,7 +1538,8 @@ index 000000000..55eeb8c0e
 +}
 +
 +func TestCompilePackageTypeError(t *testing.T) {
-+	cwd := t.TempDir()
++	repoRoot := t.TempDir()
++	cwd := filepath.Join(repoRoot, "packages", "pkg")
 +	writeTsPackage(t, cwd, `{
 +		"compilerOptions": {"outDir": "dist", "rootDir": "src", "module": "nodenext", "moduleResolution": "nodenext", "strict": true}
 +	}`, "index.ts", "export const answer: number = \"not a number\";\n")
@@ -1554,7 +1555,7 @@ index 000000000..55eeb8c0e
 +	// The worker reports diagnostics as a SARIF document; verify it is
 +	// well-formed and carries the error with a clickable location.
 +	var log sarifLog
-+	if err := json.Unmarshal([]byte(DiagnosticsToSARIF(res.Diagnostics)), &log); err != nil {
++	if err := json.Unmarshal([]byte(DiagnosticsToSARIF(repoRoot, res.Diagnostics)), &log); err != nil {
 +		t.Fatalf("invalid SARIF: %v", err)
 +	}
 +	if len(log.Runs) == 0 || len(log.Runs[0].Results) == 0 {
@@ -1568,8 +1569,61 @@ index 000000000..55eeb8c0e
 +		t.Fatalf("missing location")
 +	}
 +	loc := result.Locations[0]
-+	if loc.PhysicalLocation.ArtifactLocation.URI == "" {
++	uri := loc.PhysicalLocation.ArtifactLocation.URI
++	if uri == "" {
 +		t.Fatalf("missing artifact URI")
++	}
++	if filepath.IsAbs(uri) {
++		t.Fatalf("artifact URI must be repo-relative, got absolute path %q", uri)
++	}
++	if want := filepath.ToSlash(filepath.Join("packages", "pkg", "src", "index.ts")); uri != want {
++		t.Fatalf("artifact URI = %q, want repo-relative %q", uri, want)
++	}
++}
++
++func TestRepoRelativeSARIFURI(t *testing.T) {
++	base := t.TempDir()
++	repoRoot := filepath.Join(base, "repo")
++	outsideRoot := filepath.Join(base, "other")
++
++	tests := []struct {
++		name     string
++		repoRoot string
++		absPath  string
++		want     string
++	}{
++		{
++			name:    "in repo strips root prefix",
++			absPath: filepath.Join(repoRoot, "packages", "app", "src", "foo.ts"),
++			want:    filepath.ToSlash(filepath.Join("packages", "app", "src", "foo.ts")),
++		},
++		{
++			name:    "outside repo falls back to full path",
++			absPath: filepath.Join(outsideRoot, "src", "foo.ts"),
++			want:    filepath.ToSlash(filepath.Join(outsideRoot, "src", "foo.ts")),
++		},
++		{
++			name:    "repo root itself returns dot",
++			absPath: repoRoot,
++			want:    ".",
++		},
++		{
++			name:    "dot dot prefix segment stays relative",
++			absPath: filepath.Join(repoRoot, "..config", "foo.ts"),
++			want:    filepath.ToSlash(filepath.Join("..config", "foo.ts")),
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			repo := tt.repoRoot
++			if repo == "" {
++				repo = repoRoot
++			}
++			if got := repoRelativeSARIFURI(repo, tt.absPath); got != tt.want {
++				t.Fatalf("repoRelativeSARIFURI(%q, %q) = %q, want %q", repo, tt.absPath, got, tt.want)
++			}
++		})
 +	}
 +}
 +
@@ -1754,7 +1808,7 @@ index 000000000..55eeb8c0e
 +	for range goroutines {
 +		r := <-ch
 +		if r.res.ExitCode != 0 {
-+			t.Errorf("goroutine %d: exitCode=%d sarif=%s", r.idx, r.res.ExitCode, DiagnosticsToSARIF(r.res.Diagnostics))
++			t.Errorf("goroutine %d: exitCode=%d sarif=%s", r.idx, r.res.ExitCode, DiagnosticsToSARIF(cwds[r.idx], r.res.Diagnostics))
 +		}
 +		if len(r.res.Outputs) == 0 {
 +			t.Errorf("goroutine %d: expected non-empty Outputs", r.idx)
@@ -2217,12 +2271,14 @@ new file mode 100644
 index 000000000..e184b5182
 --- /dev/null
 +++ b/internal/luchta/sarif.go
-@@ -0,0 +1,147 @@
+@@ -0,0 +1,159 @@
 +package luchta
 +
 +import (
 +	"encoding/json"
++	"path/filepath"
 +	"strconv"
++	"strings"
 +
 +	"github.com/microsoft/typescript-go/internal/ast"
 +	"github.com/microsoft/typescript-go/internal/diagnostics"
@@ -2295,10 +2351,10 @@ index 000000000..e184b5182
 +
 +// DiagnosticsToSARIF renders compiler diagnostics as a SARIF 2.1.0 log string,
 +// suitable for emitting as a worker report with mime type [sarifMimeType].
-+func DiagnosticsToSARIF(diags []*ast.Diagnostic) string {
++func DiagnosticsToSARIF(repoRoot string, diags []*ast.Diagnostic) string {
 +	results := make([]sarifResult, 0, len(diags))
 +	for _, d := range diags {
-+		results = append(results, diagnosticToSARIFResult(d))
++		results = append(results, diagnosticToSARIFResult(repoRoot, d))
 +	}
 +	doc := sarifLog{
 +		Schema:  "https://json.schemastore.org/sarif-2.1.0.json",
@@ -2320,7 +2376,7 @@ index 000000000..e184b5182
 +	return string(b)
 +}
 +
-+func diagnosticToSARIFResult(d *ast.Diagnostic) sarifResult {
++func diagnosticToSARIFResult(repoRoot string, d *ast.Diagnostic) sarifResult {
 +	r := sarifResult{
 +		RuleID:  diagnosticRuleID(d),
 +		Level:   sarifLevel(d.Category()),
@@ -2332,10 +2388,9 @@ index 000000000..e184b5182
 +		endLine, endCol := scanner.GetECMALineAndUTF16CharacterOfPosition(file, d.End())
 +		r.Locations = []sarifLocation{{
 +			PhysicalLocation: sarifPhysicalLocation{
-+				// Absolute path so the link is clickable regardless of the
-+				// directory `luchta logs` is run from. tsgo normalizes file
-+				// names to absolute paths.
-+				ArtifactLocation: sarifArtifactLocation{URI: file.FileName()},
++				// Report paths relative to the worker launch directory (the repo
++				// root). Fall back to the absolute path for files outside the repo.
++				ArtifactLocation: sarifArtifactLocation{URI: repoRelativeSARIFURI(repoRoot, file.FileName())},
 +				Region: &sarifRegion{
 +					StartLine:   startLine + 1,
 +					StartColumn: int(startCol) + 1,
@@ -2346,6 +2401,17 @@ index 000000000..e184b5182
 +		}}
 +	}
 +	return r
++}
++
++func repoRelativeSARIFURI(repoRoot, absPath string) string {
++	rel, err := filepath.Rel(repoRoot, absPath)
++	if err == nil && !filepath.IsAbs(rel) {
++		relSlash := filepath.ToSlash(rel)
++		if relSlash != ".." && !strings.HasPrefix(relSlash, "../") {
++			return relSlash
++		}
++	}
++	return filepath.ToSlash(absPath)
 +}
 +
 +func diagnosticRuleID(d *ast.Diagnostic) string {
@@ -2412,7 +2478,7 @@ new file mode 100644
 index 000000000..ee45e2b21
 --- /dev/null
 +++ b/internal/luchta/worker.go
-@@ -0,0 +1,100 @@
+@@ -0,0 +1,109 @@
 +package luchta
 +
 +import (
@@ -2420,9 +2486,12 @@ index 000000000..ee45e2b21
 +	"context"
 +	"fmt"
 +	"io"
++	"os"
 +	"sort"
 +	"strings"
 +	"sync"
++
++	"github.com/microsoft/typescript-go/internal/tspath"
 +)
 +
 +const maxLineLength = 1 << 20 // matches luchta MAX_LINE_LENGTH
@@ -2431,6 +2500,12 @@ index 000000000..ee45e2b21
 +// protocol responses to out. Free-form parse errors go to errw (stderr). It returns
 +// when in reaches EOF, after all in-flight Runs complete.
 +func Serve(ctx context.Context, in io.Reader, out io.Writer, errw io.Writer) error {
++	repoRoot, err := os.Getwd()
++	if err != nil {
++		return fmt.Errorf("luchta-tsc-worker: get working directory: %w", err)
++	}
++	repoRoot = tspath.NormalizePath(repoRoot)
++
 +	w := NewWriter(out)
 +	scanner := bufio.NewScanner(in)
 +	scanner.Buffer(make([]byte, 0, 64*1024), maxLineLength)
@@ -2453,7 +2528,7 @@ index 000000000..ee45e2b21
 +			wg.Add(1)
 +			go func(run *Run) {
 +				defer wg.Done()
-+				handleRun(ctx, w, run)
++				handleRun(ctx, w, run, repoRoot)
 +			}(m)
 +		}
 +	}
@@ -2495,7 +2570,7 @@ index 000000000..ee45e2b21
 +	w.ResolvedModify(task.ID, merged)
 +}
 +
-+func handleRun(ctx context.Context, w *Writer, run *Run) {
++func handleRun(ctx context.Context, w *Writer, run *Run, repoRoot string) {
 +	defer func() {
 +		if r := recover(); r != nil {
 +			w.Log(run.ID, "stderr", fmt.Sprintf("panic: %v", r))
@@ -2509,7 +2584,7 @@ index 000000000..ee45e2b21
 +	// Emit diagnostics as a structured SARIF report rather than free-form text,
 +	// so luchta can render IDE-clickable errors/warnings (see luchta PR #110).
 +	if len(res.Diagnostics) > 0 {
-+		w.Report(run.ID, sarifReportFilename, sarifMimeType, DiagnosticsToSARIF(res.Diagnostics))
++		w.Report(run.ID, sarifReportFilename, sarifMimeType, DiagnosticsToSARIF(repoRoot, res.Diagnostics))
 +	}
 +	w.Done(run.ID, res.ExitCode, res.Outputs)
 +}
