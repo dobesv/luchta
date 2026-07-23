@@ -547,6 +547,62 @@ luchta logs build --file sarif.json
 ```
 The `--file` flag uses union task selection: a task is included if it has at least one of the named files. If no tasks match any of the requested files, the command exits with a non-zero error code.
 
+### CI Integration with reviewdog
+
+Luchta workers can attach diagnostic reports in [SARIF format](https://sarifweb.azurewebsites.net/) (`application/sarif+json`). You can use [reviewdog](https://github.com/reviewdog/reviewdog) in CI pipelines to parse these SARIF reports and post lint or static analysis findings directly to pull requests as inline comments or check runs.
+
+While individual raw reports can be retrieved using `luchta logs --file <NAME>`, Luchta stores all execution records and attached reports on disk under `.luchta/`. In CI workflows, you can search `.luchta` directly for `*.sarif` files, aggregate them across tasks, and submit them to reviewdog.
+
+#### Aggregating SARIF Reports and Submitting to GitHub
+
+When running tasks across multiple workspace packages, each worker emits its own SARIF report. The script below uses `jq` to concatenate the `runs` array from every `.sarif` file found under `.luchta/` into a single SARIF 2.1.0 document (filtering out empty runs), then sends it to reviewdog.
+
+```bash
+# Map these placeholders to your CI provider's own variables.
+# (e.g. in GitHub Actions: PULL_NUMBER -> github.event.number,
+#  BUILD_SHA -> github.event.pull_request.head.sha, etc.)
+export CI_PULL_REQUEST="${PULL_NUMBER}"
+export CI_REPO_OWNER="${REPO_OWNER}"
+export CI_REPO_NAME="${REPO_NAME}"
+export CI_COMMIT="${BUILD_SHA}"
+export CI_BRANCH="${BUILD_BRANCH}"
+export REVIEWDOG_GITHUB_API_TOKEN="${GITHUB_TOKEN}"
+export REVIEWDOG_SKIP_DOGHOUSE=true
+
+# Merge all SARIF reports luchta wrote (concatenate every file's `runs` array)
+# into a single SARIF 2.1.0 report, then submit via reviewdog under one check name.
+COMBINED_SARIF="${ARTIFACTS:-.}/lint.sarif"
+if [ -d .luchta ] && find .luchta -name '*.sarif' -print0 \
+     | xargs -0 jq -s '{version: "2.1.0", "$schema": "https://json.schemastore.org/sarif-2.1.0.json", runs: [(.[].runs // [])[] | select((.results // []) | length > 0)]}' \
+    > "$COMBINED_SARIF" ; then
+  reviewdog <"$COMBINED_SARIF" -f sarif -reporter=github-pr-check -name reviewdog/lint-check -filter-mode=nofilter || echo "Warning: failed to submit reviewdog report via github-pr-check"
+  reviewdog <"$COMBINED_SARIF" -f sarif -reporter=github-pr-review -name reviewdog/lint-review -filter-mode=file || echo "Warning: failed to submit reviewdog report via github-pr-review"
+else
+  echo "Warning: failed to create aggregated SARIF report, skipping reviewdog submission"
+fi
+```
+
+#### Key Parameters & Reporter Modes
+
+- **Environment variables:**
+  - `CI_PULL_REQUEST`, `CI_REPO_OWNER`, `CI_REPO_NAME`, `CI_COMMIT`, `CI_BRANCH`: Supply repository and pull request context to reviewdog.
+  - `REVIEWDOG_GITHUB_API_TOKEN`: GitHub token with permission to post PR reviews and check runs (`pull-requests: write` / `checks: write`).
+  - `REVIEWDOG_SKIP_DOGHOUSE=true`: Directs reviewdog to post directly to the GitHub API without contacting Doghouse servers.
+- **SARIF aggregation:** Multiple workers each produce separate reports. The `jq` command merges all `.sarif` files under `.luchta/` into a single SARIF 2.1.0 document and excludes runs that contain no results.
+- **Reporter modes:**
+  - `-reporter=github-pr-check`: Submits all findings as a single GitHub Check Run (`-name reviewdog/lint-check`). Using `-filter-mode=nofilter` ensures findings outside changed lines are still reported in the check summary.
+  - `-reporter=github-pr-review`: Posts inline pull request comments (`-name reviewdog/lint-review`). Using `-filter-mode=file` restricts inline comments to files modified in the pull request.
+
+#### GitLab Support
+
+reviewdog also supports GitLab Merge Requests. Reuse the same SARIF aggregation step (`$COMBINED_SARIF` above) and swap in a GitLab token and reporter. Pass `REVIEWDOG_GITLAB_API_TOKEN` (a Personal or Project Access Token) and use a GitLab reporter — `gitlab-mr-discussion` (inline MR comments) or `gitlab-mr-commit` (commit discussion) — alongside the standard GitLab CI environment variables (e.g. `CI_MERGE_REQUEST_IID` and `CI_PROJECT_PATH`), which GitLab CI sets automatically:
+
+```bash
+export REVIEWDOG_GITLAB_API_TOKEN="${GITLAB_TOKEN}"
+
+reviewdog <"$COMBINED_SARIF" -f sarif -reporter=gitlab-mr-discussion -name reviewdog/lint-review -filter-mode=file || echo "Warning: failed to submit reviewdog report to GitLab"
+```
+
 ### Explaining Task Execution (`why`)
 
 To understand why a task ran in the past or why it would run/skip now, use the `luchta why` command. This is useful for debugging unexpected cache misses or confirming which files triggered a rebuild.
