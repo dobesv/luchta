@@ -452,4 +452,80 @@ mod tests {
             "when source maps enabled, source_map_json should be Some"
         );
     }
+
+    const REACT_COMPONENT_SOURCE: &str =
+        "export function Foo({ items }: { items: number[] }) {\n  return <ul>{items.map((n) => <li key={n}>{n}</li>)}</ul>;\n}\n";
+
+    #[test]
+    fn react_compiler_memoizes_components_when_enabled() {
+        // With `jsc.transform.reactCompiler` enabled, the SWC worker must run the
+        // React Compiler transform (issue #264). The compiler rewrites components
+        // to allocate a memoization cache from `react/compiler-runtime`.
+        let temp = assert_fs::TempDir::new().expect("temp dir");
+        temp.child(".swcrc")
+            .write_str(
+                r#"{"jsc":{"parser":{"syntax":"typescript","tsx":true},"transform":{"reactCompiler":true}}}"#,
+            )
+            .expect("write .swcrc");
+        let source = temp.child("src/index.tsx");
+        source
+            .write_str(REACT_COMPONENT_SOURCE)
+            .expect("write source");
+
+        let args = SwcArgs::parse("", Some(temp.path())).expect("parse args");
+        let out = transform_source(
+            &args,
+            source.path(),
+            REACT_COMPONENT_SOURCE,
+            Path::new("src/index.tsx"),
+            "index.js.map",
+        )
+        .expect("transform succeeds");
+
+        assert!(
+            out.code.contains("react/compiler-runtime"),
+            "React Compiler output should import the compiler runtime, got:\n{}",
+            out.code
+        );
+        assert!(
+            out.code.contains("_c("),
+            "React Compiler output should allocate a memoization cache via _c(), got:\n{}",
+            out.code
+        );
+    }
+
+    #[test]
+    fn react_compiler_not_applied_when_disabled() {
+        // Without the `reactCompiler` flag the output must be a plain JSX->JS
+        // transform with no compiler-runtime memoization cache.
+        let temp = assert_fs::TempDir::new().expect("temp dir");
+        temp.child(".swcrc")
+            .write_str(r#"{"jsc":{"parser":{"syntax":"typescript","tsx":true}}}"#)
+            .expect("write .swcrc");
+        let source = temp.child("src/index.tsx");
+        source
+            .write_str(REACT_COMPONENT_SOURCE)
+            .expect("write source");
+
+        let args = SwcArgs::parse("", Some(temp.path())).expect("parse args");
+        let out = transform_source(
+            &args,
+            source.path(),
+            REACT_COMPONENT_SOURCE,
+            Path::new("src/index.tsx"),
+            "index.js.map",
+        )
+        .expect("transform succeeds");
+
+        assert!(
+            !out.code.contains("react/compiler-runtime"),
+            "React Compiler must not run when disabled, got:\n{}",
+            out.code
+        );
+        assert!(
+            !out.code.contains("_c("),
+            "React Compiler must not allocate a memoization cache when disabled, got:\n{}",
+            out.code
+        );
+    }
 }
