@@ -372,7 +372,7 @@ The top-level `tasks` map defines the pipeline. Each task may set:
 - `worker`: name of a long-lived worker (from the `workers` map) that should
   execute this task. The named worker **must** be defined or the run fails.
 - `cache`: opt-in build cache. Provide an object (e.g. `cache: {}`) to enable change-detection skips for successful prior runs; omit the field to disable. Set the `nonce` field (e.g. `cache: { nonce: "v1" }`) to force-bust this task's cache. See [Cache Nonce](#cache-nonce-force-busting-stale-cache) for details.
-- `inputs`: relative input paths/globs. Literal paths and glob matches are hashed from git-tracked files, so `.gitignore` is respected. See [Input Pattern Prefixes](#input-pattern-prefixes).
+- `inputs`: relative input paths/globs. Glob patterns are resolved against the git-tracked file listing, so `.gitignore` is respected; literal (non-glob) paths are hashed directly and are included even when git-ignored. See [Input Pattern Prefixes](#input-pattern-prefixes).
 - `outputs`: relative output paths/globs. These are checked on disk, so missing/deleted outputs invalidate cache entries even if ignored by git.
 - `dependencies`: optional filter for external package dependencies (from `yarn.lock`). Reuses the [Input Pattern Prefixes](#input-pattern-prefixes) grammar (`^`, `^^`, `pkg#`, `#`, globs).
     - **Default:** `["**/*"]` (conservative; includes all package dependencies).
@@ -395,7 +395,7 @@ The top-level `tasks` map defines the pipeline. Each task may set:
 Notes:
 - `^` and `^^` are wildcard-only even when the suffix looks like a literal path.
 - Inter-package `outputs` are not supported; prefixes apply to cache inputs only.
-- Cross-package inputs obey the target package's `.gitignore` / git-tracked file view because resolution happens relative to each target base directory.
+- Cross-package glob inputs obey the target package's `.gitignore` / git-tracked file view because resolution happens relative to each target base directory (literal paths are still taken as-is).
 - Missing named packages or path escapes fail hard.
 
 ### Task Key Formats
@@ -915,7 +915,7 @@ Luchta build cache is **opt-in** per task via `cache: {}`. Cached task skips onl
 - Default cache dir: `<workspace>/.luchta/cache`
 - Override: `LUCHTA_CACHE_DIR=/abs/path`
 - Disable: `LUCHTA_NO_CACHE=1` (or `--no-cache`)
-- Inputs use git-tracked listing, so `.gitignore` is honored for globs and literals.
+- Glob inputs use the git-tracked file listing, so `.gitignore` is honored; literal (non-glob) inputs are hashed directly and are **not** filtered by `.gitignore` (an explicitly declared path is always honored).
 - Input prefixes may target repo root (`#...`), named packages (`pkg#...`, `@scope/pkg#...`), direct upstream packages (`^...`), or transitive upstream packages (`^^...`).
 - `^` / `^^` inputs are wildcard-only and never error on zero matches; missing literals become `absent` entries only for bare / `#` / `pkg#` forms.
 - Outputs are checked directly on disk, so missing output reruns task.
