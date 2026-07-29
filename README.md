@@ -374,7 +374,7 @@ The top-level `tasks` map defines the pipeline. Each task may set:
 - `cache`: opt-in build cache. Provide an object (e.g. `cache: {}`) to enable change-detection skips for successful prior runs; omit the field to disable. Set the `nonce` field (e.g. `cache: { nonce: "v1" }`) to force-bust this task's cache. See [Cache Nonce](#cache-nonce-force-busting-stale-cache) for details.
 - `inputs`: relative input paths/globs, including `!` exclusions. Glob patterns are resolved against the git-tracked file listing, so `.gitignore` is respected; literal (non-glob) paths are hashed directly and are included even when git-ignored. See [Input Pattern Prefixes](#input-pattern-prefixes) and [Glob Syntax](#glob-syntax).
 - `outputs`: relative output paths/globs, including `!` exclusions. These are checked on disk, so missing/deleted outputs invalidate cache entries even if ignored by git. See [Glob Syntax](#glob-syntax).
-- `dependencies`: optional filter for external package dependencies (from `yarn.lock`). Reuses the [Input Pattern Prefixes](#input-pattern-prefixes) grammar (`^`, `^^`, `pkg#`, `#`, globs).
+- `dependencies`: optional filter for external package dependencies (from `yarn.lock`). Reuses the [Input Pattern Prefixes](#input-pattern-prefixes) grammar (`^`, `^^`, `pkg#`, `#`, globs). Its globs match dependency **names**, so they follow [Name globs](#name-globs-are-different).
     - **Default:** `["**/*"]` (conservative; includes all package dependencies).
     - **Semantic difference:** Patterns select which package dependencies' **resolved versions** (and their full transitive closures) feed the task's cache hash — they do NOT select files.
     - **Interpretation:** The filter selects "roots" from the package's immediate dependencies; each matched root contributes its FULL transitive closure to the hash. Narrowing the filter reduces cache invalidation (fewer roots → fewer version changes bust the cache).
@@ -402,7 +402,9 @@ Notes:
 
 ### Glob Syntax
 
-Path globs are compiled by [`globset`](https://docs.rs/globset) with `literal_separator` enabled, matching what `.gitignore`, Turborepo, and lage all do. One grammar covers `inputs`, `outputs`, the `workspaces` globs in the root `package.json`, watch patterns, and `luchta-file-exists-filter`. Patterns are matched against paths relative to a base directory (the package directory, or the repo root for `#`-prefixed patterns), always written with `/` separators.
+Luchta has two families of glob. **Path globs** match files: `inputs`, `outputs`, the `workspaces` globs in the root `package.json`, watch patterns, and `luchta-file-exists-filter`. **Name globs** match package and task names: `-p`, task arguments, and the `dependencies` filter. They share a grammar, but differ in how `*` treats `/` and in whether `!` negates. Path globs are described first; see [Name globs](#name-globs-are-different) for the differences.
+
+Path globs are compiled by [`globset`](https://docs.rs/globset) with `literal_separator` enabled, matching what `.gitignore`, Turborepo, and lage all do. Patterns are matched against paths relative to a base directory (the package directory, or the repo root for `#`-prefixed patterns), always written with `/` separators.
 
 | Pattern | Matches |
 | --- | --- |
@@ -441,13 +443,19 @@ Rules:
 - **Dotfiles are not special.** `*` matches `.env`, unlike most shells.
 - **Matching is case-sensitive**, on every platform.
 - **A misplaced double-star is not an error.** `a**b` is accepted and behaves like `a*b`. An unclosed `{` or `[` *is* a hard error and fails the run.
-- **Escaping works the same on every platform.** `\*`, `\!`, and the character-class form `[*]` all work on Windows too, because luchta forces globset's `backslash_escape` on.
+- **Escaping works the same on every platform.** `\*`, `\!`, and the character-class form `[*]` all work on Windows too, because luchta forces globset's `backslash_escape` on for path globs. Name globs keep the default, where backslash escapes are Unix-only.
 
 Whether a pattern counts as a glob at all is decided by a plain scan for `*`, `?`, `[`, or `{`. That distinction drives `.gitignore` handling for `inputs`: globs resolve against the git-tracked file listing, literals are hashed as given. See [Build Cache](#build-cache).
 
 #### Name globs are different
 
-`-p` package filters, task-name arguments, and the `dependencies` filter match package and task **names**, not paths, so they keep globset's default behavior where `*` crosses `/`. That is deliberate: `@scope/pkg` contains a slash, so `-p '*'` still matches scoped packages and `-p '@repo/*'` matches every package in a scope. Negation is not supported for name globs.
+`-p` package filters, task-name arguments, and the `dependencies` filter match package and task **names**, not paths, and are compiled with globset's *default* options. The pattern table above still applies — `{a,b}`, `[ab]`, case sensitivity, and the `{a|b}` trap are all the same — but three things differ:
+
+- **`*` and `?` cross `/`.** That is deliberate: `@scope/pkg` contains a slash, so `-p '*'` still matches scoped packages and `-p '@repo/*'` matches every package in a scope. The "recursion is explicit" rule above is about path globs only.
+- **`!` is not negation.** `-p '!@repo/app'` is not an error — it compiles to a pattern matching a package literally *named* `!@repo/app`, so it silently selects nothing. To narrow a run, list the packages you want.
+- **Backslash escapes are Unix-only.** Name globs do not force `backslash_escape`, so globset disables it on Windows where `\` is a path separator. Use the character-class form (`[*]`) if a pattern must be portable.
+
+`**` rarely adds anything to a name glob, since `*` already crosses `/`: `**/*` and `*` select the same names. It differs only beside a slash, where it makes that slash optional — `**/pkg` matches a bare `pkg` while `*/pkg` does not.
 
 #### Two exceptions
 
@@ -468,7 +476,7 @@ The `tasks` map defines how tasks are applied across the workspace:
 - `luchta run -T build` (or `--top-level`): Runs the top-level `#build` task.
 - `luchta run -p <PATTERN> build`: Selects tasks by package **name** (not path). Supports glob wildcards (e.g. `@repo/*`, `pkg-*`). Repeatable.
 - `luchta run --since <GIT_REF> build`: Restricts goal tasks to packages changed since `GIT_REF`, plus their transitive dependents.
-- `luchta run 'test*'`: Task arguments also support glob wildcards (e.g. `test:*`, `build*`). Both package and task patterns use the [Glob Syntax](#glob-syntax) grammar.
+- `luchta run 'test*'`: Task arguments also support glob wildcards (e.g. `test:*`, `build*`). Package and task patterns match **names**, so they follow [Name globs](#name-globs-are-different), not the path-glob rules used by `inputs` and `outputs`.
 - `luchta run -T -p app build`: Runs both `@repo/app#build` and the top-level `#build` task (`-T` is additive to `-p`).
 - `luchta run --continue build`: Keep building after a failure — independent tasks still run; only the failed task's transitive dependents are skipped. Exits non-zero if anything failed.
 
