@@ -16,7 +16,7 @@ pub use luchta_types::{classify_pattern, InputSemantics};
 pub use reason::{FileDelta, RunReason};
 pub use record::{
     FileEntry, ReportMeta, TaskRunRecord, SCHEMA_VERSION_V1, SCHEMA_VERSION_V2, SCHEMA_VERSION_V3,
-    SCHEMA_VERSION_V4,
+    SCHEMA_VERSION_V4, SCHEMA_VERSION_V5,
 };
 pub use resolve::{
     combined_outputs_hash, resolve_inputs, resolve_inputs_with_options,

@@ -2,7 +2,7 @@ use std::path::Path;
 use std::process;
 use std::sync::Arc;
 
-use globset::{Glob, GlobSet, GlobSetBuilder};
+use globset::{GlobSet, GlobSetBuilder};
 use luchta_worker::{
     split_current_process_argv, version_requested, DelegateHandle, ProxyError, ResolveResult,
     WorkerMessage, WorkerResponse,
@@ -189,7 +189,7 @@ async fn async_main() -> i32 {
 fn build_globset(patterns: &[String]) -> Result<GlobSet, globset::Error> {
     let mut builder = GlobSetBuilder::new();
     for pattern in patterns {
-        builder.add(Glob::new(pattern)?);
+        builder.add(luchta_glob::build_path_glob(pattern)?);
     }
     builder.build()
 }
@@ -243,4 +243,17 @@ async fn write_response(
     writer.write_all(b"\n").await?;
     writer.flush().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_globset;
+
+    #[test]
+    fn single_star_does_not_cross_directory_separator() {
+        let globs = build_globset(&["config/*.json".to_string()]).expect("build globset");
+
+        assert!(globs.is_match("config/babel.json"));
+        assert!(!globs.is_match("config/nested/babel.json"));
+    }
 }

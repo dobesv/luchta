@@ -439,7 +439,7 @@ mod tests {
         let fp = fingerprint_of(&input);
 
         let record = TaskRunRecord {
-            schema_version: luchta_cache::SCHEMA_VERSION_V4,
+            schema_version: luchta_cache::SCHEMA_VERSION_V5,
             task_spec_hash: [0; 32],
             input_patterns: vec!["src/**/*.ts".to_string()],
             inputs: vec![FileEntry {

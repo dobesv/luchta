@@ -11,6 +11,7 @@ description.workspace = true
 
 [dependencies]
 luchta-worker = { path = "../luchta-worker" }
+luchta-glob = { path = "../luchta-glob" }
 tokio = { workspace = true }
 serde_json = { workspace = true }
 notify = { workspace = true }

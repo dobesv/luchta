@@ -4,7 +4,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use crate::record::{TaskRunRecord, SCHEMA_VERSION_V4};
+use crate::record::{TaskRunRecord, SCHEMA_VERSION_V5};
 use crate::serialization::bincode_config;
 use crate::shared::atomic_write;
 use crate::{CacheError, Result};
@@ -54,8 +54,8 @@ impl Cache {
         let bytes = fs::read(self.task_dir(task_id).join(META_FILE_NAME)).ok()?;
         let (record, _): (TaskRunRecord, usize) =
             bincode::serde::decode_from_slice(&bytes, bincode_config()).ok()?;
-        // Only accept V4 records. Older versions -> clean cache miss.
-        (record.schema_version == SCHEMA_VERSION_V4).then_some(record)
+        // Only accept V5 records. Older versions -> clean cache miss.
+        (record.schema_version == SCHEMA_VERSION_V5).then_some(record)
     }
 
     pub fn write(&self, task_id: &str, artifacts: RunArtifacts<'_>) -> Result<()> {
@@ -231,6 +231,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+    use crate::record::SCHEMA_VERSION_V5;
     use crate::record::{
         FileEntry, ReportMeta, SCHEMA_VERSION_V1, SCHEMA_VERSION_V2, SCHEMA_VERSION_V3,
         SCHEMA_VERSION_V4,
@@ -394,6 +395,26 @@ mod tests {
 
         let mut record = sample_record();
         record.schema_version = SCHEMA_VERSION_V3;
+        let encoded = bincode::serde::encode_to_vec(&record, bincode_config()).unwrap();
+        fs::write(task_dir.join(META_FILE_NAME), encoded).unwrap();
+
+        assert_eq!(cache.read("pkg#build"), None);
+    }
+
+    #[test]
+    fn v4_version_field_is_rejected() {
+        let temp_dir = tempdir().unwrap();
+        let cache =
+            Cache::open(&temp_dir.path().join(LUCHTA_DIR_NAME).join(CACHE_DIR_NAME)).unwrap();
+        let task_dir = cache.task_dir("pkg#build");
+        fs::create_dir_all(&task_dir).unwrap();
+
+        // V4 records were hashed with the old glob semantics, where `*` crossed
+        // directory separators. Their input sets are wider than what the same
+        // patterns resolve to now, so reusing them would skip tasks whose real
+        // inputs changed.
+        let mut record = sample_record();
+        record.schema_version = SCHEMA_VERSION_V4;
         let encoded = bincode::serde::encode_to_vec(&record, bincode_config()).unwrap();
         fs::write(task_dir.join(META_FILE_NAME), encoded).unwrap();
 
@@ -644,7 +665,7 @@ mod tests {
 
     fn sample_record() -> TaskRunRecord {
         TaskRunRecord {
-            schema_version: SCHEMA_VERSION_V4,
+            schema_version: SCHEMA_VERSION_V5,
             task_spec_hash: [1; 32],
             input_patterns: vec!["src/**/*.ts".to_string()],
             inputs: vec![FileEntry {

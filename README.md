@@ -372,8 +372,8 @@ The top-level `tasks` map defines the pipeline. Each task may set:
 - `worker`: name of a long-lived worker (from the `workers` map) that should
   execute this task. The named worker **must** be defined or the run fails.
 - `cache`: opt-in build cache. Provide an object (e.g. `cache: {}`) to enable change-detection skips for successful prior runs; omit the field to disable. Set the `nonce` field (e.g. `cache: { nonce: "v1" }`) to force-bust this task's cache. See [Cache Nonce](#cache-nonce-force-busting-stale-cache) for details.
-- `inputs`: relative input paths/globs. Glob patterns are resolved against the git-tracked file listing, so `.gitignore` is respected; literal (non-glob) paths are hashed directly and are included even when git-ignored. See [Input Pattern Prefixes](#input-pattern-prefixes).
-- `outputs`: relative output paths/globs. These are checked on disk, so missing/deleted outputs invalidate cache entries even if ignored by git.
+- `inputs`: relative input paths/globs, including `!` exclusions. Glob patterns are resolved against the git-tracked file listing, so `.gitignore` is respected; literal (non-glob) paths are hashed directly and are included even when git-ignored. See [Input Pattern Prefixes](#input-pattern-prefixes) and [Glob Syntax](#glob-syntax).
+- `outputs`: relative output paths/globs, including `!` exclusions. These are checked on disk, so missing/deleted outputs invalidate cache entries even if ignored by git. See [Glob Syntax](#glob-syntax).
 - `dependencies`: optional filter for external package dependencies (from `yarn.lock`). Reuses the [Input Pattern Prefixes](#input-pattern-prefixes) grammar (`^`, `^^`, `pkg#`, `#`, globs).
     - **Default:** `["**/*"]` (conservative; includes all package dependencies).
     - **Semantic difference:** Patterns select which package dependencies' **resolved versions** (and their full transitive closures) feed the task's cache hash — they do NOT select files.
@@ -391,12 +391,68 @@ The top-level `tasks` map defines the pipeline. Each task may set:
 | `^path` | direct upstream packages | always wildcard; never errors on no match |
 | `^^path` | transitive upstream packages | always wildcard; never errors on no match |
 | bare `path` | own package | literal → absent if missing; glob → wildcard |
+| `!path` | every base above | global exclusion filter; takes no prefix |
 
 Notes:
 - `^` and `^^` are wildcard-only even when the suffix looks like a literal path.
+- A `!` negation is not a prefix form: it filters everything the other patterns resolved, from every base dir. See [Negation](#negation).
 - Inter-package `outputs` are not supported; prefixes apply to cache inputs only.
 - Cross-package glob inputs obey the target package's `.gitignore` / git-tracked file view because resolution happens relative to each target base directory (literal paths are still taken as-is).
 - Missing named packages or path escapes fail hard.
+
+### Glob Syntax
+
+Path globs are compiled by [`globset`](https://docs.rs/globset) with `literal_separator` enabled, matching what `.gitignore`, Turborepo, and lage all do. One grammar covers `inputs`, `outputs`, the `workspaces` globs in the root `package.json`, watch patterns, and `luchta-file-exists-filter`. Patterns are matched against paths relative to a base directory (the package directory, or the repo root for `#`-prefixed patterns), always written with `/` separators.
+
+| Pattern | Matches |
+| --- | --- |
+| `*` | zero or more characters **within one directory level** |
+| `?` | exactly one character, never `/` |
+| `**` | zero or more directories, as a leading `**/`, a trailing `/**`, a middle `/**/`, or the whole pattern `**` |
+| `{a,b}` | `a` or `b`, where each branch is itself a glob |
+| `[ab]`, `[a-z]` | one character from the set |
+| `[!ab]` | one character not in the set |
+| `!pattern` | **excludes** everything matching `pattern` (see below) |
+| `[*]`, `\*` | the literal metacharacter |
+
+Recursion is explicit: `src/*.ts` matches `src/a.ts` but not `src/deep/a.ts`, and you need `src/**/*.ts` for the latter. Patterns are anchored at the base directory, so a bare `*.ts` matches only top-level files — unlike `.gitignore`, where a slash-free pattern matches at any depth.
+
+#### Negation
+
+A pattern starting with `!` removes files instead of adding them:
+
+```js
+inputs: ["src/**", "!src/**/*.test.ts"],
+outputs: ["dist/**", "!dist/**/*.map"],
+```
+
+Rules:
+
+- **Negations always win, and order does not matter.** A file is selected when at least one normal pattern matches it and no negation does. This differs from `.gitignore`, where the last matching line wins and a later rule can re-include something excluded earlier.
+- **A negation is a global filter across every base directory.** In a task's `inputs`, one `!**/*.test.ts` applies to files resolved from your own package, from `#` root patterns, and from every `^` / `^^` upstream package, each matched relative to its own base. It does not fan out into one exclusion per package.
+- **Negations carry no package prefix.** `!shared#**` is not "exclude from the `shared` package" — the `shared#` is just part of the pattern text. Write the path shape you want to exclude.
+- **Negation applies to literal paths too.** Listing `src/secret.ts` and `!src/secret.ts` together yields nothing.
+- **A negation alone selects nothing.** There is no implicit "everything" to subtract from.
+- To match a file whose name really starts with `!`, escape it: `\!important.txt`.
+
+#### Details worth knowing
+
+- **Alternates are comma-separated, not pipe-separated.** `{a,b}` works; `{a|b}` is not an alternate at all, it matches the literal text `a|b`. An empty branch (`{a,}`) is dropped rather than matching the empty string. Nesting braces is not supported by globset — avoid it even where it appears to work.
+- **Dotfiles are not special.** `*` matches `.env`, unlike most shells.
+- **Matching is case-sensitive**, on every platform.
+- **A misplaced double-star is not an error.** `a**b` is accepted and behaves like `a*b`. An unclosed `{` or `[` *is* a hard error and fails the run.
+- **Escaping works the same on every platform.** `\*`, `\!`, and the character-class form `[*]` all work on Windows too, because luchta forces globset's `backslash_escape` on.
+
+Whether a pattern counts as a glob at all is decided by a plain scan for `*`, `?`, `[`, or `{`. That distinction drives `.gitignore` handling for `inputs`: globs resolve against the git-tracked file listing, literals are hashed as given. See [Build Cache](#build-cache).
+
+#### Name globs are different
+
+`-p` package filters, task-name arguments, and the `dependencies` filter match package and task **names**, not paths, so they keep globset's default behavior where `*` crosses `/`. That is deliberate: `@scope/pkg` contains a slash, so `-p '*'` still matches scoped packages and `-p '@repo/*'` matches every package in a scope. Negation is not supported for name globs.
+
+#### Two exceptions
+
+- `.oxfmtrc` patterns read by the oxfmt worker (`ignorePatterns`, and `files` / `excludeFiles` inside `overrides`) use full **gitignore** semantics via the `ignore` crate: `!` negates with last-match-wins, a leading `/` anchors to the directory holding the config file, a trailing `/` matches directories only, and a slash-free pattern matches at any depth.
+- The ast-grep worker's `languageGlobs` keep globset's defaults, so `*.vue` there matches at any depth, mirroring ast-grep upstream.
 
 ### Task Key Formats
 
@@ -412,7 +468,7 @@ The `tasks` map defines how tasks are applied across the workspace:
 - `luchta run -T build` (or `--top-level`): Runs the top-level `#build` task.
 - `luchta run -p <PATTERN> build`: Selects tasks by package **name** (not path). Supports glob wildcards (e.g. `@repo/*`, `pkg-*`). Repeatable.
 - `luchta run --since <GIT_REF> build`: Restricts goal tasks to packages changed since `GIT_REF`, plus their transitive dependents.
-- `luchta run 'test*'`: Task arguments also support glob wildcards (e.g. `test:*`, `build*`).
+- `luchta run 'test*'`: Task arguments also support glob wildcards (e.g. `test:*`, `build*`). Both package and task patterns use the [Glob Syntax](#glob-syntax) grammar.
 - `luchta run -T -p app build`: Runs both `@repo/app#build` and the top-level `#build` task (`-T` is additive to `-p`).
 - `luchta run --continue build`: Keep building after a failure — independent tasks still run; only the failed task's transitive dependents are skipped. Exits non-zero if anything failed.
 
@@ -915,7 +971,7 @@ Luchta build cache is **opt-in** per task via `cache: {}`. Cached task skips onl
 - Default cache dir: `<workspace>/.luchta/cache`
 - Override: `LUCHTA_CACHE_DIR=/abs/path`
 - Disable: `LUCHTA_NO_CACHE=1` (or `--no-cache`)
-- Glob inputs use the git-tracked file listing, so `.gitignore` is honored; literal (non-glob) inputs are hashed directly and are **not** filtered by `.gitignore` (an explicitly declared path is always honored).
+- Glob inputs use the git-tracked file listing, so `.gitignore` is honored; literal (non-glob) inputs are hashed directly and are **not** filtered by `.gitignore` (an explicitly declared path is always honored). A pattern counts as a glob if it contains `*`, `?`, `[`, or `{` — see [Glob Syntax](#glob-syntax).
 - Input prefixes may target repo root (`#...`), named packages (`pkg#...`, `@scope/pkg#...`), direct upstream packages (`^...`), or transitive upstream packages (`^^...`).
 - `^` / `^^` inputs are wildcard-only and never error on zero matches; missing literals become `absent` entries only for bare / `#` / `pkg#` forms.
 - Outputs are checked directly on disk, so missing output reruns task.

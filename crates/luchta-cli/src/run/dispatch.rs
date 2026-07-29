@@ -15,7 +15,7 @@ use luchta_cache::shared::{
 };
 use luchta_cache::{
     decide_shared_restore, task_cache_key, CurrentState, FileEntry, ReportInput, RunArtifacts,
-    RunReason, SCHEMA_VERSION_V4,
+    RunReason, SCHEMA_VERSION_V5,
 };
 use luchta_types::EnvSpec;
 use luchta_worker::BUILTIN_PASSTHROUGH_ENV;
@@ -709,7 +709,7 @@ fn assemble_run_record(
         .unwrap_or(1);
 
     Box::new(TaskRunRecord {
-        schema_version: SCHEMA_VERSION_V4,
+        schema_version: SCHEMA_VERSION_V5,
         task_spec_hash: cache_ctx.task_spec_hash,
         input_patterns: patterns.input_patterns.clone(),
         inputs,
@@ -1781,7 +1781,7 @@ fn outputs_lexically_in_package(output_patterns: &[String]) -> bool {
 fn hydrate_local_cache(cache: Arc<Cache>, task_id: TaskId, hit: &RestoredHit) {
     let cache_key = task_id.to_string();
     let mut record = hit.record.clone();
-    record.schema_version = SCHEMA_VERSION_V4;
+    record.schema_version = SCHEMA_VERSION_V5;
     record.run_reason = Some(RunReason::SharedCacheHit);
     let reports: Vec<ReportInput> = hit
         .record
@@ -1843,7 +1843,7 @@ mod tests {
 
     use crate::cli::OutputMode;
     use crate::progress::ProgressReporter;
-    use luchta_cache::{decide, FileDelta, ReportInput, RunReason, SCHEMA_VERSION_V4};
+    use luchta_cache::{decide, FileDelta, ReportInput, RunReason, SCHEMA_VERSION_V5};
     use luchta_engine::CollectedReport;
     use std::sync::atomic::AtomicBool;
 
@@ -2124,7 +2124,7 @@ mod tests {
             }
         };
 
-        assert_eq!(record.schema_version, SCHEMA_VERSION_V4);
+        assert_eq!(record.schema_version, SCHEMA_VERSION_V5);
         assert_eq!(record.run_reason, Some(run_reason));
     }
 
@@ -2363,7 +2363,7 @@ mod tests {
         let hydrated = cache
             .read(&task_id.to_string())
             .expect("hydrated record should exist");
-        assert_eq!(hydrated.schema_version, SCHEMA_VERSION_V4);
+        assert_eq!(hydrated.schema_version, SCHEMA_VERSION_V5);
         assert_eq!(hydrated.run_reason, Some(RunReason::SharedCacheHit));
     }
 

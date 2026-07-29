@@ -6,7 +6,7 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
-use globset::{Glob, GlobSet, GlobSetBuilder};
+use luchta_glob::PathMatcher;
 use serde::Deserialize;
 use walkdir::WalkDir;
 
@@ -79,7 +79,7 @@ impl YarnWorkspace {
     /// glob and contain a `package.json`.
     fn collect_package_paths(
         &self,
-        matcher: &GlobSet,
+        matcher: &PathMatcher,
     ) -> Result<BTreeSet<PathBuf>, WorkspaceError> {
         let mut package_paths = BTreeSet::new();
 
@@ -102,7 +102,7 @@ impl YarnWorkspace {
     fn matched_package_dir(
         &self,
         entry: &walkdir::DirEntry,
-        matcher: &GlobSet,
+        matcher: &PathMatcher,
     ) -> Result<Option<PathBuf>, WorkspaceError> {
         if !entry.file_type().is_dir() {
             return Ok(None);
@@ -174,18 +174,9 @@ fn read_package_json(path: &Path) -> Result<PackageJson, WorkspaceError> {
     })
 }
 
-fn build_globset(patterns: &[String]) -> Result<GlobSet, WorkspaceError> {
-    let mut builder = GlobSetBuilder::new();
-    for pattern in patterns {
-        let glob = Glob::new(pattern).map_err(|error| {
-            WorkspaceError::Discovery(format!("invalid workspace glob '{pattern}': {error}"))
-        })?;
-        builder.add(glob);
-    }
-
-    builder
-        .build()
-        .map_err(|error| WorkspaceError::Discovery(format!("invalid workspace globs: {error}")))
+fn build_globset(patterns: &[String]) -> Result<PathMatcher, WorkspaceError> {
+    PathMatcher::new(patterns)
+        .map_err(|error| WorkspaceError::Discovery(format!("invalid workspace glob: {error}")))
 }
 
 fn package_node_from_package_json(
@@ -272,27 +263,50 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn ignores_node_modules_packages() {
+    /// Builds a workspace whose root declares `workspaces: <globs>`, writes each
+    /// `(package.json path, name)` pair, and returns the discovered names sorted.
+    fn discover_with_globs(globs: &str, packages: &[(&str, &str)]) -> Vec<String> {
         let temp_dir = tempdir().expect("create temp dir");
         write_json(
             temp_dir.path().join("package.json"),
-            r#"{
-                "name": "root",
-                "private": true,
-                "workspaces": ["packages/*", "node_modules/*"]
-            }"#,
+            &format!(r#"{{"name": "root", "private": true, "workspaces": {globs}}}"#),
         );
-        write_package(
-            temp_dir.path().join("packages/real/package.json"),
-            "@repo/real",
-        );
-        write_package(
-            temp_dir.path().join("node_modules/stray/package.json"),
-            "stray",
-        );
+        for (path, name) in packages {
+            write_package(temp_dir.path().join(path), name);
+        }
+        discover_sorted(&temp_dir)
+    }
 
-        assert_eq!(discover_sorted(&temp_dir), vec!["@repo/real", "root"]);
+    #[test]
+    fn workspace_globs_select_only_matching_packages() {
+        // `packages/*` matches one directory level, so a package nested inside
+        // another package is not a workspace — the same rule yarn applies.
+        let nested = discover_with_globs(
+            r#"["packages/*"]"#,
+            &[
+                ("packages/app/package.json", "@repo/app"),
+                ("packages/app/fixtures/inner/package.json", "@fixture/inner"),
+            ],
+        );
+        assert_eq!(nested, vec!["@repo/app", "root"], "nested package");
+
+        let negated = discover_with_globs(
+            r#"["packages/*", "!packages/examples"]"#,
+            &[
+                ("packages/app/package.json", "@repo/app"),
+                ("packages/examples/package.json", "@repo/examples"),
+            ],
+        );
+        assert_eq!(negated, vec!["@repo/app", "root"], "negated glob");
+
+        let node_modules = discover_with_globs(
+            r#"["packages/*", "node_modules/*"]"#,
+            &[
+                ("packages/real/package.json", "@repo/real"),
+                ("node_modules/stray/package.json", "stray"),
+            ],
+        );
+        assert_eq!(node_modules, vec!["@repo/real", "root"], "node_modules");
     }
 
     /// Discovers a workspace whose single `@repo/app` package has the given

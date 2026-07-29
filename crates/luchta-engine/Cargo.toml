@@ -20,6 +20,7 @@ tokio-stream = { workspace = true }
 futures = { workspace = true }
 libc = { workspace = true }
 luchta-types = { path = "../luchta-types" }
+luchta-glob = { path = "../luchta-glob" }
 luchta-worker = { path = "../luchta-worker" }
 luchta-workspace = { path = "../luchta-workspace" }
 luchta-cache = { path = "../luchta-cache" }

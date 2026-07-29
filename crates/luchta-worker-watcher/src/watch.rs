@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use globset::{Glob, GlobSetBuilder};
+use luchta_glob::PathMatcher;
 use notify::Watcher;
 use notify_debouncer_full::{new_debouncer, DebounceEventResult};
 use thiserror::Error;
@@ -43,7 +43,7 @@ pub enum WatchError {
 /// 2. Path stripped of cwd prefix (handles relative globs with absolute event paths)
 /// 3. Canonicalized path stripped of canonicalized cwd (handles symlink differences)
 fn path_matches(
-    globset: &globset::GlobSet,
+    globset: &PathMatcher,
     cwd: &Option<PathBuf>,
     canonical_cwd: &Option<PathBuf>,
     path: &Path,
@@ -53,18 +53,18 @@ fn path_matches(
         || matches_canonical_relative(globset, canonical_cwd, path)
 }
 
-fn matches_raw(globset: &globset::GlobSet, path: &Path) -> bool {
+fn matches_raw(globset: &PathMatcher, path: &Path) -> bool {
     globset.is_match(path)
 }
 
-fn matches_relative_to(globset: &globset::GlobSet, base: &Option<PathBuf>, path: &Path) -> bool {
+fn matches_relative_to(globset: &PathMatcher, base: &Option<PathBuf>, path: &Path) -> bool {
     base.as_deref()
         .and_then(|base| path.strip_prefix(base).ok())
         .is_some_and(|relative| globset.is_match(relative))
 }
 
 fn matches_canonical_relative(
-    globset: &globset::GlobSet,
+    globset: &PathMatcher,
     canonical_base: &Option<PathBuf>,
     path: &Path,
 ) -> bool {
@@ -80,16 +80,8 @@ fn matches_canonical_relative(
 ///
 /// Returns `WatchError::InvalidGlob` if any pattern cannot be parsed,
 /// or `WatchError::GlobsetBuild` if the set cannot be built.
-pub fn build_glob_set(globs: &[String]) -> Result<globset::GlobSet, WatchError> {
-    let mut builder = GlobSetBuilder::new();
-    for pattern in globs {
-        let glob =
-            Glob::new(pattern).map_err(|e| WatchError::InvalidGlob(format!("{pattern}: {e}")))?;
-        builder.add(glob);
-    }
-    builder
-        .build()
-        .map_err(|e| WatchError::GlobsetBuild(e.to_string()))
+pub fn build_glob_set(globs: &[String]) -> Result<PathMatcher, WatchError> {
+    PathMatcher::new(globs).map_err(|e| WatchError::InvalidGlob(e.to_string()))
 }
 
 /// Determines the watch roots from glob patterns.
@@ -103,7 +95,14 @@ pub fn build_glob_set(globs: &[String]) -> Result<globset::GlobSet, WatchError> 
 pub fn watch_roots(globs: &[String]) -> Vec<PathBuf> {
     let mut roots: Vec<PathBuf> = Vec::new();
 
-    for pattern in globs {
+    // Negations only shrink what matches, so they contribute no watch roots.
+    // Treating one as an include would look for the literal prefix `!src`,
+    // fail, and walk up to an existing ancestor — silently widening the watch
+    // to the whole working directory.
+    for pattern in globs
+        .iter()
+        .filter(|pattern| !luchta_glob::is_negated(pattern))
+    {
         if let Some(root) = find_existing_ancestor(pattern) {
             if !roots.contains(&root) {
                 roots.push(root);
@@ -321,6 +320,24 @@ mod tests {
     }
 
     #[test]
+    fn glob_set_single_star_does_not_cross_separator() {
+        let globs = vec!["src/*.rs".to_string()];
+        let globset = build_glob_set(&globs).expect("build globset");
+
+        assert!(globset.is_match("src/lib.rs"));
+        assert!(!globset.is_match("src/deep/nested.rs"));
+    }
+
+    #[test]
+    fn glob_set_negation_excludes_matching_paths() {
+        let globs = vec!["src/**/*.rs".to_string(), "!src/**/*_test.rs".to_string()];
+        let globset = build_glob_set(&globs).expect("build globset");
+
+        assert!(globset.is_match("src/lib.rs"));
+        assert!(!globset.is_match("src/lib_test.rs"));
+    }
+
+    #[test]
     fn glob_set_invalid_pattern() {
         let globs = vec!["[invalid".to_string()]; // Unclosed bracket
         let err = build_glob_set(&globs).expect_err("should fail");
@@ -346,6 +363,29 @@ mod tests {
 
         assert_eq!(result.len(), 1);
         assert!(result[0].ends_with("src") || result[0].ends_with("src/"));
+    }
+
+    #[test]
+    fn watch_roots_ignores_negated_patterns() {
+        require_nextest();
+        let temp = TempDir::new().expect("create temp dir");
+        let temp_path = temp.path();
+
+        fs::create_dir_all(temp_path.join("src")).expect("create src");
+
+        let original = std::env::current_dir().expect("get cwd");
+        std::env::set_current_dir(temp_path).expect("set cwd");
+
+        // `!src/generated/**` has no literal prefix that exists, so treating it
+        // as an include would walk up to an existing ancestor and silently
+        // widen the watch to the whole working directory.
+        let with_negation =
+            watch_roots(&["src/**/*.rs".to_string(), "!src/generated/**".to_string()]);
+        let without_negation = watch_roots(&["src/**/*.rs".to_string()]);
+
+        std::env::set_current_dir(&original).expect("restore cwd");
+
+        assert_eq!(with_negation, without_negation);
     }
 
     #[test]

@@ -224,7 +224,7 @@ async fn structural_move_package_to_new_top_level_dir_triggers_rebuild() {
         .run_structural_case(
             PackageMutation::Rename {
                 from: "packages/app",
-                to: "packages/cat/app",
+                to: "apps/app",
             },
             &["app"],
             "expected noop watcher harness to avoid extra worker cycle for pure structural move",
@@ -232,7 +232,7 @@ async fn structural_move_package_to_new_top_level_dir_triggers_rebuild() {
         .await;
     let moved_path = harness
         .workspace_root
-        .join("packages/cat/app")
+        .join("apps/app")
         .canonicalize()
         .expect("moved app path");
     harness
