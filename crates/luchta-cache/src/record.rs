@@ -12,6 +12,11 @@ pub const SCHEMA_VERSION_V2: u32 = 2;
 pub const SCHEMA_VERSION_V3: u32 = 3;
 /// Fourth schema version: adds `run_reason` field.
 pub const SCHEMA_VERSION_V4: u32 = 4;
+/// Fifth schema version: same shape as V4, but input and output patterns are
+/// matched with `literal_separator` semantics (`*` no longer crosses `/`) and
+/// support `!` negation. V4 records were hashed against a wider input set, so
+/// reusing them could skip a task whose real inputs changed.
+pub const SCHEMA_VERSION_V5: u32 = 5;
 
 /// Serialized cache metadata for one task execution.
 ///

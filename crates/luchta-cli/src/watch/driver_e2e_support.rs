@@ -27,9 +27,12 @@ echo '{{"concurrency":{{"maxWeight":4}},"workers":{{"fake":{{"command":"{}"}}}},
 
 pub(super) fn write_blocking_workspace(workspace_root: &std::path::Path) {
     std::fs::create_dir_all(workspace_root.join("packages/app")).expect("create package dir");
+    // `apps/*` is declared so the structural-move test can relocate a package
+    // to a different top-level directory. `packages/*` matches one directory
+    // level only, so a destination has to be covered by its own glob.
     std::fs::write(
         workspace_root.join("package.json"),
-        r#"{"name": "root", "private": true, "workspaces": ["packages/*"]}"#,
+        r#"{"name": "root", "private": true, "workspaces": ["packages/*", "apps/*"]}"#,
     )
     .expect("write root package.json");
     std::fs::write(

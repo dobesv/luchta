@@ -2816,6 +2816,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "hyperlocal",
+ "luchta-glob",
  "luchta-test-support",
  "luchta-types",
  "serde",
@@ -2888,6 +2889,7 @@ dependencies = [
  "futures",
  "libc",
  "luchta-cache",
+ "luchta-glob",
  "luchta-types",
  "luchta-worker",
  "luchta-workspace",
@@ -2918,11 +2920,19 @@ version = "0.1.27"
 dependencies = [
  "assert_cmd",
  "globset",
+ "luchta-glob",
  "luchta-worker",
  "serde_json",
  "tempfile",
  "tokio",
  "walkdir",
+]
+
+[[package]]
+name = "luchta-glob"
+version = "0.1.27"
+dependencies = [
+ "globset",
 ]
 
 [[package]]
@@ -3048,6 +3058,7 @@ version = "0.1.27"
 dependencies = [
  "assert_cmd",
  "globset",
+ "luchta-glob",
  "luchta-test-support",
  "luchta-worker",
  "notify",
@@ -3063,6 +3074,7 @@ name = "luchta-workspace"
 version = "0.1.27"
 dependencies = [
  "globset",
+ "luchta-glob",
  "luchta-types",
  "petgraph 0.6.5",
  "serde",

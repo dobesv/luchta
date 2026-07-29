@@ -140,6 +140,20 @@ pub fn expand_input_patterns(
     let mut requests = Vec::new();
 
     for pattern in patterns {
+        // A negation is a global filter over everything the other patterns
+        // resolve, so it never gets a package prefix, never fans out across
+        // upstream packages, and is not a path that could escape a base dir.
+        // It resolves relative to whichever base each candidate came from.
+        if let (true, body) = luchta_glob::split_negation(pattern) {
+            requests.push(ResolveRequest {
+                base_dir: repo_root.to_path_buf(),
+                pattern: body.to_string(),
+                semantics: InputSemantics::Wildcard,
+                negated: true,
+            });
+            continue;
+        }
+
         let parsed = parse_input_pattern(pattern, source_pkg)?;
         requests.extend(build_requests_for_pattern(
             &ctx,
@@ -194,6 +208,7 @@ impl ExpansionCtx<'_> {
             base_dir,
             pattern: spec.pattern.path.to_string(),
             semantics: spec.semantics,
+            negated: false,
         })
     }
 }
@@ -557,6 +572,68 @@ mod tests {
 
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].semantics, InputSemantics::Literal);
+    }
+
+    #[test]
+    fn negated_pattern_becomes_one_global_negated_request() {
+        let (graph, repo_root, source_pkg) = test_context("frontend");
+
+        let patterns = vec!["src/**".to_string(), "!**/*.test.ts".to_string()];
+        let requests = expand_input_patterns(&patterns, &source_pkg, &graph, &repo_root).unwrap();
+
+        let negated = requests
+            .iter()
+            .filter(|request| request.negated)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            negated.len(),
+            1,
+            "one negation must not fan out per package"
+        );
+        assert_eq!(negated[0].pattern, "**/*.test.ts", "`!` must be stripped");
+    }
+
+    #[test]
+    fn negation_does_not_fan_out_across_upstream_packages() {
+        let graph = make_graph_with_deps(vec![
+            ("frontend", &["shared", "utils"]),
+            ("shared", &[]),
+            ("utils", &[]),
+        ]);
+        let repo_root = PathBuf::from("/repo");
+        let source_pkg = PackageName::from("frontend");
+
+        let patterns = vec!["^src/**".to_string(), "!**/*.test.ts".to_string()];
+        let requests = expand_input_patterns(&patterns, &source_pkg, &graph, &repo_root).unwrap();
+
+        assert_eq!(
+            requests.iter().filter(|r| r.negated).count(),
+            1,
+            "the negation is a global filter, not a per-upstream include"
+        );
+        assert_eq!(
+            requests.iter().filter(|r| !r.negated).count(),
+            2,
+            "`^src/**` still expands to both upstream packages"
+        );
+    }
+
+    #[test]
+    fn negation_body_is_not_parsed_for_a_package_prefix() {
+        let (graph, repo_root, source_pkg) = test_context("frontend");
+
+        // Negations are global filters, so `shared#` is not a package prefix
+        // here — it stays part of the pattern body rather than retargeting the
+        // filter at the `shared` package.
+        let patterns = vec!["src/**".to_string(), "!shared#**".to_string()];
+        let requests = expand_input_patterns(&patterns, &source_pkg, &graph, &repo_root).unwrap();
+
+        let negated = requests
+            .iter()
+            .filter(|request| request.negated)
+            .collect::<Vec<_>>();
+        assert_eq!(negated.len(), 1);
+        assert_eq!(negated[0].pattern, "shared#**");
     }
 
     #[test]

@@ -145,7 +145,7 @@ fn cache_write_read_report_byte_exact() {
 fn test_record_with_reports() -> luchta_cache::TaskRunRecord {
     use std::collections::BTreeMap;
     luchta_cache::TaskRunRecord {
-        schema_version: 4,
+        schema_version: luchta_cache::SCHEMA_VERSION_V5,
         task_spec_hash: [1u8; 32],
         input_patterns: vec!["src/**/*.ts".to_string()],
         inputs: vec![],
@@ -199,19 +199,11 @@ fn cache_v1_schema_returns_none() {
     );
 }
 
-#[test]
-fn cache_duplicate_filename_last_wins() {
-    use luchta_cache::{
-        Cache, ReportInput, RunArtifacts, TaskRunRecord, CACHE_DIR_NAME, LUCHTA_DIR_NAME,
-    };
+/// A minimal current-schema record for tests that only exercise report writing.
+fn minimal_record(reports: Vec<luchta_cache::ReportMeta>) -> luchta_cache::TaskRunRecord {
     use std::collections::BTreeMap;
-    use tempfile::tempdir;
-
-    let temp_dir = tempdir().unwrap();
-    let cache = Cache::open(&temp_dir.path().join(LUCHTA_DIR_NAME).join(CACHE_DIR_NAME)).unwrap();
-
-    let record = TaskRunRecord {
-        schema_version: 4,
+    luchta_cache::TaskRunRecord {
+        schema_version: luchta_cache::SCHEMA_VERSION_V5,
         task_spec_hash: [1u8; 32],
         input_patterns: vec![],
         inputs: vec![],
@@ -226,14 +218,25 @@ fn cache_duplicate_filename_last_wins() {
         exit_status: 0,
         succeeded: true,
         start_unix_ms: 0,
-        end_unix_ms: 100,
-        reports: vec![luchta_cache::ReportMeta {
-            filename: "report.json".to_string(),
-            mime_type: "application/json".to_string(),
-        }],
+        end_unix_ms: 0,
+        reports,
         cache_nonce: None,
         run_reason: None,
-    };
+    }
+}
+
+#[test]
+fn cache_duplicate_filename_last_wins() {
+    use luchta_cache::{Cache, ReportInput, RunArtifacts, CACHE_DIR_NAME, LUCHTA_DIR_NAME};
+    use tempfile::tempdir;
+
+    let temp_dir = tempdir().unwrap();
+    let cache = Cache::open(&temp_dir.path().join(LUCHTA_DIR_NAME).join(CACHE_DIR_NAME)).unwrap();
+
+    let record = minimal_record(vec![luchta_cache::ReportMeta {
+        filename: "report.json".to_string(),
+        mime_type: "application/json".to_string(),
+    }]);
 
     // Two reports with same filename - last should win
     let reports = vec![
@@ -274,36 +277,14 @@ fn cache_duplicate_filename_last_wins() {
 #[test]
 fn cache_rejects_traversal_filename() {
     use luchta_cache::{
-        Cache, CacheError, ReportInput, RunArtifacts, TaskRunRecord, CACHE_DIR_NAME,
-        LUCHTA_DIR_NAME,
+        Cache, CacheError, ReportInput, RunArtifacts, CACHE_DIR_NAME, LUCHTA_DIR_NAME,
     };
-    use std::collections::BTreeMap;
     use tempfile::tempdir;
 
     let temp_dir = tempdir().unwrap();
     let cache = Cache::open(&temp_dir.path().join(LUCHTA_DIR_NAME).join(CACHE_DIR_NAME)).unwrap();
 
-    let record = TaskRunRecord {
-        schema_version: 4,
-        task_spec_hash: [1u8; 32],
-        input_patterns: vec![],
-        inputs: vec![],
-        output_patterns: vec![],
-        outputs: vec![],
-        detected_input_patterns: false,
-        detected_output_patterns: false,
-        outputs_hash: [0u8; 32],
-        env_hash: [0u8; 32],
-        pkg_dep_hash: [0u8; 32],
-        dep_outputs: BTreeMap::new(),
-        exit_status: 0,
-        succeeded: true,
-        start_unix_ms: 0,
-        end_unix_ms: 0,
-        reports: vec![],
-        cache_nonce: None,
-        run_reason: None,
-    };
+    let record = minimal_record(vec![]);
 
     // Try to write with path traversal filename
     let reports = vec![ReportInput {
@@ -338,36 +319,13 @@ fn cache_rejects_traversal_filename() {
 
 #[test]
 fn cache_rejects_reserved_filename() {
-    use luchta_cache::{
-        Cache, ReportInput, RunArtifacts, TaskRunRecord, CACHE_DIR_NAME, LUCHTA_DIR_NAME,
-    };
-    use std::collections::BTreeMap;
+    use luchta_cache::{Cache, ReportInput, RunArtifacts, CACHE_DIR_NAME, LUCHTA_DIR_NAME};
     use tempfile::tempdir;
 
     let temp_dir = tempdir().unwrap();
     let cache = Cache::open(&temp_dir.path().join(LUCHTA_DIR_NAME).join(CACHE_DIR_NAME)).unwrap();
 
-    let record = TaskRunRecord {
-        schema_version: 4,
-        task_spec_hash: [1u8; 32],
-        input_patterns: vec![],
-        inputs: vec![],
-        output_patterns: vec![],
-        outputs: vec![],
-        detected_input_patterns: false,
-        detected_output_patterns: false,
-        outputs_hash: [0u8; 32],
-        env_hash: [0u8; 32],
-        pkg_dep_hash: [0u8; 32],
-        dep_outputs: BTreeMap::new(),
-        exit_status: 0,
-        succeeded: true,
-        start_unix_ms: 0,
-        end_unix_ms: 0,
-        reports: vec![],
-        cache_nonce: None,
-        run_reason: None,
-    };
+    let record = minimal_record(vec![]);
 
     // Try to write with reserved filename
     for reserved_name in ["stdout.log", "stderr.log", "meta.bincode"] {

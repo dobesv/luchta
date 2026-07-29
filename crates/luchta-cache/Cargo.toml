@@ -11,6 +11,7 @@ description.workspace = true
 
 [dependencies]
 luchta-types = { path = "../luchta-types" }
+luchta-glob = { path = "../luchta-glob" }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 bincode = { workspace = true }

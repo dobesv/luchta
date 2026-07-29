@@ -8,7 +8,7 @@ use std::{
 };
 
 use gix::bstr::ByteSlice;
-use globset::{Glob, GlobSet, GlobSetBuilder};
+use globset::{GlobSet, GlobSetBuilder};
 use luchta_types::{classify_pattern, InputSemantics};
 use walkdir::WalkDir;
 
@@ -130,6 +130,61 @@ pub struct ResolveRequest {
     pub base_dir: PathBuf,
     pub pattern: String,
     pub semantics: InputSemantics,
+    /// True when the source pattern carried a leading `!`.
+    ///
+    /// Negations are global filters, not per-base includes: every negation in a
+    /// task's pattern list is applied to the files resolved from *every* base
+    /// dir (own package, repo root, each upstream package), matched against the
+    /// path relative to that base. `pattern` holds the body with the `!`
+    /// already stripped.
+    pub negated: bool,
+}
+
+impl ResolveRequest {
+    /// Builds a request from a raw pattern, splitting off a leading `!` and
+    /// classifying the remaining body.
+    pub fn new(base_dir: PathBuf, pattern: &str) -> Self {
+        let (negated, body) = luchta_glob::split_negation(pattern);
+        Self {
+            base_dir,
+            semantics: classify_pattern(body),
+            pattern: body.to_string(),
+            negated,
+        }
+    }
+}
+
+/// Compiled exclusion set shared by every base dir in one resolution.
+struct Exclusions(Option<GlobSet>);
+
+impl Exclusions {
+    /// An empty exclusion set, for test helpers that resolve one pattern in
+    /// isolation. Production paths always compile the task's real negations.
+    #[cfg(test)]
+    fn none() -> Self {
+        Self(None)
+    }
+
+    fn compile<'a>(patterns: impl Iterator<Item = &'a str>) -> Result<Self> {
+        let patterns = patterns.collect::<Vec<_>>();
+        if patterns.is_empty() {
+            return Ok(Self(None));
+        }
+        let mut builder = GlobSetBuilder::new();
+        for pattern in patterns {
+            builder.add(luchta_glob::build_path_glob(pattern).map_err(CacheError::InvalidGlob)?);
+        }
+        Ok(Self(Some(
+            builder.build().map_err(CacheError::BuildGlobSet)?,
+        )))
+    }
+
+    /// Tests a path expressed relative to its own base dir.
+    fn excludes(&self, relative_path: &Path) -> bool {
+        self.0
+            .as_ref()
+            .is_some_and(|set| set.is_match(relative_path))
+    }
 }
 
 pub fn resolve_inputs(base_dir: &Path, patterns: &[String]) -> Result<Vec<FileEntry>> {
@@ -145,12 +200,7 @@ pub fn resolve_inputs_with_options(
 ) -> Result<Vec<FileEntry>> {
     let requests = patterns
         .iter()
-        .cloned()
-        .map(|pattern| ResolveRequest {
-            semantics: classify_pattern(&pattern),
-            base_dir: base_dir.to_path_buf(),
-            pattern,
-        })
+        .map(|pattern| ResolveRequest::new(base_dir.to_path_buf(), pattern))
         .collect::<Vec<_>>();
     resolve_inputs_with_semantics_and_options(&requests, options)
 }
@@ -177,8 +227,14 @@ pub fn resolve_inputs_with_semantics_and_options(
     let mut merged_entries = Vec::new();
     let mut worktree_roots = Vec::new();
     let prior_by_path = prior_entries_by_path(options.prior_entries);
+    let exclusions = Exclusions::compile(
+        requests
+            .iter()
+            .filter(|request| request.negated)
+            .map(|request| request.pattern.as_str()),
+    )?;
 
-    for request in requests {
+    for request in requests.iter().filter(|request| !request.negated) {
         let base_dir_prefix = qualified_base_dir_prefix(
             &request.base_dir,
             &mut base_dir_prefix_cache,
@@ -206,6 +262,7 @@ pub fn resolve_inputs_with_semantics_and_options(
             &StdFs,
             &prior_by_path,
             options,
+            &exclusions,
         )?);
     }
 
@@ -236,10 +293,11 @@ fn resolve_single_request(
     file_reader: &dyn FileReader,
     prior_by_path: &HashMap<&str, &FileEntry>,
     options: ResolveOptions<'_>,
+    exclusions: &Exclusions,
 ) -> Result<Vec<FileEntry>> {
     match request.semantics {
         InputSemantics::Literal => {
-            resolve_literal_request(request, base, file_reader, prior_by_path)
+            resolve_literal_request(request, base, file_reader, prior_by_path, exclusions)
         }
         InputSemantics::Wildcard => resolve_wildcard_request(
             request,
@@ -248,6 +306,7 @@ fn resolve_single_request(
             file_reader,
             prior_by_path,
             options.listing_cache,
+            exclusions,
         ),
     }
 }
@@ -257,10 +316,17 @@ fn resolve_literal_request(
     base: ResolvedBase<'_>,
     file_reader: &dyn FileReader,
     prior_by_path: &HashMap<&str, &FileEntry>,
+    exclusions: &Exclusions,
 ) -> Result<Vec<FileEntry>> {
+    // Literals skip glob compilation, so any escape in the pattern has to be
+    // resolved here or the backslash would end up in the looked-up filename.
+    let path = PathBuf::from(luchta_glob::unescape_literal(&request.pattern));
+    if exclusions.excludes(&path) {
+        return Ok(Vec::new());
+    }
     Ok(vec![file_entry_from_path(
         base,
-        PathBuf::from(&request.pattern),
+        path,
         file_reader,
         prior_by_path,
     )?])
@@ -273,6 +339,7 @@ fn resolve_wildcard_request(
     file_reader: &dyn FileReader,
     prior_by_path: &HashMap<&str, &FileEntry>,
     listing_cache: Option<&ListingCache>,
+    exclusions: &Exclusions,
 ) -> Result<Vec<FileEntry>> {
     let candidates = cached_input_candidates(&request.base_dir, candidate_cache, listing_cache)?;
     resolve_wildcard_with_candidates(
@@ -281,6 +348,7 @@ fn resolve_wildcard_request(
         candidates,
         file_reader,
         prior_by_path,
+        exclusions,
     )
 }
 
@@ -357,16 +425,25 @@ fn resolve_with_candidates(
         return Ok(Vec::new());
     }
 
-    let literal_paths = patterns
+    let (excluded, included): (Vec<&String>, Vec<&String>) = patterns
+        .iter()
+        .partition(|pattern| luchta_glob::is_negated(pattern));
+    let exclusions = Exclusions::compile(
+        excluded
+            .iter()
+            .map(|pattern| luchta_glob::split_negation(pattern).1),
+    )?;
+
+    let literal_paths = included
         .iter()
         .filter(|pattern| classify_pattern(pattern) == InputSemantics::Literal)
-        .map(PathBuf::from)
+        .map(|pattern| PathBuf::from(luchta_glob::unescape_literal(pattern)))
         .collect::<Vec<_>>();
 
-    let glob_patterns = patterns
+    let glob_patterns = included
         .iter()
         .filter(|pattern| classify_pattern(pattern) == InputSemantics::Wildcard)
-        .cloned()
+        .map(|pattern| (*pattern).clone())
         .collect::<Vec<_>>();
 
     let mut resolved_paths = BTreeSet::new();
@@ -380,6 +457,8 @@ fn resolve_with_candidates(
             }
         }
     }
+
+    resolved_paths.retain(|path| !exclusions.excludes(path));
 
     let base = ResolvedBase {
         dir: base_dir,
@@ -400,11 +479,14 @@ fn resolve_wildcard_with_candidates(
     candidates: Vec<PathBuf>,
     file_reader: &dyn FileReader,
     prior_by_path: &HashMap<&str, &FileEntry>,
+    exclusions: &Exclusions,
 ) -> Result<Vec<FileEntry>> {
     let globset = build_globset(&[pattern.to_string()])?;
     let matched = candidates
         .into_iter()
-        .filter(|candidate| globset.is_match(candidate.as_path()))
+        .filter(|candidate| {
+            globset.is_match(candidate.as_path()) && !exclusions.excludes(candidate.as_path())
+        })
         .collect::<Vec<_>>();
     resolve_file_entries(base, matched, file_reader, prior_by_path)
 }
@@ -538,7 +620,7 @@ fn cached_output_candidates(
 fn build_globset(patterns: &[String]) -> Result<GlobSet> {
     let mut builder = GlobSetBuilder::new();
     for pattern in patterns {
-        builder.add(Glob::new(pattern).map_err(CacheError::InvalidGlob)?);
+        builder.add(luchta_glob::build_path_glob(pattern).map_err(CacheError::InvalidGlob)?);
     }
     builder.build().map_err(CacheError::BuildGlobSet)
 }
@@ -845,8 +927,15 @@ fn prefix_union(patterns: &[String]) -> Option<Vec<PathBuf>> {
         return Some(Vec::new());
     }
 
+    // Negations only ever shrink the result set, so they must not contribute
+    // walk roots — a `!dist/**` prefix would widen the walk for no reason, and
+    // worse, an exclusion-only pattern list would produce a prefix set that
+    // misses the directories the includes actually need.
     let mut prefixes = Vec::new();
-    for pattern in patterns {
+    for pattern in patterns
+        .iter()
+        .filter(|pattern| !luchta_glob::is_negated(pattern))
+    {
         let prefix = static_prefix(pattern)?;
         prefixes.push(prefix);
     }
@@ -921,7 +1010,7 @@ mod tests {
         resolve_inputs, resolve_inputs_with_options, resolve_inputs_with_semantics,
         resolve_literal_request, resolve_outputs, resolve_outputs_with_options,
         resolve_wildcard_with_candidates, resolve_with, resolve_with_candidates,
-        strip_suffix_components, walk_output_candidates, CandidateLister, FileReader,
+        strip_suffix_components, walk_output_candidates, CandidateLister, Exclusions, FileReader,
         FilesystemLister, ListingCache, ResolveOptions, ResolveRequest, ResolvedBase, StdFs,
     };
     use crate::FileEntry;
@@ -1551,9 +1640,13 @@ mod tests {
         candidate_lister: &dyn CandidateLister,
     ) -> Result<Vec<FileEntry>> {
         match request.semantics {
-            InputSemantics::Literal => {
-                resolve_literal_request(request, base, file_reader, prior_by_path)
-            }
+            InputSemantics::Literal => resolve_literal_request(
+                request,
+                base,
+                file_reader,
+                prior_by_path,
+                &Exclusions::none(),
+            ),
             InputSemantics::Wildcard => {
                 let candidates = cached_input_candidates_for_tests(
                     &request.base_dir,
@@ -1567,6 +1660,7 @@ mod tests {
                     candidates,
                     file_reader,
                     prior_by_path,
+                    &Exclusions::none(),
                 )
             }
         }
@@ -1776,6 +1870,134 @@ mod tests {
             expected
         );
         assert_eq!(first, second);
+    }
+
+    /// Seeds a committed repo with `files` and returns the input entry paths
+    /// that `patterns` resolve to.
+    fn resolved_input_paths(files: &[(&str, &str)], patterns: &[&str]) -> Vec<String> {
+        let repo = TestRepo::new();
+        for (path, contents) in files {
+            repo.write_file(path, contents);
+        }
+        repo.git_add_and_commit_all();
+
+        let patterns = patterns
+            .iter()
+            .map(|p| (*p).to_string())
+            .collect::<Vec<_>>();
+        entry_paths(resolve_inputs(repo.path(), &patterns).unwrap())
+    }
+
+    /// Same as [`resolved_input_paths`] but for outputs, which are read off
+    /// disk and so need no commit.
+    fn resolved_output_paths(files: &[(&str, &str)], patterns: &[&str]) -> Vec<String> {
+        let repo = TestRepo::new();
+        for (path, contents) in files {
+            repo.write_file(path, contents);
+        }
+
+        let patterns = patterns
+            .iter()
+            .map(|p| (*p).to_string())
+            .collect::<Vec<_>>();
+        entry_paths(resolve_outputs(repo.path(), &patterns).unwrap())
+    }
+
+    fn entry_paths(entries: Vec<FileEntry>) -> Vec<String> {
+        entries.into_iter().map(|entry| entry.path).collect()
+    }
+
+    #[test]
+    fn single_star_does_not_cross_directory_separator() {
+        let resolved = resolved_input_paths(
+            &[("src/one.txt", "one\n"), ("src/nested/two.txt", "two\n")],
+            &["src/*.txt"],
+        );
+
+        assert_eq!(
+            resolved,
+            vec!["src/one.txt"],
+            "`*` must match within one directory level, like .gitignore and Turborepo"
+        );
+    }
+
+    #[test]
+    fn double_star_still_crosses_directory_separators() {
+        let resolved = resolved_input_paths(
+            &[("src/one.txt", "one\n"), ("src/nested/two.txt", "two\n")],
+            &["src/**/*.txt"],
+        );
+
+        assert_eq!(resolved, vec!["src/nested/two.txt", "src/one.txt"]);
+    }
+
+    #[test]
+    fn negated_pattern_excludes_matching_inputs() {
+        let resolved = resolved_input_paths(
+            &[("src/a.ts", "a\n"), ("src/a.test.ts", "t\n")],
+            &["src/*.ts", "!src/*.test.ts"],
+        );
+
+        assert_eq!(resolved, vec!["src/a.ts"]);
+    }
+
+    #[test]
+    fn negated_pattern_excludes_a_literal_input() {
+        let resolved = resolved_input_paths(
+            &[("src/a.ts", "a\n"), ("src/secret.ts", "s\n")],
+            &["src/*.ts", "src/secret.ts", "!src/secret.ts"],
+        );
+
+        assert_eq!(
+            resolved,
+            vec!["src/a.ts"],
+            "a negation must also drop a path that was declared literally"
+        );
+    }
+
+    #[test]
+    fn one_negation_filters_every_base_dir() {
+        let repo = TestRepo::new();
+        repo.write_file("packages/app/src/a.ts", "a\n");
+        repo.write_file("packages/app/src/a.test.ts", "t\n");
+        repo.write_file("shared/src/b.ts", "b\n");
+        repo.write_file("shared/src/b.test.ts", "t\n");
+        repo.git_add_and_commit_all();
+
+        let requests = vec![
+            repo.request_from("packages/app", "src/*.ts", InputSemantics::Wildcard),
+            repo.request_from("shared", "src/*.ts", InputSemantics::Wildcard),
+            repo.negation("src/*.test.ts"),
+        ];
+
+        let resolved = resolve_inputs_with_semantics(&requests).unwrap();
+
+        assert_eq!(
+            resolved
+                .iter()
+                .map(|entry| entry.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["packages/app/src/a.ts", "shared/src/b.ts"],
+            "a single negation applies to files resolved from every base dir, \
+             matched relative to each base"
+        );
+    }
+
+    #[test]
+    fn negated_pattern_excludes_matching_outputs() {
+        let resolved = resolved_output_paths(
+            &[("dist/app.js", "j\n"), ("dist/app.js.map", "m\n")],
+            &["dist/*", "!dist/*.map"],
+        );
+
+        assert_eq!(resolved, vec!["dist/app.js"]);
+    }
+
+    #[test]
+    fn escaped_bang_is_a_literal_filename_not_a_negation() {
+        let resolved = resolved_input_paths(&[("!important.txt", "x\n")], &[r"\!important.txt"]);
+
+        assert_eq!(resolved, vec!["!important.txt"]);
     }
 
     #[test]
@@ -2044,13 +2266,9 @@ mod tests {
             git(self.path(), ["commit", "-m", &message]);
         }
 
-        /// Create a ResolveRequest from repo root with given pattern and semantics.
+        /// Create a ResolveRequest rooted at the repo with the given pattern.
         fn request(&self, pattern: &str, semantics: InputSemantics) -> ResolveRequest {
-            ResolveRequest {
-                base_dir: self.path().to_path_buf(),
-                pattern: pattern.to_string(),
-                semantics,
-            }
+            self.request_at(self.path().to_path_buf(), pattern, semantics)
         }
 
         /// Create a ResolveRequest from a subdirectory within the repo.
@@ -2060,10 +2278,28 @@ mod tests {
             pattern: &str,
             semantics: InputSemantics,
         ) -> ResolveRequest {
+            self.request_at(self.path().join(subdir), pattern, semantics)
+        }
+
+        /// Create a global negation request (its base dir is irrelevant).
+        fn negation(&self, pattern: &str) -> ResolveRequest {
             ResolveRequest {
-                base_dir: self.path().join(subdir),
+                negated: true,
+                ..self.request(pattern, InputSemantics::Wildcard)
+            }
+        }
+
+        fn request_at(
+            &self,
+            base_dir: PathBuf,
+            pattern: &str,
+            semantics: InputSemantics,
+        ) -> ResolveRequest {
+            ResolveRequest {
+                base_dir,
                 pattern: pattern.to_string(),
                 semantics,
+                negated: false,
             }
         }
     }
