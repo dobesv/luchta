@@ -1,4 +1,5 @@
 use std::{
+    cmp::Reverse,
     collections::{HashMap, HashSet, VecDeque},
     sync::Arc,
 };
@@ -17,6 +18,37 @@ use crate::task_graph::{TaskGraph, TaskNode};
 
 pub type CompletionSignal = oneshot::Sender<bool>;
 pub type ReadyTaskMessage = (TaskNode, CompletionSignal);
+
+fn compute_downstream_weights(
+    nodes: &HashMap<NodeIndex, TaskNode>,
+    dependents: &HashMap<NodeIndex, Vec<NodeIndex>>,
+    order: &[NodeIndex],
+) -> HashMap<NodeIndex, u64> {
+    let mut downstream_weights = HashMap::with_capacity(nodes.len());
+
+    for node_index in order {
+        let own_weight = u64::from(
+            nodes
+                .get(node_index)
+                .expect("downstream weight node missing task payload")
+                .weight,
+        );
+        let dependent_weight = dependents
+            .get(node_index)
+            .into_iter()
+            .flatten()
+            .map(|dependent| {
+                downstream_weights
+                    .get(dependent)
+                    .copied()
+                    .expect("dependent downstream weight not computed")
+            })
+            .sum::<u64>();
+        downstream_weights.insert(*node_index, own_weight + dependent_weight);
+    }
+
+    downstream_weights
+}
 
 #[derive(Debug)]
 pub struct Walker {
@@ -66,6 +98,7 @@ struct WalkerState {
     nodes: HashMap<NodeIndex, TaskNode>,
     dependencies_remaining: std::sync::Mutex<HashMap<NodeIndex, usize>>,
     dependents: HashMap<NodeIndex, Vec<NodeIndex>>,
+    downstream_weights: HashMap<NodeIndex, u64>,
     states: std::sync::Mutex<HashMap<NodeIndex, NodeState>>,
     terminal_count: std::sync::Mutex<usize>,
     total_count: usize,
@@ -96,12 +129,33 @@ impl WalkerState {
                 .push(edge.source());
         }
 
+        let indices_by_id = nodes
+            .iter()
+            .map(|(index, node)| (node.id.clone(), *index))
+            .collect::<HashMap<_, _>>();
+        let mut order = graph
+            .topological_order()
+            .expect("walker graph must be acyclic")
+            .into_iter()
+            .map(|node| {
+                indices_by_id
+                    .get(&node.id)
+                    .copied()
+                    .expect("topological node missing walker index")
+            })
+            .collect::<Vec<_>>();
+        order.reverse();
+        // Diamond paths intentionally double-count shared work. This accepted approximation is a
+        // dispatch hint, not an exact unlock metric, and is computed once because walks use an
+        // immutable DAG.
+        let downstream_weights = compute_downstream_weights(&nodes, &dependents, &order);
         let total_count = nodes.len();
 
         Self {
             nodes,
             dependencies_remaining: std::sync::Mutex::new(dependencies_remaining),
             dependents,
+            downstream_weights,
             states: std::sync::Mutex::new(states),
             terminal_count: std::sync::Mutex::new(0),
             total_count,
@@ -165,14 +219,52 @@ impl WalkerState {
             .lock()
             .expect("walker dependencies poisoned");
 
-        self.nodes
+        let mut ready = self
+            .nodes
             .keys()
             .copied()
             .filter(|node_index| {
                 states.get(node_index) == Some(&NodeState::Pending)
                     && remaining.get(node_index).copied().unwrap_or_default() == 0
             })
-            .collect()
+            .collect::<Vec<_>>();
+
+        // dispatch priority; does not affect topological readiness or semaphore acquisition.
+        // Head-of-line blocking at the semaphore is a known limitation deferred to a follow-up.
+        ready.sort_by(|left, right| {
+            let left_node = self
+                .nodes
+                .get(left)
+                .expect("ready node missing task payload");
+            let right_node = self
+                .nodes
+                .get(right)
+                .expect("ready node missing task payload");
+            (
+                Reverse(
+                    self.downstream_weights
+                        .get(left)
+                        .copied()
+                        .unwrap_or_default(),
+                ),
+                Reverse(left_node.weight),
+                &left_node.id.package.0,
+                &left_node.id.task.0,
+            )
+                .cmp(&(
+                    Reverse(
+                        self.downstream_weights
+                            .get(right)
+                            .copied()
+                            .unwrap_or_default(),
+                    ),
+                    Reverse(right_node.weight),
+                    &right_node.id.package.0,
+                    &right_node.id.task.0,
+                ))
+        });
+
+        ready
     }
 
     fn set_running(&self, node_index: NodeIndex) {
@@ -272,12 +364,13 @@ impl WalkerState {
 mod tests {
     use std::{collections::HashMap, fs, path::Path, time::Duration};
 
-    use luchta_types::{DependsOn, PackageName, TaskDefinition, TaskName};
+    use luchta_types::{DependsOn, PackageName, TaskDefinition, TaskId, TaskName};
     use luchta_workspace::{PackageGraph, PackageNode};
+    use petgraph::graph::NodeIndex;
     use tokio::time::timeout;
 
-    use super::Walker;
-    use crate::task_graph::TaskGraph;
+    use super::{compute_downstream_weights, Walker};
+    use crate::task_graph::{TaskGraph, TaskNode};
 
     #[tokio::test]
     async fn emits_linear_chain_in_dependency_first_order() {
@@ -353,6 +446,108 @@ mod tests {
         walker.wait().await.expect("walker join");
     }
 
+    #[tokio::test]
+    async fn emits_higher_downstream_weight_first() {
+        let task_graph = build_task_graph_weighted(vec![
+            ("@repo/medium", 4, vec![]),
+            ("@repo/light", 1, vec![]),
+            ("@repo/heavy", 9, vec![]),
+        ]);
+
+        assert_dispatch_order(
+            &task_graph,
+            &[
+                "@repo/heavy#build",
+                "@repo/medium#build",
+                "@repo/light#build",
+            ],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn emits_deterministic_order_for_equal_weight_tasks() {
+        let task_graph = build_task_graph(vec![
+            ("@repo/c", vec![]),
+            ("@repo/a", vec![]),
+            ("@repo/b", vec![]),
+        ]);
+
+        assert_dispatch_order(
+            &task_graph,
+            &["@repo/a#build", "@repo/b#build", "@repo/c#build"],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn prioritizes_task_that_unlocks_more_work() {
+        let task_graph = build_task_graph_weighted(vec![
+            ("@repo/heavy-dependent", 20, vec!["@repo/z-unlocker"]),
+            ("@repo/z-unlocker", 1, vec![]),
+            ("@repo/a-independent", 1, vec![]),
+        ]);
+        let (walker, mut ready) = Walker::new(&task_graph);
+
+        let (first, first_done) = recv_task(&mut ready).await;
+        assert_eq!(first.id.to_string(), "@repo/z-unlocker#build");
+        let (second, second_done) = recv_task(&mut ready).await;
+        assert_eq!(second.id.to_string(), "@repo/a-independent#build");
+        first_done.send(true).expect("signal unlocker success");
+        second_done.send(true).expect("signal independent success");
+
+        let (dependent, dependent_done) = recv_task(&mut ready).await;
+        assert_eq!(dependent.id.to_string(), "@repo/heavy-dependent#build");
+        dependent_done.send(true).expect("signal dependent success");
+        walker.wait().await.expect("walker join");
+    }
+
+    #[test]
+    fn computes_downstream_weights_with_diamond_double_counting() {
+        let root = NodeIndex::new(0);
+        let left = NodeIndex::new(1);
+        let right = NodeIndex::new(2);
+        let dependency = NodeIndex::new(3);
+        let nodes = [root, left, right, dependency]
+            .into_iter()
+            .map(|index| {
+                (
+                    index,
+                    TaskNode {
+                        id: TaskId::new("@repo/package", format!("task-{}", index.index())),
+                        weight: 1,
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let dependents = HashMap::from([
+            (root, vec![]),
+            (left, vec![root]),
+            (right, vec![root]),
+            (dependency, vec![left, right]),
+        ]);
+
+        let weights =
+            compute_downstream_weights(&nodes, &dependents, &[root, left, right, dependency]);
+
+        assert_eq!(weights.get(&root), Some(&1));
+        assert_eq!(weights.get(&left), Some(&2));
+        assert_eq!(weights.get(&right), Some(&2));
+        assert_eq!(weights.get(&dependency), Some(&5));
+    }
+
+    async fn assert_dispatch_order(task_graph: &TaskGraph, expected: &[&str]) {
+        let (walker, mut ready) = Walker::new(task_graph);
+
+        for expected_id in expected {
+            let (task, done) = recv_task(&mut ready).await;
+            assert_eq!(task.id.to_string(), *expected_id);
+            done.send(true).expect("signal task success");
+        }
+
+        walker.wait().await.expect("walker join");
+    }
+
     async fn recv_task(
         ready: &mut tokio::sync::mpsc::Receiver<super::ReadyTaskMessage>,
     ) -> super::ReadyTaskMessage {
@@ -379,26 +574,36 @@ mod tests {
     }
 
     fn build_task_graph(packages: Vec<(&str, Vec<&str>)>) -> TaskGraph {
+        build_task_graph_weighted(
+            packages
+                .into_iter()
+                .map(|(name, dependencies)| (name, 1, dependencies))
+                .collect(),
+        )
+    }
+
+    fn build_task_graph_weighted(packages: Vec<(&str, u32, Vec<&str>)>) -> TaskGraph {
         let temp_dir = tempfile::tempdir().expect("create temp dir");
         let mut package_nodes = Vec::new();
+        let mut pipeline = HashMap::new();
 
-        for (name, dependencies) in packages {
+        for (name, weight, dependencies) in packages {
             let package_dir = temp_dir
                 .path()
                 .join(name.trim_start_matches('@').replace('/', "_"));
             write_package(package_dir.join("package.json"), name, &dependencies);
             package_nodes.push(package_node(package_dir, name));
+            pipeline.insert(
+                TaskName::from(format!("{name}#build")),
+                TaskDefinition {
+                    depends_on: vec![DependsOn::DirectUpstream(TaskName::from("build"))],
+                    weight,
+                    ..TaskDefinition::default()
+                },
+            );
         }
 
         let package_graph = PackageGraph::build(package_nodes).expect("build package graph");
-        let pipeline = HashMap::from([(
-            TaskName::from("build"),
-            TaskDefinition {
-                depends_on: vec![DependsOn::DirectUpstream(TaskName::from("build"))],
-                ..TaskDefinition::default()
-            },
-        )]);
-
         TaskGraph::build(&package_graph, &pipeline).expect("build task graph")
     }
 
