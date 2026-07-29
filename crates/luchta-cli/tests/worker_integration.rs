@@ -1158,6 +1158,73 @@ fn real_bash_worker_clears_ambient_env_end_to_end() {
     temp.close().expect("cleanup temp dir");
 }
 
+#[test]
+fn real_bash_worker_env_defaults_reach_subprocess_end_to_end() {
+    let temp = assert_fs::TempDir::new().expect("create temp dir");
+    write_workspace(
+        &temp,
+        &[Pkg {
+            name: "myapp",
+            script: "echo package-build-script-unused",
+            depends_on_a: false,
+        }],
+    );
+    let env_capture = init_marker(&temp, "env_capture.txt");
+    // Defaults declared at all three scopes (global, worker, task), plus one
+    // task-scope default that the ambient environment overrides.
+    write_config(
+        &temp,
+        &format!(
+            concat!(
+                r#"{{"concurrency":{{"maxWeight":1}},"#,
+                r#""env":{{"LUCHTA_TEST_GLOBAL_DEFAULT":{{"default":"global-fallback"}}}},"#,
+                r#""tasks":{{"build":{{"worker":"bash","command":"env > {capture}","#,
+                r#""env":{{"LUCHTA_TEST_TASK_DEFAULT":{{"default":"task-fallback"}},"#,
+                r#""LUCHTA_TEST_AMBIENT_WINS":{{"default":"unused-fallback"}}}}}}}},"#,
+                r#""workers":{{"bash":{{"command":"{worker}","#,
+                r#""env":{{"LUCHTA_TEST_WORKER_DEFAULT":{{"default":"worker-fallback"}}}}}}}}}}"#,
+            ),
+            worker = bash_worker_bin().display(),
+            capture = env_capture.display()
+        ),
+    );
+
+    assert_cmd::Command::cargo_bin("luchta")
+        .expect("find binary")
+        .env("NO_COLOR", "1")
+        .env_remove("LUCHTA_TEST_GLOBAL_DEFAULT")
+        .env_remove("LUCHTA_TEST_WORKER_DEFAULT")
+        .env_remove("LUCHTA_TEST_TASK_DEFAULT")
+        .env("LUCHTA_TEST_AMBIENT_WINS", "ambient-value")
+        .arg("run")
+        .arg("build")
+        .arg("--workspace-root")
+        .arg(temp.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("✔ 1 ⏩ 0"));
+
+    let captured = fs::read_to_string(&env_capture).expect("read env capture");
+    assert!(
+        captured.contains("LUCHTA_TEST_GLOBAL_DEFAULT=global-fallback"),
+        "global-scope default should reach subprocess: {captured}"
+    );
+    assert!(
+        captured.contains("LUCHTA_TEST_WORKER_DEFAULT=worker-fallback"),
+        "worker-scope default should reach subprocess: {captured}"
+    );
+    assert!(
+        captured.contains("LUCHTA_TEST_TASK_DEFAULT=task-fallback"),
+        "task-scope default should reach subprocess: {captured}"
+    );
+    assert!(
+        captured.contains("LUCHTA_TEST_AMBIENT_WINS=ambient-value"),
+        "ambient value should override the declared default: {captured}"
+    );
+
+    temp.close().expect("cleanup temp dir");
+}
+
 fn wait_for_file(path: &Path, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     while !path.exists() {
