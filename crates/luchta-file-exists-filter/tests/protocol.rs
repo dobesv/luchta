@@ -276,3 +276,84 @@ fn resolve_uses_current_dir_when_cwd_missing() {
     assert_eq!(response["id"].as_str(), Some("job-root"));
     assert_eq!(response["result"]["decision"].as_str(), Some("accept"));
 }
+
+#[test]
+fn crashing_resolve_delegate_fails_without_pruning() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    fs::write(temp.path().join("workspace.config"), "present\n").expect("write file");
+    let input = format!(
+        "{}\n",
+        resolve_line(resolve_task("job-delegate-crash", None))
+    );
+    let mut command = Command::new(worker_bin());
+    command
+        .current_dir(temp.path())
+        .arg("workspace.config")
+        .arg("--")
+        .args(["sh", "-c", "read -r _line; exit 42"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = command.spawn().expect("spawn worker");
+    child
+        .stdin
+        .take()
+        .expect("stdin piped")
+        .write_all(input.as_bytes())
+        .expect("write request");
+    let output = child.wait_with_output().expect("wait for worker output");
+
+    assert!(!output.status.success(), "worker unexpectedly succeeded");
+    let stdout = String::from_utf8(output.stdout).expect("stdout utf8");
+    assert!(
+        stdout.lines().all(|line| {
+            let response: Value = serde_json::from_str(line).expect("valid jsonl response");
+            response["type"] != "resolved"
+        }),
+        "worker emitted synthetic resolved response: {stdout}"
+    );
+}
+
+#[test]
+fn pattern_evaluation_error_fails_without_pruning() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let input = format!(
+        "{}\n",
+        resolve_line(resolve_task("job-pattern-error", None))
+    );
+    let mut command = Command::new(worker_bin());
+    command
+        .current_dir(temp.path())
+        .arg("workspace.config")
+        .arg("--")
+        .args(["sh", "-c", "while IFS= read -r _line; do :; done"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = command.spawn().expect("spawn worker");
+    fs::remove_dir(temp.path()).expect("remove worker current directory");
+    child
+        .stdin
+        .take()
+        .expect("stdin piped")
+        .write_all(input.as_bytes())
+        .expect("write request");
+    let output = child.wait_with_output().expect("wait for worker output");
+
+    assert!(!output.status.success(), "worker unexpectedly succeeded");
+    let stderr = String::from_utf8(output.stderr).expect("stderr utf8");
+    assert!(
+        stderr.contains("failed to evaluate file-exists patterns"),
+        "unexpected stderr: {stderr}"
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout utf8");
+    assert!(
+        stdout.lines().all(|line| {
+            let response: Value = serde_json::from_str(line).expect("valid jsonl response");
+            response["type"] != "resolved"
+        }),
+        "worker emitted synthetic resolved response: {stdout}"
+    );
+}

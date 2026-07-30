@@ -26,6 +26,7 @@ enum ResolveDecisionSpec {
 #[derive(Clone, Copy)]
 enum DelegateBehavior<'a> {
     Ignore,
+    Crash,
     Sentinel(&'a Path),
     Resolve(ResolveDecisionSpec),
     LogThenResolve {
@@ -132,6 +133,7 @@ fn resolve_worker_argv(id: CaseId, decision: ResolveDecisionSpec) -> Vec<String>
 fn delegate_argv(id: CaseId, behavior: DelegateBehavior<'_>) -> Vec<String> {
     let script = match behavior {
         DelegateBehavior::Ignore => "while IFS= read -r _line; do :; done\n".to_owned(),
+        DelegateBehavior::Crash => "read -r _line; exit 42\n".to_owned(),
         DelegateBehavior::Sentinel(path) => {
             format!(
                 "while IFS= read -r _line; do\n  touch '{}'\ndone\n",
@@ -264,8 +266,23 @@ fn assert_resolve_case(case: ResolveCase<'_>) {
     }
 }
 
+fn assert_failed_without_resolved(output: &Output) {
+    assert!(
+        !output.status.success(),
+        "worker unexpectedly succeeded: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        parse_jsonl(&output.stdout)
+            .iter()
+            .all(|response| response["type"] != "resolved"),
+        "worker emitted synthetic resolved response: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
 #[test]
-fn resolve_worker_errors_returns_prune() {
+fn resolve_worker_crash_fails_without_pruning() {
     let id = CaseId("resolve-error");
     let output = run_worker(
         &shell_program("exit 1"),
@@ -273,9 +290,34 @@ fn resolve_worker_errors_returns_prune() {
         &[resolve_message(id)],
     );
 
-    let responses = assert_resolved_count_one(&output);
-    assert_eq!(responses[0]["id"], id.as_str());
-    assert_eq!(responses[0]["result"]["decision"], "prune");
+    assert_failed_without_resolved(&output);
+}
+
+#[test]
+fn run_delegate_crash_after_accept_fails_without_pruning() {
+    let id = CaseId("accept-delegate-crash");
+    let output = run_worker(
+        &resolve_worker_argv(id, ResolveDecisionSpec::Accept),
+        &delegate_argv(id, DelegateBehavior::Crash),
+        &[resolve_message(id)],
+    );
+
+    assert_failed_without_resolved(&output);
+}
+
+#[test]
+fn run_delegate_crash_after_modify_fails_without_pruning() {
+    let id = CaseId("modify-delegate-crash");
+    let output = run_worker(
+        &resolve_worker_argv(
+            id,
+            ResolveDecisionSpec::ModifyCommand(Text("build:modified")),
+        ),
+        &delegate_argv(id, DelegateBehavior::Crash),
+        &[resolve_message(id)],
+    );
+
+    assert_failed_without_resolved(&output);
 }
 
 #[test]

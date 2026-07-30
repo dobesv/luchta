@@ -318,6 +318,20 @@ impl DelegateHandle {
         self.exit_status.lock().await.as_ref().copied()
     }
 
+    /// Format a diagnostic for a delegate failure with command and exit status.
+    pub async fn failure_message(&self, context: &str, error: ProxyError) -> String {
+        let exit = match self.exit_status().await {
+            Some(status) => status.to_string(),
+            None => "<unknown>".to_owned(),
+        };
+        format!(
+            "{context}: command={:?}, exit={}, error={}",
+            self.delegate_command(),
+            exit,
+            error
+        )
+    }
+
     pub async fn shutdown(&self) -> Result<(), ProxyError> {
         let state = self.state.lock().await.take();
         if let Some(state) = state {
