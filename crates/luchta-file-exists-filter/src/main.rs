@@ -15,8 +15,8 @@ type SharedWriter = Arc<Mutex<Box<dyn AsyncWrite + Unpin + Send>>>;
 
 /// Bound on how long the delegate may take to answer a forwarded `resolve`.
 /// `resolve` runs during graph build and must be fast; a delegate that is alive
-/// but never responds would otherwise hang the whole build. On timeout we treat
-/// the task as pruned (clean error, no hang).
+/// but never responds would otherwise hang the whole build. A timeout fails the
+/// worker.
 const RESOLVE_FORWARD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 fn main() {
@@ -113,25 +113,17 @@ async fn async_main() -> i32 {
                             )
                             .await
                         {
-                            let exit = match delegate.exit_status().await {
-                                Some(status) => status.to_string(),
-                                None => "<unknown>".to_owned(),
-                            };
                             eprintln!(
-                                "delegate failed before resolve decision: command={:?}, exit={}, error={}",
-                                delegate.delegate_command(),
-                                exit,
-                                error
+                                "{}",
+                                delegate
+                                    .failure_message(
+                                        "delegate failed before resolve decision",
+                                        error,
+                                    )
+                                    .await
                             );
-                            let response =
-                                WorkerResponse::resolved(request_id, ResolveResult::prune(None));
-                            if let Err(write_error) =
-                                write_response(&stdout_writer, &response).await
-                            {
-                                eprintln!("failed to write resolve fallback: {write_error}");
-                                exit_code = 1;
-                                break;
-                            }
+                            exit_code = 1;
+                            break;
                         }
                     }
                     Ok(false) => {
@@ -144,28 +136,19 @@ async fn async_main() -> i32 {
                         }
                     }
                     Err(error) => {
-                        eprintln!("failed to evaluate file-exists patterns: {error}");
-                        let response =
-                            WorkerResponse::resolved(request_id, ResolveResult::prune(None));
-                        if let Err(write_error) = write_response(&stdout_writer, &response).await {
-                            eprintln!("failed to write resolve fallback: {write_error}");
-                            exit_code = 1;
-                            break;
-                        }
+                        eprintln!(
+                            "failed to evaluate file-exists patterns: patterns={patterns:?}, error={error}"
+                        );
+                        exit_code = 1;
+                        break;
                     }
                 }
             }
             WorkerMessage::Run(request) => {
                 if let Err(error) = delegate.send(WorkerMessage::Run(request)).await {
-                    let exit = match delegate.exit_status().await {
-                        Some(status) => status.to_string(),
-                        None => "<unknown>".to_owned(),
-                    };
                     eprintln!(
-                        "delegate failed: command={:?}, exit={}, error={}",
-                        delegate.delegate_command(),
-                        exit,
-                        error
+                        "{}",
+                        delegate.failure_message("delegate failed", error).await
                     );
                     exit_code = 1;
                     break;

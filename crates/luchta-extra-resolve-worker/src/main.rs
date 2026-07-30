@@ -230,7 +230,12 @@ async fn handle_resolve_task(app: &App, resolve: ResolveTask) -> Result<(), Stri
     let resolve_id = resolve.id.clone();
     let result = match resolve_via_delegate(&app.resolve_delegate, resolve.clone()).await {
         Ok(result) => result,
-        Err(_) => return emit_prune(app, resolve_id).await,
+        Err(error) => {
+            return Err(app
+                .resolve_delegate
+                .failure_message("delegate failed before resolve decision", error)
+                .await);
+        }
     };
 
     match result.decision {
@@ -250,7 +255,10 @@ async fn handle_resolve_task(app: &App, resolve: ResolveTask) -> Result<(), Stri
 async fn handle_accept(app: &App, resolve_id: String, resolve: ResolveTask) -> Result<(), String> {
     match resolve_via_run_delegate(app, resolve).await {
         Ok(result) => emit_resolve_result(app, resolve_id, result).await,
-        Err(_) => emit_prune(app, resolve_id).await,
+        Err(error) => Err(app
+            .run_delegate
+            .failure_message("delegate failed before resolve decision", error)
+            .await),
     }
 }
 
@@ -263,7 +271,12 @@ async fn handle_modify(
     let modified_resolve = apply_modification(&original_resolve, &modification);
     let delegate_result = match resolve_via_run_delegate(app, modified_resolve).await {
         Ok(result) => result,
-        Err(_) => return emit_prune(app, resolve_id).await,
+        Err(error) => {
+            return Err(app
+                .run_delegate
+                .failure_message("delegate failed before resolve decision", error)
+                .await);
+        }
     };
 
     match delegate_result.decision {
@@ -277,16 +290,10 @@ async fn handle_modify(
 
 async fn handle_run_request(app: &App, request: WorkerRequest) -> Result<(), String> {
     if let Err(error) = app.run_delegate.send(WorkerMessage::Run(request)).await {
-        let exit = match app.run_delegate.exit_status().await {
-            Some(status) => status.to_string(),
-            None => "<unknown>".to_owned(),
-        };
-        return Err(format!(
-            "delegate failed: command={:?}, exit={}, error={}",
-            app.run_delegate.delegate_command(),
-            exit,
-            error
-        ));
+        return Err(app
+            .run_delegate
+            .failure_message("delegate failed", error)
+            .await);
     }
 
     Ok(())
@@ -349,10 +356,6 @@ async fn emit_resolve_result(
     write_response(&app.stdout_writer, &response)
         .await
         .map_err(|error| format!("failed to write resolve response: {error}"))
-}
-
-async fn emit_prune(app: &App, resolve_id: String) -> Result<(), String> {
-    emit_resolve_result(app, resolve_id, ResolveResult::prune(None)).await
 }
 
 async fn write_response(

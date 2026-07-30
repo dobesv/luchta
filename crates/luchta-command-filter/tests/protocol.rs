@@ -178,3 +178,40 @@ fn run_forwards_done_from_delegate() {
     assert_eq!(responses[0]["id"], "run-done");
     assert_eq!(responses[0]["exitCode"], 0);
 }
+
+#[test]
+fn crashing_resolve_delegate_fails_without_pruning() {
+    let output = run_filter(
+        &["sh", "-c", "exit 0"],
+        "read -r _line; exit 42",
+        &[resolve_message("resolve-crash")],
+    );
+
+    assert!(!output.status.success(), "worker unexpectedly succeeded");
+    let responses = parse_jsonl(&output.stdout);
+    assert!(
+        responses
+            .iter()
+            .all(|response| response["type"] != "resolved"),
+        "worker emitted synthetic resolved response: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
+fn failing_predicate_fails_without_pruning() {
+    let output = run_filter(
+        &["definitely-not-a-real-command"],
+        "while IFS= read -r _line; do :; done",
+        &[resolve_message("predicate-crash")],
+    );
+
+    assert!(!output.status.success(), "worker unexpectedly succeeded");
+    assert!(
+        parse_jsonl(&output.stdout)
+            .iter()
+            .all(|response| response["type"] != "resolved"),
+        "worker emitted synthetic resolved response: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
