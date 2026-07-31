@@ -2,8 +2,9 @@
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 
-use ignore::{DirEntry, WalkBuilder};
+use ignore::{DirEntry, WalkBuilder, WalkState};
 use oxc_linter::{
     ConfigStore, ConfigStoreBuilder, ExternalPluginStore, LintIgnoreMatcher, Oxlintrc,
 };
@@ -85,6 +86,61 @@ pub fn collect_target_files(
     ignore_base: &Path,
 ) -> Result<(Vec<PathBuf>, Vec<String>), String> {
     let ignore_matcher = LintIgnoreMatcher::new(ignore_patterns, ignore_base, Vec::new());
+    let (mut builder, warnings) = target_walk_builder(cwd);
+    let threads = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    let walker = builder.threads(threads).build_parallel();
+
+    let (tx, rx) = mpsc::channel::<Result<PathBuf, String>>();
+    let matcher = &ignore_matcher;
+    walker.run(|| {
+        let tx = tx.clone();
+        Box::new(move |entry| match entry {
+            Ok(entry) => {
+                if is_target_entry(&entry, matcher) && tx.send(Ok(entry.into_path())).is_err() {
+                    return WalkState::Quit;
+                }
+                WalkState::Continue
+            }
+            Err(error) => {
+                let _ = tx.send(Err(format!(
+                    "failed to walk workspace for sources: {error}"
+                )));
+                WalkState::Quit
+            }
+        })
+    });
+    drop(tx);
+
+    let mut files = Vec::new();
+    for item in rx {
+        files.push(item?);
+    }
+    files.sort();
+    files.dedup();
+    Ok((files, warnings))
+}
+
+/// Resolve-phase probe: reports whether any lintable file exists, stopping at
+/// the first match instead of walking the whole tree. The full (parallel)
+/// walk happens once, at run time, in [`collect_target_files`].
+pub fn has_target_files(
+    cwd: &Path,
+    ignore_patterns: &[String],
+    ignore_base: &Path,
+) -> Result<(bool, Vec<String>), String> {
+    let ignore_matcher = LintIgnoreMatcher::new(ignore_patterns, ignore_base, Vec::new());
+    let (builder, warnings) = target_walk_builder(cwd);
+    for entry in builder.build() {
+        let entry =
+            entry.map_err(|error| format!("failed to walk workspace for sources: {error}"))?;
+        if is_target_entry(&entry, &ignore_matcher) {
+            return Ok((true, warnings));
+        }
+    }
+    Ok((false, warnings))
+}
+
+fn target_walk_builder(cwd: &Path) -> (WalkBuilder, Vec<String>) {
     let mut builder = WalkBuilder::new(cwd);
     builder
         .hidden(false)
@@ -108,20 +164,17 @@ pub fn collect_target_files(
             ));
         }
     }
+    (builder, warnings)
+}
 
-    let mut files = Vec::new();
-    for entry in builder.build() {
-        let entry =
-            entry.map_err(|error| format!("failed to walk workspace for sources: {error}"))?;
-        let path = entry.into_path();
-        if path.is_dir() || !is_js_ts_source(&path) || ignore_matcher.should_ignore(&path) {
-            continue;
-        }
-        files.push(path);
-    }
-    files.sort();
-    files.dedup();
-    Ok((files, warnings))
+fn is_target_entry(entry: &DirEntry, ignore_matcher: &LintIgnoreMatcher) -> bool {
+    // With follow_links enabled, file_type() reflects the followed target and
+    // avoids the extra stat that a path.is_dir() call would issue per entry.
+    entry
+        .file_type()
+        .is_some_and(|file_type| !file_type.is_dir())
+        && is_js_ts_source(entry.path())
+        && !ignore_matcher.should_ignore(entry.path())
 }
 
 fn find_root_config_path(cwd: &Path) -> Option<PathBuf> {
@@ -168,7 +221,7 @@ mod tests {
 
     use assert_fs::TempDir;
 
-    use super::{collect_target_files, discover_config};
+    use super::{collect_target_files, discover_config, has_target_files};
 
     #[test]
     fn collect_target_files_skips_gitignored_directory() {
@@ -325,6 +378,34 @@ mod tests {
 
         assert!(warnings.is_empty(), "warnings: {warnings:?}");
         assert_eq!(relative_paths(cwd, files), vec!["src/foo.ts"]);
+    }
+
+    #[test]
+    fn has_target_files_finds_source_and_respects_ignores() {
+        let temp = TempDir::new().expect("tempdir");
+        let cwd = temp.path();
+        fs::create_dir_all(cwd.join("src")).expect("src");
+        fs::write(cwd.join("src/foo.ts"), "export const foo = 1;\n").expect("src file");
+
+        let (found, warnings) = has_target_files(cwd, &[], cwd).expect("probe");
+        assert!(warnings.is_empty(), "warnings: {warnings:?}");
+        assert!(found);
+
+        let (found, _) =
+            has_target_files(cwd, &["src/foo.ts".to_owned()], cwd).expect("probe with ignore");
+        assert!(!found, "ignored file should not count as a target");
+    }
+
+    #[test]
+    fn has_target_files_is_false_for_empty_tree() {
+        let temp = TempDir::new().expect("tempdir");
+        let cwd = temp.path();
+        fs::create_dir_all(cwd.join("docs")).expect("docs");
+        fs::write(cwd.join("docs/readme.md"), "hi\n").expect("md file");
+
+        let (found, warnings) = has_target_files(cwd, &[], cwd).expect("probe");
+        assert!(warnings.is_empty(), "warnings: {warnings:?}");
+        assert!(!found);
     }
 
     fn relative_paths(cwd: &std::path::Path, files: Vec<std::path::PathBuf>) -> Vec<String> {

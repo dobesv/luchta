@@ -19,6 +19,14 @@ serde_json = { workspace = true }
 tokio = { workspace = true }
 swc_core = { workspace = true, optional = true, features = ["base_react_compiler"] }
 
+# mimalloc as the global allocator — see luchta-oxlint-worker/Cargo.toml for
+# the rationale and target gating notes.
+[target.'cfg(not(any(target_os = "linux", target_os = "freebsd", target_arch = "arm", target_arch = "riscv64", target_family = "wasm")))'.dependencies]
+mimalloc = { workspace = true }
+
+[target.'cfg(all(target_os = "linux", not(target_arch = "arm"), not(target_arch = "riscv64")))'.dependencies]
+mimalloc = { workspace = true, features = ["local_dynamic_tls"] }
+
 [dev-dependencies]
 assert_fs = { workspace = true }
 tempfile = { workspace = true }

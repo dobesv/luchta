@@ -1,14 +1,3 @@
-# tsgo.patch
-# pinned upstream SHA: 2bd066d87f5bafd315be9f40889d0a60b9e58e0b (tag typescript/v7.0.2 — TypeScript 7.0 GA)
-# Applies on top of the submodule pinned in vendor/tsgo. Adds Yarn PnP module
-# resolution (internal/pnp, internal/vfs/pnpvfs, resolver/modulespecifiers hooks)
-# and the luchta-tsc-worker glue (internal/luchta, cmd/luchta-tsc-worker).
-# regenerate: check out vendor/tsgo at the pinned SHA, apply this patch, resolve
-#   any rejects, then: git -C vendor/tsgo add -A && \
-#   git -C vendor/tsgo diff --binary --staged 2bd066d87f5bafd315be9f40889d0a60b9e58e0b > patches/tsgo.patch
-# NOTE: always use --binary (CRLF preservation); .gitattributes keeps this file -text.
-#   The Yarn PnP runtime fixtures (testdata/fixtures/pnp/*.cjs) are intentionally
-#   included so the vendored pnp tests are self-contained.
 diff --git a/Herebyfile.mjs b/Herebyfile.mjs
 index c3fd9a5c9..4fc4a5b5f 100644
 --- a/Herebyfile.mjs
@@ -1237,10 +1226,10 @@ index 8a0b7214c..4ad55f8d0 100644
  		NpmExecutor: s,
 diff --git a/internal/luchta/compile.go b/internal/luchta/compile.go
 new file mode 100644
-index 000000000..feb693348
+index 000000000..06f503d44
 --- /dev/null
 +++ b/internal/luchta/compile.go
-@@ -0,0 +1,252 @@
+@@ -0,0 +1,255 @@
 +package luchta
 +
 +import (
@@ -1283,7 +1272,10 @@ index 000000000..feb693348
 +// when not a PnP workspace).
 +func compilerFS(cwd string) (vfs.FS, *pnp.PnpApi) {
 +	fsys := bundled.WrapFS(osvfs.FS())
-+	pnpApi := pnp.InitPnpApi(fsys, cwd) // nil when there is no .pnp.cjs above cwd
++	// Cached variant: the worker compiles every package in the workspace from
++	// one process, and re-parsing the multi-MB .pnp.cjs per package costs tens
++	// of milliseconds each plus GC churn. The cache revalidates by size+mtime.
++	pnpApi := pnp.InitPnpApiCached(fsys, cwd) // nil when there is no .pnp.cjs above cwd
 +	if pnpApi != nil {
 +		fsys = pnpvfs.From(fsys)
 +	}
@@ -1495,7 +1487,7 @@ index 000000000..feb693348
 +}
 diff --git a/internal/luchta/compile_test.go b/internal/luchta/compile_test.go
 new file mode 100644
-index 000000000..55eeb8c0e
+index 000000000..3335dbd1b
 --- /dev/null
 +++ b/internal/luchta/compile_test.go
 @@ -0,0 +1,316 @@
@@ -2268,7 +2260,7 @@ index 000000000..909e7abd0
 +}
 diff --git a/internal/luchta/sarif.go b/internal/luchta/sarif.go
 new file mode 100644
-index 000000000..e184b5182
+index 000000000..04d343468
 --- /dev/null
 +++ b/internal/luchta/sarif.go
 @@ -0,0 +1,159 @@
@@ -2475,10 +2467,10 @@ index 000000000..cb44e392f
 +func (s *runSystem) PnpApi() *pnp.PnpApi                       { return s.pnpApi }
 diff --git a/internal/luchta/worker.go b/internal/luchta/worker.go
 new file mode 100644
-index 000000000..ee45e2b21
+index 000000000..57502527b
 --- /dev/null
 +++ b/internal/luchta/worker.go
-@@ -0,0 +1,109 @@
+@@ -0,0 +1,124 @@
 +package luchta
 +
 +import (
@@ -2523,7 +2515,15 @@ index 000000000..ee45e2b21
 +		}
 +		switch m := msg.(type) {
 +		case *ResolveTask:
-+			handleResolveTask(w, m, errw)
++			// Off the read loop: ResolveInputs parses tsconfigs (filesystem
++			// work), and the resolve phase sends one of these per package.
++			// Handling them inline would serialize resolves and delay
++			// dispatch of any Run messages queued behind them.
++			wg.Add(1)
++			go func(task *ResolveTask) {
++				defer wg.Done()
++				handleResolveTask(w, task, errw)
++			}(m)
 +		case *Run:
 +			wg.Add(1)
 +			go func(run *Run) {
@@ -2558,6 +2558,13 @@ index 000000000..ee45e2b21
 +}
 +
 +func handleResolveTask(w *Writer, task *ResolveTask, errw io.Writer) {
++	defer func() {
++		if r := recover(); r != nil {
++			fmt.Fprintf(errw, "luchta-tsc-worker: resolve panic: %v\n", r)
++			// Fall back to accept, same as the ResolveInputs error path below.
++			w.ResolvedAccept(task.ID)
++		}
++	}()
 +	workerInputs, err := ResolveInputs(task.Cwd)
 +	if err != nil {
 +		fmt.Fprintf(errw, "luchta-tsc-worker: resolve inputs: %v\n", err)
@@ -3628,15 +3635,19 @@ index 000000000..283da74ee
 +}
 diff --git a/internal/pnp/pnp.go b/internal/pnp/pnp.go
 new file mode 100644
-index 000000000..c1ef2598d
+index 000000000..f5f8b1d0b
 --- /dev/null
 +++ b/internal/pnp/pnp.go
-@@ -0,0 +1,23 @@
+@@ -0,0 +1,110 @@
 +package pnp
 +
 +import (
++	"os"
 +	"strings"
++	"sync"
++	"time"
 +
++	"github.com/microsoft/typescript-go/internal/tspath"
 +	"github.com/microsoft/typescript-go/internal/vfs"
 +)
 +
@@ -3652,15 +3663,183 @@ index 000000000..c1ef2598d
 +	return nil
 +}
 +
++// fileIdentity captures the on-disk identity of a manifest source file so a
++// cached parse can be validated without re-reading the file.
++type fileIdentity struct {
++	exists  bool
++	size    int64
++	modTime time.Time
++}
++
++func identityOf(path string) fileIdentity {
++	info, err := os.Stat(path)
++	if err != nil {
++		return fileIdentity{}
++	}
++	return fileIdentity{exists: true, size: info.Size(), modTime: info.ModTime()}
++}
++
++type cachedManifest struct {
++	manifest *PnpManifestData
++	// parseManifestFromPath reads .pnp.data.json when present, otherwise the
++	// data blob embedded in .pnp.cjs — so both identities gate reuse.
++	cjs  fileIdentity
++	data fileIdentity
++}
++
++var manifestCache sync.Map // manifest dir (normalized) -> *cachedManifest
++
++// InitPnpApiCached is InitPnpApi backed by a process-wide cache of parsed
++// manifests, for long-lived processes that compile many packages under one
++// workspace. The workspace .pnp.cjs is multiple MB and parsing it costs tens
++// of milliseconds; without the cache every compilation pays that again.
++// A cached manifest is reused only while the size and mtime of .pnp.cjs and
++// .pnp.data.json are unchanged, so manifest rewrites (e.g. yarn install
++// during watch) are picked up.
++//
++// The returned PnpApi shares the cached manifest with other callers and must
++// be treated as read-only; do not call RefreshManifest on it.
++func InitPnpApiCached(fs vfs.FS, filePath string) *PnpApi {
++	manifestDir := findClosestPnpManifestDir(fs, filePath)
++	if manifestDir == "" {
++		return nil
++	}
++
++	cjs := identityOf(tspath.CombinePaths(manifestDir, ".pnp.cjs"))
++	if !cjs.exists {
++		// FileExists saw the manifest but os.Stat cannot (e.g. a virtual test
++		// FS); fall back to the uncached path.
++		return InitPnpApi(fs, filePath)
++	}
++	data := identityOf(tspath.CombinePaths(manifestDir, ".pnp.data.json"))
++
++	if value, ok := manifestCache.Load(manifestDir); ok {
++		cached := value.(*cachedManifest)
++		if cached.cjs == cjs && cached.data == data {
++			return &PnpApi{fs: fs, url: filePath, manifest: cached.manifest}
++		}
++	}
++
++	manifest, err := parseManifestFromPath(fs, manifestDir)
++	if err != nil {
++		return nil
++	}
++	manifestCache.Store(manifestDir, &cachedManifest{manifest: manifest, cjs: cjs, data: data})
++	return &PnpApi{fs: fs, url: filePath, manifest: manifest}
++}
++
++// findClosestPnpManifestDir walks up from filePath and returns the first
++// directory containing a .pnp.cjs manifest, or "" when there is none.
++func findClosestPnpManifestDir(fs vfs.FS, filePath string) string {
++	directoryPath := tspath.GetNormalizedAbsolutePath(filePath, "/")
++
++	for {
++		if fs.FileExists(tspath.CombinePaths(directoryPath, ".pnp.cjs")) {
++			return directoryPath
++		}
++
++		if tspath.IsDiskPathRoot(directoryPath) {
++			return ""
++		}
++
++		directoryPath = tspath.GetDirectoryPath(directoryPath)
++	}
++}
++
 +func IsPnpLoaderFile(path string) bool {
 +	return strings.HasSuffix(path, ".pnp.cjs")
 +}
+diff --git a/internal/pnp/pnp_test.go b/internal/pnp/pnp_test.go
+new file mode 100644
+index 000000000..7ceec8d6b
+--- /dev/null
++++ b/internal/pnp/pnp_test.go
+@@ -0,0 +1,79 @@
++package pnp
++
++import (
++	"os"
++	"path/filepath"
++	"testing"
++	"time"
++
++	"github.com/microsoft/typescript-go/internal/repo"
++	"github.com/microsoft/typescript-go/internal/vfs/osvfs"
++)
++
++func writeFixtureManifest(t *testing.T, dir string) {
++	t.Helper()
++	fixture := filepath.Join(repo.TestDataPath(), "fixtures", "pnp", "pnp-yarn-v4.cjs")
++	content, err := os.ReadFile(fixture)
++	if err != nil {
++		t.Fatalf("read fixture: %v", err)
++	}
++	if err := os.WriteFile(filepath.Join(dir, ".pnp.cjs"), content, 0o644); err != nil {
++		t.Fatalf("write manifest: %v", err)
++	}
++}
++
++func TestInitPnpApiCachedReusesParsedManifest(t *testing.T) {
++	t.Parallel()
++	root := t.TempDir()
++	writeFixtureManifest(t, root)
++	pkg := filepath.Join(root, "packages", "app")
++	if err := os.MkdirAll(pkg, 0o755); err != nil {
++		t.Fatalf("mkdir: %v", err)
++	}
++
++	first := InitPnpApiCached(osvfs.FS(), pkg)
++	if first == nil {
++		t.Fatal("expected PnpApi for workspace with .pnp.cjs")
++	}
++	second := InitPnpApiCached(osvfs.FS(), root)
++	if second == nil {
++		t.Fatal("expected PnpApi on second lookup")
++	}
++	if first.manifest != second.manifest {
++		t.Fatal("expected cached manifest to be reused while file is unchanged")
++	}
++}
++
++func TestInitPnpApiCachedReparsesWhenManifestChanges(t *testing.T) {
++	t.Parallel()
++	root := t.TempDir()
++	writeFixtureManifest(t, root)
++
++	first := InitPnpApiCached(osvfs.FS(), root)
++	if first == nil {
++		t.Fatal("expected PnpApi for workspace with .pnp.cjs")
++	}
++
++	// Force a different mtime; same-instant rewrites could otherwise be
++	// indistinguishable on coarse-timestamp filesystems.
++	manifestPath := filepath.Join(root, ".pnp.cjs")
++	newTime := time.Now().Add(2 * time.Second)
++	if err := os.Chtimes(manifestPath, newTime, newTime); err != nil {
++		t.Fatalf("chtimes: %v", err)
++	}
++
++	second := InitPnpApiCached(osvfs.FS(), root)
++	if second == nil {
++		t.Fatal("expected PnpApi after manifest touch")
++	}
++	if first.manifest == second.manifest {
++		t.Fatal("expected manifest to be re-parsed after mtime change")
++	}
++}
++
++func TestInitPnpApiCachedReturnsNilWithoutManifest(t *testing.T) {
++	t.Parallel()
++	if api := InitPnpApiCached(osvfs.FS(), t.TempDir()); api != nil {
++		t.Fatal("expected nil PnpApi when no .pnp.cjs exists")
++	}
++}
 diff --git a/internal/pnp/pnpapi.go b/internal/pnp/pnpapi.go
 new file mode 100644
-index 000000000..0fb2efe30
+index 000000000..dee0e68c3
 --- /dev/null
 +++ b/internal/pnp/pnpapi.go
-@@ -0,0 +1,388 @@
+@@ -0,0 +1,379 @@
 +package pnp
 +
 +/*
@@ -3818,20 +3997,11 @@ index 000000000..0fb2efe30
 +}
 +
 +func (p *PnpApi) findClosestPnpManifest() (*PnpManifestData, error) {
-+	directoryPath := tspath.GetNormalizedAbsolutePath(p.url, "/")
-+
-+	for {
-+		pnpPath := tspath.CombinePaths(directoryPath, ".pnp.cjs")
-+		if p.fs.FileExists(pnpPath) {
-+			return parseManifestFromPath(p.fs, directoryPath)
-+		}
-+
-+		if tspath.IsDiskPathRoot(directoryPath) {
-+			return nil, errors.New("no PnP manifest found")
-+		}
-+
-+		directoryPath = tspath.GetDirectoryPath(directoryPath)
++	directoryPath := findClosestPnpManifestDir(p.fs, p.url)
++	if directoryPath == "" {
++		return nil, errors.New("no PnP manifest found")
 +	}
++	return parseManifestFromPath(p.fs, directoryPath)
 +}
 +
 +func (p *PnpApi) GetPackage(locator *Locator) *PackageInfo {

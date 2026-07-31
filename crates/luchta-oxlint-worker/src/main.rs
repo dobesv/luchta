@@ -19,7 +19,7 @@ use luchta_worker::{
 };
 
 #[cfg(feature = "oxc")]
-use crate::config::{collect_target_files, discover_config};
+use crate::config::{collect_target_files, discover_config, has_target_files};
 #[cfg(feature = "oxc")]
 use crate::lint::{has_error, initial_suppression_action, lint_files};
 #[cfg(feature = "oxc")]
@@ -30,6 +30,18 @@ use crate::sarif::build_sarif;
 use crate::suppressions::{
     suppression_exit_code, suppression_log_lines, FinalizeResult, SUPPRESSIONS_FILENAME,
 };
+
+// Same cfg gate as oxlint's own binary: mimalloc is not available/wanted on
+// these targets (and the dependency is only declared for the others).
+#[cfg(not(any(
+    target_arch = "arm",
+    target_arch = "riscv64",
+    miri,
+    target_os = "freebsd",
+    target_family = "wasm"
+)))]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[cfg(feature = "oxc")]
 struct OxlintWorker;
@@ -53,8 +65,8 @@ impl Worker for OxlintWorker {
             Ok(loaded) => loaded,
             Err(error) => return ResolveResult::reject(error),
         };
-        let (files, warnings) =
-            match collect_target_files(cwd, &loaded.ignore_patterns, &loaded.ignore_base) {
+        let (has_files, warnings) =
+            match has_target_files(cwd, &loaded.ignore_patterns, &loaded.ignore_base) {
                 Ok(result) => result,
                 Err(error) => return ResolveResult::reject(error),
             };
@@ -62,7 +74,7 @@ impl Worker for OxlintWorker {
             return ResolveResult::reject(warnings.join("; "));
         }
 
-        if files.is_empty() {
+        if !has_files {
             return ResolveResult::prune(Some("no JS/TS source files found for oxlint".to_owned()));
         }
 
@@ -210,29 +222,26 @@ impl Worker for OxlintWorker {
                 }
             }
 
-            let findings = results.findings.clone();
-            for finding in &findings {
-                let line = format!(
+            let findings = &results.findings;
+            let finding_lines = findings.iter().map(|finding| {
+                format!(
                     "{}:{}:{}: {} [{}] {}",
                     finding.relative_uri,
                     finding.start_line,
                     finding.start_column,
                     severity_label(finding.severity),
-                    finding
-                        .rule_id
-                        .clone()
-                        .unwrap_or_else(|| "unknown".to_owned()),
+                    finding.rule_id.as_deref().unwrap_or("unknown"),
                     finding.message
-                );
-                if let Err(error) = ctx.emit_stdout(line).await {
-                    let _ = ctx
-                        .emit_stderr(format!("failed to emit oxlint log: {error}"))
-                        .await;
-                    return InProcessOutcome::Done {
-                        exit_code: 1,
-                        outputs: None,
-                    };
-                }
+                )
+            });
+            if let Err(error) = ctx.emit_stdout_lines(finding_lines).await {
+                let _ = ctx
+                    .emit_stderr(format!("failed to emit oxlint log: {error}"))
+                    .await;
+                return InProcessOutcome::Done {
+                    exit_code: 1,
+                    outputs: None,
+                };
             }
 
             for line in suppression_log_lines(&results.finalize) {
@@ -247,9 +256,9 @@ impl Worker for OxlintWorker {
                 }
             }
 
-            let exit_code = if has_error(&findings) { 1 } else { 0 };
+            let exit_code = if has_error(findings) { 1 } else { 0 };
             if !findings.is_empty() {
-                let report = match build_sarif(&findings) {
+                let report = match build_sarif(findings) {
                     Ok(report) => report,
                     Err(error) => {
                         let _ = ctx.emit_stderr(error).await;

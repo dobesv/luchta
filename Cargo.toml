@@ -79,6 +79,9 @@ fs2 = "0.4.3"
 ignore = "0.4.27"
 notify = "6"
 notify-debouncer-full = "0.3"
+# Plain `mimalloc` rather than oxlint's `mimalloc-safe`: the latter builds via
+# cmake, which we don't want to require of every build environment.
+mimalloc = "0.1.43"
 
 # oxc toolchain pinned to a single main rev 415fe1e7bb423cf05019c5e2c9a5705eebbc5447
 # (see plan note open-verification-items). Requires Rust >= 1.94.
@@ -99,3 +102,13 @@ serde-sarif = "0.8.0"
 
 # swc pinned exact — SWC breaks public API on minor bumps. See plan note a394e139 (probe).
 swc_core = { version = "=74.0.2", features = ["base_module", "common", "ecma_ast", "ecma_parser", "ecma_helpers_inline"] }
+
+# Match oxlint's own release settings (fat LTO, one codegen unit) so the
+# bundled oxc crates run at full speed; without this the workers lint
+# noticeably slower than the native oxlint binary. `panic = "abort"` is
+# deliberately NOT set: workers are persistent processes that must survive a
+# panicking job (panics are caught at spawn_blocking/JoinSet boundaries).
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"

@@ -39,6 +39,17 @@ rustc-hash = "2.1.1"
 serde = { workspace = true, optional = true, features = ["derive"] }
 serde_json = { workspace = true, optional = true }
 
+# mimalloc as the global allocator, with target gating modeled on oxlint's
+# (apps/oxlint/Cargo.toml). oxc is allocation-heavy outside its arena; the
+# system allocator (especially musl's, used by the Linux release targets) is
+# markedly slower under rayon parallelism. `local_dynamic_tls` avoids TLS
+# crashes in static/musl builds.
+[target.'cfg(not(any(target_os = "linux", target_os = "freebsd", target_arch = "arm", target_arch = "riscv64", target_family = "wasm")))'.dependencies]
+mimalloc = { workspace = true }
+
+[target.'cfg(all(target_os = "linux", not(target_arch = "arm"), not(target_arch = "riscv64")))'.dependencies]
+mimalloc = { workspace = true, features = ["local_dynamic_tls"] }
+
 [dev-dependencies]
 assert_cmd = { workspace = true }
 assert_fs = { workspace = true }

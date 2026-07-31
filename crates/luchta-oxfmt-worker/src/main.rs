@@ -1,3 +1,15 @@
+// Same cfg gate as the mimalloc dependency declarations; see
+// luchta-oxlint-worker/src/main.rs.
+#[cfg(not(any(
+    target_arch = "arm",
+    target_arch = "riscv64",
+    miri,
+    target_os = "freebsd",
+    target_family = "wasm"
+)))]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[cfg(feature = "oxc")]
 mod config;
 #[cfg(feature = "oxc")]
