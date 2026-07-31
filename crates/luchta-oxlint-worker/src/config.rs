@@ -170,7 +170,9 @@ fn target_walk_builder(cwd: &Path) -> (WalkBuilder, Vec<String>) {
 fn is_target_entry(entry: &DirEntry, ignore_matcher: &LintIgnoreMatcher) -> bool {
     // With follow_links enabled, file_type() reflects the followed target and
     // avoids the extra stat that a path.is_dir() call would issue per entry.
-    entry.file_type().is_some_and(|file_type| !file_type.is_dir())
+    entry
+        .file_type()
+        .is_some_and(|file_type| !file_type.is_dir())
         && is_js_ts_source(entry.path())
         && !ignore_matcher.should_ignore(entry.path())
 }
