@@ -63,6 +63,31 @@ impl JobContext {
         .await
     }
 
+    /// Emit many stdout lines with a single writer lock and flush.
+    ///
+    /// Prefer this over calling [`Self::emit_stdout`] in a loop: each single
+    /// emit serializes, locks, writes, and flushes the shared pipe, which is
+    /// a syscall per line.
+    pub async fn emit_stdout_lines<I>(&self, lines: I) -> Result<(), WorkerError>
+    where
+        I: IntoIterator,
+        I::Item: Into<String>,
+    {
+        let mut buffer = Vec::new();
+        for line in lines {
+            let response = WorkerResponse::log(self.id.clone(), LogStream::Stdout, line.into());
+            serde_json::to_writer(&mut buffer, &response)?;
+            buffer.push(b'\n');
+        }
+        if buffer.is_empty() {
+            return Ok(());
+        }
+        let mut writer = self.writer.lock().await;
+        writer.write_all(&buffer).await?;
+        writer.flush().await?;
+        Ok(())
+    }
+
     pub async fn emit_stderr(&self, line: impl Into<String>) -> Result<(), WorkerError> {
         write_response(
             &self.writer,
@@ -169,7 +194,15 @@ fn spawn_resolve<W: Worker>(
     let writer = Arc::clone(writer);
     jobs.spawn(async move {
         let id = resolve.id.clone();
-        let result = worker.resolve_task(&resolve);
+        // Resolve delegates do blocking filesystem work (config discovery,
+        // directory walks). Run them off the event loop so they don't stall
+        // protocol reads and log writes, and so concurrent resolves don't
+        // serialize behind each other on the current-thread runtime.
+        let result = tokio::task::spawn_blocking(move || worker.resolve_task(&resolve))
+            .await
+            .unwrap_or_else(|join_error| {
+                ResolveResult::reject(format!("resolve delegate panicked: {join_error}"))
+            });
         if let Err(error) = write_response(&writer, &WorkerResponse::resolved(id, result)).await {
             if !error.is_pipe_shutdown() {
                 eprintln!("resolve failed: {error}");
@@ -441,6 +474,30 @@ mod tests {
             responses.push(serde_json::from_str(&line).expect("decode response"));
         }
         responses
+    }
+
+    #[tokio::test]
+    async fn emit_stdout_lines_writes_one_log_response_per_line() {
+        let (writer, reader) = writer_pair();
+        let ctx = JobContext::new("job-1".to_owned(), Arc::clone(&writer));
+
+        ctx.emit_stdout_lines(["first".to_owned(), "second".to_owned()])
+            .await
+            .expect("batch emit succeeds");
+        ctx.emit_stdout_lines(Vec::<String>::new())
+            .await
+            .expect("empty batch is a no-op");
+        drop(ctx);
+        drop(writer);
+        let responses = read_responses(reader).await;
+
+        assert_eq!(
+            responses,
+            vec![
+                WorkerResponse::log("job-1", LogStream::Stdout, "first"),
+                WorkerResponse::log("job-1", LogStream::Stdout, "second"),
+            ]
+        );
     }
 
     #[tokio::test]
