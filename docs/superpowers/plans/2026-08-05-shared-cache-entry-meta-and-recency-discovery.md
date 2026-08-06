@@ -34,6 +34,18 @@ Recorded here because the plan is the briefing source for each task.
   `entries/<input_key>`: every candidate for one input_key resolves identically. Accepted consequence —
   a GC'd blob is now a rebuild rather than a fallback to another commit's outputs.
 
+- **Task 7 (during execution):** removing git-commit shard naming orphaned two e2e tests that assert on
+  `snapshots/<commit>` and `snapshots/<commit>-dirty` directory layout. Human ruling: rewrite both in Task 8
+  to assert the surviving property rather than the removed mechanism. `dirty_key_isolation` becomes
+  `dirty_tree_entry_is_not_reused_by_clean_build`; `accumulation_single_snapshot_multiple_entries` becomes
+  `entries_from_separate_runs_are_both_discoverable`. Also deleted in Task 7: `cross_commit_key_hierarchy`,
+  which called the now-deleted `git::candidate_commit_keys` directly and could not compile.
+
+- **Task 7 review (during execution):** the zero-padding property of `new_session_shard_key` shipped
+  untested — every Task 7 test used an already-13-digit timestamp, so `{now_unix_ms:013}` never actually
+  padded. The padding is the ordering fallback for remotes that don't report ModTime, so it is load-bearing.
+  A short-timestamp case was added to Task 8's test block. Additive, so no human ruling needed.
+
 ## Scope Note
 
 This plan covers two subsystems. **Phase 1 (Tasks 1–6) is independently shippable** and fixes #278 on its own. **Phase 2 (Tasks 7–11)** fixes #277 and does not depend on Phase 1 landing first, but the ordering here is deliberate: Phase 1 makes restore two-phase (cheap meta fetch, then blob), which is what makes Phase 2's wider candidate set affordable. If you need to stop early, stop at the end of Task 6.
@@ -1593,7 +1605,8 @@ git commit -m "name shared cache shards by session id instead of git commit"
 
 **Files:**
 - Modify: `crates/luchta-cache/src/shared/discovery.rs` (replace the stub)
-- Test: inline tests in `discovery.rs`
+- Modify: `crates/luchta-cli/tests/shared_cache_e2e.rs` (rewrite two obsolete commit-key tests — see Step 5)
+- Test: inline tests in `discovery.rs`; rewritten e2e tests in `shared_cache_e2e.rs`
 
 **Interfaces:**
 - Consumes: `SharedCachePaths::snapshots_dir`, `new_session_shard_key` (Task 7).
@@ -1618,6 +1631,17 @@ Add to the test module in `discovery.rs`:
     }
 
     const NOW: u64 = 1_754_431_200_000;
+
+    #[test]
+    fn shard_key_zero_pads_short_timestamps_so_lexical_order_stays_chronological() {
+        // The 13-digit pad is the ordering fallback for remotes that don't report
+        // ModTime. Task 7's tests all used already-13-digit values, so padding never
+        // actually fired — this covers the case where it does.
+        let short = new_session_shard_key(5, 0);
+        let full = new_session_shard_key(1_754_431_200_123, 0);
+        assert_eq!(short, "0000000000005-00000000");
+        assert!(short < full, "{short} must sort before {full}");
+    }
 
     #[test]
     fn rank_returns_newest_first() {
@@ -1820,10 +1844,41 @@ Export `ShardCandidate`, `rank_shard_candidates`, `discover_recent_shard_keys`, 
 Run: `cargo nextest run -p luchta-cache`
 Expected: PASS, including the restore tests that broke in Task 7 — they write and read within one process, so the local shard dir is discoverable.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Rewrite the two obsolete commit-key tests**
+
+Task 7 removed git-commit shard naming, which left two e2e tests in
+`crates/luchta-cli/tests/shared_cache_e2e.rs` asserting on a directory layout that no longer
+exists. Both protect properties that DO survive — rewrite them to assert the property instead
+of the mechanism. Do not delete them.
+
+`dirty_key_isolation` currently asserts `snapshots/<commit>-dirty` exists and `snapshots/<commit>`
+does not. The surviving property is that a clean build must not consume a dirty build's entry —
+now enforced by `decide_shared_restore` comparing `record.inputs` against the working tree, not by
+key namespacing. Rewrite it as: build with a dirty tree (counter reaches 1), commit the change,
+build again clean, and assert the second build did NOT report a shared hit and the counter advanced
+to 2. Drop every assertion about snapshot directory names. Rename it to
+`dirty_tree_entry_is_not_reused_by_clean_build` and update the doc comment to describe the
+content-validation mechanism.
+
+`accumulation_single_snapshot_multiple_entries` currently builds the path
+`snapshots/<commit>` and asserts one shard dir holds both entries. Under session shard keys two
+separate `luchta run` invocations produce two shard dirs, so that premise is gone; what survives is
+that both entries remain discoverable. Rewrite it as: run `lint`, run `test`, then delete the local
+cache and re-run each, asserting both report a shared hit and neither counter advances. Rename it to
+`entries_from_separate_runs_are_both_discoverable`.
+
+Both rewrites must be discriminating. For the dirty test, confirm it fails if you make
+`decide_shared_restore` return `true` unconditionally. Report that evidence.
+
+- [ ] **Step 6: Run the full suite**
+
+Run: `cargo nextest run --workspace --no-fail-fast`
+Expected: all tests passing, 0 failed. Task 7 left 17 failures; this task must clear every one.
+
+- [ ] **Step 7: Commit**
 
 ```bash
-git add crates/luchta-cache/src/shared/discovery.rs crates/luchta-cache/src/shared/mod.rs
+git add crates/luchta-cache/src/shared/discovery.rs crates/luchta-cache/src/shared/mod.rs crates/luchta-cli/tests/shared_cache_e2e.rs
 git commit -m "discover shared cache shards by recency instead of git ancestry"
 ```
 
