@@ -17,7 +17,6 @@ pub use blob::{
     write_outputs_blob, BlobReadResult, BlobReadResultWithMeta, BlobWriteResult, MetaFiles,
     StagedRestore,
 };
-use discovery::discover_recent_shard_keys;
 pub use discovery::{
     current_session_shard_key, new_session_shard_key, rank_shard_candidates, ShardCandidate,
     DEFAULT_SHARD_MAX_AGE_MS,
@@ -188,7 +187,7 @@ pub struct SharedCache {
     paths: Arc<SharedCachePaths>,
     /// Session shard key to write this process's entries under.
     write_commit_key: Option<String>,
-    /// Bound on how many candidate shards `discover_recent_shard_keys` returns.
+    /// Bound on how many candidate shards `candidate_keys()` returns.
     ///
     /// See `candidate_keys()` for why this isn't resolved into a fixed list at
     /// `open()` time.
@@ -828,16 +827,23 @@ impl SharedCache {
 
     /// Discovers the candidate shard keys for this cache, newest-first.
     ///
-    /// The method itself does a fresh directory listing on every call, but its
-    /// only production caller is `build_index()`, which runs inside
-    /// `self.index`'s `OnceLock::get_or_init` — so in practice this resolves
-    /// once per process, on the first restore attempt. `store()` never
-    /// invalidates that `OnceLock`, so entries this process writes *after* its
-    /// first restore attempt are not picked up by later restores in the same
+    /// The method itself does a fresh directory listing (and, if a remote is
+    /// configured, a fresh remote listing) on every call, but its only
+    /// production caller is `build_index()`, which runs inside `self.index`'s
+    /// `OnceLock::get_or_init` — so in practice this resolves once per
+    /// process, on the first restore attempt. `store()` never invalidates
+    /// that `OnceLock`, so entries this process writes *after* its first
+    /// restore attempt are not picked up by later restores in the same
     /// process; only a fresh `SharedCache` (a new process) sees them. This is
     /// deliberately later than `open()`, not "live": it exists so that shards
     /// seeded after `open()` — chiefly by tests, which often store before ever
     /// calling `try_restore_candidates` — are still found.
+    ///
+    /// Remote-only shards (a shard written by another machine, with no local
+    /// directory) are merged in before ranking: local and remote candidates
+    /// are deduplicated by key and passed through the same
+    /// `rank_shard_candidates` call, so age filtering and the history-length
+    /// cap apply uniformly regardless of where a shard was discovered.
     ///
     /// This process's own write shard is always included even if nothing has
     /// been stored to it yet: its directory may not exist on disk at the time
@@ -846,10 +852,44 @@ impl SharedCache {
     /// `remote_unreachable_trips_disable_flag_and_build_continues`: with zero
     /// local shards, the write key is the only candidate a remote-pull attempt
     /// has to probe, and that probe is what trips the disable flag. Don't
-    /// drop it as a "no-op" without checking that test.
+    /// drop it as a "no-op" without checking that test. It's injected after
+    /// ranking, not before: a freshly generated session key would otherwise be
+    /// age-filtered or truncated away by the history-length cap.
     #[must_use]
     pub fn candidate_keys(&self) -> Vec<String> {
-        let mut keys = discover_recent_shard_keys(&self.paths, self.history_len);
+        self.candidate_keys_with_remote(
+            #[cfg(unix)]
+            self.remote.as_ref(),
+        )
+    }
+
+    fn candidate_keys_with_remote(&self, #[cfg(unix)] remote: Option<&RemoteSync>) -> Vec<String> {
+        let mut candidates = discovery::local_shard_candidates_for(&self.paths);
+
+        // Remote-only shards are the whole point of #277: a shard written by
+        // another machine has no local directory to discover.
+        #[cfg(unix)]
+        if let Some(remote) = remote {
+            let known: HashSet<&str> = candidates.iter().map(|c| c.key.as_str()).collect();
+            let extra: Vec<ShardCandidate> = remote
+                .list_shard_candidates()
+                .into_iter()
+                .filter(|c| !known.contains(c.key.as_str()))
+                .collect();
+            candidates.extend(extra);
+        }
+
+        let now_unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis() as u64)
+            .unwrap_or(0);
+        let mut keys = rank_shard_candidates(
+            candidates,
+            self.history_len,
+            Some(DEFAULT_SHARD_MAX_AGE_MS),
+            now_unix_ms,
+        );
+
         if let Some(write_key) = &self.write_commit_key {
             if !keys.iter().any(|key| key == write_key) {
                 keys.insert(0, write_key.clone());

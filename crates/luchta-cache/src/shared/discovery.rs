@@ -8,7 +8,6 @@
 //! Shards are now named `<unix_ms>-<nonce>` and discovered by recency.
 
 use std::fs;
-use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -80,24 +79,14 @@ pub fn rank_shard_candidates(
     kept.into_iter().map(|candidate| candidate.key).collect()
 }
 
-/// Discover shard keys present in the local cache, newest-first.
+/// Discover shard directories present in the local cache, unranked.
+///
+/// Exposed so callers that also have a remote listing (see `RemoteSync::
+/// list_shard_candidates`) can union the two candidate sets before calling
+/// `rank_shard_candidates` once over the combined set.
 #[must_use]
-pub fn discover_recent_shard_keys(paths: &SharedCachePaths, limit: usize) -> Vec<String> {
-    let candidates = local_shard_candidates(&paths.snapshots_dir);
-    let now_unix_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_millis() as u64)
-        .unwrap_or(0);
-    rank_shard_candidates(
-        candidates,
-        limit,
-        Some(DEFAULT_SHARD_MAX_AGE_MS),
-        now_unix_ms,
-    )
-}
-
-fn local_shard_candidates(snapshots_dir: &Path) -> Vec<ShardCandidate> {
-    let Ok(entries) = fs::read_dir(snapshots_dir) else {
+pub fn local_shard_candidates_for(paths: &SharedCachePaths) -> Vec<ShardCandidate> {
+    let Ok(entries) = fs::read_dir(&paths.snapshots_dir) else {
         return Vec::new();
     };
 
@@ -257,7 +246,16 @@ mod tests {
         )
         .unwrap();
 
-        let discovered = discover_recent_shard_keys(&paths, 10);
+        let now_unix_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let discovered = rank_shard_candidates(
+            local_shard_candidates_for(&paths),
+            10,
+            Some(DEFAULT_SHARD_MAX_AGE_MS),
+            now_unix_ms,
+        );
         assert_eq!(
             discovered.first().map(String::as_str),
             Some("0000000000001-aaaa")
@@ -266,7 +264,7 @@ mod tests {
     }
 
     #[test]
-    fn discover_returns_empty_when_snapshots_dir_is_missing() {
+    fn local_shard_candidates_for_returns_empty_when_snapshots_dir_is_missing() {
         let temp = tempfile::TempDir::new().unwrap();
         let paths = SharedCachePaths {
             root: temp.path().to_path_buf(),
@@ -274,6 +272,6 @@ mod tests {
             snapshots_dir: temp.path().join("does-not-exist"),
             entries_dir: temp.path().join("entries"),
         };
-        assert!(discover_recent_shard_keys(&paths, 10).is_empty());
+        assert!(local_shard_candidates_for(&paths).is_empty());
     }
 }
