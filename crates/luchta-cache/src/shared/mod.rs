@@ -19,7 +19,7 @@ pub use blob::{
 };
 pub use discovery::{
     current_session_shard_key, new_session_shard_key, rank_shard_candidates, ShardCandidate,
-    DEFAULT_SHARD_MAX_AGE_MS, DEFAULT_SHARED_CACHE_ENTRY_BUDGET,
+    DEFAULT_SHARD_BYTE_BUDGET, DEFAULT_SHARD_MAX_AGE_MS,
 };
 pub use entry_meta::{
     encode_entry_meta, entry_meta_path, read_entry_meta, write_entry_meta, EntryMeta,
@@ -188,9 +188,8 @@ pub struct SharedCache {
     /// Session shard key to write this process's entries under.
     write_commit_key: Option<String>,
     /// Hard upper bound on how many candidate shards `candidate_keys()`
-    /// returns, on top of the entry-count budget (see
-    /// `DEFAULT_SHARED_CACHE_ENTRY_BUDGET`) that `rank_shard_candidates`
-    /// applies in the same pass.
+    /// returns, on top of the byte budget (see `DEFAULT_SHARD_BYTE_BUDGET`)
+    /// that `rank_shard_candidates` applies in the same pass.
     ///
     /// See `candidate_keys()` for why this isn't resolved into a fixed list at
     /// `open()` time.
@@ -511,7 +510,10 @@ impl SharedCache {
         // process just wrote (its own write shard, or shards a test wrote
         // directly) don't have a directory on disk until after `open()` runs,
         // so discovery has to happen at first use, not eagerly at open time.
-        let candidate_keys = self.candidate_keys();
+        let (candidate_keys, candidates_since_last_rollup) = self.discover_candidates(
+            #[cfg(unix)]
+            remote,
+        );
 
         #[cfg(unix)]
         self.pull_candidate_commits(remote, &candidate_keys);
@@ -528,7 +530,7 @@ impl SharedCache {
             );
         }
 
-        self.maybe_write_rollup(&candidate_keys);
+        self.maybe_write_rollup(&candidate_keys, candidates_since_last_rollup);
 
         merged
     }
@@ -537,13 +539,25 @@ impl SharedCache {
     ///
     /// Throttled independently of GC (see `gc::should_run_rollup`), so it
     /// doesn't re-serialize the whole index on every store — only when the
-    /// throttle window has elapsed and there is more than one source shard to
-    /// merge. Runs on every platform: collapsing many small local shards into
-    /// one is useful even with no remote configured. Pushing the result
-    /// upstream is unix-only, like the rest of remote sync, so that part is
-    /// split into its own cfg-gated helper.
-    fn maybe_write_rollup(&self, keys: &[String]) {
-        if keys.len() < 2 || !gc::should_run_rollup(&self.paths, gc::DEFAULT_GC_THROTTLE) {
+    /// 24h throttle window has elapsed, or `candidates_since_last_rollup`
+    /// exceeds `gc::ROLLUP_PRESSURE_THRESHOLD` — and there is more than one
+    /// source shard to merge. The pressure trigger is what keeps a burst of
+    /// local churn from filling the shard-count `limit` before a rollup ever
+    /// gets a chance to fold an older shard in: the threshold sits below the
+    /// limit precisely so the rollup fires while there's still headroom, not
+    /// after the limit has already done the evicting. Runs on every
+    /// platform: collapsing many small local shards into one is useful even
+    /// with no remote configured. Pushing the result upstream is unix-only,
+    /// like the rest of remote sync, so that part is split into its own
+    /// cfg-gated helper.
+    fn maybe_write_rollup(&self, keys: &[String], candidates_since_last_rollup: usize) {
+        if keys.len() < 2
+            || !gc::should_run_rollup(
+                &self.paths,
+                gc::DEFAULT_GC_THROTTLE,
+                candidates_since_last_rollup,
+            )
+        {
             return;
         }
         let rollup_key = current_session_shard_key();
@@ -882,8 +896,8 @@ impl SharedCache {
     /// directory) are merged in before ranking: local and remote candidates
     /// are deduplicated by key and passed through the same
     /// `rank_shard_candidates` call, so age filtering, the history-length
-    /// cap, and the entry-count budget all apply uniformly regardless of
-    /// where a shard was discovered.
+    /// cap, and the byte budget all apply uniformly regardless of where a
+    /// shard was discovered.
     ///
     /// This process's own write shard is always included even if nothing has
     /// been stored to it yet: its directory may not exist on disk at the time
@@ -897,13 +911,29 @@ impl SharedCache {
     /// age-filtered or truncated away by the history-length cap.
     #[must_use]
     pub fn candidate_keys(&self) -> Vec<String> {
-        self.candidate_keys_with_remote(
+        self.discover_candidates(
             #[cfg(unix)]
             self.remote.as_ref(),
         )
+        .0
     }
 
-    fn candidate_keys_with_remote(&self, #[cfg(unix)] remote: Option<&RemoteSync>) -> Vec<String> {
+    /// Discovers and ranks candidate shard keys, alongside a count of how
+    /// many discovered candidates (before ranking/truncation) were modified
+    /// after the last rollup fired.
+    ///
+    /// That count is the shard-count-pressure signal `maybe_write_rollup`
+    /// uses to decide whether to fire a rollup early, independent of the 24h
+    /// throttle — see `gc::should_run_rollup`. It has to be computed here,
+    /// from the pre-ranking candidate set, rather than recomputed later from
+    /// the already-ranked `candidate_keys()`: by the time ranking has
+    /// truncated the list, an evicted candidate can no longer be counted
+    /// (and there's no reason to redo the local directory listing, or worse,
+    /// a second remote listing call, just to get it).
+    fn discover_candidates(
+        &self,
+        #[cfg(unix)] remote: Option<&RemoteSync>,
+    ) -> (Vec<String>, usize) {
         let mut candidates = discovery::local_shard_candidates_for(&self.paths);
 
         // Remote-only shards are the whole point of #277: a shard written by
@@ -919,6 +949,15 @@ impl SharedCache {
             candidates.extend(extra);
         }
 
+        let rollup_marker_unix_ms = gc::rollup_marker_modified_unix_ms(&self.paths);
+        let candidates_since_last_rollup = candidates
+            .iter()
+            .filter(|candidate| match rollup_marker_unix_ms {
+                Some(since) => candidate.modified_unix_ms > since,
+                None => true,
+            })
+            .count();
+
         let now_unix_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|elapsed| elapsed.as_millis() as u64)
@@ -926,7 +965,7 @@ impl SharedCache {
         let mut keys = rank_shard_candidates(
             candidates,
             self.history_len,
-            DEFAULT_SHARED_CACHE_ENTRY_BUDGET,
+            DEFAULT_SHARD_BYTE_BUDGET,
             Some(DEFAULT_SHARD_MAX_AGE_MS),
             now_unix_ms,
         );
@@ -936,7 +975,7 @@ impl SharedCache {
                 keys.insert(0, write_key.clone());
             }
         }
-        keys
+        (keys, candidates_since_last_rollup)
     }
 }
 
@@ -1586,7 +1625,7 @@ mod tests {
         // time on top of the load this test is counting. Rollup re-reads are
         // covered on their own in `snapshot::tests`; this test is only about
         // proving the merged index isn't rebuilt per restore call.
-        let _ = gc::should_run_rollup(&paths, std::time::Duration::from_secs(3600));
+        let _ = gc::should_run_rollup(&paths, std::time::Duration::from_secs(3600), 0);
         let (snapshot_store, load_counter) = SnapshotStore::new_with_counter(paths);
         let cache =
             SharedCache::from_parts_for_test(temp_repo.path(), 1_000_000, 10, snapshot_store)
@@ -1615,6 +1654,202 @@ mod tests {
             load_counter.load(Ordering::SeqCst)
         );
         assert!(cache.index.get().is_some());
+    }
+
+    fn shard_dir_count(cache_dir: &Path) -> usize {
+        fs::read_dir(cache_dir.join("snapshots"))
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter(|entry| entry.path().is_dir())
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn shard_count_pressure_rollup_does_not_retrigger_without_fresh_churn() {
+        // Directly seed enough distinct local shards to exceed the pressure
+        // threshold in one discovery pass, bypassing `store()` so this stays
+        // focused on discovery/rollup behavior rather than the store path.
+        let temp_cache = TempDir::new().unwrap();
+        let seed_count = gc::ROLLUP_PRESSURE_THRESHOLD + 1;
+        for i in 0..seed_count {
+            let paths = open_shared_paths(temp_cache.path()).unwrap();
+            let store = SnapshotStore::new(paths);
+            let seed = i as u8;
+            store.merge_entry(
+                &format!("{i:013}-seed"),
+                SnapshotEntry {
+                    task_id: format!("pkg#seed-{i}"),
+                    input_key: derive_input_key([seed; 32], [9; 32], [9; 32], [9; 32]),
+                    outputs_hash: [0; 32],
+                    task_spec_hash: [seed; 32],
+                    env_hash: [9; 32],
+                    pkg_dep_hash: [9; 32],
+                    duration_ms: 200,
+                    output_bytes: 0,
+                    cached_at_unix_ms: 1,
+                    tool_version: None,
+                },
+            );
+        }
+
+        let before_first_run = shard_dir_count(temp_cache.path());
+        assert_eq!(before_first_run, seed_count, "sanity: all seeds landed");
+
+        let temp_repo = TempDir::new().unwrap();
+        setup_git_repo(temp_repo.path());
+        create_commit(temp_repo.path());
+
+        // First "run": discovery should see shard-count pressure and fire a
+        // rollup, adding one new shard directory.
+        {
+            let cache = SharedCache::open_with_cache_dir(
+                temp_repo.path(),
+                1_000_000,
+                100,
+                Some(temp_cache.path()),
+            )
+            .unwrap();
+            let restore_dir = temp_repo.path().join("restore-first");
+            fs::create_dir_all(&restore_dir).unwrap();
+            let probe_key = derive_input_key([254; 32], [8; 32], [8; 32], [8; 32]);
+            let _ = cache
+                .try_restore_candidates("pkg#probe", &probe_key, &restore_dir)
+                .next();
+        }
+
+        let after_first_run = shard_dir_count(temp_cache.path());
+        assert_eq!(
+            after_first_run,
+            before_first_run + 1,
+            "a rollup should have added exactly one new shard directory"
+        );
+
+        // Second "run": no new shards since the rollup. Discovery must not
+        // fire a second one -- without the reset, a naive
+        // discovered-count-since-forever check would retrigger on every
+        // single call once churn crossed the threshold, since rollups never
+        // delete their sources.
+        {
+            let cache = SharedCache::open_with_cache_dir(
+                temp_repo.path(),
+                1_000_000,
+                100,
+                Some(temp_cache.path()),
+            )
+            .unwrap();
+            let restore_dir = temp_repo.path().join("restore-second");
+            fs::create_dir_all(&restore_dir).unwrap();
+            let probe_key = derive_input_key([253; 32], [8; 32], [8; 32], [8; 32]);
+            let _ = cache
+                .try_restore_candidates("pkg#probe", &probe_key, &restore_dir)
+                .next();
+        }
+
+        let after_second_run = shard_dir_count(temp_cache.path());
+        assert_eq!(
+            after_second_run, after_first_run,
+            "no new rollup should fire without fresh churn since the last one"
+        );
+    }
+
+    #[test]
+    fn shard_count_pressure_rollup_keeps_an_old_pack_reachable_through_heavy_local_churn() {
+        // The motivating #277 scenario: an older shard ("the pack") plus
+        // enough newer, tiny local shards to exceed the shard-count `limit`
+        // on their own. Without the pressure trigger, the count cap alone
+        // would evict the pack before any rollup got a chance to fold it in.
+        let temp_repo = TempDir::new().unwrap();
+        setup_git_repo(temp_repo.path());
+        create_commit(temp_repo.path());
+        let temp_cache = TempDir::new().unwrap();
+
+        let package_dir = temp_repo.path().join("pkg");
+        fs::create_dir_all(&package_dir).unwrap();
+        let empty_hash = crate::resolve::combined_outputs_hash(&[]);
+        let mut record = sample_record(true, 200);
+        record.output_patterns = vec![];
+        record.outputs = vec![];
+        record.outputs_hash = empty_hash;
+
+        const HISTORY_LEN: usize = 20;
+
+        let old_input_key = derive_input_key([88; 32], [1; 32], [1; 32], [1; 32]);
+        {
+            let cache = SharedCache::open_with_cache_dir(
+                temp_repo.path(),
+                1_000_000,
+                HISTORY_LEN,
+                Some(temp_cache.path()),
+            )
+            .unwrap();
+            cache
+                .store(
+                    "pkg#old",
+                    &old_input_key,
+                    &empty_hash,
+                    &package_dir,
+                    &[],
+                    &record,
+                    b"",
+                    b"",
+                    &[],
+                    temp_repo.path(),
+                )
+                .unwrap();
+        }
+
+        // 25 more "runs": each writes one fresh shard, then triggers
+        // discovery, simulating local churn well past both the pressure
+        // threshold (15) and the shard-count cap (20).
+        for i in 0..25u8 {
+            let cache = SharedCache::open_with_cache_dir(
+                temp_repo.path(),
+                1_000_000,
+                HISTORY_LEN,
+                Some(temp_cache.path()),
+            )
+            .unwrap();
+            let churn_input_key = derive_input_key([i; 32], [2; 32], [2; 32], [2; 32]);
+            cache
+                .store(
+                    "pkg#churn",
+                    &churn_input_key,
+                    &empty_hash,
+                    &package_dir,
+                    &[],
+                    &record,
+                    b"",
+                    b"",
+                    &[],
+                    temp_repo.path(),
+                )
+                .unwrap();
+            let restore_dir = temp_repo.path().join(format!("restore-{i}"));
+            fs::create_dir_all(&restore_dir).unwrap();
+            let _ = cache
+                .try_restore_candidates("pkg#churn", &churn_input_key, &restore_dir)
+                .next();
+        }
+
+        let cache = SharedCache::open_with_cache_dir(
+            temp_repo.path(),
+            1_000_000,
+            HISTORY_LEN,
+            Some(temp_cache.path()),
+        )
+        .unwrap();
+        let restore_dir = temp_repo.path().join("restore-final");
+        fs::create_dir_all(&restore_dir).unwrap();
+        assert!(
+            cache
+                .try_restore_candidates("pkg#old", &old_input_key, &restore_dir)
+                .next()
+                .is_some(),
+            "the old pack's entry should survive heavy local churn once shard-count pressure rolls it up"
+        );
     }
 
     #[test]

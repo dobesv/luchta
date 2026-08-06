@@ -265,7 +265,7 @@ impl RemoteSync {
             .filter(|entry| entry.is_dir)
             .map(|entry| ShardCandidate {
                 modified_unix_ms: shard_key_unix_ms(&entry.name).unwrap_or(0),
-                entry_count: remote_entry_count_proxy(entry.size),
+                approx_bytes: remote_approx_bytes(entry.size),
                 key: entry.name,
             })
             .collect()
@@ -286,16 +286,13 @@ impl RemoteSync {
     }
 }
 
-/// Proxy for a remote shard's entry count.
+/// Proxy for a remote shard's byte size.
 ///
-/// The rclone listing reports a directory's `size`, not a `SnapshotEntry`
-/// count — loading the shard for a real count would cost a network round
-/// trip per candidate, defeating the point of a cheap ranking pass. A
-/// non-positive (or otherwise unrepresentable) size falls back to 1 so an
-/// unknown-size candidate still counts toward the entry budget instead of
+/// A non-positive (or otherwise unrepresentable) size falls back to 1 so an
+/// unknown-size candidate still counts toward the byte budget instead of
 /// being treated as free.
-fn remote_entry_count_proxy(size: i64) -> usize {
-    usize::try_from(size).unwrap_or(1).max(1)
+fn remote_approx_bytes(size: i64) -> u64 {
+    u64::try_from(size).unwrap_or(1).max(1)
 }
 
 /// Recover the timestamp from a `<unix_ms>-<nonce>` shard key.
