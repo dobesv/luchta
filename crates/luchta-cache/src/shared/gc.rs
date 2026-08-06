@@ -59,22 +59,32 @@ pub fn maybe_run_gc(
     Some(stats)
 }
 
-/// Shard-count pressure threshold: if this many discovered candidates have
-/// appeared since the last rollup, fire one immediately instead of waiting
-/// for the 24h throttle.
+/// Shard-count pressure threshold for a given shard-count cap (`history_len`,
+/// `DEFAULT_SHARED_CACHE_HISTORY_LEN` in the CLI by default, but
+/// user-configurable with no floor via `LUCHTA_SHARED_CACHE_HISTORY`): if
+/// this many discovered candidates have appeared since the last rollup, fire
+/// one immediately instead of waiting for the 24h throttle.
 ///
-/// Set below the shard-count `limit` (20, `DEFAULT_SHARED_CACHE_HISTORY_LEN`
-/// in the CLI) so a burst of local churn triggers a rollup while there's
-/// still headroom in the count cap: at 16 new shards, discovery hasn't had
-/// to evict anything yet, so the rollup still sees (and so keeps) whatever
-/// older shard the churn would otherwise have pushed out. Without that
-/// headroom, pressure would only be detected after the cap had already done
-/// the evicting it exists to prevent.
-pub const ROLLUP_PRESSURE_THRESHOLD: usize = 15;
+/// Must sit strictly below `history_len` so a burst of local churn triggers a
+/// rollup while there's still headroom in the count cap: with headroom
+/// still available, discovery hasn't had to evict anything yet, so the
+/// rollup still sees (and so keeps) whatever older shard the churn would
+/// otherwise have pushed out. Without that headroom, pressure would only be
+/// detected after the cap had already done the evicting it exists to
+/// prevent. A hardcoded constant can't guarantee that margin once
+/// `history_len` is configurable, so this is derived from the cap instead:
+/// three quarters of it, floored at 1 so the threshold is never 0 (which
+/// would fire a rollup on every single call). At the default cap of 20 this
+/// yields 15, matching the historical fixed value.
+#[must_use]
+pub fn rollup_pressure_threshold(history_len: usize) -> usize {
+    ((history_len * 3) / 4).max(1)
+}
 
 /// True if `throttle` has elapsed since the last shard rollup, or if
-/// `candidates_since_last_rollup` exceeds `ROLLUP_PRESSURE_THRESHOLD`. Stamps
-/// the rollup marker on a `true` result.
+/// `candidates_since_last_rollup` exceeds
+/// [`rollup_pressure_threshold(history_len)`](rollup_pressure_threshold).
+/// Stamps the rollup marker on a `true` result.
 ///
 /// Throttled independently of `maybe_run_gc`: rollups run inside
 /// `build_index` (see `mod.rs::maybe_write_rollup`), not from the CLI's GC
@@ -94,10 +104,11 @@ pub const ROLLUP_PRESSURE_THRESHOLD: usize = 15;
 pub fn should_run_rollup(
     paths: &SharedCachePaths,
     throttle: Duration,
+    history_len: usize,
     candidates_since_last_rollup: usize,
 ) -> bool {
     let due_by_time = should_run_marked(paths, ROLLUP_MARKER_NAME, throttle, SystemTime::now());
-    let due_by_pressure = candidates_since_last_rollup > ROLLUP_PRESSURE_THRESHOLD;
+    let due_by_pressure = candidates_since_last_rollup > rollup_pressure_threshold(history_len);
     if !due_by_time && !due_by_pressure {
         return false;
     }
@@ -530,8 +541,8 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let paths = crate::shared::paths::open_shared_paths(temp.path()).unwrap();
 
-        assert!(should_run_rollup(&paths, Duration::from_secs(3600), 0));
-        assert!(!should_run_rollup(&paths, Duration::from_secs(3600), 0));
+        assert!(should_run_rollup(&paths, Duration::from_secs(3600), 20, 0));
+        assert!(!should_run_rollup(&paths, Duration::from_secs(3600), 20, 0));
     }
 
     #[test]
@@ -539,7 +550,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let paths = crate::shared::paths::open_shared_paths(temp.path()).unwrap();
 
-        assert!(should_run_rollup(&paths, Duration::from_secs(3600), 0));
+        assert!(should_run_rollup(&paths, Duration::from_secs(3600), 20, 0));
         // GC has its own marker, so it is still eligible.
         assert!(maybe_run_gc(&paths, Duration::from_secs(60), Duration::from_secs(3600)).is_some());
     }
@@ -549,13 +560,47 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let paths = crate::shared::paths::open_shared_paths(temp.path()).unwrap();
 
-        assert!(should_run_rollup(&paths, Duration::from_secs(3600), 0));
+        assert!(should_run_rollup(&paths, Duration::from_secs(3600), 20, 0));
         // Still well inside the throttle window, but pressure alone must
         // still trigger a second rollup.
         assert!(should_run_rollup(
             &paths,
             Duration::from_secs(3600),
-            ROLLUP_PRESSURE_THRESHOLD + 1
+            20,
+            rollup_pressure_threshold(20) + 1
+        ));
+    }
+
+    #[test]
+    fn should_run_rollup_fires_on_shard_count_pressure_with_a_small_configured_cap() {
+        // The finding this covers: a hardcoded pressure threshold is only
+        // correct against the *default* cap of 20. `history_len` is
+        // user-configurable via `LUCHTA_SHARED_CACHE_HISTORY` with no floor,
+        // so a small cap (e.g. 8) needs its own, proportionally smaller
+        // threshold -- otherwise pressure could never fire before the cap
+        // itself started evicting shards.
+        let temp = TempDir::new().unwrap();
+        let paths = crate::shared::paths::open_shared_paths(temp.path()).unwrap();
+        let small_history_len = 8;
+        let threshold = rollup_pressure_threshold(small_history_len);
+        // Sanity: the threshold must leave headroom below the cap, not just
+        // be some arbitrary small number.
+        assert!(threshold < small_history_len);
+
+        assert!(should_run_rollup(
+            &paths,
+            Duration::from_secs(3600),
+            small_history_len,
+            0
+        ));
+        // Pressure fires well before `small_history_len` candidates have
+        // accumulated -- proving the threshold scaled down with the cap
+        // instead of staying pinned at a value derived from the default 20.
+        assert!(should_run_rollup(
+            &paths,
+            Duration::from_secs(3600),
+            small_history_len,
+            threshold + 1
         ));
     }
 
@@ -567,14 +612,15 @@ mod tests {
         assert!(should_run_rollup(
             &paths,
             Duration::from_secs(3600),
-            ROLLUP_PRESSURE_THRESHOLD + 1
+            20,
+            rollup_pressure_threshold(20) + 1
         ));
         // Immediately after, with no fresh churn, neither the throttle nor
         // pressure should retrigger. Without this reset, a naive
         // count-since-forever check would fire on every single call once
         // churn crossed the threshold, since rollups never delete their
         // sources.
-        assert!(!should_run_rollup(&paths, Duration::from_secs(3600), 0));
+        assert!(!should_run_rollup(&paths, Duration::from_secs(3600), 20, 0));
     }
 
     #[test]
@@ -583,8 +629,26 @@ mod tests {
         let paths = crate::shared::paths::open_shared_paths(temp.path()).unwrap();
 
         assert!(rollup_marker_modified_unix_ms(&paths).is_none());
-        assert!(should_run_rollup(&paths, Duration::from_secs(3600), 0));
+        assert!(should_run_rollup(&paths, Duration::from_secs(3600), 20, 0));
         assert!(rollup_marker_modified_unix_ms(&paths).is_some());
+    }
+
+    #[test]
+    fn rollup_pressure_threshold_matches_historical_default() {
+        // history_len = 20 (DEFAULT_SHARED_CACHE_HISTORY_LEN) must yield 15,
+        // preserving the behavior of the old hardcoded constant exactly.
+        assert_eq!(rollup_pressure_threshold(20), 15);
+    }
+
+    #[test]
+    fn rollup_pressure_threshold_never_reaches_zero() {
+        // Degenerate small caps: the threshold must never be 0, since that
+        // would fire a rollup on literally every call.
+        assert_eq!(rollup_pressure_threshold(0), 1);
+        assert_eq!(rollup_pressure_threshold(1), 1);
+        assert_eq!(rollup_pressure_threshold(2), 1);
+        assert_eq!(rollup_pressure_threshold(4), 3);
+        assert_eq!(rollup_pressure_threshold(8), 6);
     }
 
     #[test]

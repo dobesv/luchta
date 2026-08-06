@@ -540,21 +540,24 @@ impl SharedCache {
     /// Throttled independently of GC (see `gc::should_run_rollup`), so it
     /// doesn't re-serialize the whole index on every store — only when the
     /// 24h throttle window has elapsed, or `candidates_since_last_rollup`
-    /// exceeds `gc::ROLLUP_PRESSURE_THRESHOLD` — and there is more than one
-    /// source shard to merge. The pressure trigger is what keeps a burst of
-    /// local churn from filling the shard-count `limit` before a rollup ever
-    /// gets a chance to fold an older shard in: the threshold sits below the
+    /// exceeds `gc::rollup_pressure_threshold(self.history_len)` — and there
+    /// is more than one source shard to merge. The pressure trigger is what
+    /// keeps a burst of local churn from filling the shard-count `limit`
+    /// before a rollup ever gets a chance to fold an older shard in: the
+    /// threshold is derived from `self.history_len` so it sits below the
     /// limit precisely so the rollup fires while there's still headroom, not
-    /// after the limit has already done the evicting. Runs on every
-    /// platform: collapsing many small local shards into one is useful even
-    /// with no remote configured. Pushing the result upstream is unix-only,
-    /// like the rest of remote sync, so that part is split into its own
-    /// cfg-gated helper.
+    /// after the limit has already done the evicting — even when
+    /// `history_len` isn't the default (it's user-configurable via
+    /// `LUCHTA_SHARED_CACHE_HISTORY`). Runs on every platform: collapsing
+    /// many small local shards into one is useful even with no remote
+    /// configured. Pushing the result upstream is unix-only, like the rest
+    /// of remote sync, so that part is split into its own cfg-gated helper.
     fn maybe_write_rollup(&self, keys: &[String], candidates_since_last_rollup: usize) {
         if keys.len() < 2
             || !gc::should_run_rollup(
                 &self.paths,
                 gc::DEFAULT_GC_THROTTLE,
+                self.history_len,
                 candidates_since_last_rollup,
             )
         {
@@ -1625,7 +1628,7 @@ mod tests {
         // time on top of the load this test is counting. Rollup re-reads are
         // covered on their own in `snapshot::tests`; this test is only about
         // proving the merged index isn't rebuilt per restore call.
-        let _ = gc::should_run_rollup(&paths, std::time::Duration::from_secs(3600), 0);
+        let _ = gc::should_run_rollup(&paths, std::time::Duration::from_secs(3600), 10, 0);
         let (snapshot_store, load_counter) = SnapshotStore::new_with_counter(paths);
         let cache =
             SharedCache::from_parts_for_test(temp_repo.path(), 1_000_000, 10, snapshot_store)
@@ -1672,8 +1675,12 @@ mod tests {
         // Directly seed enough distinct local shards to exceed the pressure
         // threshold in one discovery pass, bypassing `store()` so this stays
         // focused on discovery/rollup behavior rather than the store path.
+        // `history_len` here (100, passed to `open_with_cache_dir` below) is
+        // deliberately non-default so the pressure threshold has to be
+        // derived from it, not the hardcoded value for the default cap of 20.
         let temp_cache = TempDir::new().unwrap();
-        let seed_count = gc::ROLLUP_PRESSURE_THRESHOLD + 1;
+        let history_len = 100;
+        let seed_count = gc::rollup_pressure_threshold(history_len) + 1;
         for i in 0..seed_count {
             let paths = open_shared_paths(temp_cache.path()).unwrap();
             let store = SnapshotStore::new(paths);
@@ -1708,7 +1715,7 @@ mod tests {
             let cache = SharedCache::open_with_cache_dir(
                 temp_repo.path(),
                 1_000_000,
-                100,
+                history_len,
                 Some(temp_cache.path()),
             )
             .unwrap();
@@ -1736,7 +1743,7 @@ mod tests {
             let cache = SharedCache::open_with_cache_dir(
                 temp_repo.path(),
                 1_000_000,
-                100,
+                history_len,
                 Some(temp_cache.path()),
             )
             .unwrap();
