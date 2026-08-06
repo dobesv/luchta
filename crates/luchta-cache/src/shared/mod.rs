@@ -1,8 +1,8 @@
 pub(crate) mod atomicio;
 pub mod blob;
+mod discovery;
 pub mod entry_meta;
 pub mod gc;
-pub mod git;
 pub mod paths;
 #[cfg(unix)]
 pub mod rclone;
@@ -17,12 +17,13 @@ pub use blob::{
     write_outputs_blob, BlobReadResult, BlobReadResultWithMeta, BlobWriteResult, MetaFiles,
     StagedRestore,
 };
+use discovery::discover_recent_shard_keys;
+pub use discovery::{current_session_shard_key, new_session_shard_key};
 pub use entry_meta::{
     encode_entry_meta, entry_meta_path, read_entry_meta, write_entry_meta, EntryMeta,
     EntryMetaWriteResult, EntryReport, ENTRY_META_SCHEMA_VERSION,
 };
 pub use gc::{maybe_run_gc, run_gc, GcStats, DEFAULT_GC_RETENTION, DEFAULT_GC_THROTTLE};
-pub use git::{candidate_commit_keys, resolve_commit_key, CommitKey};
 pub use paths::{
     open_shared_paths, resolve_shared_cache_dir, SharedCachePaths, BLOBS_DIR_NAME,
     ENTRIES_DIR_NAME, SHARED_CACHE_DIR_ENV, SNAPSHOTS_DIR_NAME,
@@ -171,9 +172,9 @@ impl MergedIndex {
 pub struct SharedCache {
     /// Resolved paths for the cache.
     paths: Arc<SharedCachePaths>,
-    /// Write commit key for the current repo state (None if dirty/unavailable).
+    /// Session shard key to write this process's entries under.
     write_commit_key: Option<String>,
-    /// Candidate commit keys for lookup (newest-first).
+    /// Candidate shard keys for lookup (newest-first).
     candidate_keys: Vec<String>,
     /// Snapshot store for merge_entry.
     snapshot_store: SnapshotStore,
@@ -229,9 +230,7 @@ pub struct OpenExtras<'a> {
 impl SharedCache {
     /// Opens the shared cache for a repo.
     ///
-    /// Returns `None` if:
-    /// - The shared cache directory cannot be created
-    /// - No commit key is available (not in a git repo)
+    /// Returns `None` if the shared cache directory cannot be created.
     pub fn open(repo_root: &Path, size_cap_bytes: u64, history_len: usize) -> Option<Self> {
         Self::open_with_remote(
             repo_root,
@@ -270,19 +269,15 @@ impl SharedCache {
         history_len: usize,
         extras: OpenExtras<'_>,
     ) -> Option<Self> {
+        let _ = repo_root;
         let cache_path = extras
             .cache_dir
             .map(|p| p.to_path_buf())
             .unwrap_or_else(resolve_shared_cache_dir);
         let paths = Arc::new(open_shared_paths(&cache_path).ok()?);
 
-        let write_commit_key = match resolve_commit_key(repo_root) {
-            CommitKey::Clean(key) => Some(key),
-            CommitKey::Dirty(key) => Some(key),
-            CommitKey::Unavailable => None,
-        };
-
-        let candidate_keys = candidate_commit_keys(repo_root, history_len);
+        let write_commit_key = Some(current_session_shard_key());
+        let candidate_keys = discover_recent_shard_keys(&paths, history_len);
 
         let snapshot_store = SnapshotStore::new((*paths).clone());
         #[cfg(unix)]
@@ -320,15 +315,11 @@ impl SharedCache {
         history_len: usize,
         snapshot_store: SnapshotStore,
     ) -> Option<Self> {
+        let _ = repo_root;
         let paths = snapshot_store.paths().clone();
 
-        let write_commit_key = match resolve_commit_key(repo_root) {
-            CommitKey::Clean(key) => Some(key),
-            CommitKey::Dirty(key) => Some(key),
-            CommitKey::Unavailable => None,
-        };
-
-        let candidate_keys = candidate_commit_keys(repo_root, history_len);
+        let write_commit_key = Some(current_session_shard_key());
+        let candidate_keys = discover_recent_shard_keys(&paths, history_len);
 
         Some(Self {
             paths: Arc::new(paths),
