@@ -16,11 +16,13 @@ pub const DEFAULT_GC_THROTTLE: Duration = Duration::from_secs(24 * 60 * 60);
 const LAST_GC_MARKER: &str = ".last-gc";
 const SNAPSHOT_SUFFIX: &str = ".bincode";
 const BLOB_SUFFIX: &str = ".tar.zst";
+const ENTRY_META_SUFFIX: &str = ".bin";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct GcStats {
     pub snapshots_deleted: u64,
     pub blobs_deleted: u64,
+    pub entries_deleted: usize,
     pub bytes_freed: u64,
 }
 
@@ -31,6 +33,7 @@ pub fn run_gc(paths: &SharedCachePaths, retention: Duration) -> GcStats {
 
     gc_snapshot_dir(paths, retention, now, &mut stats);
     gc_blob_dir(paths, retention, now, &mut stats);
+    gc_entries_dir(paths, retention, now, &mut stats);
 
     stats
 }
@@ -165,6 +168,37 @@ fn gc_blob_dir(
     }
 }
 
+fn gc_entries_dir(
+    paths: &SharedCachePaths,
+    retention: Duration,
+    now: SystemTime,
+    stats: &mut GcStats,
+) {
+    let entries = match fs::read_dir(&paths.entries_dir) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+
+    for entry in entries {
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
+        if !has_file_name_suffix(&path, ENTRY_META_SUFFIX) {
+            continue;
+        }
+        if !is_older_than(&path, retention, now) {
+            continue;
+        }
+
+        // Age-based, like blobs. A reader that loses the race treats the
+        // missing meta as a cache miss and reruns the task.
+        let meta_bytes = file_len(&path);
+        if remove_file_if_exists(&path) {
+            stats.entries_deleted += 1;
+            stats.bytes_freed = stats.bytes_freed.saturating_add(meta_bytes);
+        }
+    }
+}
+
 fn should_run_gc(paths: &SharedCachePaths, throttle: Duration, now: SystemTime) -> bool {
     let marker_path = gc_marker_path(paths);
     match fs::metadata(marker_path).and_then(|metadata| metadata.modified()) {
@@ -242,7 +276,7 @@ mod tests {
     use filetime::FileTime;
     use std::sync::Arc;
     use std::thread;
-    use tempfile::tempdir;
+    use tempfile::{tempdir, TempDir};
 
     fn entry_for(task_id: &str, outputs_hash: [u8; 32]) -> SnapshotEntry {
         let task_spec_hash = [1; 32];
@@ -469,6 +503,58 @@ mod tests {
 
         assert!(stats.snapshots_deleted <= 1);
         assert!(stats.blobs_deleted <= 1);
+    }
+
+    #[test]
+    fn run_gc_deletes_old_entry_meta() {
+        let temp = TempDir::new().unwrap();
+        let paths = crate::shared::paths::open_shared_paths(temp.path()).unwrap();
+        let input_key = [12_u8; 32];
+
+        let meta = crate::shared::EntryMeta {
+            schema_version: crate::shared::ENTRY_META_SCHEMA_VERSION,
+            outputs_hash: [1; 32],
+            has_outputs: false,
+            record: vec![0],
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            reports: Vec::new(),
+        };
+        crate::shared::write_entry_meta(&paths, &input_key, &meta).unwrap();
+
+        let path = crate::shared::entry_meta_path(&paths, &input_key);
+        set_mtime(
+            &path,
+            SystemTime::now() - Duration::from_secs(60 * 60 * 24 * 30),
+        );
+
+        let stats = run_gc(&paths, Duration::from_secs(60 * 60 * 24 * 7));
+
+        assert_eq!(stats.entries_deleted, 1);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn run_gc_keeps_recent_entry_meta() {
+        let temp = TempDir::new().unwrap();
+        let paths = crate::shared::paths::open_shared_paths(temp.path()).unwrap();
+        let input_key = [13_u8; 32];
+
+        let meta = crate::shared::EntryMeta {
+            schema_version: crate::shared::ENTRY_META_SCHEMA_VERSION,
+            outputs_hash: [1; 32],
+            has_outputs: false,
+            record: vec![0],
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            reports: Vec::new(),
+        };
+        crate::shared::write_entry_meta(&paths, &input_key, &meta).unwrap();
+
+        let stats = run_gc(&paths, Duration::from_secs(60 * 60 * 24 * 7));
+
+        assert_eq!(stats.entries_deleted, 0);
+        assert!(crate::shared::entry_meta_path(&paths, &input_key).exists());
     }
 
     fn set_mtime(path: &Path, modified: SystemTime) {
