@@ -19,7 +19,7 @@ pub use blob::{
 };
 pub use discovery::{
     current_session_shard_key, new_session_shard_key, rank_shard_candidates, ShardCandidate,
-    DEFAULT_SHARD_MAX_AGE_MS,
+    DEFAULT_SHARD_MAX_AGE_MS, DEFAULT_SHARED_CACHE_ENTRY_BUDGET,
 };
 pub use entry_meta::{
     encode_entry_meta, entry_meta_path, read_entry_meta, write_entry_meta, EntryMeta,
@@ -43,7 +43,7 @@ pub use remote::DEFAULT_TIMEOUT_DISABLE_THRESHOLD;
 pub use scope::{classify_outputs, OutputScope, ScopeError};
 pub use snapshot::{
     combined_dep_outputs_hash, derive_input_key, input_key_hex, MergeEntryOutcome, MergeResult,
-    Snapshot, SnapshotEntry, SnapshotStore, SNAPSHOT_SCHEMA_VERSION,
+    Snapshot, SnapshotEntry, SnapshotStore, SnapshotUpload, SNAPSHOT_SCHEMA_VERSION,
 };
 use std::collections::HashSet;
 #[cfg(unix)]
@@ -187,7 +187,10 @@ pub struct SharedCache {
     paths: Arc<SharedCachePaths>,
     /// Session shard key to write this process's entries under.
     write_commit_key: Option<String>,
-    /// Bound on how many candidate shards `candidate_keys()` returns.
+    /// Hard upper bound on how many candidate shards `candidate_keys()`
+    /// returns, on top of the entry-count budget (see
+    /// `DEFAULT_SHARED_CACHE_ENTRY_BUDGET`) that `rank_shard_candidates`
+    /// applies in the same pass.
     ///
     /// See `candidate_keys()` for why this isn't resolved into a fixed list at
     /// `open()` time.
@@ -525,8 +528,44 @@ impl SharedCache {
             );
         }
 
+        self.maybe_write_rollup(&candidate_keys);
+
         merged
     }
+
+    /// Roll the currently-discoverable shards into one merged shard.
+    ///
+    /// Throttled independently of GC (see `gc::should_run_rollup`), so it
+    /// doesn't re-serialize the whole index on every store — only when the
+    /// throttle window has elapsed and there is more than one source shard to
+    /// merge. Runs on every platform: collapsing many small local shards into
+    /// one is useful even with no remote configured. Pushing the result
+    /// upstream is unix-only, like the rest of remote sync, so that part is
+    /// split into its own cfg-gated helper.
+    fn maybe_write_rollup(&self, keys: &[String]) {
+        if keys.len() < 2 || !gc::should_run_rollup(&self.paths, gc::DEFAULT_GC_THROTTLE) {
+            return;
+        }
+        let rollup_key = current_session_shard_key();
+        let Some(upload) = self.snapshot_store.write_rollup_shard(keys, &rollup_key) else {
+            return;
+        };
+        self.maybe_push_rollup_upload(rollup_key, upload);
+    }
+
+    #[cfg(unix)]
+    fn maybe_push_rollup_upload(&self, rollup_key: String, upload: SnapshotUpload) {
+        let Some(remote) = &self.remote else {
+            return;
+        };
+        if remote.is_disabled() {
+            return;
+        }
+        remote.enqueue_push_snapshot_upload(rollup_key, upload);
+    }
+
+    #[cfg(not(unix))]
+    fn maybe_push_rollup_upload(&self, _rollup_key: String, _upload: SnapshotUpload) {}
 
     #[cfg(unix)]
     fn pull_candidate_commits(&self, remote: Option<&RemoteSync>, candidate_keys: &[String]) {
@@ -842,8 +881,9 @@ impl SharedCache {
     /// Remote-only shards (a shard written by another machine, with no local
     /// directory) are merged in before ranking: local and remote candidates
     /// are deduplicated by key and passed through the same
-    /// `rank_shard_candidates` call, so age filtering and the history-length
-    /// cap apply uniformly regardless of where a shard was discovered.
+    /// `rank_shard_candidates` call, so age filtering, the history-length
+    /// cap, and the entry-count budget all apply uniformly regardless of
+    /// where a shard was discovered.
     ///
     /// This process's own write shard is always included even if nothing has
     /// been stored to it yet: its directory may not exist on disk at the time
@@ -886,6 +926,7 @@ impl SharedCache {
         let mut keys = rank_shard_candidates(
             candidates,
             self.history_len,
+            DEFAULT_SHARED_CACHE_ENTRY_BUDGET,
             Some(DEFAULT_SHARD_MAX_AGE_MS),
             now_unix_ms,
         );
@@ -1540,6 +1581,12 @@ mod tests {
         );
 
         let paths = open_shared_paths(temp_cache.path()).unwrap();
+        // Pre-stamp the rollup throttle so `build_index`'s own rollup pass
+        // doesn't fire during this test and re-read both fixtures a second
+        // time on top of the load this test is counting. Rollup re-reads are
+        // covered on their own in `snapshot::tests`; this test is only about
+        // proving the merged index isn't rebuilt per restore call.
+        let _ = gc::should_run_rollup(&paths, std::time::Duration::from_secs(3600));
         let (snapshot_store, load_counter) = SnapshotStore::new_with_counter(paths);
         let cache =
             SharedCache::from_parts_for_test(temp_repo.path(), 1_000_000, 10, snapshot_store)

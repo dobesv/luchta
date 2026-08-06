@@ -424,6 +424,47 @@ impl SnapshotStore {
             .join(format!("{shard_key}.{SNAPSHOT_FILE_EXTENSION}"))
     }
 
+    /// Merge every entry from `shard_keys` into one new shard at `rollup_key`.
+    ///
+    /// Source shards are deliberately left in place: another machine may be
+    /// reading them, and cross-session deletion would lose entries. GC ages
+    /// them out on its own schedule.
+    pub fn write_rollup_shard(
+        &self,
+        shard_keys: &[String],
+        rollup_key: &str,
+    ) -> Option<SnapshotUpload> {
+        let mut rolled = Snapshot::new();
+        for shard_key in shard_keys {
+            let Some(snapshot) = self.load(shard_key) else {
+                continue;
+            };
+            merge_shard_entries(&mut rolled, snapshot);
+        }
+
+        if rolled.entries.is_empty() {
+            return None;
+        }
+
+        let shard_dir = self.shard_dir_path(rollup_key);
+        if let Err(err) = fs::create_dir_all(&shard_dir) {
+            eprintln!(
+                "warning: failed to create rollup shard dir {}: {err}",
+                shard_dir.display()
+            );
+            return None;
+        }
+
+        // No visible shards to subsume: the rollup adds, it never deletes.
+        match self.write_consolidated_shard(rollup_key, &rolled, &[]) {
+            MergeEntryOutcome {
+                new_snapshot_upload: Some(upload),
+                ..
+            } => Some(upload),
+            _ => None,
+        }
+    }
+
     fn delete_shard_files_by_id(&self, shard_key: &str, shard_id: &str) {
         for path in [
             self.shard_dir_path(shard_key)
@@ -1266,6 +1307,48 @@ mod tests {
         assert!(!merged
             .entries
             .contains_key(&input_key_hex(missing_entry.input_key)));
+    }
+
+    #[test]
+    fn write_rollup_shard_merges_all_source_shards() {
+        let temp = tempdir().unwrap();
+        let paths = crate::shared::paths::open_shared_paths(temp.path()).unwrap();
+        let store = SnapshotStore::new(paths);
+
+        store.merge_entry("0000000000001-aaaa", sample_entry_with_seed(1, [1; 32]));
+        store.merge_entry("0000000000002-bbbb", sample_entry_with_seed(2, [2; 32]));
+
+        let upload = store
+            .write_rollup_shard(
+                &[
+                    "0000000000001-aaaa".to_string(),
+                    "0000000000002-bbbb".to_string(),
+                ],
+                "0000000000003-rollup",
+            )
+            .expect("rollup should be written");
+
+        assert!(!upload.shard_id.is_empty());
+
+        let rolled = store
+            .load("0000000000003-rollup")
+            .expect("rollup snapshot loads");
+        assert_eq!(rolled.entries.len(), 2);
+
+        // Sources survive — another machine may still be reading them.
+        assert!(store.load("0000000000001-aaaa").is_some());
+        assert!(store.load("0000000000002-bbbb").is_some());
+    }
+
+    #[test]
+    fn write_rollup_shard_returns_none_when_there_is_nothing_to_roll_up() {
+        let temp = tempdir().unwrap();
+        let paths = crate::shared::paths::open_shared_paths(temp.path()).unwrap();
+        let store = SnapshotStore::new(paths);
+
+        assert!(store
+            .write_rollup_shard(&[], "0000000000003-rollup")
+            .is_none());
     }
 
     fn write_snapshot_file(path: &Path, snapshot: Snapshot) {

@@ -13,7 +13,14 @@ use crate::shared::{derive_input_key, restore_blob, SnapshotEntry, SnapshotStore
 pub const DEFAULT_GC_RETENTION: Duration = Duration::from_secs(14 * 24 * 60 * 60);
 /// Default throttle window for opportunistic GC runs.
 pub const DEFAULT_GC_THROTTLE: Duration = Duration::from_secs(24 * 60 * 60);
-const LAST_GC_MARKER: &str = ".last-gc";
+/// Marker file for the GC throttle.
+const GC_MARKER_NAME: &str = ".gc-marker";
+/// Marker file for the shard rollup throttle.
+///
+/// A separate marker from `GC_MARKER_NAME` so a GC run and a rollup run don't
+/// throttle each other: `mod.rs::build_index` runs its rollup on its own
+/// schedule, independent of the CLI's `maybe_run_gc` call.
+pub const ROLLUP_MARKER_NAME: &str = ".rollup-marker";
 const SNAPSHOT_SUFFIX: &str = ".bincode";
 const BLOB_SUFFIX: &str = ".tar.zst";
 const ENTRY_META_SUFFIX: &str = ".bin";
@@ -43,13 +50,30 @@ pub fn maybe_run_gc(
     retention: Duration,
     throttle: Duration,
 ) -> Option<GcStats> {
-    if !should_run_gc(paths, throttle, SystemTime::now()) {
+    if !should_run_marked(paths, GC_MARKER_NAME, throttle, SystemTime::now()) {
         return None;
     }
 
     let stats = run_gc(paths, retention);
-    let _ = write_gc_marker(paths, SystemTime::now());
+    let _ = write_marker(paths, GC_MARKER_NAME, SystemTime::now());
     Some(stats)
+}
+
+/// True if `throttle` has elapsed since the last shard rollup. Stamps the
+/// rollup marker so a subsequent call within the throttle window returns
+/// `false`.
+///
+/// Throttled independently of `maybe_run_gc`: rollups run inside
+/// `build_index` (see `mod.rs::maybe_write_rollup`), not from the CLI's GC
+/// hook, and re-serialize the whole discovered index, so they need their own
+/// cadence rather than piggybacking on the GC throttle.
+#[must_use]
+pub fn should_run_rollup(paths: &SharedCachePaths, throttle: Duration) -> bool {
+    if !should_run_marked(paths, ROLLUP_MARKER_NAME, throttle, SystemTime::now()) {
+        return false;
+    }
+    let _ = write_marker(paths, ROLLUP_MARKER_NAME, SystemTime::now());
+    true
 }
 
 fn gc_snapshot_dir(
@@ -199,26 +223,35 @@ fn gc_entries_dir(
     }
 }
 
-fn should_run_gc(paths: &SharedCachePaths, throttle: Duration, now: SystemTime) -> bool {
-    let marker_path = gc_marker_path(paths);
-    match fs::metadata(marker_path).and_then(|metadata| metadata.modified()) {
+/// True if `throttle` has elapsed since the marker named `marker_name` was
+/// last stamped (or if it has never been stamped). Shared by the GC throttle
+/// and the rollup throttle, each with its own marker file, so neither run
+/// throttles the other.
+fn should_run_marked(
+    paths: &SharedCachePaths,
+    marker_name: &str,
+    throttle: Duration,
+    now: SystemTime,
+) -> bool {
+    let path = marker_path(paths, marker_name);
+    match fs::metadata(path).and_then(|metadata| metadata.modified()) {
         Ok(modified) => elapsed_at_least(modified, throttle, now),
         Err(error) if error.kind() == io::ErrorKind::NotFound => true,
         Err(_) => true,
     }
 }
 
-fn write_gc_marker(paths: &SharedCachePaths, now: SystemTime) -> io::Result<()> {
+fn write_marker(paths: &SharedCachePaths, marker_name: &str, now: SystemTime) -> io::Result<()> {
     let timestamp = now
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
         .to_string();
-    atomic_write(&gc_marker_path(paths), timestamp.as_bytes()).map_err(io::Error::other)
+    atomic_write(&marker_path(paths, marker_name), timestamp.as_bytes()).map_err(io::Error::other)
 }
 
-fn gc_marker_path(paths: &SharedCachePaths) -> PathBuf {
-    paths.root.join(LAST_GC_MARKER)
+fn marker_path(paths: &SharedCachePaths, marker_name: &str) -> PathBuf {
+    paths.root.join(marker_name)
 }
 
 fn has_file_name_suffix(path: &Path, suffix: &str) -> bool {
@@ -448,7 +481,26 @@ mod tests {
 
         assert!(first.is_some());
         assert!(second.is_none());
-        assert!(gc_marker_path(&paths).exists());
+        assert!(marker_path(&paths, GC_MARKER_NAME).exists());
+    }
+
+    #[test]
+    fn should_run_rollup_throttles_back_to_back_calls() {
+        let temp = TempDir::new().unwrap();
+        let paths = crate::shared::paths::open_shared_paths(temp.path()).unwrap();
+
+        assert!(should_run_rollup(&paths, Duration::from_secs(3600)));
+        assert!(!should_run_rollup(&paths, Duration::from_secs(3600)));
+    }
+
+    #[test]
+    fn rollup_throttle_is_independent_of_the_gc_throttle() {
+        let temp = TempDir::new().unwrap();
+        let paths = crate::shared::paths::open_shared_paths(temp.path()).unwrap();
+
+        assert!(should_run_rollup(&paths, Duration::from_secs(3600)));
+        // GC has its own marker, so it is still eligible.
+        assert!(maybe_run_gc(&paths, Duration::from_secs(60), Duration::from_secs(3600)).is_some());
     }
 
     #[test]

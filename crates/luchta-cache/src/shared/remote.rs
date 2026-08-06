@@ -117,6 +117,7 @@ struct PushQueue {
 #[derive(Debug)]
 enum PushMsg {
     Push(OwnedPushArtifacts),
+    PushSnapshotUpload(String, SnapshotUpload),
     #[cfg(any(test, doctest))]
     Flush(std::sync::mpsc::Sender<()>),
 }
@@ -264,6 +265,7 @@ impl RemoteSync {
             .filter(|entry| entry.is_dir)
             .map(|entry| ShardCandidate {
                 modified_unix_ms: shard_key_unix_ms(&entry.name).unwrap_or(0),
+                entry_count: remote_entry_count_proxy(entry.size),
                 key: entry.name,
             })
             .collect()
@@ -282,6 +284,18 @@ impl RemoteSync {
             self.remote_base_fs.trim_end_matches('/')
         )
     }
+}
+
+/// Proxy for a remote shard's entry count.
+///
+/// The rclone listing reports a directory's `size`, not a `SnapshotEntry`
+/// count — loading the shard for a real count would cost a network round
+/// trip per candidate, defeating the point of a cheap ranking pass. A
+/// non-positive (or otherwise unrepresentable) size falls back to 1 so an
+/// unknown-size candidate still counts toward the entry budget instead of
+/// being treated as free.
+fn remote_entry_count_proxy(size: i64) -> usize {
+    usize::try_from(size).unwrap_or(1).max(1)
 }
 
 /// Recover the timestamp from a `<unix_ms>-<nonce>` shard key.
@@ -327,6 +341,9 @@ impl RemoteSync {
             for msg in rx {
                 match msg {
                     PushMsg::Push(push) => worker_remote.push_store_artifacts_owned(push),
+                    PushMsg::PushSnapshotUpload(commit_key, upload) => {
+                        let _ = worker_remote.push_snapshot_upload(&commit_key, &upload);
+                    }
                     #[cfg(any(test, doctest))]
                     PushMsg::Flush(ack) => {
                         let _ = ack.send(());
@@ -359,6 +376,31 @@ impl RemoteSync {
             return;
         };
         if tx.send(PushMsg::Push(push)).is_err() {
+            eprintln!("debug: remote push queue closed before enqueue completed");
+        }
+    }
+
+    /// Enqueue a rollup shard upload on the same push queue `store()` uses.
+    ///
+    /// `push_snapshot_upload` already does the transfer (it's the same call
+    /// `push_store_artifacts` makes after a snapshot merge); this just gets a
+    /// rollup's upload onto that queue instead of blocking the caller on it.
+    pub(crate) fn enqueue_push_snapshot_upload(&self, commit_key: String, upload: SnapshotUpload) {
+        let Some(tx) = self
+            .push_queue
+            .tx
+            .lock()
+            .expect("push queue tx mutex poisoned")
+            .as_ref()
+            .cloned()
+        else {
+            let _ = self.push_snapshot_upload(&commit_key, &upload);
+            return;
+        };
+        if tx
+            .send(PushMsg::PushSnapshotUpload(commit_key, upload))
+            .is_err()
+        {
             eprintln!("debug: remote push queue closed before enqueue completed");
         }
     }
@@ -1203,6 +1245,7 @@ mod tests {
                         release_rx.recv().unwrap();
                         processed_tx.send(()).unwrap();
                     }
+                    PushMsg::PushSnapshotUpload(..) => {}
                     PushMsg::Flush(ack) => {
                         let _ = ack.send(());
                     }

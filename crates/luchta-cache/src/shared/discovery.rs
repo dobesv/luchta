@@ -8,10 +8,12 @@
 //! Shards are now named `<unix_ms>-<nonce>` and discovered by recency.
 
 use std::fs;
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::shared::paths::SharedCachePaths;
+use crate::shared::snapshot::SNAPSHOT_FILE_EXTENSION;
 
 static SHARD_NONCE: AtomicU64 = AtomicU64::new(0);
 
@@ -19,12 +21,30 @@ static SHARD_NONCE: AtomicU64 = AtomicU64::new(0);
 /// short enough that the merged index stays small.
 pub const DEFAULT_SHARD_MAX_AGE_MS: u64 = 1000 * 60 * 60 * 24 * 14;
 
+/// Default entry budget (in on-disk shard bytes — see `ShardCandidate::
+/// entry_count`) for the discovery window, on top of the existing
+/// shard-count `limit`. Sized well above what a single day's worth of local
+/// `luchta run` invocations would produce, so ordinary local churn does not
+/// push an older, not-yet-rolled-up shard out of the window before a rollup
+/// ever sees it.
+pub const DEFAULT_SHARED_CACHE_ENTRY_BUDGET: usize = 50 * 1024 * 1024;
+
 /// A shard directory found on disk (or reported by a remote listing),
-/// carrying just enough to rank it: its key and last-modified time.
+/// carrying just enough to rank it: its key, last-modified time, and a weight
+/// for the entry-budget walk in `rank_shard_candidates`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShardCandidate {
     pub key: String,
     pub modified_unix_ms: u64,
+    /// A cheap proxy for how much this shard would cost to load: its on-disk
+    /// (or remote-listed) byte size, or 1 when unknown. Not a literal
+    /// `SnapshotEntry` count — an exact count would mean decoding every
+    /// candidate during discovery, doubling the load `build_index` already
+    /// does for the shards that survive ranking. Byte size is roughly linear
+    /// in entry count for this format (each `SnapshotEntry` is dominated by a
+    /// handful of fixed-size hashes), and it's the same unit remote listings
+    /// already report, so local and remote candidates rank on a common scale.
+    pub entry_count: usize,
 }
 
 /// Build a shard key from an explicit timestamp and nonce.
@@ -48,7 +68,19 @@ pub fn current_session_shard_key() -> String {
     new_session_shard_key(now_unix_ms, nonce)
 }
 
-/// Rank candidates newest-first, capped at `limit` and filtered by `max_age_ms`.
+/// Rank candidates newest-first, filtered by `max_age_ms`, then walk that
+/// list accumulating `entry_count` until either `entry_budget` is reached or
+/// `limit` shards have been kept — whichever comes first.
+///
+/// `limit` is a hard upper bound on shard *count*, independent of
+/// `entry_budget`: it exists so a run of shards that individually under-report
+/// (or a remote listing with unknown sizes, which fall back to an
+/// `entry_count` of 1) can't force the walk through an unbounded number of
+/// shards while still short of the budget. `entry_budget` is what actually
+/// keeps the window scoped to a bounded amount of history: a handful of tiny
+/// local shards contribute only a handful of entries, so they don't burn
+/// through the budget the way they would a shard-count-only limit, leaving
+/// room for an older, larger shard (e.g. a rollup pack) to still make the cut.
 ///
 /// Ties on modification time fall back to key order descending, which is
 /// chronological because keys are zero-padded millisecond timestamps.
@@ -56,6 +88,7 @@ pub fn current_session_shard_key() -> String {
 pub fn rank_shard_candidates(
     candidates: Vec<ShardCandidate>,
     limit: usize,
+    entry_budget: usize,
     max_age_ms: Option<u64>,
     now_unix_ms: u64,
 ) -> Vec<String> {
@@ -75,8 +108,17 @@ pub fn rank_shard_candidates(
             .cmp(&left.modified_unix_ms)
             .then_with(|| right.key.cmp(&left.key))
     });
-    kept.truncate(limit);
-    kept.into_iter().map(|candidate| candidate.key).collect()
+
+    let mut selected = Vec::new();
+    let mut entries_so_far: usize = 0;
+    for candidate in kept {
+        if selected.len() >= limit || entries_so_far >= entry_budget {
+            break;
+        }
+        entries_so_far = entries_so_far.saturating_add(candidate.entry_count);
+        selected.push(candidate.key);
+    }
+    selected
 }
 
 /// Discover shard directories present in the local cache, unranked.
@@ -108,9 +150,30 @@ pub fn local_shard_candidates_for(paths: &SharedCachePaths) -> Vec<ShardCandidat
         candidates.push(ShardCandidate {
             key: key.to_string(),
             modified_unix_ms,
+            entry_count: shard_dir_byte_size(&path),
         });
     }
     candidates
+}
+
+/// Sum of the `.bincode` shard file sizes in a shard directory: a cheap
+/// stand-in for entry count that costs a `read_dir` and some `stat` calls,
+/// not a decode of every candidate's contents. Falls back to 1 (never 0, so
+/// the candidate still counts toward the entry budget) if the directory
+/// can't be read or is empty.
+fn shard_dir_byte_size(shard_dir: &Path) -> usize {
+    let Ok(entries) = fs::read_dir(shard_dir) else {
+        return 1;
+    };
+    let total: u64 = entries
+        .flatten()
+        .filter(|entry| {
+            entry.path().extension().and_then(|ext| ext.to_str()) == Some(SNAPSHOT_FILE_EXTENSION)
+        })
+        .filter_map(|entry| entry.metadata().ok())
+        .map(|metadata| metadata.len())
+        .sum();
+    usize::try_from(total).unwrap_or(usize::MAX).max(1)
 }
 
 #[cfg(test)]
@@ -147,13 +210,26 @@ mod tests {
     }
 
     fn candidate(key: &str, modified_unix_ms: u64) -> ShardCandidate {
+        candidate_with_entries(key, modified_unix_ms, 1)
+    }
+
+    fn candidate_with_entries(
+        key: &str,
+        modified_unix_ms: u64,
+        entry_count: usize,
+    ) -> ShardCandidate {
         ShardCandidate {
             key: key.to_string(),
             modified_unix_ms,
+            entry_count,
         }
     }
 
     const NOW: u64 = 1_754_431_200_000;
+    /// Large enough that no test below accidentally exercises the entry
+    /// budget when it means to be testing something else (age, count limit,
+    /// tie-breaking).
+    const AMPLE_BUDGET: usize = 1_000_000;
 
     #[test]
     fn shard_key_zero_pads_short_timestamps_so_lexical_order_stays_chronological() {
@@ -175,6 +251,7 @@ mod tests {
                 candidate("c", NOW - 2_000),
             ],
             10,
+            AMPLE_BUDGET,
             None,
             NOW,
         );
@@ -190,6 +267,7 @@ mod tests {
                 candidate("c", NOW - 2_000),
             ],
             2,
+            AMPLE_BUDGET,
             None,
             NOW,
         );
@@ -204,6 +282,7 @@ mod tests {
                 candidate("stale", NOW - 100_000),
             ],
             10,
+            AMPLE_BUDGET,
             Some(10_000),
             NOW,
         );
@@ -218,10 +297,50 @@ mod tests {
                 candidate("0000000000001-bbbb", NOW),
             ],
             10,
+            AMPLE_BUDGET,
             None,
             NOW,
         );
         assert_eq!(ranked, vec!["0000000000001-bbbb", "0000000000001-aaaa"]);
+    }
+
+    #[test]
+    fn rank_applies_the_entry_budget_as_a_hard_stop() {
+        let ranked = rank_shard_candidates(
+            vec![
+                candidate_with_entries("a", NOW - 2_000, 5),
+                candidate_with_entries("b", NOW - 1_000, 5),
+                candidate_with_entries("c", NOW - 3_000, 5),
+            ],
+            10,
+            8,
+            None,
+            NOW,
+        );
+        // "b" (5) then "a" (5) crosses the budget of 8 at 10; "c" never runs.
+        assert_eq!(ranked, vec!["b", "a"]);
+    }
+
+    #[test]
+    fn rank_bounds_by_entry_count_not_shard_count_so_local_churn_does_not_evict_an_old_pack() {
+        // 20 fresh, one-entry local shards plus one much older 500-entry
+        // rollup pack. A shard-count-only cap of 20 would fill up on the
+        // fresh shards alone and never even look at the pack — this proves
+        // ranking now walks by accumulated entry count, so the pack survives
+        // as long as the entry budget and shard-count limit both have room
+        // for it.
+        let mut candidates: Vec<ShardCandidate> = (0..20)
+            .map(|i| candidate_with_entries(&format!("fresh-{i:02}"), NOW - i as u64, 1))
+            .collect();
+        candidates.push(candidate_with_entries("old-pack", NOW - 1_000_000, 500));
+
+        let ranked = rank_shard_candidates(candidates, 25, 100, None, NOW);
+
+        assert_eq!(ranked.len(), 21);
+        assert!(
+            ranked.contains(&"old-pack".to_string()),
+            "the older, larger pack must not be evicted by 20 tiny local shards"
+        );
     }
 
     #[test]
@@ -253,6 +372,7 @@ mod tests {
         let discovered = rank_shard_candidates(
             local_shard_candidates_for(&paths),
             10,
+            AMPLE_BUDGET,
             Some(DEFAULT_SHARD_MAX_AGE_MS),
             now_unix_ms,
         );
@@ -273,5 +393,32 @@ mod tests {
             entries_dir: temp.path().join("entries"),
         };
         assert!(local_shard_candidates_for(&paths).is_empty());
+    }
+
+    #[test]
+    fn local_shard_candidates_for_weighs_entry_count_by_on_disk_shard_bytes() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let paths = crate::shared::paths::open_shared_paths(temp.path()).unwrap();
+
+        let small_dir = paths.snapshots_dir.join("0000000000001-small");
+        let big_dir = paths.snapshots_dir.join("0000000000002-big");
+        fs::create_dir_all(&small_dir).unwrap();
+        fs::create_dir_all(&big_dir).unwrap();
+        fs::write(small_dir.join("aaaa.bincode"), vec![0u8; 10]).unwrap();
+        fs::write(big_dir.join("bbbb.bincode"), vec![0u8; 1000]).unwrap();
+        // A `.merged` sidecar isn't a shard and must not count toward the size.
+        fs::write(big_dir.join("bbbb.merged"), vec![0u8; 1000]).unwrap();
+
+        let candidates = local_shard_candidates_for(&paths);
+        let small = candidates
+            .iter()
+            .find(|c| c.key == "0000000000001-small")
+            .unwrap();
+        let big = candidates
+            .iter()
+            .find(|c| c.key == "0000000000002-big")
+            .unwrap();
+        assert_eq!(small.entry_count, 10);
+        assert_eq!(big.entry_count, 1000);
     }
 }
