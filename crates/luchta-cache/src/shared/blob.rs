@@ -908,15 +908,27 @@ pub fn restore_blob_with_meta(
         .tempdir_in(package_dir)?;
 
     match extract_blob_with_meta_to_staging(compressed, package_dir, staging_dir.path()) {
-        Ok(Some(meta)) => Ok(BlobReadResultWithMeta::Restored(StagedRestore {
+        Ok(meta) => Ok(BlobReadResultWithMeta::Restored(StagedRestore {
             meta,
             staging_dir,
             package_dir: package_dir.to_path_buf(),
         })),
-        Ok(None) => Ok(BlobReadResultWithMeta::Corrupt),
         Err(RestoreError::Corrupt) => Ok(BlobReadResultWithMeta::Corrupt),
         Err(RestoreError::Io(error)) => Err(error),
     }
+}
+
+/// Restore an outputs-only blob into a staging directory.
+///
+/// Blobs written by older clients still carry a `.luchta-meta/` directory.
+/// Its contents are ignored here — `entries/<input_key>` is authoritative —
+/// and `move_non_meta_files` filters it out on commit.
+pub fn restore_outputs_staged(
+    paths: &SharedCachePaths,
+    outputs_hash: &[u8; 32],
+    package_dir: &Path,
+) -> io::Result<BlobReadResultWithMeta<StagedRestore>> {
+    restore_blob_with_meta(paths, outputs_hash, package_dir)
 }
 
 /// A staged restore that holds extracted files in a temp directory.
@@ -932,6 +944,23 @@ pub struct StagedRestore {
 }
 
 impl StagedRestore {
+    /// A staged restore holding no files. Commits to an empty path list.
+    pub fn empty(package_dir: &Path) -> io::Result<Self> {
+        let staging_dir = tempfile::Builder::new()
+            .prefix("blob-restore-empty-")
+            .tempdir_in(package_dir)?;
+        Ok(Self {
+            meta: MetaFiles {
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                record: Vec::new(),
+                reports: Vec::new(),
+            },
+            staging_dir,
+            package_dir: package_dir.to_path_buf(),
+        })
+    }
+
     /// Move all non-meta files from staging into the package directory.
     /// Returns absolute destination paths written into the package directory.
     /// After this call, the staging directory is cleaned up.
@@ -969,7 +998,7 @@ fn extract_blob_with_meta_to_staging(
     compressed: File,
     package_dir: &Path,
     staging_dir: &Path,
-) -> Result<Option<MetaFiles>, RestoreError> {
+) -> Result<MetaFiles, RestoreError> {
     let decoder = zstd::Decoder::new(compressed).map_err(|_| RestoreError::Corrupt)?;
     let mut archive = Archive::new(decoder);
     let entries = archive.entries().map_err(|_| RestoreError::Corrupt)?;
@@ -1053,20 +1082,15 @@ fn extract_blob_with_meta_to_staging(
         }
     }
 
-    // Meta files are optional - we only need at least one present
-    // If no meta files, return Corrupt
-    if meta_stdout.is_none() && meta_stderr.is_none() && meta_record.is_none() {
-        // No meta files found, blob may be from an older version
-        // Return None to indicate corrupt/missing meta
-        return Ok(None);
-    }
-
-    Ok(Some(MetaFiles {
+    // Outputs-only blobs (the current format, see write_outputs_blob) carry no
+    // .luchta-meta at all — that is not corruption, just an entry whose record,
+    // stdout, and stderr live in entries/<input_key> instead.
+    Ok(MetaFiles {
         stdout: meta_stdout.unwrap_or_default(),
         stderr: meta_stderr.unwrap_or_default(),
         record: meta_record.unwrap_or_default(),
         reports: meta_reports,
-    }))
+    })
 }
 
 struct MoveOutputsError {

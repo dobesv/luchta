@@ -367,6 +367,14 @@ impl RemoteSync {
         }
     }
 
+    pub(crate) fn pull_entry_meta(
+        &self,
+        _paths: &SharedCachePaths,
+        _input_key: &[u8; 32],
+    ) -> Result<(), rclone::RcloneError> {
+        Ok(())
+    }
+
     pub(crate) fn pull_blob(
         &self,
         paths: &SharedCachePaths,

@@ -13,8 +13,9 @@ pub mod snapshot;
 
 pub(crate) use atomicio::atomic_write;
 pub use blob::{
-    restore_blob, restore_blob_with_meta, write_blob_with_meta, write_outputs_blob, BlobReadResult,
-    BlobReadResultWithMeta, BlobWriteResult, MetaFiles, StagedRestore,
+    restore_blob, restore_blob_with_meta, restore_outputs_staged, write_blob_with_meta,
+    write_outputs_blob, BlobReadResult, BlobReadResultWithMeta, BlobWriteResult, MetaFiles,
+    StagedRestore,
 };
 pub use entry_meta::{
     encode_entry_meta, entry_meta_path, read_entry_meta, write_entry_meta, EntryMeta,
@@ -86,6 +87,25 @@ pub struct StagedCandidate {
 }
 
 impl StagedCandidate {
+    /// A candidate with no output files. Commits to an empty path list.
+    pub fn empty_outputs(
+        outputs_hash: [u8; 32],
+        record: TaskRunRecord,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+        reports: Vec<crate::store::ReportInput>,
+        package_dir: &Path,
+    ) -> std::io::Result<Self> {
+        Ok(Self {
+            outputs_hash,
+            record,
+            stdout,
+            stderr,
+            reports,
+            staged: blob::StagedRestore::empty(package_dir)?,
+        })
+    }
+
     /// Commit this restore by moving staged files into the package directory.
     pub fn commit(self) -> std::io::Result<(RestoredHit, Vec<std::path::PathBuf>)> {
         let written_paths = self.staged.commit()?;
@@ -394,24 +414,68 @@ impl SharedCache {
     }
 
     /// Stage a single entry, returning a StagedCandidate for validation.
+    ///
+    /// Two-phase: fetch the small `entries/<input_key>` object first and decode
+    /// the record from it. Only pull the outputs blob if the entry actually has
+    /// outputs. A candidate rejected by `decide_shared_restore` therefore never
+    /// costs an outputs download.
     fn stage_entry(
         entry: &SnapshotEntry,
         paths: &SharedCachePaths,
         package_dir: &Path,
         #[cfg(unix)] remote: Option<&RemoteSync>,
     ) -> Option<StagedCandidate> {
-        if !blob_path(paths, &entry.outputs_hash).is_file() {
-            #[cfg(unix)]
+        #[cfg(unix)]
+        if read_entry_meta(paths, &entry.input_key).is_none() {
             if let Some(remote) = remote {
-                if let Err(err) = remote.pull_blob(paths, &entry.outputs_hash) {
+                if let Err(err) = remote.pull_entry_meta(paths, &entry.input_key) {
                     eprintln!(
-                        "debug: remote blob pull failed for outputs_hash={}: {err}",
-                        hex_hash(entry.outputs_hash)
+                        "debug: remote entry meta pull failed for input_key={}: {err}",
+                        hex_hash(entry.input_key)
                     );
                 }
             }
         }
-        let staged = match restore_blob_with_meta(paths, &entry.outputs_hash, package_dir) {
+
+        let meta = read_entry_meta(paths, &entry.input_key)?;
+
+        let record: TaskRunRecord =
+            match bincode::serde::decode_from_slice(&meta.record, bincode_config()) {
+                Ok((record, _)) => record,
+                Err(_) => return None,
+            };
+
+        let reports: Vec<crate::store::ReportInput> = meta
+            .reports
+            .into_iter()
+            .map(crate::store::ReportInput::from)
+            .collect();
+
+        if record.outputs.is_empty() {
+            return StagedCandidate::empty_outputs(
+                meta.outputs_hash,
+                record,
+                meta.stdout,
+                meta.stderr,
+                reports,
+                package_dir,
+            )
+            .ok();
+        }
+
+        if !blob_path(paths, &meta.outputs_hash).is_file() {
+            #[cfg(unix)]
+            if let Some(remote) = remote {
+                if let Err(err) = remote.pull_blob(paths, &meta.outputs_hash) {
+                    eprintln!(
+                        "debug: remote blob pull failed for outputs_hash={}: {err}",
+                        hex_hash(meta.outputs_hash)
+                    );
+                }
+            }
+        }
+
+        let staged = match restore_outputs_staged(paths, &meta.outputs_hash, package_dir) {
             Ok(BlobReadResultWithMeta::Restored(staged)) => staged,
             Ok(BlobReadResultWithMeta::Missing) | Ok(BlobReadResultWithMeta::Corrupt) => {
                 return None
@@ -419,24 +483,12 @@ impl SharedCache {
             Err(_) => return None,
         };
 
-        // Decode record.
-        let record: TaskRunRecord =
-            match bincode::serde::decode_from_slice(&staged.meta.record, bincode_config()) {
-                Ok((record, _)) => record,
-                Err(_) => {
-                    // Discard staging on decode failure
-                    let _ = staged.discard();
-                    return None;
-                }
-            };
-
-        let meta = staged.meta.clone();
         Some(StagedCandidate {
-            outputs_hash: entry.outputs_hash,
+            outputs_hash: meta.outputs_hash,
             record,
             stdout: meta.stdout,
             stderr: meta.stderr,
-            reports: meta.reports,
+            reports,
             staged,
         })
     }
@@ -1317,6 +1369,22 @@ mod tests {
         )
         .unwrap();
 
+        // Restore is keyed by input_key now, not by outputs_hash: write the
+        // entries/<input_key> object the two-phase restore path reads from.
+        write_entry_meta(
+            &cache.paths,
+            &input_key,
+            &EntryMeta {
+                schema_version: ENTRY_META_SCHEMA_VERSION,
+                outputs_hash: [7; 32],
+                record: meta.record.clone(),
+                stdout: meta.stdout.clone(),
+                stderr: meta.stderr.clone(),
+                reports: vec![],
+            },
+        )
+        .unwrap();
+
         // Now also add a snapshot entry for commit2 (newer) with a DIFFERENT outputs_hash
         // This simulates the case where commit2's blob is missing but commit1's exists.
         let entry_commit2 = SnapshotEntry {
@@ -1710,6 +1778,121 @@ mod tests {
         assert!(
             snapshot.entries.contains_key(&input_key_hex(key_b)),
             "entry B should be recorded in the snapshot"
+        );
+    }
+
+    #[test]
+    fn restore_reads_meta_from_entries_not_from_blob() {
+        let temp_repo = TempDir::new().unwrap();
+        setup_git_repo(temp_repo.path());
+        create_commit(temp_repo.path());
+
+        let temp_cache = TempDir::new().unwrap();
+        let cache = SharedCache::open_with_cache_dir(
+            temp_repo.path(),
+            1_000_000,
+            10,
+            Some(temp_cache.path()),
+        )
+        .unwrap();
+
+        let package_dir = temp_repo.path().join("pkg");
+        fs::create_dir_all(package_dir.join("dist")).unwrap();
+        fs::write(package_dir.join("dist/main.js"), "console.log('hi');").unwrap();
+
+        let input_key = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32]);
+        let record = sample_record(true, 200);
+
+        cache
+            .store(
+                "pkg#build",
+                &input_key,
+                &[7; 32],
+                &package_dir,
+                &[PathBuf::from("dist/main.js")],
+                &record,
+                b"stdout output",
+                b"stderr output",
+                &[],
+                temp_repo.path(),
+            )
+            .unwrap();
+
+        let restore_dir = temp_repo.path().join("restore");
+        fs::create_dir_all(&restore_dir).unwrap();
+
+        let (hit, written_paths) = cache
+            .try_restore_candidates("pkg#build", &input_key, &restore_dir)
+            .next()
+            .expect("expected at least one candidate")
+            .commit()
+            .expect("commit should succeed");
+
+        assert_eq!(hit.outputs_hash, [7; 32]);
+        assert_eq!(hit.stdout, b"stdout output");
+        assert_eq!(hit.stderr, b"stderr output");
+        assert_eq!(written_paths, vec![restore_dir.join("dist/main.js")]);
+        assert_eq!(
+            fs::read(restore_dir.join("dist/main.js")).unwrap(),
+            b"console.log('hi');"
+        );
+        assert!(!restore_dir.join(".luchta-meta").exists());
+    }
+
+    #[test]
+    fn no_output_task_restores_without_touching_a_blob() {
+        let temp_repo = TempDir::new().unwrap();
+        setup_git_repo(temp_repo.path());
+        create_commit(temp_repo.path());
+
+        let temp_cache = TempDir::new().unwrap();
+        let cache = SharedCache::open_with_cache_dir(
+            temp_repo.path(),
+            1_000_000,
+            10,
+            Some(temp_cache.path()),
+        )
+        .unwrap();
+
+        let empty_hash = crate::resolve::combined_outputs_hash(&[]);
+        let package_dir = temp_repo.path().join("pkg");
+        fs::create_dir_all(&package_dir).unwrap();
+
+        let mut record = sample_record(true, 200);
+        record.output_patterns = vec![];
+        record.outputs = vec![];
+        record.outputs_hash = empty_hash;
+        let input_key = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32]);
+
+        cache
+            .store(
+                "pkg#lint",
+                &input_key,
+                &empty_hash,
+                &package_dir,
+                &[],
+                &record,
+                b"lint output",
+                b"",
+                &[],
+                temp_repo.path(),
+            )
+            .unwrap();
+
+        let restore_dir = temp_repo.path().join("restore");
+        fs::create_dir_all(&restore_dir).unwrap();
+
+        let (hit, written_paths) = cache
+            .try_restore_candidates("pkg#lint", &input_key, &restore_dir)
+            .next()
+            .expect("expected a candidate for a no-output task")
+            .commit()
+            .expect("commit should succeed");
+
+        assert_eq!(hit.stdout, b"lint output");
+        assert!(
+            written_paths.is_empty(),
+            "nothing to write for a no-output task"
         );
     }
 }
