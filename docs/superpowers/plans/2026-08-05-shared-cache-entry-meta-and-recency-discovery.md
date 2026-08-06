@@ -18,6 +18,22 @@
 - `#[cfg(unix)]` gates all remote-sync code. Follow the existing gating exactly when touching `shared/mod.rs` and `shared/remote.rs`.
 - Commit after every task with an imperative subject line. No AI attribution footers.
 
+## Amendments during execution
+
+Recorded here because the plan is the briefing source for each task.
+
+- **Task 4 (during execution):** `EntryMeta` gains `pub has_outputs: bool`, set in `store` from
+  `!matches!(blob_result, BlobWriteResult::NoOutputs)`. Task 4's `stage_entry` branches on
+  `!meta.has_outputs`, NOT on `record.outputs.is_empty()` as originally written. Reason: the write side
+  decides "no blob" from `rel_output_paths` (absent entries filtered out, then missing-on-disk files
+  skipped), so a task with declared-but-absent outputs stored no blob yet had a non-empty
+  `record.outputs` — restore then chased a blob that could never exist, missing permanently and firing a
+  futile remote pull each attempt. `ENTRY_META_SCHEMA_VERSION` stays at 1; nothing has shipped.
+- **Task 4 (during execution):** the multi-candidate blob-miss fallback in `try_restore_candidates` is
+  deleted and `stage_entry` narrowed to take `input_key: &[u8; 32]`. It became inert once meta moved to
+  `entries/<input_key>`: every candidate for one input_key resolves identically. Accepted consequence —
+  a GC'd blob is now a rebuild rather than a fallback to another commit's outputs.
+
 ## Scope Note
 
 This plan covers two subsystems. **Phase 1 (Tasks 1–6) is independently shippable** and fixes #278 on its own. **Phase 2 (Tasks 7–11)** fixes #277 and does not depend on Phase 1 landing first, but the ordering here is deliberate: Phase 1 makes restore two-phase (cheap meta fetch, then blob), which is what makes Phase 2's wider candidate set affordable. If you need to stop early, stop at the end of Task 6.
@@ -1209,6 +1225,7 @@ Add to `#[cfg(test)] mod tests` in `gc.rs`:
         let meta = crate::shared::EntryMeta {
             schema_version: crate::shared::ENTRY_META_SCHEMA_VERSION,
             outputs_hash: [1; 32],
+            has_outputs: false,
             record: vec![0],
             stdout: Vec::new(),
             stderr: Vec::new(),
@@ -1234,6 +1251,7 @@ Add to `#[cfg(test)] mod tests` in `gc.rs`:
         let meta = crate::shared::EntryMeta {
             schema_version: crate::shared::ENTRY_META_SCHEMA_VERSION,
             outputs_hash: [1; 32],
+            has_outputs: false,
             record: vec![0],
             stdout: Vec::new(),
             stderr: Vec::new(),

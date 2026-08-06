@@ -151,15 +151,12 @@ pub enum StoreOutcome {
 pub struct MergedIndex {
     /// input_key_hex -> (SnapshotEntry, commit_key) with newest-wins semantics.
     entries: HashMap<String, (SnapshotEntry, String)>,
-    /// Loaded snapshots retained in memory for blob-miss fallback (newest-first order).
-    snapshots: Vec<(String, Snapshot)>,
 }
 
 impl MergedIndex {
     fn new() -> Self {
         Self {
             entries: HashMap::new(),
-            snapshots: Vec::new(),
         }
     }
 
@@ -349,11 +346,17 @@ impl SharedCache {
     ///
     /// Lookup proceeds as follows:
     /// 1. Build merged index on first access (lazy, ONCE).
-    /// 2. O(1) lookup by input_key in merged index.
-    /// 3. If found, extract blob to staging and return a StagedCandidate for validation.
+    /// 2. O(1) lookup by input_key in merged index — no disk read.
+    /// 3. If found, stage from `entries/<input_key>` (and its outputs blob, if
+    ///    any) and return a StagedCandidate for validation.
     /// 4. Caller validates candidate by calling `validate()` with a FileStateResolver.
     /// 5. If valid, caller calls `commit()` to move files into package_dir.
-    /// 6. If blob missing, fall back to older candidates (blob-miss) from in-memory snapshots.
+    ///
+    /// There is at most one candidate per input_key: `stage_entry` resolves
+    /// everything (record, outputs_hash, stdout/stderr) from the single
+    /// `entries/<input_key>` object, so trying a different `SnapshotEntry` for
+    /// the same input_key across commits can never produce a different
+    /// result. A blob that's been GC'd is a rebuild, not a fallback.
     pub fn try_restore_candidates(
         &self,
         _task_id: &str,
@@ -365,38 +368,20 @@ impl SharedCache {
         let index = self.get_or_build_index();
         let input_key_hex = input_key_hex(*input_key);
 
-        // O(1) lookup in the merged index — NO disk read
-        let primary_entry = index.entries.get(&input_key_hex);
+        // O(1) lookup in the merged index — NO disk read. Only gates whether
+        // any snapshot ever recorded this input_key as cacheable.
+        let candidate = index
+            .entries
+            .contains_key(&input_key_hex)
+            .then_some(*input_key);
 
-        // Collect all candidate entries (primary + alternates) with their outputs_hash
-        let mut candidates: Vec<SnapshotEntry> = Vec::new();
-
-        if let Some((entry, _commit_key)) = primary_entry {
-            candidates.push(entry.clone());
-        }
-
-        // Blob-miss fallback: collect entries from older in-memory snapshots with different outputs_hash
-        for (_commit_key, snapshot) in &index.snapshots {
-            if let Some(alt_entry) = snapshot.entries.get(&input_key_hex) {
-                // Skip if same outputs_hash (already have this candidate)
-                if candidates
-                    .iter()
-                    .any(|c| c.outputs_hash == alt_entry.outputs_hash)
-                {
-                    continue;
-                }
-                candidates.push(alt_entry.clone());
-            }
-        }
-
-        // Stage each candidate (returns None for missing/corrupt blobs)
         let paths = self.paths.clone();
         let package_dir = package_dir.to_path_buf();
         #[cfg(unix)]
         let remote = self.remote.clone();
-        candidates.into_iter().filter_map(move |entry| {
+        candidate.into_iter().filter_map(move |input_key| {
             Self::stage_entry(
-                &entry,
+                &input_key,
                 &paths,
                 &package_dir,
                 #[cfg(unix)]
@@ -420,24 +405,24 @@ impl SharedCache {
     /// outputs. A candidate rejected by `decide_shared_restore` therefore never
     /// costs an outputs download.
     fn stage_entry(
-        entry: &SnapshotEntry,
+        input_key: &[u8; 32],
         paths: &SharedCachePaths,
         package_dir: &Path,
         #[cfg(unix)] remote: Option<&RemoteSync>,
     ) -> Option<StagedCandidate> {
         #[cfg(unix)]
-        if read_entry_meta(paths, &entry.input_key).is_none() {
+        if read_entry_meta(paths, input_key).is_none() {
             if let Some(remote) = remote {
-                if let Err(err) = remote.pull_entry_meta(paths, &entry.input_key) {
+                if let Err(err) = remote.pull_entry_meta(paths, input_key) {
                     eprintln!(
                         "debug: remote entry meta pull failed for input_key={}: {err}",
-                        hex_hash(entry.input_key)
+                        hex_hash(*input_key)
                     );
                 }
             }
         }
 
-        let meta = read_entry_meta(paths, &entry.input_key)?;
+        let meta = read_entry_meta(paths, input_key)?;
 
         let record: TaskRunRecord =
             match bincode::serde::decode_from_slice(&meta.record, bincode_config()) {
@@ -451,7 +436,7 @@ impl SharedCache {
             .map(crate::store::ReportInput::from)
             .collect();
 
-        if record.outputs.is_empty() {
+        if !meta.has_outputs {
             return StagedCandidate::empty_outputs(
                 meta.outputs_hash,
                 record,
@@ -531,9 +516,6 @@ impl SharedCache {
                 remote,
             );
         }
-
-        // Reverse snapshots so newest is first.
-        merged.snapshots.reverse();
 
         merged
     }
@@ -640,7 +622,6 @@ impl SharedCache {
         for (input_key_hex, entry) in &snapshot.entries {
             merged.insert_entry(input_key_hex.clone(), entry.clone(), commit_key.to_string());
         }
-        merged.snapshots.push((commit_key.to_string(), snapshot));
     }
 
     /// Store task outputs in the shared cache.
@@ -701,9 +682,14 @@ impl SharedCache {
         let meta_record =
             bincode::serde::encode_to_vec(record, bincode_config()).map_err(io::Error::other)?;
 
-        let meta = EntryMeta {
+        // `has_outputs` is provisional here — the size-cap estimate below
+        // doesn't depend on its value (encoding a bool costs the same byte
+        // either way) — and is corrected from `blob_result` once we know
+        // whether `write_outputs_blob` actually wrote a blob.
+        let mut meta = EntryMeta {
             schema_version: ENTRY_META_SCHEMA_VERSION,
             outputs_hash: *outputs_hash,
+            has_outputs: !rel_output_paths.is_empty(),
             record: meta_record,
             stdout: stdout.to_vec(),
             stderr: stderr.to_vec(),
@@ -730,6 +716,12 @@ impl SharedCache {
         if let BlobWriteResult::SkippedTooLarge { bytes } = blob_result {
             return Ok(StoreOutcome::SkippedTooLarge { bytes });
         }
+
+        // Authoritative: a declared output can still be absent on disk, in
+        // which case `write_outputs_blob` returns `NoOutputs` even though
+        // `record.outputs` is non-empty. Restore must trust this bit, not
+        // re-derive it from the record.
+        meta.has_outputs = !matches!(blob_result, BlobWriteResult::NoOutputs);
 
         write_entry_meta(&self.paths, input_key, &meta)?;
 
@@ -1311,12 +1303,16 @@ mod tests {
     }
 
     #[test]
-    fn multi_candidate_hit_in_older_snapshot() {
-        // Create repo with 2 commits.
+    fn legacy_blob_with_embedded_meta_restores_outputs_only() {
+        // Blobs written by pre-Task-4 clients still embed a `.luchta-meta/`
+        // directory (see `write_blob_with_meta`). Restore must still extract
+        // their output files correctly, and must not leak that embedded meta
+        // into the restored package directory: `entries/<input_key>` is
+        // authoritative for the record/stdout/stderr, and
+        // `move_non_meta_files` filters `.luchta-meta` out on commit.
         let temp_repo = TempDir::new().unwrap();
         setup_git_repo(temp_repo.path());
-        let commit1 = create_commit(temp_repo.path());
-        let commit2 = create_commit(temp_repo.path());
+        let commit = create_commit(temp_repo.path());
 
         let temp_cache = TempDir::new().unwrap();
         let cache = SharedCache::open_with_cache_dir(
@@ -1327,7 +1323,6 @@ mod tests {
         )
         .unwrap();
 
-        // Store under commit1.
         let package_dir = temp_repo.path().join("pkg");
         fs::create_dir_all(package_dir.join("dist")).unwrap();
         fs::write(package_dir.join("dist/main.js"), "v1").unwrap();
@@ -1335,8 +1330,7 @@ mod tests {
         let input_key = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32]);
         let record = sample_record(true, 200);
 
-        // Manually create snapshot for commit1 (older).
-        let entry_commit1 = SnapshotEntry {
+        let entry = SnapshotEntry {
             task_id: "pkg#build".to_string(),
             input_key,
             outputs_hash: [7; 32],
@@ -1348,11 +1342,9 @@ mod tests {
             cached_at_unix_ms: 1_000_000_000_000,
             tool_version: None,
         };
-        cache
-            .snapshot_store
-            .merge_entry(&commit1, entry_commit1.clone());
+        cache.snapshot_store.merge_entry(&commit, entry);
 
-        // Create blob with the right outputs_hash.
+        // Legacy blob: meta embedded via write_blob_with_meta (pre-Task-2 format).
         let meta = MetaFiles {
             stdout: b"stdout v1".to_vec(),
             stderr: b"stderr v1".to_vec(),
@@ -1369,14 +1361,15 @@ mod tests {
         )
         .unwrap();
 
-        // Restore is keyed by input_key now, not by outputs_hash: write the
-        // entries/<input_key> object the two-phase restore path reads from.
+        // entries/<input_key> is what the two-phase restore path actually
+        // reads; the meta embedded in the blob above is ignored.
         write_entry_meta(
             &cache.paths,
             &input_key,
             &EntryMeta {
                 schema_version: ENTRY_META_SCHEMA_VERSION,
                 outputs_hash: [7; 32],
+                has_outputs: true,
                 record: meta.record.clone(),
                 stdout: meta.stdout.clone(),
                 stderr: meta.stderr.clone(),
@@ -1385,44 +1378,23 @@ mod tests {
         )
         .unwrap();
 
-        // Now also add a snapshot entry for commit2 (newer) with a DIFFERENT outputs_hash
-        // This simulates the case where commit2's blob is missing but commit1's exists.
-        let entry_commit2 = SnapshotEntry {
-            task_id: "pkg#build".to_string(),
-            input_key,
-            outputs_hash: [8; 32], // Different hash - blob won't exist for this.
-            task_spec_hash: [1; 32],
-            env_hash: [2; 32],
-            pkg_dep_hash: [3; 32],
-            duration_ms: 200,
-            output_bytes: 100,
-            cached_at_unix_ms: 2_000_000_000_000,
-            tool_version: None,
-        };
-        cache.snapshot_store.merge_entry(&commit2, entry_commit2);
-
-        // Restore should find entry from commit1 via blob-miss fallback.
         let restore_dir = temp_repo.path().join("restore");
         fs::create_dir_all(&restore_dir).unwrap();
 
-        // Verify candidate_keys includes both commits.
-        assert!(cache.candidate_keys().contains(&commit1));
-
-        // Use new try_restore_candidates API
-        let mut candidates: Vec<_> = cache
+        let (hit, written_paths) = cache
             .try_restore_candidates("pkg#build", &input_key, &restore_dir)
-            .collect();
-
-        // Should have at least one candidate
-        assert!(!candidates.is_empty(), "expected at least one candidate");
-
-        // The first valid candidate should be from commit1 (commit2's blob is missing)
-        let (hit, written_paths) = candidates
-            .remove(0)
+            .next()
+            .expect("expected a candidate")
             .commit()
             .expect("commit should succeed");
+
         assert_eq!(hit.stdout, b"stdout v1");
         assert_eq!(written_paths, vec![restore_dir.join("dist/main.js")]);
+        assert_eq!(fs::read(restore_dir.join("dist/main.js")).unwrap(), b"v1");
+        assert!(
+            !restore_dir.join(".luchta-meta").exists(),
+            "embedded legacy meta must be filtered out on commit"
+        );
     }
 
     #[test]
@@ -1893,6 +1865,79 @@ mod tests {
         assert!(
             written_paths.is_empty(),
             "nothing to write for a no-output task"
+        );
+    }
+
+    #[test]
+    fn absent_declared_output_restores_from_meta_without_blob() {
+        // A task can declare an output path and still not produce it: its
+        // FileEntry has `absent: true`, so `record.outputs` is non-empty even
+        // though nothing was written to disk. The caller filters absent
+        // entries out of `rel_output_paths` before calling `store`, so
+        // `write_outputs_blob` sees no existing files and returns `NoOutputs`
+        // — no blob is written. Restore must trust `EntryMeta::has_outputs`
+        // (set from that `NoOutputs` result), not re-derive "has outputs"
+        // from `record.outputs.is_empty()`, which is false here.
+        let temp_repo = TempDir::new().unwrap();
+        setup_git_repo(temp_repo.path());
+        create_commit(temp_repo.path());
+
+        let temp_cache = TempDir::new().unwrap();
+        let cache = SharedCache::open_with_cache_dir(
+            temp_repo.path(),
+            1_000_000,
+            10,
+            Some(temp_cache.path()),
+        )
+        .unwrap();
+
+        let package_dir = temp_repo.path().join("pkg");
+        fs::create_dir_all(&package_dir).unwrap();
+
+        let mut record = sample_record(true, 200);
+        record.outputs = vec![FileEntry {
+            path: "dist/missing.js".to_string(),
+            size: 0,
+            mtime_ns: 0,
+            hash: [0; 32],
+            absent: true,
+        }];
+        let input_key = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32]);
+
+        let result = cache
+            .store(
+                "pkg#build",
+                &input_key,
+                &[7; 32],
+                &package_dir,
+                &[], // the declared output was never produced: no path to archive
+                &record,
+                b"stdout output",
+                b"",
+                &[],
+                temp_repo.path(),
+            )
+            .unwrap();
+        assert_eq!(result, StoreOutcome::Stored);
+        assert!(
+            !blob_path(cache.paths(), &[7; 32]).exists(),
+            "no blob should be written when the only declared output is absent"
+        );
+
+        let restore_dir = temp_repo.path().join("restore");
+        fs::create_dir_all(&restore_dir).unwrap();
+
+        let (hit, written_paths) = cache
+            .try_restore_candidates("pkg#build", &input_key, &restore_dir)
+            .next()
+            .expect("a non-empty record.outputs must not block restore when has_outputs is false")
+            .commit()
+            .expect("commit should succeed");
+
+        assert_eq!(hit.stdout, b"stdout output");
+        assert!(
+            written_paths.is_empty(),
+            "nothing to write when the declared output was never produced"
         );
     }
 }

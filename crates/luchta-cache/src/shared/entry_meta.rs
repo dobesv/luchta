@@ -36,6 +36,15 @@ pub struct EntryMeta {
     /// Points at `blobs/<outputs_hash>.tar.zst`. All-zero-length output sets
     /// share one hash, which is why meta cannot live inside that blob.
     pub outputs_hash: [u8; 32],
+    /// Whether an outputs blob was actually written for this entry.
+    ///
+    /// Authoritative bit set by `store` from `write_outputs_blob`'s result.
+    /// Do not re-derive this from `record.outputs.is_empty()`: a task can
+    /// declare an output path and still produce nothing (all `FileEntry`s
+    /// `absent: true`), in which case `record.outputs` is non-empty but no
+    /// blob was ever written. Restore must not stat/pull a blob that will
+    /// never exist.
+    pub has_outputs: bool,
     /// Bincode-encoded `TaskRunRecord`.
     pub record: Vec<u8>,
     pub stdout: Vec<u8>,
@@ -127,6 +136,7 @@ mod tests {
         EntryMeta {
             schema_version: ENTRY_META_SCHEMA_VERSION,
             outputs_hash: [7; 32],
+            has_outputs: true,
             record: vec![1, 2, 3, 4],
             stdout: b"out".to_vec(),
             stderr: b"err".to_vec(),
