@@ -711,8 +711,9 @@ mod tests {
     use crate::shared::snapshot::snapshot_bincode_config;
     use crate::shared::tests::{create_commit, sample_record, setup_git_repo};
     use crate::shared::{
-        derive_input_key, input_key_hex, new_session_shard_key, MergeResult, OpenExtras,
-        SharedCache, Snapshot, SnapshotEntry, StoreOutcome, SNAPSHOT_SCHEMA_VERSION,
+        current_session_shard_key, derive_input_key, input_key_hex, new_session_shard_key,
+        MergeResult, OpenExtras, SharedCache, Snapshot, SnapshotEntry, StoreOutcome,
+        SNAPSHOT_SCHEMA_VERSION,
     };
     use std::collections::BTreeMap;
     use std::fs;
@@ -776,9 +777,9 @@ mod tests {
         }
     }
 
-    fn remote_snapshot_files(remote_root: &Path, commit: &str) -> Vec<String> {
-        let commit_dir = remote_root.join("snapshots").join(commit);
-        let Ok(read_dir) = fs::read_dir(commit_dir) else {
+    fn remote_snapshot_files(remote_root: &Path, shard_key: &str) -> Vec<String> {
+        let shard_dir = remote_root.join("snapshots").join(shard_key);
+        let Ok(read_dir) = fs::read_dir(shard_dir) else {
             return Vec::new();
         };
         let mut entries = read_dir
@@ -826,7 +827,6 @@ mod tests {
         remote_root: TempDir,
         local_cache: TempDir,
         package_dir: PathBuf,
-        commit: String,
         remote: RemoteSync,
     }
 
@@ -834,7 +834,6 @@ mod tests {
         fn new(file_body: &str) -> Self {
             let temp_repo = TempDir::new().unwrap();
             setup_git_repo(temp_repo.path());
-            let commit = create_commit(temp_repo.path());
             let remote_root = TempDir::new().unwrap();
             let local_cache = TempDir::new().unwrap();
             let package_dir = temp_repo.path().join("pkg");
@@ -849,11 +848,17 @@ mod tests {
                 remote_root,
                 local_cache,
                 package_dir,
-                commit,
                 remote,
             }
         }
 
+        /// Builds a `SharedCache` pointed at this harness's remote and local
+        /// cache dir. Since Task 7, the cache writes to a session-generated
+        /// `<unix_ms>-<nonce>` shard key it picks for itself — there is no
+        /// longer any commit-derived key a test can predict up front, so
+        /// callers that need to know where a `store()` on this cache landed
+        /// must read it back via `write_commit_key()` (see `StoredRemoteCase::
+        /// shard_key`).
         fn cache(&self) -> SharedCache {
             open_cache_with_remote(self.temp_repo.path(), self.local_cache.path(), &self.remote)
         }
@@ -864,6 +869,13 @@ mod tests {
         cache: SharedCache,
         input_key: [u8; 32],
         outputs_hash: [u8; 32],
+    }
+
+    impl StoredRemoteCase {
+        /// The shard key `cache` actually wrote its entry to.
+        fn shard_key(&self) -> &str {
+            self.cache.write_commit_key().expect("write key")
+        }
     }
 
     fn seed_remote_store(
@@ -921,8 +933,8 @@ mod tests {
         );
     }
 
-    fn assert_remote_store_layout(remote_root: &Path, commit: &str, outputs_hash: &[u8; 32]) {
-        let files = remote_snapshot_files(remote_root, commit);
+    fn assert_remote_store_layout(remote_root: &Path, shard_key: &str, outputs_hash: &[u8; 32]) {
+        let files = remote_snapshot_files(remote_root, shard_key);
         assert_eq!(files.len(), 2);
         assert_snapshot_shard_count(&files, 1, 1);
         assert_remote_has_blob(remote_root, outputs_hash);
@@ -946,18 +958,18 @@ mod tests {
     fn seed_snapshot_entry(
         seed_cache: &SharedCache,
         remote_seed: &RemoteSync,
-        commit: &str,
+        shard_key: &str,
         entry: SnapshotEntry,
     ) -> String {
         let outputs_hash = entry.outputs_hash;
         let input_key = entry.input_key;
         let merge = seed_cache
             .snapshot_store
-            .merge_entry_with_outcome(commit, entry);
+            .merge_entry_with_outcome(shard_key, entry);
         let shard_id = merge.new_snapshot_upload.as_ref().unwrap().shard_id.clone();
         remote_seed.push_store_artifacts(PushArtifacts {
             paths: seed_cache.paths(),
-            commit_key: commit,
+            commit_key: shard_key,
             outputs_hash: &outputs_hash,
             input_key: &input_key,
             has_outputs: true,
@@ -968,7 +980,7 @@ mod tests {
 
     fn seed_remote_snapshot_entries(
         repo_root: &Path,
-        commit: &str,
+        shard_key: &str,
         remote_root: &Path,
     ) -> (SharedCache, String, String) {
         let remote_seed_root = TempDir::new().unwrap();
@@ -987,7 +999,7 @@ mod tests {
         let merge1_id = seed_snapshot_entry(
             &seed_cache,
             &remote_seed,
-            commit,
+            shard_key,
             SnapshotEntry {
                 task_id: "pkg#a".to_string(),
                 input_key: derive_input_key([11; 32], [12; 32], [13; 32], [14; 32]),
@@ -1004,7 +1016,7 @@ mod tests {
         let merge2_id = seed_snapshot_entry(
             &seed_cache,
             &remote_seed,
-            commit,
+            shard_key,
             SnapshotEntry {
                 task_id: "pkg#b".to_string(),
                 input_key: derive_input_key([15; 32], [16; 32], [17; 32], [18; 32]),
@@ -1260,11 +1272,11 @@ mod tests {
 
     fn assert_snapshot_upload_failure_preserves_remote(
         remote_root: &Path,
-        commit: &str,
+        shard_key: &str,
         before: &[String],
         expected_present_ids: &[&str],
     ) {
-        let remote_after = remote_snapshot_files(remote_root, commit);
+        let remote_after = remote_snapshot_files(remote_root, shard_key);
         assert_eq!(remote_after, before);
         for shard_id in expected_present_ids {
             assert!(remote_after.iter().any(|name| name.starts_with(shard_id)));
@@ -1282,17 +1294,18 @@ mod tests {
         }
 
         let harness = RemoteHarness::new("console.log('guard');\n");
+        let cache = harness.cache();
+        let shard_key = cache.write_commit_key().expect("write key").to_string();
         let (seed_cache, _merge1_id, merge2_id) = seed_remote_snapshot_entries(
             harness.temp_repo.path(),
-            &harness.commit,
+            &shard_key,
             harness.remote_root.path(),
         );
-        let remote_before = remote_snapshot_files(harness.remote_root.path(), &harness.commit);
+        let remote_before = remote_snapshot_files(harness.remote_root.path(), &shard_key);
         assert_eq!(remote_before.len(), 2);
         seed_guard_blob(&harness.local_cache, [23; 32], b"blob-23");
-        let cache = harness.cache();
         let mut merge3 = cache.snapshot_store.merge_entry_with_outcome(
-            &harness.commit,
+            &shard_key,
             SnapshotEntry {
                 task_id: "pkg#c".to_string(),
                 input_key: derive_input_key([19; 32], [20; 32], [21; 32], [22; 32]),
@@ -1322,13 +1335,13 @@ mod tests {
             .remote_root
             .path()
             .join("snapshots")
-            .join(&harness.commit)
+            .join(&shard_key)
             .join(format!("subsuming-shard.{SNAPSHOT_FILE_EXTENSION}"));
         fs::create_dir_all(&blocking_path).unwrap();
         let input_key = derive_input_key([19; 32], [20; 32], [21; 32], [22; 32]);
         harness.remote.push_store_artifacts(PushArtifacts {
             paths: cache.paths(),
-            commit_key: &harness.commit,
+            commit_key: &shard_key,
             outputs_hash: &[23; 32],
             input_key: &input_key,
             has_outputs: true,
@@ -1345,7 +1358,7 @@ mod tests {
             .collect();
         assert_snapshot_upload_failure_preserves_remote(
             harness.remote_root.path(),
-            &harness.commit,
+            &shard_key,
             &remote_before,
             &expected_present_ids,
         );
@@ -1500,7 +1513,7 @@ mod tests {
         assert!(local_cache
             .path()
             .join("snapshots")
-            .join(&seed.harness.commit)
+            .join(seed.shard_key())
             .exists());
         assert!(local_cache
             .path()
@@ -1526,7 +1539,7 @@ mod tests {
         );
         assert_remote_store_layout(
             seed.harness.remote_root.path(),
-            &seed.harness.commit,
+            seed.shard_key(),
             &seed.outputs_hash,
         );
     }
@@ -1550,7 +1563,7 @@ mod tests {
             .remote_root
             .path()
             .join("snapshots")
-            .join(&seed.harness.commit);
+            .join(seed.shard_key());
         let mut bincode_files = Vec::new();
         let mut merged_files = Vec::new();
         for entry in fs::read_dir(&snapshot_dir).unwrap() {
@@ -1565,7 +1578,7 @@ mod tests {
         assert_eq!(bincode_files.len(), 1);
         assert_eq!(merged_files.len(), 1);
 
-        let local_snapshot_dir = seed.cache.paths().snapshots_dir.join(&seed.harness.commit);
+        let local_snapshot_dir = seed.cache.paths().snapshots_dir.join(seed.shard_key());
         let local_shard_name = bincode_files.pop().unwrap();
         let local_merged_name = merged_files.pop().unwrap();
         assert_eq!(
@@ -1702,7 +1715,7 @@ mod tests {
         );
         assert_remote_store_layout(
             seed.harness.remote_root.path(),
-            &seed.harness.commit,
+            seed.shard_key(),
             &seed.outputs_hash,
         );
 
@@ -1732,7 +1745,7 @@ mod tests {
         assert!(machine_b_cache
             .path()
             .join("snapshots")
-            .join(&seed.harness.commit)
+            .join(seed.shard_key())
             .exists());
         assert!(machine_b_cache.path().join("blobs").exists());
     }
@@ -1750,17 +1763,16 @@ mod tests {
             280,
             (b"stdout-race", b"stderr-race"),
         );
-        let shard_name =
-            remote_snapshot_files(seed.harness.remote_root.path(), &seed.harness.commit)
-                .into_iter()
-                .find(|name| name.ends_with(".bincode"))
-                .expect("expected remote shard");
+        let shard_name = remote_snapshot_files(seed.harness.remote_root.path(), seed.shard_key())
+            .into_iter()
+            .find(|name| name.ends_with(".bincode"))
+            .expect("expected remote shard");
         fs::remove_file(
             seed.harness
                 .remote_root
                 .path()
                 .join("snapshots")
-                .join(&seed.harness.commit)
+                .join(seed.shard_key())
                 .join(&shard_name),
         )
         .unwrap();
@@ -1782,7 +1794,7 @@ mod tests {
             .local_cache
             .path()
             .join("snapshots")
-            .join(&seed.harness.commit)
+            .join(seed.shard_key())
             .join(&shard_name)
             .exists());
     }
@@ -1795,12 +1807,16 @@ mod tests {
         }
 
         let harness = RemoteHarness::new("console.log('compact-mid-push');\n");
+        // No `cache.store()` runs in this test, so there's no write key to
+        // match against — just a fresh, unique shard key to seed and assert
+        // against consistently.
+        let shard_key = current_session_shard_key();
         let (seed_cache, _merge1_id, surviving_shard_id) = seed_remote_snapshot_entries(
             harness.temp_repo.path(),
-            &harness.commit,
+            &shard_key,
             harness.remote_root.path(),
         );
-        let remote_before = remote_snapshot_files(harness.remote_root.path(), &harness.commit);
+        let remote_before = remote_snapshot_files(harness.remote_root.path(), &shard_key);
         assert_eq!(remote_before.len(), 2);
         seed_guard_blob(&harness.local_cache, [0x66; 32], b"blob-66");
 
@@ -1819,28 +1835,28 @@ mod tests {
                 surviving_shard_id.clone(),
             ],
         };
-        let remote_commit_dir = harness
+        let remote_shard_dir = harness
             .remote_root
             .path()
             .join("snapshots")
-            .join(&harness.commit);
+            .join(&shard_key);
         fs::write(
-            remote_commit_dir.join(format!("{}.{}", upload_shard_id, SNAPSHOT_FILE_EXTENSION)),
+            remote_shard_dir.join(format!("{}.{}", upload_shard_id, SNAPSHOT_FILE_EXTENSION)),
             &upload_shard_bytes,
         )
         .unwrap();
         fs::write(
-            remote_commit_dir.join(format!("{}.{}", upload_shard_id, SNAPSHOT_MERGED_EXTENSION)),
+            remote_shard_dir.join(format!("{}.{}", upload_shard_id, SNAPSHOT_MERGED_EXTENSION)),
             &upload_merged_bytes,
         )
         .unwrap();
 
         let disabling_shard_id = "disabling-shard-mid-push";
         let poisoned_file =
-            remote_commit_dir.join(format!("{disabling_shard_id}.{SNAPSHOT_FILE_EXTENSION}"));
+            remote_shard_dir.join(format!("{disabling_shard_id}.{SNAPSHOT_FILE_EXTENSION}"));
         fs::create_dir_all(&poisoned_file).unwrap();
         fs::write(
-            remote_commit_dir.join(format!("{disabling_shard_id}.{SNAPSHOT_MERGED_EXTENSION}")),
+            remote_shard_dir.join(format!("{disabling_shard_id}.{SNAPSHOT_MERGED_EXTENSION}")),
             b"disabling-merged",
         )
         .unwrap();
@@ -1848,7 +1864,7 @@ mod tests {
         let input_key = derive_input_key([71; 32], [72; 32], [73; 32], [74; 32]);
         harness.remote.push_store_artifacts(PushArtifacts {
             paths: seed_cache.paths(),
-            commit_key: &harness.commit,
+            commit_key: &shard_key,
             outputs_hash: &[0x66; 32],
             input_key: &input_key,
             has_outputs: true,
@@ -1858,7 +1874,7 @@ mod tests {
         fs::remove_dir(&poisoned_file).unwrap();
         drop(seed_cache);
 
-        let snapshot_files = remote_snapshot_files(harness.remote_root.path(), &harness.commit);
+        let snapshot_files = remote_snapshot_files(harness.remote_root.path(), &shard_key);
         assert_eq!(snapshot_files.len(), 5);
         assert!(snapshot_files
             .iter()
@@ -1888,23 +1904,28 @@ mod tests {
         }
 
         let harness = RemoteHarness::new("console.log('compact');\n");
+        // Build the cache first so the pre-seeded shards below land in the
+        // exact shard `cache.store()` will write (and compact) into: the
+        // cache picks its own write key at construction, so there is no
+        // predictable key to seed ahead of time otherwise.
+        let cache = harness.cache();
+        let shard_key = cache.write_commit_key().expect("write key").to_string();
         let (seed_cache, merge1_id, merge2_id) = seed_remote_snapshot_entries(
             harness.temp_repo.path(),
-            &harness.commit,
+            &shard_key,
             harness.remote_root.path(),
         );
-        let seeded_files = remote_snapshot_files(harness.remote_root.path(), &harness.commit);
+        let seeded_files = remote_snapshot_files(harness.remote_root.path(), &shard_key);
         assert_eq!(seeded_files.len(), 2);
         assert!(harness
             .remote_root
             .path()
             .join("snapshots")
-            .join(&harness.commit)
+            .join(&shard_key)
             .join(format!("{merge2_id}.bincode"))
             .exists());
 
         fs::remove_dir_all(harness.local_cache.path().join("snapshots")).ok();
-        let cache = harness.cache();
         let input_key = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32]);
         let outcome = cache
             .store(
@@ -1924,7 +1945,7 @@ mod tests {
         assert!(matches!(outcome, StoreOutcome::Stored));
         drop(seed_cache);
 
-        let snapshot_files = remote_snapshot_files(harness.remote_root.path(), &harness.commit);
+        let snapshot_files = remote_snapshot_files(harness.remote_root.path(), &shard_key);
         assert_eq!(snapshot_files.len(), 4);
         assert!(!snapshot_files
             .iter()
@@ -1986,7 +2007,7 @@ mod tests {
         assert!(local_cache
             .path()
             .join("snapshots")
-            .join(&seed.harness.commit)
+            .join(seed.shard_key())
             .exists());
         assert!(local_cache
             .path()
