@@ -18,7 +18,10 @@ pub use blob::{
     StagedRestore,
 };
 use discovery::discover_recent_shard_keys;
-pub use discovery::{current_session_shard_key, new_session_shard_key};
+pub use discovery::{
+    current_session_shard_key, new_session_shard_key, rank_shard_candidates, ShardCandidate,
+    DEFAULT_SHARD_MAX_AGE_MS,
+};
 pub use entry_meta::{
     encode_entry_meta, entry_meta_path, read_entry_meta, write_entry_meta, EntryMeta,
     EntryMetaWriteResult, EntryReport, ENTRY_META_SCHEMA_VERSION,
@@ -162,7 +165,16 @@ impl MergedIndex {
     }
 
     fn insert_entry(&mut self, input_key_hex: String, entry: SnapshotEntry, commit_key: String) {
-        // Newest-wins: later entries in the iteration overwrite earlier.
+        // Newest-wins by the entry's own recorded build time (`cached_at_unix_ms`),
+        // not by shard discovery order. Shards are grouped by when they were
+        // *written to this cache*, which needn't match when their contents were
+        // *produced* — e.g. a remote sync can land after a fresher local build.
+        // On a tie, later-iterated (i.e. shard-discovery-order) wins, same as before.
+        if let Some((existing, _)) = self.entries.get(&input_key_hex) {
+            if existing.cached_at_unix_ms > entry.cached_at_unix_ms {
+                return;
+            }
+        }
         self.entries.insert(input_key_hex, (entry, commit_key));
     }
 }
@@ -174,8 +186,13 @@ pub struct SharedCache {
     paths: Arc<SharedCachePaths>,
     /// Session shard key to write this process's entries under.
     write_commit_key: Option<String>,
-    /// Candidate shard keys for lookup (newest-first).
-    candidate_keys: Vec<String>,
+    /// Bound on how many candidate shards `discover_recent_shard_keys` returns.
+    ///
+    /// Candidates are (re)discovered lazily at index-build time rather than
+    /// cached from `open()`, so that entries written by this same process
+    /// (its own write shard, or shards created directly by tests) are found —
+    /// their directories don't exist yet at `open()` time.
+    history_len: usize,
     /// Snapshot store for merge_entry.
     snapshot_store: SnapshotStore,
     /// Optional remote sync for on-demand restore pull.
@@ -277,7 +294,6 @@ impl SharedCache {
         let paths = Arc::new(open_shared_paths(&cache_path).ok()?);
 
         let write_commit_key = Some(current_session_shard_key());
-        let candidate_keys = discover_recent_shard_keys(&paths, history_len);
 
         let snapshot_store = SnapshotStore::new((*paths).clone());
         #[cfg(unix)]
@@ -295,7 +311,7 @@ impl SharedCache {
         Some(Self {
             paths,
             write_commit_key,
-            candidate_keys,
+            history_len,
             snapshot_store,
             #[cfg(unix)]
             remote,
@@ -319,12 +335,11 @@ impl SharedCache {
         let paths = snapshot_store.paths().clone();
 
         let write_commit_key = Some(current_session_shard_key());
-        let candidate_keys = discover_recent_shard_keys(&paths, history_len);
 
         Some(Self {
             paths: Arc::new(paths),
             write_commit_key,
-            candidate_keys,
+            history_len,
             snapshot_store,
             #[cfg(unix)]
             remote: None,
@@ -493,13 +508,19 @@ impl SharedCache {
     }
 
     fn build_index(&self, #[cfg(unix)] remote: Option<&RemoteSync>) -> MergedIndex {
+        // Discovered fresh here, not cached from `open()`: entries this same
+        // process just wrote (its own write shard, or shards a test wrote
+        // directly) don't have a directory on disk until after `open()` runs,
+        // so discovery has to happen at first use, not eagerly at open time.
+        let candidate_keys = self.candidate_keys();
+
         #[cfg(unix)]
-        self.pull_candidate_commits(remote);
+        self.pull_candidate_commits(remote, &candidate_keys);
 
         let mut merged = MergedIndex::new();
 
         // Iterate in reverse order (oldest first) so that newest overwrites.
-        for commit_key in self.candidate_keys.iter().rev() {
+        for commit_key in candidate_keys.iter().rev() {
             self.load_commit_into_index(
                 &mut merged,
                 commit_key,
@@ -512,14 +533,14 @@ impl SharedCache {
     }
 
     #[cfg(unix)]
-    fn pull_candidate_commits(&self, remote: Option<&RemoteSync>) {
+    fn pull_candidate_commits(&self, remote: Option<&RemoteSync>, candidate_keys: &[String]) {
         let Some(remote) = remote.cloned() else {
             return;
         };
         Self::run_candidate_pulls_on_dedicated_thread(
             remote,
             self.snapshot_store.clone(),
-            self.candidate_keys.clone(),
+            candidate_keys.to_vec(),
         );
     }
 
@@ -808,10 +829,25 @@ impl SharedCache {
         self.write_commit_key.as_deref()
     }
 
-    /// Returns the candidate keys for this cache.
+    /// Discovers the current candidate shard keys for this cache, newest-first.
+    ///
+    /// Recomputed on every call (a cheap directory listing) rather than cached
+    /// from `open()`, so it reflects shards written since this cache was opened.
+    ///
+    /// This process's own write shard is always included even if nothing has
+    /// been stored to it yet: its directory may not exist on disk at the time
+    /// of the first lookup (e.g. a restore attempted before any store), so it
+    /// can't be found by directory discovery alone, but it's still the one
+    /// shard we know for certain is relevant to this run.
     #[must_use]
-    pub fn candidate_keys(&self) -> &[String] {
-        &self.candidate_keys
+    pub fn candidate_keys(&self) -> Vec<String> {
+        let mut keys = discover_recent_shard_keys(&self.paths, self.history_len);
+        if let Some(write_key) = &self.write_commit_key {
+            if !keys.iter().any(|key| key == write_key) {
+                keys.insert(0, write_key.clone());
+            }
+        }
+        keys
     }
 }
 

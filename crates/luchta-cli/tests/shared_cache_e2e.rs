@@ -736,12 +736,18 @@ fn cross_worktree_shared_cache_hit() {
     );
 }
 
-/// Test: dirty key isolation.
+/// Test: a dirty-tree build's entry is not reused by a later clean build.
 ///
-/// A dirty-tree build writes a `<commit>-dirty.bincode` snapshot, NEVER the clean one.
-/// A clean build does not get a dirty hit.
+/// Session shard keys carry no notion of git state, so a clean build can now
+/// discover a dirty build's shard just like any other candidate — nothing
+/// about the shard's name keeps them apart anymore. Isolation instead comes
+/// from content validation: the candidate is found (its input_key is scoped
+/// to the task/env/deps, not to file content), but `decide_shared_restore`
+/// compares the candidate's recorded `record.inputs` against the current
+/// working tree and rejects it once the tree no longer matches what the
+/// dirty build actually saw.
 #[test]
-fn dirty_key_isolation() {
+fn dirty_tree_entry_is_not_reused_by_clean_build() {
     let shared_cache_dir = tempfile::tempdir().unwrap();
 
     let temp = assert_fs::TempDir::new().unwrap();
@@ -765,15 +771,14 @@ fn dirty_key_isolation() {
         .unwrap();
     init_git(&temp);
 
-    let commit = get_head_commit(temp.path());
-
     // Make dirty (uncommitted change)
     temp.child("packages/app/src.txt")
         .write_str("dirty change\n")
         .unwrap();
     // Do NOT commit — tree is dirty
 
-    // Build in dirty state — counter advances to 1
+    // Build in dirty state — counter advances to 1. The entry lands in this
+    // process's own shard, recorded against the dirty content.
     Command::cargo_bin("luchta")
         .unwrap()
         .arg("run")
@@ -790,39 +795,44 @@ fn dirty_key_isolation() {
 
     temp.child("packages/app/counter.txt").assert("1\n");
 
-    // Verify dirty snapshot shard dir exists, clean commit dir does NOT
-    let snapshots_dir = shared_cache_dir.path().join("snapshots");
-    let dirty_snapshot_dir = snapshots_dir.join(format!("{}-dirty", commit));
-    let clean_snapshot_dir = snapshots_dir.join(&commit);
+    // Finalize with content DIFFERENT from what was dirty-built, and commit
+    // it. The task-level candidate is still found (same task, env, deps —
+    // input_key doesn't depend on file content), but its recorded inputs no
+    // longer match the tree.
+    temp.child("packages/app/src.txt")
+        .write_str("final change\n")
+        .unwrap();
+    git_commit_all(temp.path(), "commit the change");
 
-    let dirty_snapshot_shards = snapshot_shard_paths(&dirty_snapshot_dir);
-    assert!(
-        !dirty_snapshot_shards.is_empty(),
-        "dirty snapshot shard(s) should exist"
-    );
-    assert!(
-        !clean_snapshot_dir.exists(),
-        "clean snapshot dir should NOT exist"
-    );
+    // Wipe local cache so the second build has to go through the shared cache.
+    std::fs::remove_dir_all(temp.child(".luchta/cache").path()).unwrap();
 
-    // NEW TEST START — verify written entry structure directly
-    // Load the snapshot and verify entry structure
-    let paths = luchta_cache::shared::open_shared_paths(shared_cache_dir.path()).unwrap();
-    let store = luchta_cache::shared::snapshot::SnapshotStore::new(paths);
-    let snapshot = store.load(&format!("{}-dirty", commit));
-    assert!(snapshot.is_some(), "dirty snapshot should load");
-    let snapshot = snapshot.unwrap();
-    assert!(
-        !snapshot.entries.is_empty(),
-        "dirty snapshot should have entries"
-    );
+    // Second, clean build must NOT reuse the dirty build's entry: its
+    // recorded inputs (the dirty content) don't match the now-committed tree,
+    // so this is a genuine miss and the task runs again.
+    let second = Command::cargo_bin("luchta")
+        .unwrap()
+        .arg("run")
+        .arg("pkgbuild")
+        .arg("--workspace-root")
+        .arg(temp.path())
+        .env("LUCHTA_SHARED_CACHE", "1")
+        .env(
+            "LUCHTA_SHARED_CACHE_DIR",
+            shared_cache_dir.path().to_str().unwrap(),
+        )
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let second_stdout = String::from_utf8(second).unwrap();
 
-    // Verify the entry has correct task_id
-    let entry = snapshot.entries.values().next().unwrap();
-    assert_eq!(
-        entry.task_id, "app#pkgbuild",
-        "entry should have correct task_id"
+    assert!(
+        !second_stdout.contains("📥"),
+        "clean build must not restore the dirty build's entry, stdout was:\n{second_stdout}"
     );
+    temp.child("packages/app/counter.txt").assert("2\n");
 }
 
 /// Test: cross-commit shared cache hit — the headline CI value.
@@ -1002,9 +1012,14 @@ fn cross_commit_shared_cache_hit() {
     temp.child("run-count.txt").assert("2\n");
 }
 
-/// Test: accumulation — running multiple tasks on SAME commit produces ONE snapshot with multiple entries.
+/// Test: entries from separate `luchta run` invocations are both discoverable.
+///
+/// Session shard keys are per-invocation, not per-commit: running `lint` then
+/// `test` produces two separate shard directories, not one shared snapshot
+/// like the old commit-keyed scheme. What survives is that recency discovery
+/// surfaces both shards, so a later build can restore either task's entry.
 #[test]
-fn accumulation_single_snapshot_multiple_entries() {
+fn entries_from_separate_runs_are_both_discoverable() {
     let shared_cache_dir = tempfile::tempdir().unwrap();
 
     let temp = assert_fs::TempDir::new().unwrap();
@@ -1032,7 +1047,7 @@ fn accumulation_single_snapshot_multiple_entries() {
         .unwrap();
     init_git(&temp);
 
-    // Run lint
+    // Run lint — its own shard.
     Command::cargo_bin("luchta")
         .unwrap()
         .arg("run")
@@ -1046,8 +1061,9 @@ fn accumulation_single_snapshot_multiple_entries() {
         )
         .assert()
         .success();
+    temp.child("packages/app/lint-counter.txt").assert("1\n");
 
-    // Run test (same commit)
+    // Run test — a separate invocation, a separate shard.
     Command::cargo_bin("luchta")
         .unwrap()
         .arg("run")
@@ -1061,33 +1077,58 @@ fn accumulation_single_snapshot_multiple_entries() {
         )
         .assert()
         .success();
+    temp.child("packages/app/test-counter.txt").assert("1\n");
 
-    // Verify commit snapshot shard(s) preserve both entries
-    let commit = get_head_commit(temp.path());
-    let commit_snapshot_dir = shared_cache_dir.path().join("snapshots").join(&commit);
-    let shard_paths = snapshot_shard_paths(&commit_snapshot_dir);
+    // Wipe local cache so both re-runs have to go through the shared cache.
+    std::fs::remove_dir_all(temp.child(".luchta/cache").path()).unwrap();
 
+    // Re-run lint: restored from its shard, counter unchanged.
+    let lint_rerun = Command::cargo_bin("luchta")
+        .unwrap()
+        .arg("run")
+        .arg("lint")
+        .arg("--workspace-root")
+        .arg(temp.path())
+        .env("LUCHTA_SHARED_CACHE", "1")
+        .env(
+            "LUCHTA_SHARED_CACHE_DIR",
+            shared_cache_dir.path().to_str().unwrap(),
+        )
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let lint_rerun_stdout = String::from_utf8(lint_rerun).unwrap();
     assert!(
-        !shard_paths.is_empty(),
-        "snapshot shard(s) should exist for commit"
+        lint_rerun_stdout.contains("📥 1"),
+        "lint re-run should report a shared hit, stdout was:\n{lint_rerun_stdout}"
     );
+    temp.child("packages/app/lint-counter.txt").assert("1\n");
 
-    // Load merged snapshot and verify entry count
-    let paths = luchta_cache::shared::open_shared_paths(shared_cache_dir.path()).unwrap();
-    let store = luchta_cache::shared::snapshot::SnapshotStore::new(paths);
-    let snapshot = store.load(&commit).expect("snapshot should load");
-
-    assert_eq!(
-        snapshot.entries.len(),
-        2,
-        "snapshot should have 2 entries (lint + test)"
+    // Re-run test: restored from its own (different) shard, counter unchanged.
+    let test_rerun = Command::cargo_bin("luchta")
+        .unwrap()
+        .arg("run")
+        .arg("test")
+        .arg("--workspace-root")
+        .arg(temp.path())
+        .env("LUCHTA_SHARED_CACHE", "1")
+        .env(
+            "LUCHTA_SHARED_CACHE_DIR",
+            shared_cache_dir.path().to_str().unwrap(),
+        )
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let test_rerun_stdout = String::from_utf8(test_rerun).unwrap();
+    assert!(
+        test_rerun_stdout.contains("📥 1"),
+        "test re-run should report a shared hit, stdout was:\n{test_rerun_stdout}"
     );
-
-    // Verify each task has an entry
-    let has_lint = snapshot.entries.values().any(|e| e.task_id == "app#lint");
-    let has_test = snapshot.entries.values().any(|e| e.task_id == "app#test");
-    assert!(has_lint, "snapshot should contain lint entry");
-    assert!(has_test, "snapshot should contain test entry");
+    temp.child("packages/app/test-counter.txt").assert("1\n");
 }
 
 /// Test: over-size-cap task is NOT cached.
@@ -1207,7 +1248,6 @@ fn get_head_commit(repo_path: &Path) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
-#[allow(dead_code)]
 /// Commit all changes in repo.
 fn git_commit_all(repo_path: &Path, message: &str) {
     use std::process::Command;
