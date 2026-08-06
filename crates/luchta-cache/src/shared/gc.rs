@@ -238,7 +238,7 @@ fn remove_file_if_exists(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shared::{open_shared_paths, write_blob};
+    use crate::shared::{open_shared_paths, write_outputs_blob};
     use filetime::FileTime;
     use std::sync::Arc;
     use std::thread;
@@ -289,7 +289,7 @@ mod tests {
         let output_path = package_dir.join(&output_rel);
         fs::create_dir_all(output_path.parent().unwrap()).unwrap();
         fs::write(&output_path, b"shared blob data").unwrap();
-        let result = write_blob(
+        let result = write_outputs_blob(
             paths,
             &outputs_hash,
             package_dir,

@@ -13,7 +13,7 @@ pub mod snapshot;
 
 pub(crate) use atomicio::atomic_write;
 pub use blob::{
-    restore_blob, restore_blob_with_meta, write_blob, write_blob_with_meta, BlobReadResult,
+    restore_blob, restore_blob_with_meta, write_blob_with_meta, write_outputs_blob, BlobReadResult,
     BlobReadResultWithMeta, BlobWriteResult, MetaFiles, StagedRestore,
 };
 pub use entry_meta::{
