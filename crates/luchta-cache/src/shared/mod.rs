@@ -1695,5 +1695,21 @@ mod tests {
             !blob_path(cache.paths(), &empty_hash).exists(),
             "no outputs means no blob file"
         );
+
+        // NoOutputs is a success path: the entry must still be indexed.
+        let write_key = cache.write_commit_key().expect("write key");
+        let snapshot = cache
+            .snapshot_store
+            .load(write_key)
+            .expect("snapshot should exist for no-output entries");
+        assert_eq!(snapshot.entries.len(), 2, "both no-output entries indexed");
+        assert!(
+            snapshot.entries.contains_key(&input_key_hex(key_a)),
+            "entry A should be recorded in the snapshot"
+        );
+        assert!(
+            snapshot.entries.contains_key(&input_key_hex(key_b)),
+            "entry B should be recorded in the snapshot"
+        );
     }
 }
