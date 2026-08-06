@@ -1,5 +1,6 @@
 pub(crate) mod atomicio;
 pub mod blob;
+pub mod entry_meta;
 pub mod gc;
 pub mod git;
 pub mod paths;
@@ -14,6 +15,10 @@ pub(crate) use atomicio::atomic_write;
 pub use blob::{
     restore_blob, restore_blob_with_meta, write_blob, write_blob_with_meta, BlobReadResult,
     BlobReadResultWithMeta, BlobWriteResult, MetaFiles, StagedRestore,
+};
+pub use entry_meta::{
+    encode_entry_meta, entry_meta_path, read_entry_meta, write_entry_meta, EntryMeta,
+    EntryMetaWriteResult, EntryReport, ENTRY_META_SCHEMA_VERSION,
 };
 pub use gc::{maybe_run_gc, run_gc, GcStats, DEFAULT_GC_RETENTION, DEFAULT_GC_THROTTLE};
 pub use git::{candidate_commit_keys, resolve_commit_key, CommitKey};

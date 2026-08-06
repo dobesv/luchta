@@ -1080,6 +1080,7 @@ mod tests {
                 root: PathBuf::from(format!("/tmp/luchta-test-{n}")),
                 blobs_dir: PathBuf::from(format!("/tmp/luchta-test-{n}/blobs")),
                 snapshots_dir: PathBuf::from(format!("/tmp/luchta-test-{n}/snapshots")),
+                entries_dir: PathBuf::from(format!("/tmp/luchta-test-{n}/entries")),
             }),
             commit_key: format!("commit-{n}"),
             outputs_hash: [n as u8; 32],
