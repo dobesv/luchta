@@ -645,26 +645,41 @@ impl SharedCache {
             }
         }
 
-        // Prepare meta files.
+        // Prepare per-entry meta. Keyed by input_key, never by outputs_hash.
         let meta_record =
             bincode::serde::encode_to_vec(record, bincode_config()).map_err(io::Error::other)?;
 
-        let meta = MetaFiles {
+        let meta = EntryMeta {
+            schema_version: ENTRY_META_SCHEMA_VERSION,
+            outputs_hash: *outputs_hash,
+            record: meta_record,
             stdout: stdout.to_vec(),
             stderr: stderr.to_vec(),
-            record: meta_record,
-            reports: reports.to_vec(),
+            reports: reports.iter().map(EntryReport::from).collect(),
         };
 
-        // Write blob with meta.
-        let blob_result = write_blob_with_meta(
+        // Meta counts toward the size cap, same as when it lived in the blob.
+        let meta_bytes = encode_entry_meta(&meta)?.len() as u64;
+        let output_bytes: u64 = record.outputs.iter().map(|file| file.size).sum();
+        let total_bytes = output_bytes.saturating_add(meta_bytes);
+        if total_bytes > self.size_cap_bytes {
+            return Ok(StoreOutcome::SkippedTooLarge { bytes: total_bytes });
+        }
+
+        let blob_result = write_outputs_blob(
             &self.paths,
             outputs_hash,
             package_dir,
             rel_output_paths,
             self.size_cap_bytes,
-            &meta,
         )?;
+
+        // Don't leave meta pointing at a blob that was never written.
+        if let BlobWriteResult::SkippedTooLarge { bytes } = blob_result {
+            return Ok(StoreOutcome::SkippedTooLarge { bytes });
+        }
+
+        write_entry_meta(&self.paths, input_key, &meta)?;
 
         let entry = SnapshotEntry {
             task_id: task_id.to_string(),
@@ -674,11 +689,11 @@ impl SharedCache {
             env_hash: record.env_hash,
             pkg_dep_hash: record.pkg_dep_hash,
             duration_ms,
-            output_bytes: record.outputs.iter().map(|f| f.size).sum(),
+            output_bytes,
             cached_at_unix_ms: record.end_unix_ms,
             tool_version: None,
         };
-        self.finish_store(blob_result, &write_key, entry)
+        self.finish_store(blob_result, &write_key, input_key, entry)
     }
 
     /// Records the snapshot entry and pushes to the remote after a blob write.
@@ -686,12 +701,18 @@ impl SharedCache {
         &self,
         blob_result: BlobWriteResult,
         write_key: &str,
+        input_key: &[u8; 32],
         entry: SnapshotEntry,
     ) -> io::Result<StoreOutcome> {
         match blob_result {
-            BlobWriteResult::Written | BlobWriteResult::AlreadyExists => {
+            // NoOutputs is a success: the entry meta is what makes it restorable.
+            BlobWriteResult::Written
+            | BlobWriteResult::AlreadyExists
+            | BlobWriteResult::NoOutputs => {
                 #[cfg(unix)]
                 let outputs_hash = entry.outputs_hash;
+                #[cfg(unix)]
+                let has_outputs = !matches!(blob_result, BlobWriteResult::NoOutputs);
                 let merge = self
                     .snapshot_store
                     .merge_entry_with_outcome(write_key, entry);
@@ -699,13 +720,12 @@ impl SharedCache {
                     return Ok(StoreOutcome::SkippedLockUnavailable);
                 }
                 #[cfg(unix)]
-                self.enqueue_remote_push(write_key, outputs_hash, merge);
+                self.enqueue_remote_push(write_key, outputs_hash, *input_key, has_outputs, merge);
                 Ok(StoreOutcome::Stored)
             }
             BlobWriteResult::SkippedTooLarge { bytes } => {
                 Ok(StoreOutcome::SkippedTooLarge { bytes })
             }
-            BlobWriteResult::NoOutputs => Ok(StoreOutcome::Stored), // Empty outputs are cacheable.
         }
     }
 
@@ -714,8 +734,11 @@ impl SharedCache {
         &self,
         write_key: &str,
         outputs_hash: [u8; 32],
+        input_key: [u8; 32],
+        has_outputs: bool,
         merge: MergeEntryOutcome,
     ) {
+        let _ = (input_key, has_outputs);
         let Some(remote) = &self.remote else {
             return;
         };
@@ -1598,5 +1621,79 @@ mod tests {
         assert!(!restore_dir.join(".luchta-meta/stdout.log").exists());
         assert!(!restore_dir.join(".luchta-meta/stderr.log").exists());
         assert!(!restore_dir.join(".luchta-meta/meta.bincode").exists());
+    }
+
+    #[test]
+    fn two_no_output_tasks_keep_separate_meta() {
+        let temp_repo = TempDir::new().unwrap();
+        setup_git_repo(temp_repo.path());
+        create_commit(temp_repo.path());
+
+        let temp_cache = TempDir::new().unwrap();
+        let cache = SharedCache::open_with_cache_dir(
+            temp_repo.path(),
+            1_000_000,
+            10,
+            Some(temp_cache.path()),
+        )
+        .unwrap();
+
+        let empty_hash = crate::resolve::combined_outputs_hash(&[]);
+
+        let pkg_a = temp_repo.path().join("pkg-a");
+        let pkg_b = temp_repo.path().join("pkg-b");
+        fs::create_dir_all(&pkg_a).unwrap();
+        fs::create_dir_all(&pkg_b).unwrap();
+
+        let mut record_a = sample_record(true, 200);
+        record_a.output_patterns = vec![];
+        record_a.outputs = vec![];
+        record_a.outputs_hash = empty_hash;
+        record_a.task_spec_hash = [11; 32];
+        let key_a = derive_input_key([11; 32], [2; 32], [3; 32], [4; 32]);
+
+        let mut record_b = record_a.clone();
+        record_b.task_spec_hash = [22; 32];
+        let key_b = derive_input_key([22; 32], [2; 32], [3; 32], [4; 32]);
+
+        cache
+            .store(
+                "pkg-a#lint",
+                &key_a,
+                &empty_hash,
+                &pkg_a,
+                &[],
+                &record_a,
+                b"A stdout",
+                b"",
+                &[],
+                temp_repo.path(),
+            )
+            .unwrap();
+        cache
+            .store(
+                "pkg-b#lint",
+                &key_b,
+                &empty_hash,
+                &pkg_b,
+                &[],
+                &record_b,
+                b"B stdout",
+                b"",
+                &[],
+                temp_repo.path(),
+            )
+            .unwrap();
+
+        let meta_a = read_entry_meta(cache.paths(), &key_a).expect("meta for A");
+        let meta_b = read_entry_meta(cache.paths(), &key_b).expect("meta for B");
+
+        assert_eq!(meta_a.stdout, b"A stdout");
+        assert_eq!(meta_b.stdout, b"B stdout");
+
+        assert!(
+            !blob_path(cache.paths(), &empty_hash).exists(),
+            "no outputs means no blob file"
+        );
     }
 }
