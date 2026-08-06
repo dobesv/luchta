@@ -21,8 +21,8 @@ use std::time::Duration;
 
 use super::snapshot::{SnapshotUpload, SNAPSHOT_FILE_EXTENSION, SNAPSHOT_MERGED_EXTENSION};
 use super::{
-    blob_path, hex_hash, rclone, MergeEntryOutcome, RcloneRcd, SharedCachePaths, SnapshotStore,
-    BLOBS_DIR_NAME, SNAPSHOTS_DIR_NAME,
+    blob_path, entry_meta_path, hex_hash, rclone, MergeEntryOutcome, RcloneRcd, SharedCachePaths,
+    SnapshotStore, BLOBS_DIR_NAME, ENTRIES_DIR_NAME, SNAPSHOTS_DIR_NAME,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,6 +126,8 @@ pub(crate) struct OwnedPushArtifacts {
     pub(crate) paths: Arc<SharedCachePaths>,
     pub(crate) commit_key: String,
     pub(crate) outputs_hash: [u8; 32],
+    pub(crate) input_key: [u8; 32],
+    pub(crate) has_outputs: bool,
     pub(crate) merge: MergeEntryOutcome,
 }
 
@@ -134,6 +136,8 @@ pub(crate) struct PushArtifacts<'a> {
     pub(crate) paths: &'a SharedCachePaths,
     pub(crate) commit_key: &'a str,
     pub(crate) outputs_hash: &'a [u8; 32],
+    pub(crate) input_key: &'a [u8; 32],
+    pub(crate) has_outputs: bool,
     pub(crate) merge: MergeEntryOutcome,
 }
 
@@ -227,6 +231,13 @@ impl RemoteSync {
     fn blobs_fs(&self) -> String {
         format!(
             "{}/{BLOBS_DIR_NAME}",
+            self.remote_base_fs.trim_end_matches('/')
+        )
+    }
+
+    fn entries_fs(&self) -> String {
+        format!(
+            "{}/{ENTRIES_DIR_NAME}",
             self.remote_base_fs.trim_end_matches('/')
         )
     }
@@ -341,6 +352,8 @@ impl RemoteSync {
             paths: &push.paths,
             commit_key: &push.commit_key,
             outputs_hash: &push.outputs_hash,
+            input_key: &push.input_key,
+            has_outputs: push.has_outputs,
             merge: push.merge,
         });
     }
@@ -369,10 +382,20 @@ impl RemoteSync {
 
     pub(crate) fn pull_entry_meta(
         &self,
-        _paths: &SharedCachePaths,
-        _input_key: &[u8; 32],
+        paths: &SharedCachePaths,
+        input_key: &[u8; 32],
     ) -> Result<(), rclone::RcloneError> {
-        Ok(())
+        if self.is_disabled() {
+            return Ok(());
+        }
+        let local_path = entry_meta_path(paths, input_key);
+        if local_path.exists() {
+            return Ok(());
+        }
+        let file_name = format!("{}.bin", hex_hash(*input_key));
+        self.copy_remote_file_down(&self.entries_fs(), &file_name, &local_path)
+            .inspect(|_| self.record_remote_success())
+            .inspect_err(|err| self.record_remote_error(err))
     }
 
     pub(crate) fn pull_blob(
@@ -443,10 +466,15 @@ impl RemoteSync {
             paths,
             commit_key,
             outputs_hash,
+            input_key,
+            has_outputs,
             merge,
         } = push;
 
-        self.push_blob_if_missing(paths, outputs_hash);
+        if has_outputs {
+            self.push_blob_if_missing(paths, outputs_hash);
+        }
+        self.push_entry_meta_if_missing(paths, input_key);
 
         if self.is_disabled() {
             return;
@@ -495,6 +523,38 @@ impl RemoteSync {
         if let Err(err) = self.copy_local_file_up(&local_path, &remote_fs, &blob_name) {
             self.record_remote_error(&err);
             eprintln!("warn: shared cache remote blob upload failed for {blob_name}: {err}");
+        } else {
+            self.record_remote_success();
+        }
+    }
+
+    fn push_entry_meta_if_missing(&self, paths: &SharedCachePaths, input_key: &[u8; 32]) {
+        let remote_fs = self.entries_fs();
+        let file_name = format!("{}.bin", hex_hash(*input_key));
+        match self
+            .rclone
+            .stat(&remote_fs, &file_name, self.rclone.default_timeout())
+        {
+            Ok(Some(_)) => {
+                self.record_remote_success();
+                return;
+            }
+            Ok(None) => {
+                self.record_remote_success();
+            }
+            Err(err) => {
+                self.record_remote_error(&err);
+                eprintln!(
+                    "warn: shared cache remote entry meta stat failed for {file_name}: {err}"
+                );
+                return;
+            }
+        }
+
+        let local_path = entry_meta_path(paths, input_key);
+        if let Err(err) = self.copy_local_file_up(&local_path, &remote_fs, &file_name) {
+            self.record_remote_error(&err);
+            eprintln!("warn: shared cache remote entry meta upload failed for {file_name}: {err}");
         } else {
             self.record_remote_success();
         }
@@ -838,6 +898,7 @@ mod tests {
         entry: SnapshotEntry,
     ) -> String {
         let outputs_hash = entry.outputs_hash;
+        let input_key = entry.input_key;
         let merge = seed_cache
             .snapshot_store
             .merge_entry_with_outcome(commit, entry);
@@ -846,6 +907,8 @@ mod tests {
             paths: seed_cache.paths(),
             commit_key: commit,
             outputs_hash: &outputs_hash,
+            input_key: &input_key,
+            has_outputs: true,
             merge,
         });
         shard_id
@@ -1092,6 +1155,8 @@ mod tests {
             }),
             commit_key: format!("commit-{n}"),
             outputs_hash: [n as u8; 32],
+            input_key: [n as u8; 32],
+            has_outputs: true,
             merge: MergeEntryOutcome {
                 result: MergeResult::Inserted,
                 new_snapshot_upload: None,
@@ -1208,10 +1273,13 @@ mod tests {
             .join(&harness.commit)
             .join(format!("subsuming-shard.{SNAPSHOT_FILE_EXTENSION}"));
         fs::create_dir_all(&blocking_path).unwrap();
+        let input_key = derive_input_key([19; 32], [20; 32], [21; 32], [22; 32]);
         harness.remote.push_store_artifacts(PushArtifacts {
             paths: cache.paths(),
             commit_key: &harness.commit,
             outputs_hash: &[23; 32],
+            input_key: &input_key,
+            has_outputs: true,
             merge: merge3,
         });
         // The failed upload must not have disabled the remote permanently in a
@@ -1497,6 +1565,77 @@ mod tests {
     }
 
     #[test]
+    fn remote_store_uploads_entry_meta_and_second_machine_restores_no_output_task() {
+        if !should_run_rclone_test() {
+            eprintln!("skipping rclone-gated shared-cache entry-meta sync test; rclone not on PATH or LUCHTA_TEST_RCLONE disabled");
+            return;
+        }
+
+        let remote_root = TempDir::new().unwrap();
+        let machine_a_cache = TempDir::new().unwrap();
+        let machine_b_cache = TempDir::new().unwrap();
+
+        let repo = TempDir::new().unwrap();
+        setup_git_repo(repo.path());
+        create_commit(repo.path());
+
+        let empty_hash = crate::resolve::combined_outputs_hash(&[]);
+        let package_dir = repo.path().join("pkg");
+        fs::create_dir_all(&package_dir).unwrap();
+
+        let mut record = sample_record(true, 200);
+        record.output_patterns = vec![];
+        record.outputs = vec![];
+        record.outputs_hash = empty_hash;
+        let input_key = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32]);
+
+        let remote = RemoteSync::new(
+            Arc::new(RcloneRcd::with_default_timeout().unwrap()),
+            format!(":local:{}", remote_root.path().display()),
+            8,
+        );
+
+        let cache_a = open_cache_with_remote(repo.path(), machine_a_cache.path(), &remote);
+        cache_a
+            .store(
+                "pkg#lint",
+                &input_key,
+                &empty_hash,
+                &package_dir,
+                &[],
+                &record,
+                b"lint output",
+                b"",
+                &[],
+                repo.path(),
+            )
+            .unwrap();
+        cache_a.flush_push_queue();
+
+        assert!(
+            remote_root
+                .path()
+                .join("entries")
+                .read_dir()
+                .unwrap()
+                .count()
+                > 0,
+            "entry meta should be uploaded"
+        );
+
+        // Same remote, fresh local cache: stands in for a second machine.
+        let cache_b = open_cache_with_remote(repo.path(), machine_b_cache.path(), &remote);
+        let restore_dir = repo.path().join("restore");
+        fs::create_dir_all(&restore_dir).unwrap();
+
+        let candidate = cache_b
+            .try_restore_candidates("pkg#lint", &input_key, &restore_dir)
+            .next()
+            .expect("machine B should find the entry");
+        assert_eq!(candidate.stdout, b"lint output");
+    }
+
+    #[test]
     fn remote_cross_machine_store_on_a_restore_on_fresh_b_when_rclone_enabled() {
         if !should_run_rclone_test() {
             eprintln!("skipping rclone-gated cross-machine shared-cache test; rclone not on PATH or LUCHTA_TEST_RCLONE disabled");
@@ -1654,10 +1793,13 @@ mod tests {
         )
         .unwrap();
 
+        let input_key = derive_input_key([71; 32], [72; 32], [73; 32], [74; 32]);
         harness.remote.push_store_artifacts(PushArtifacts {
             paths: seed_cache.paths(),
             commit_key: &harness.commit,
             outputs_hash: &[0x66; 32],
+            input_key: &input_key,
+            has_outputs: true,
             merge: merge3,
         });
         assert!(harness.remote.is_disabled_for_test());

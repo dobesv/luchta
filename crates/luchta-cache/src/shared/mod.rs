@@ -25,7 +25,7 @@ pub use gc::{maybe_run_gc, run_gc, GcStats, DEFAULT_GC_RETENTION, DEFAULT_GC_THR
 pub use git::{candidate_commit_keys, resolve_commit_key, CommitKey};
 pub use paths::{
     open_shared_paths, resolve_shared_cache_dir, SharedCachePaths, BLOBS_DIR_NAME,
-    SHARED_CACHE_DIR_ENV, SNAPSHOTS_DIR_NAME,
+    ENTRIES_DIR_NAME, SHARED_CACHE_DIR_ENV, SNAPSHOTS_DIR_NAME,
 };
 #[cfg(unix)]
 pub use rclone::RcloneRcd;
@@ -737,7 +737,14 @@ impl SharedCache {
             cached_at_unix_ms: record.end_unix_ms,
             tool_version: None,
         };
-        self.finish_store(blob_result, &write_key, input_key, entry)
+        self.finish_store(
+            blob_result,
+            &write_key,
+            input_key,
+            #[cfg(unix)]
+            meta.has_outputs,
+            entry,
+        )
     }
 
     /// Records the snapshot entry and pushes to the remote after a blob write.
@@ -746,6 +753,7 @@ impl SharedCache {
         blob_result: BlobWriteResult,
         write_key: &str,
         input_key: &[u8; 32],
+        #[cfg(unix)] has_outputs: bool,
         entry: SnapshotEntry,
     ) -> io::Result<StoreOutcome> {
         match blob_result {
@@ -755,8 +763,6 @@ impl SharedCache {
             | BlobWriteResult::NoOutputs => {
                 #[cfg(unix)]
                 let outputs_hash = entry.outputs_hash;
-                #[cfg(unix)]
-                let has_outputs = !matches!(blob_result, BlobWriteResult::NoOutputs);
                 let merge = self
                     .snapshot_store
                     .merge_entry_with_outcome(write_key, entry);
@@ -782,7 +788,6 @@ impl SharedCache {
         has_outputs: bool,
         merge: MergeEntryOutcome,
     ) {
-        let _ = (input_key, has_outputs);
         let Some(remote) = &self.remote else {
             return;
         };
@@ -793,6 +798,8 @@ impl SharedCache {
             paths: Arc::clone(&self.paths),
             commit_key: write_key.to_string(),
             outputs_hash,
+            input_key,
+            has_outputs,
             merge,
         });
     }
