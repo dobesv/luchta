@@ -95,6 +95,8 @@ pub fn write_entry_meta(
 ) -> io::Result<EntryMetaWriteResult> {
     let path = entry_meta_path(paths, input_key);
     if path.exists() {
+        // TOCTOU is tolerated: concurrent writers for the same input_key are idempotent
+        // because identical input_key means equivalent content anyway.
         return Ok(EntryMetaWriteResult::AlreadyExists);
     }
     let encoded = encode_entry_meta(meta)?;
@@ -107,7 +109,8 @@ pub fn write_entry_meta(
 pub fn read_entry_meta(paths: &SharedCachePaths, input_key: &[u8; 32]) -> Option<EntryMeta> {
     let bytes = fs::read(entry_meta_path(paths, input_key)).ok()?;
     let raw = zstd::decode_all(bytes.as_slice()).ok()?;
-    let (meta, _) = bincode::serde::decode_from_slice::<EntryMeta, _>(&raw, bincode_config()).ok()?;
+    let (meta, _) =
+        bincode::serde::decode_from_slice::<EntryMeta, _>(&raw, bincode_config()).ok()?;
     if meta.schema_version != ENTRY_META_SCHEMA_VERSION {
         return None;
     }
