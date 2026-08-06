@@ -1801,10 +1801,13 @@ mod tests {
                 .unwrap();
         }
 
-        // 25 more "runs": each writes one fresh shard, then triggers
-        // discovery, simulating local churn well past both the pressure
-        // threshold (15) and the shard-count cap (20).
-        for i in 0..25u8 {
+        // 21 more "runs": each writes one fresh shard, then triggers
+        // discovery, simulating local churn past both the pressure
+        // threshold (15) and the shard-count cap (20). Kept to the minimum
+        // that clears both bars rather than a rounder, larger number: each
+        // iteration opens a fresh `SharedCache` and does real disk I/O, and
+        // this test doesn't need more churn than that to prove the property.
+        for i in 0..21u8 {
             let cache = SharedCache::open_with_cache_dir(
                 temp_repo.path(),
                 1_000_000,
