@@ -46,7 +46,7 @@ pub use snapshot::{
     combined_dep_outputs_hash, derive_input_key, input_key_hex, MergeEntryOutcome, MergeResult,
     Snapshot, SnapshotEntry, SnapshotStore, SNAPSHOT_SCHEMA_VERSION,
 };
-use std::collections::HashMap;
+use std::collections::HashSet;
 #[cfg(unix)]
 use std::collections::VecDeque;
 use std::io;
@@ -151,31 +151,33 @@ pub enum StoreOutcome {
 }
 
 /// Merged index from all candidate snapshots, built lazily on first access.
+///
+/// Just a presence set: `try_restore_candidates` only asks "did *any* candidate
+/// ever record this input_key as cacheable" (`contains`). The actual record,
+/// outputs_hash, and streams for a hit are resolved afterward from the single
+/// `entries/<input_key>` object (see `stage_entry`), not from anything carried
+/// here — so there is nothing to arbitrate between shards that both mention the
+/// same input_key. An earlier version stored `(SnapshotEntry, String)` per key
+/// and picked a "winner" on conflict; that payload had no reader outside tests
+/// and its comparator (`cached_at_unix_ms`, a wall clock from whichever machine
+/// wrote the entry) was unsound across machines with skewed clocks. Removed
+/// rather than kept and documented, since Task 9 would otherwise inherit it
+/// silently when merging remote listings into this same index.
 #[derive(Debug, Clone)]
 pub struct MergedIndex {
-    /// input_key_hex -> (SnapshotEntry, commit_key) with newest-wins semantics.
-    entries: HashMap<String, (SnapshotEntry, String)>,
+    /// Set of input_key_hex values recorded as cacheable by some candidate shard.
+    entries: HashSet<String>,
 }
 
 impl MergedIndex {
     fn new() -> Self {
         Self {
-            entries: HashMap::new(),
+            entries: HashSet::new(),
         }
     }
 
-    fn insert_entry(&mut self, input_key_hex: String, entry: SnapshotEntry, commit_key: String) {
-        // Newest-wins by the entry's own recorded build time (`cached_at_unix_ms`),
-        // not by shard discovery order. Shards are grouped by when they were
-        // *written to this cache*, which needn't match when their contents were
-        // *produced* — e.g. a remote sync can land after a fresher local build.
-        // On a tie, later-iterated (i.e. shard-discovery-order) wins, same as before.
-        if let Some((existing, _)) = self.entries.get(&input_key_hex) {
-            if existing.cached_at_unix_ms > entry.cached_at_unix_ms {
-                return;
-            }
-        }
-        self.entries.insert(input_key_hex, (entry, commit_key));
+    fn insert_entry(&mut self, input_key_hex: String) {
+        self.entries.insert(input_key_hex);
     }
 }
 
@@ -188,10 +190,8 @@ pub struct SharedCache {
     write_commit_key: Option<String>,
     /// Bound on how many candidate shards `discover_recent_shard_keys` returns.
     ///
-    /// Candidates are (re)discovered lazily at index-build time rather than
-    /// cached from `open()`, so that entries written by this same process
-    /// (its own write shard, or shards created directly by tests) are found —
-    /// their directories don't exist yet at `open()` time.
+    /// See `candidate_keys()` for why this isn't resolved into a fixed list at
+    /// `open()` time.
     history_len: usize,
     /// Snapshot store for merge_entry.
     snapshot_store: SnapshotStore,
@@ -376,10 +376,7 @@ impl SharedCache {
 
         // O(1) lookup in the merged index — NO disk read. Only gates whether
         // any snapshot ever recorded this input_key as cacheable.
-        let candidate = index
-            .entries
-            .contains_key(&input_key_hex)
-            .then_some(*input_key);
+        let candidate = index.entries.contains(&input_key_hex).then_some(*input_key);
 
         let paths = self.paths.clone();
         let package_dir = package_dir.to_path_buf();
@@ -631,8 +628,8 @@ impl SharedCache {
         let Some(snapshot) = self.snapshot_store.load(commit_key) else {
             return;
         };
-        for (input_key_hex, entry) in &snapshot.entries {
-            merged.insert_entry(input_key_hex.clone(), entry.clone(), commit_key.to_string());
+        for input_key_hex in snapshot.entries.keys() {
+            merged.insert_entry(input_key_hex.clone());
         }
     }
 
@@ -829,16 +826,27 @@ impl SharedCache {
         self.write_commit_key.as_deref()
     }
 
-    /// Discovers the current candidate shard keys for this cache, newest-first.
+    /// Discovers the candidate shard keys for this cache, newest-first.
     ///
-    /// Recomputed on every call (a cheap directory listing) rather than cached
-    /// from `open()`, so it reflects shards written since this cache was opened.
+    /// The method itself does a fresh directory listing on every call, but its
+    /// only production caller is `build_index()`, which runs inside
+    /// `self.index`'s `OnceLock::get_or_init` — so in practice this resolves
+    /// once per process, on the first restore attempt. `store()` never
+    /// invalidates that `OnceLock`, so entries this process writes *after* its
+    /// first restore attempt are not picked up by later restores in the same
+    /// process; only a fresh `SharedCache` (a new process) sees them. This is
+    /// deliberately later than `open()`, not "live": it exists so that shards
+    /// seeded after `open()` — chiefly by tests, which often store before ever
+    /// calling `try_restore_candidates` — are still found.
     ///
     /// This process's own write shard is always included even if nothing has
     /// been stored to it yet: its directory may not exist on disk at the time
     /// of the first lookup (e.g. a restore attempted before any store), so it
-    /// can't be found by directory discovery alone, but it's still the one
-    /// shard we know for certain is relevant to this run.
+    /// can't be found by directory discovery alone. This is load-bearing for
+    /// `remote_unreachable_trips_disable_flag_and_build_continues`: with zero
+    /// local shards, the write key is the only candidate a remote-pull attempt
+    /// has to probe, and that probe is what trips the disable flag. Don't
+    /// drop it as a "no-op" without checking that test.
     #[must_use]
     pub fn candidate_keys(&self) -> Vec<String> {
         let mut keys = discover_recent_shard_keys(&self.paths, self.history_len);
@@ -1429,56 +1437,6 @@ mod tests {
             !restore_dir.join(".luchta-meta").exists(),
             "embedded legacy meta must be filtered out on commit"
         );
-    }
-
-    #[test]
-    fn newest_wins_on_conflict() {
-        // Create repo with 2 commits.
-        let temp_repo = TempDir::new().unwrap();
-        setup_git_repo(temp_repo.path());
-        let commit1 = create_commit(temp_repo.path());
-        let commit2 = create_commit(temp_repo.path());
-
-        let temp_cache = TempDir::new().unwrap();
-        let cache = SharedCache::open_with_cache_dir(
-            temp_repo.path(),
-            1_000_000,
-            5,
-            Some(temp_cache.path()),
-        )
-        .unwrap();
-
-        // Same input_key, different outputs_hash.
-        let input_key = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32]);
-
-        let entry1 = SnapshotEntry {
-            task_id: "pkg#build".to_string(),
-            input_key,
-            outputs_hash: [1; 32],
-            task_spec_hash: [1; 32],
-            env_hash: [2; 32],
-            pkg_dep_hash: [3; 32],
-            duration_ms: 100,
-            output_bytes: 50,
-            cached_at_unix_ms: 1_000_000_000_000,
-            tool_version: None,
-        };
-
-        let mut entry2 = entry1.clone();
-        entry2.outputs_hash = [2; 32];
-        entry2.cached_at_unix_ms = 2_000_000_000_000;
-
-        // Insert both entries (order doesn't matter, newest wins).
-        cache.snapshot_store.merge_entry(&commit2, entry2);
-        cache.snapshot_store.merge_entry(&commit1, entry1);
-
-        // Build index.
-        let index = cache.get_or_build_index();
-        let input_hex = input_key_hex(input_key);
-        let (found, _key) = index.entries.get(&input_hex).unwrap();
-
-        // Newest (commit2) should win.
-        assert_eq!(found.outputs_hash, [2; 32]);
     }
 
     fn write_snapshot_fixture(snapshot_dir: &Path, commit: &str, entry: SnapshotEntry) {
