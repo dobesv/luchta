@@ -116,28 +116,36 @@ struct PushQueue {
 
 #[derive(Debug)]
 enum PushMsg {
-    Push(OwnedPushArtifacts),
+    EntryArtifacts(OwnedEntryArtifacts),
+    IndexMerge(OwnedIndexPush),
     #[cfg(any(test, doctest))]
     Flush(std::sync::mpsc::Sender<()>),
 }
 
+/// Owned inputs for [`RemoteSync::push_entry_artifacts`], queued so the push
+/// can happen off the caller's thread.
+///
+/// Content-addressed and independent of any shard: a restore on another
+/// machine needs the blob and entry meta regardless of whether this run's
+/// index push has happened, which is exactly why this is split out from
+/// [`OwnedIndexPush`] rather than bundled with it.
 #[derive(Debug)]
-pub(crate) struct OwnedPushArtifacts {
+pub(crate) struct OwnedEntryArtifacts {
     pub(crate) paths: Arc<SharedCachePaths>,
-    pub(crate) commit_key: String,
     pub(crate) outputs_hash: [u8; 32],
     pub(crate) input_key: [u8; 32],
     pub(crate) has_outputs: bool,
-    pub(crate) merge: MergeEntryOutcome,
 }
 
-/// Inputs for [`RemoteSync::push_store_artifacts`].
-pub(crate) struct PushArtifacts<'a> {
-    pub(crate) paths: &'a SharedCachePaths,
-    pub(crate) commit_key: &'a str,
-    pub(crate) outputs_hash: &'a [u8; 32],
-    pub(crate) input_key: &'a [u8; 32],
-    pub(crate) has_outputs: bool,
+/// Owned inputs for [`RemoteSync::push_index_merge`], queued so the push can
+/// happen off the caller's thread.
+///
+/// No `paths` field: unlike the entry-artifact push, the index push never
+/// reads from disk — `push_snapshot_upload` takes the shard bytes straight
+/// from `merge.new_snapshot_upload`.
+#[derive(Debug)]
+pub(crate) struct OwnedIndexPush {
+    pub(crate) shard_key: String,
     pub(crate) merge: MergeEntryOutcome,
 }
 
@@ -276,7 +284,8 @@ impl RemoteSync {
         let worker = std::thread::spawn(move || {
             for msg in rx {
                 match msg {
-                    PushMsg::Push(push) => worker_remote.push_store_artifacts_owned(push),
+                    PushMsg::EntryArtifacts(push) => worker_remote.push_entry_artifacts_owned(push),
+                    PushMsg::IndexMerge(push) => worker_remote.push_index_merge_owned(push),
                     #[cfg(any(test, doctest))]
                     PushMsg::Flush(ack) => {
                         let _ = ack.send(());
@@ -296,7 +305,7 @@ impl RemoteSync {
             .expect("push queue worker mutex poisoned") = Some(worker);
     }
 
-    pub(crate) fn enqueue_push_store_artifacts(&self, push: OwnedPushArtifacts) {
+    pub(crate) fn enqueue_entry_artifacts(&self, push: OwnedEntryArtifacts) {
         let Some(tx) = self
             .push_queue
             .tx
@@ -305,10 +314,27 @@ impl RemoteSync {
             .as_ref()
             .cloned()
         else {
-            self.push_store_artifacts_owned(push);
+            self.push_entry_artifacts_owned(push);
             return;
         };
-        if tx.send(PushMsg::Push(push)).is_err() {
+        if tx.send(PushMsg::EntryArtifacts(push)).is_err() {
+            eprintln!("debug: remote push queue closed before enqueue completed");
+        }
+    }
+
+    pub(crate) fn enqueue_index_push(&self, push: OwnedIndexPush) {
+        let Some(tx) = self
+            .push_queue
+            .tx
+            .lock()
+            .expect("push queue tx mutex poisoned")
+            .as_ref()
+            .cloned()
+        else {
+            self.push_index_merge_owned(push);
+            return;
+        };
+        if tx.send(PushMsg::IndexMerge(push)).is_err() {
             eprintln!("debug: remote push queue closed before enqueue completed");
         }
     }
@@ -349,15 +375,17 @@ impl RemoteSync {
         }
     }
 
-    fn push_store_artifacts_owned(&self, push: OwnedPushArtifacts) {
-        self.push_store_artifacts(PushArtifacts {
-            paths: &push.paths,
-            commit_key: &push.commit_key,
-            outputs_hash: &push.outputs_hash,
-            input_key: &push.input_key,
-            has_outputs: push.has_outputs,
-            merge: push.merge,
-        });
+    fn push_entry_artifacts_owned(&self, push: OwnedEntryArtifacts) {
+        self.push_entry_artifacts(
+            &push.paths,
+            &push.outputs_hash,
+            &push.input_key,
+            push.has_outputs,
+        );
+    }
+
+    fn push_index_merge_owned(&self, push: OwnedIndexPush) {
+        self.push_index_merge(&push.shard_key, &push.merge);
     }
 
     pub(crate) fn pull_snapshot_commit(&self, snapshot_store: &SnapshotStore, commit_key: &str) {
@@ -460,30 +488,46 @@ impl RemoteSync {
         Ok(())
     }
 
-    pub(crate) fn push_store_artifacts(&self, push: PushArtifacts<'_>) {
+    /// Pushes the content-addressed blob (when `has_outputs`) and the
+    /// `entries/<input_key>.bin` object.
+    ///
+    /// Independent of [`push_index_merge`](Self::push_index_merge): both the
+    /// blob and the entry meta are useful to a restore on another machine
+    /// whether or not this run's index push has happened yet, so this half
+    /// is dispatchable on its own.
+    pub(crate) fn push_entry_artifacts(
+        &self,
+        paths: &SharedCachePaths,
+        outputs_hash: &[u8; 32],
+        input_key: &[u8; 32],
+        has_outputs: bool,
+    ) {
         if self.is_disabled() {
             return;
         }
-        let PushArtifacts {
-            paths,
-            commit_key,
-            outputs_hash,
-            input_key,
-            has_outputs,
-            merge,
-        } = push;
 
         if has_outputs {
             self.push_blob_if_missing(paths, outputs_hash);
         }
         self.push_entry_meta_if_missing(paths, input_key);
+    }
 
+    /// Pushes the merged index shard (when the merge produced one) and then
+    /// deletes the shards it subsumed.
+    ///
+    /// Re-checks `is_disabled()` on entry: the artifact pushes this normally
+    /// follows can trip the circuit breaker, and this half must not attempt
+    /// an index push against a remote that just went dark. The subsumed
+    /// deletes only run if the replacement shard uploaded successfully
+    /// (`uploaded_new_shard`) — never reorder or drop that gate, or a delete
+    /// could remove a shard's data before its replacement is confirmed live.
+    pub(crate) fn push_index_merge(&self, shard_key: &str, merge: &MergeEntryOutcome) {
         if self.is_disabled() {
             return;
         }
 
         let uploaded_new_shard = match merge.new_snapshot_upload.as_ref() {
-            Some(upload) => self.push_snapshot_upload(commit_key, upload),
+            Some(upload) => self.push_snapshot_upload(shard_key, upload),
             None => false,
         };
 
@@ -495,8 +539,8 @@ impl RemoteSync {
             if self.is_disabled() {
                 break;
             }
-            self.delete_remote_snapshot_file(commit_key, shard_id, SNAPSHOT_FILE_EXTENSION);
-            self.delete_remote_snapshot_file(commit_key, shard_id, SNAPSHOT_MERGED_EXTENSION);
+            self.delete_remote_snapshot_file(shard_key, shard_id, SNAPSHOT_FILE_EXTENSION);
+            self.delete_remote_snapshot_file(shard_key, shard_id, SNAPSHOT_MERGED_EXTENSION);
         }
     }
 
@@ -850,6 +894,10 @@ mod tests {
                 harness.temp_repo.path(),
             )
             .unwrap();
+        // The index merge/push is deferred to the end-of-run flush; a
+        // caller of this helper expects a fully "landed" remote store, same
+        // as before batching, so simulate the run ending here.
+        cache.flush_pending_entries();
         cache.flush_push_queue();
         assert!(matches!(outcome, StoreOutcome::Stored));
         StoredRemoteCase {
@@ -915,14 +963,8 @@ mod tests {
             .snapshot_store
             .merge_entry_with_outcome(shard_key, entry);
         let shard_id = merge.new_snapshot_upload.as_ref().unwrap().shard_id.clone();
-        remote_seed.push_store_artifacts(PushArtifacts {
-            paths: seed_cache.paths(),
-            commit_key: shard_key,
-            outputs_hash: &outputs_hash,
-            input_key: &input_key,
-            has_outputs: true,
-            merge,
-        });
+        remote_seed.push_entry_artifacts(seed_cache.paths(), &outputs_hash, &input_key, true);
+        remote_seed.push_index_merge(shard_key, &merge);
         shard_id
     }
 
@@ -1145,12 +1187,13 @@ mod tests {
         let worker = thread::spawn(move || {
             for msg in rx {
                 match msg {
-                    PushMsg::Push(_) => {
+                    PushMsg::EntryArtifacts(_) => {
                         let count = processed_in_worker.fetch_add(1, Ordering::SeqCst);
                         started_tx.send(count).unwrap();
                         release_rx.recv().unwrap();
                         processed_tx.send(()).unwrap();
                     }
+                    PushMsg::IndexMerge(_) => {}
                     PushMsg::Flush(ack) => {
                         let _ = ack.send(());
                     }
@@ -1158,33 +1201,27 @@ mod tests {
             }
         });
 
-        let make_push = |n| OwnedPushArtifacts {
+        let make_push = |n| OwnedEntryArtifacts {
             paths: Arc::new(SharedCachePaths {
                 root: PathBuf::from(format!("/tmp/luchta-test-{n}")),
                 blobs_dir: PathBuf::from(format!("/tmp/luchta-test-{n}/blobs")),
                 snapshots_dir: PathBuf::from(format!("/tmp/luchta-test-{n}/snapshots")),
                 entries_dir: PathBuf::from(format!("/tmp/luchta-test-{n}/entries")),
             }),
-            commit_key: format!("commit-{n}"),
             outputs_hash: [n as u8; 32],
             input_key: [n as u8; 32],
             has_outputs: true,
-            merge: MergeEntryOutcome {
-                result: MergeResult::Inserted,
-                new_snapshot_upload: None,
-                subsumed_shard_ids: Vec::new(),
-            },
         };
 
-        tx.send(PushMsg::Push(make_push(1))).unwrap();
+        tx.send(PushMsg::EntryArtifacts(make_push(1))).unwrap();
         started_rx.recv().unwrap();
-        tx.send(PushMsg::Push(make_push(2))).unwrap();
+        tx.send(PushMsg::EntryArtifacts(make_push(2))).unwrap();
 
         let (send_result_tx, send_result_rx) = channel();
         let send_third = {
             let tx = tx.clone();
             thread::spawn(move || {
-                let sent = tx.send(PushMsg::Push(make_push(3))).is_ok();
+                let sent = tx.send(PushMsg::EntryArtifacts(make_push(3))).is_ok();
                 send_result_tx.send(sent).unwrap();
             })
         };
@@ -1287,14 +1324,10 @@ mod tests {
             .join(format!("subsuming-shard.{SNAPSHOT_FILE_EXTENSION}"));
         fs::create_dir_all(&blocking_path).unwrap();
         let input_key = derive_input_key([19; 32], [20; 32], [21; 32], [22; 32], [5; 32]);
-        harness.remote.push_store_artifacts(PushArtifacts {
-            paths: cache.paths(),
-            commit_key: &shard_key,
-            outputs_hash: &[23; 32],
-            input_key: &input_key,
-            has_outputs: true,
-            merge: merge3,
-        });
+        harness
+            .remote
+            .push_entry_artifacts(cache.paths(), &[23; 32], &input_key, true);
+        harness.remote.push_index_merge(&shard_key, &merge3);
         // The failed upload must not have disabled the remote permanently in a
         // way that hides a delete — but it must have skipped the subsumed-shard
         // deletes. Remove the blocking dir so the snapshot listing below only
@@ -1633,8 +1666,13 @@ mod tests {
                 .unwrap()
                 .count()
                 > 0,
-            "entry meta should be uploaded"
+            "entry meta should be uploaded immediately, before any index flush"
         );
+
+        // The index merge/push is deferred to the end-of-run flush -- machine
+        // B's restore below needs it, so simulate machine A's run ending.
+        cache_a.flush_pending_entries();
+        cache_a.flush_push_queue();
 
         // Same remote, fresh local cache: stands in for a second machine.
         let cache_b = open_cache_with_remote(repo.path(), machine_b_cache.path(), &remote);
@@ -1810,14 +1848,10 @@ mod tests {
         .unwrap();
 
         let input_key = derive_input_key([71; 32], [72; 32], [73; 32], [74; 32], [5; 32]);
-        harness.remote.push_store_artifacts(PushArtifacts {
-            paths: seed_cache.paths(),
-            commit_key: &shard_key,
-            outputs_hash: &[0x66; 32],
-            input_key: &input_key,
-            has_outputs: true,
-            merge: merge3,
-        });
+        harness
+            .remote
+            .push_entry_artifacts(seed_cache.paths(), &[0x66; 32], &input_key, true);
+        harness.remote.push_index_merge(&shard_key, &merge3);
         assert!(harness.remote.is_disabled_for_test());
         fs::remove_dir(&poisoned_file).unwrap();
         drop(seed_cache);
@@ -1889,6 +1923,9 @@ mod tests {
                 harness.temp_repo.path(),
             )
             .unwrap();
+        // The index merge (and the compaction it drives) is deferred to the
+        // end-of-run flush.
+        cache.flush_pending_entries();
         cache.flush_push_queue();
         assert!(matches!(outcome, StoreOutcome::Stored));
         drop(seed_cache);
@@ -2046,14 +2083,8 @@ mod tests {
             format!(":local:{}", remote_root.path().display()),
             8,
         );
-        remote_seed.push_store_artifacts(PushArtifacts {
-            paths: &seed_paths,
-            commit_key: &remote_only_key,
-            outputs_hash: &[0; 32],
-            input_key: &input_key,
-            has_outputs: false,
-            merge,
-        });
+        remote_seed.push_entry_artifacts(&seed_paths, &[0; 32], &input_key, false);
+        remote_seed.push_index_merge(&remote_only_key, &merge);
 
         // Fresh local cache: it never wrote to `remote_only_key`, and that
         // key isn't its own write bucket either. The only way it can see
@@ -2072,14 +2103,14 @@ mod tests {
     }
 
     #[test]
-    fn flush_refreshes_on_remote_backed_cache_pushes_the_merge_and_entry_meta() {
+    fn flush_pending_entries_on_remote_backed_cache_pushes_the_merge_and_entry_meta() {
         if !should_run_rclone_test() {
             eprintln!("skipping rclone-gated shared-cache refresh push test; rclone not on PATH or LUCHTA_TEST_RCLONE disabled");
             return;
         }
 
         // A refresh must reach the remote, not just this machine's local
-        // index: `enqueue_push_store_artifacts` is the only path in this
+        // index: `enqueue_index_push` is the only path in this
         // crate that syncs a snapshot shard outward. A refresh that only
         // updated the local `SnapshotStore` would leave the day-window leak
         // open for every OTHER machine pulling from the same remote --
@@ -2093,7 +2124,7 @@ mod tests {
         // A real hit always has a locally-readable meta object before
         // `refresh_entry` is ever called -- `try_restore_candidates` requires
         // `read_entry_meta` to succeed to produce a candidate at all -- so
-        // seed one here for `flush_refreshes` to read `has_outputs` from.
+        // seed one here for `flush_pending_entries` to read `has_outputs` from.
         let record_bytes = bincode::serde::encode_to_vec(
             sample_record(true, 200),
             crate::serialization::bincode_config(),
@@ -2129,7 +2160,7 @@ mod tests {
 
         // `refresh_entry` only records the entry and touches its local
         // mtime -- nothing reaches the remote (or even the local index)
-        // until `flush_refreshes` runs.
+        // until `flush_pending_entries` runs.
         cache.refresh_entry(&input_key, &entry);
         cache.flush_push_queue();
         let write_key = cache.write_bucket_key().unwrap().to_string();
@@ -2141,15 +2172,15 @@ mod tests {
         // Nothing has been merged into today's write bucket yet, so this
         // flush is the day's first hit that adds the key: the merge outcome
         // is `Inserted`, which is exactly the case that must trigger a real
-        // remote push (see `flush_refreshes`'s doc comment for why
+        // remote push (see `flush_pending_entries`'s doc comment for why
         // `IdempotentNoop`/`ConflictKeptExisting` push at most the entry
         // meta/blob, not a fresh snapshot shard).
-        cache.flush_refreshes();
+        cache.flush_pending_entries();
         cache.flush_push_queue();
 
         assert!(
             !remote_snapshot_files(harness.remote_root.path(), &write_key).is_empty(),
-            "flush_refreshes must push the merged snapshot shard to the remote, \
+            "flush_pending_entries must push the merged snapshot shard to the remote, \
              not just merge it into the local index"
         );
         assert!(
@@ -2159,12 +2190,12 @@ mod tests {
                 .join("entries")
                 .join(format!("{}.bin", hex_hash(input_key)))
                 .exists(),
-            "flush_refreshes must push the entry meta object to the remote too"
+            "flush_pending_entries must push the entry meta object to the remote too"
         );
     }
 
     #[test]
-    fn flush_refreshes_collapses_two_hits_into_a_single_push() {
+    fn flush_pending_entries_collapses_two_hits_into_a_single_push() {
         if !should_run_rclone_test() {
             eprintln!("skipping rclone-gated shared-cache refresh-batching test; rclone not on PATH or LUCHTA_TEST_RCLONE disabled");
             return;
@@ -2175,7 +2206,14 @@ mod tests {
         // exactly the runs where the cache works best, saturating the rclone
         // daemon and tripping its timeout-disable circuit breaker. Batching
         // must collapse any number of hits in one run into exactly one
-        // push -- proven here with two hits for two distinct keys.
+        // push -- shown here with two hits for two distinct keys.
+        //
+        // The discriminating assertion is the pre-flush emptiness check
+        // below, not the post-flush `assert_snapshot_shard_count(&files, 1, 1)`:
+        // `push_index_merge` deletes each subsumed shard from the remote, so
+        // two eager per-hit pushes also settle at one shard. Same reasoning as
+        // `store_pushes_artifacts_immediately_but_defers_the_index_push_to_flush`
+        // and its local counterpart in `mod.rs`.
         let harness = RemoteHarness::new("console.log('flush-collapse');\n");
         let cache = harness.cache();
 
@@ -2238,7 +2276,7 @@ mod tests {
             "two hits with no flush yet must not have reached the remote"
         );
 
-        cache.flush_refreshes();
+        cache.flush_pending_entries();
         cache.flush_push_queue();
 
         let files = remote_snapshot_files(harness.remote_root.path(), &write_key);
@@ -2264,5 +2302,225 @@ mod tests {
                 "both hits' entries must be present in the one pushed shard"
             );
         }
+    }
+
+    #[test]
+    fn store_pushes_artifacts_immediately_but_defers_the_index_push_to_flush() {
+        if !should_run_rclone_test() {
+            eprintln!("skipping rclone-gated store-defers-index-push test; rclone not on PATH or LUCHTA_TEST_RCLONE disabled");
+            return;
+        }
+
+        // The invariant most at risk from batching the index merge out of
+        // `store()`: a restore on another machine must be able to find a
+        // store's blob/entry-meta artifacts whether or not this run's index
+        // push has happened. Proven here directly against the remote, with
+        // no `flush_pending_entries` call before the artifact assertions.
+        // Three distinct stores (not one) so the entry-meta count can be an
+        // exact 3, catching silently dropped artifact pushes. The post-flush
+        // shard count is a resting-state invariant only -- it does NOT prove
+        // the merge was batched, because `push_index_merge` deletes each
+        // subsumed shard from the remote, so N eager merges also settle at
+        // one shard. What catches a reinstated eager push is the pre-flush
+        // `remote_snapshot_files` emptiness check below.
+        let harness = RemoteHarness::new("console.log('defer');\n");
+        let cache = harness.cache();
+        let mut outputs_hashes = Vec::new();
+
+        for seed in 0u8..3 {
+            let input_key = derive_input_key([seed; 32], [2; 32], [3; 32], [4; 32], [5; 32]);
+            let outputs_hash = [0x99 + seed; 32];
+            let outcome = cache
+                .store(
+                    "pkg#build",
+                    &input_key,
+                    &outputs_hash,
+                    &harness.package_dir,
+                    &[PathBuf::from("dist/main.js")],
+                    &sample_record(true, 300),
+                    b"stdout-defer",
+                    b"stderr-defer",
+                    &[],
+                    harness.temp_repo.path(),
+                )
+                .unwrap();
+            assert_eq!(outcome, StoreOutcome::Stored);
+            outputs_hashes.push(outputs_hash);
+        }
+        // The artifact pushes are queued to a background rclone worker;
+        // drain the queue once before checking the remote landed all three,
+        // still without any `flush_pending_entries` call.
+        cache.flush_push_queue();
+        for outputs_hash in &outputs_hashes {
+            assert_remote_has_blob(harness.remote_root.path(), outputs_hash);
+        }
+
+        assert_eq!(
+            harness
+                .remote_root
+                .path()
+                .join("entries")
+                .read_dir()
+                .unwrap()
+                .count(),
+            3,
+            "three distinct stores must produce three entry-meta objects on the remote, \
+             before any index flush"
+        );
+
+        let write_key = cache.write_bucket_key().expect("write key").to_string();
+        assert!(
+            remote_snapshot_files(harness.remote_root.path(), &write_key).is_empty(),
+            "the index merge must not reach the remote until flush_pending_entries runs"
+        );
+
+        cache.flush_pending_entries();
+        cache.flush_push_queue();
+
+        let files = remote_snapshot_files(harness.remote_root.path(), &write_key);
+        assert_snapshot_shard_count(&files, 1, 1);
+    }
+
+    #[test]
+    fn entry_artifacts_and_index_push_are_independently_dispatchable() {
+        if !should_run_rclone_test() {
+            eprintln!("skipping rclone-gated split-push-dispatch test; rclone not on PATH or LUCHTA_TEST_RCLONE disabled");
+            return;
+        }
+
+        let harness = RemoteHarness::new("console.log('split');\n");
+        let cache = harness.cache();
+        let input_key = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32], [5; 32]);
+        let outputs_hash = crate::resolve::combined_outputs_hash(&[]);
+
+        // A real entry always has a locally-readable meta object before its
+        // artifacts are pushed. Seed one directly instead of going through
+        // `cache.store()`: as of the batching change, `finish_store` only
+        // ever enqueues the artifact half itself (the index half is deferred
+        // to `flush_pending_entries`), so a `store()`-driven test couldn't
+        // exercise the index half of this dispatch at all.
+        //
+        // Half the point of this test is compile-time: this
+        // `OwnedEntryArtifacts` literal does not compile against the old
+        // fused `OwnedPushArtifacts`, which required a `merge` field. The
+        // runtime assertions below are the weaker half -- they would also
+        // hold for the old fused struct handed a no-op merge -- so read them
+        // as "the halves don't secretly share state", not as proof the struct
+        // was split.
+        crate::shared::write_entry_meta(
+            cache.paths(),
+            &input_key,
+            &crate::shared::EntryMeta {
+                schema_version: crate::shared::ENTRY_META_SCHEMA_VERSION,
+                outputs_hash,
+                has_outputs: false,
+                record: Vec::new(),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                reports: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        harness.remote.enqueue_entry_artifacts(OwnedEntryArtifacts {
+            paths: Arc::new(cache.paths().clone()),
+            outputs_hash,
+            input_key,
+            has_outputs: false,
+        });
+        harness.remote.drain_push_queue();
+
+        // Entry artifacts reached the remote...
+        assert!(
+            harness
+                .remote_root
+                .path()
+                .join("entries")
+                .read_dir()
+                .unwrap()
+                .count()
+                > 0,
+            "entry meta must be pushed by the artifact half"
+        );
+        // ...while the index shard did not, because no index push was enqueued.
+        let snapshots = harness.remote_root.path().join("snapshots");
+        assert!(
+            !snapshots.exists() || snapshots.read_dir().unwrap().count() == 0,
+            "the index half must not run when only artifacts were enqueued"
+        );
+    }
+
+    #[test]
+    fn a_store_only_flush_pushes_no_catchup_entry_artifacts() {
+        if !should_run_rclone_test() {
+            eprintln!("skipping rclone-gated store-only catch-up test; rclone not on PATH or LUCHTA_TEST_RCLONE disabled");
+            return;
+        }
+
+        // A store already pushed its own blob and entry meta in
+        // `finish_store`, so the flush has nothing to catch up for it --
+        // only a refreshed entry, whose artifacts may have been pushed by an
+        // earlier run on another machine, queues a catch-up representative.
+        // A store-only flush that picked an arbitrary pending entry as the
+        // representative would re-push artifacts it just pushed: pointless
+        // remote traffic on exactly the path batching exists to make cheaper.
+        //
+        // Observed from the remote rather than from
+        // `pending_catchup_representative`: deleting the remote entry-meta
+        // object first makes the catch-up push, if it happens, restore the
+        // file. Asserting the private field instead stays green under the
+        // pre-batching `entries.first().cloned()` representative, because
+        // that never touched the field.
+        let harness = RemoteHarness::new("console.log('store-only-catchup');\n");
+        let cache = harness.cache();
+        let input_key = derive_input_key([61; 32], [62; 32], [63; 32], [64; 32], [65; 32]);
+        let outputs_hash = [0x5a; 32];
+
+        let outcome = cache
+            .store(
+                "pkg#build",
+                &input_key,
+                &outputs_hash,
+                &harness.package_dir,
+                &[PathBuf::from("dist/main.js")],
+                &sample_record(true, 300),
+                b"stdout-store-only",
+                b"stderr-store-only",
+                &[],
+                harness.temp_repo.path(),
+            )
+            .unwrap();
+        assert_eq!(outcome, StoreOutcome::Stored);
+
+        // Drain the artifact push `finish_store` enqueued, so the remote
+        // entry-meta object exists to be deleted.
+        cache.flush_push_queue();
+        let remote_entry = harness
+            .remote_root
+            .path()
+            .join("entries")
+            .join(format!("{}.bin", hex_hash(input_key)));
+        assert!(
+            remote_entry.exists(),
+            "store() must push its own entry meta immediately, before any flush"
+        );
+        fs::remove_file(&remote_entry).unwrap();
+
+        cache.flush_pending_entries();
+        cache.flush_push_queue();
+
+        assert!(
+            !remote_entry.exists(),
+            "a store-only flush must not push catch-up entry artifacts; the deleted \
+             entry meta was re-uploaded, so the flush picked a representative it \
+             should not have"
+        );
+        // The index push itself still has to happen -- this test must fail
+        // for the catch-up push, not because the flush did nothing at all.
+        let write_key = cache.write_bucket_key().expect("write key").to_string();
+        assert!(
+            !remote_snapshot_files(harness.remote_root.path(), &write_key).is_empty(),
+            "the flush must still push the merged index shard"
+        );
     }
 }

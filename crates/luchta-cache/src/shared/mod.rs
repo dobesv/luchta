@@ -145,8 +145,6 @@ pub enum StoreOutcome {
     SkippedTooLarge { bytes: u64 },
     /// Skipped: outputs cross package boundary.
     SkippedCrossPackage,
-    /// Skipped: shared snapshot merge could not take lock or write snapshot metadata.
-    SkippedLockUnavailable,
     /// Skipped: shared cache disabled (no write bucket key).
     Disabled,
 }
@@ -217,12 +215,60 @@ pub struct SharedCache {
     index: OnceLock<MergedIndex>,
     /// Size cap for individual blobs.
     size_cap_bytes: u64,
-    /// Entries refreshed by a cache hit this run, keyed by `input_key` so
-    /// repeat hits of the same key collapse to one entry. Recorded here by
-    /// `refresh_entry` and only actually merged/pushed by `flush_refreshes`,
-    /// called once after all tasks complete — see `flush_refreshes`'s doc
-    /// comment for why a per-hit push would be self-defeating.
-    pending_refreshes: Mutex<HashMap<[u8; 32], SnapshotEntry>>,
+    /// Entries accumulated this run for the single end-of-run index merge,
+    /// keyed by `input_key` so repeat writes of the same key collapse to one
+    /// entry. Two callers feed this same map:
+    ///
+    /// - `finish_store`, right after a fresh store (a miss). This run's own
+    ///   artifacts were just pushed immediately by `enqueue_entry_artifacts`,
+    ///   so this entry needs no remote catch-up at flush time.
+    /// - `refresh_entry`, right after a cache hit. This entry's artifacts may
+    ///   have been pushed by some earlier run, possibly on another machine,
+    ///   so it may need a catch-up push — see `pending_catchup_representative`.
+    ///
+    /// A given `input_key` can only ever be stored (following a miss) or
+    /// refreshed (following a hit) in one run, never both, so a repeat
+    /// `HashMap::insert` for the same key is last-write-wins over two entries
+    /// that describe the same content-addressed result — never an actual
+    /// conflict.
+    ///
+    /// Merged and pushed exactly once per run by `flush_pending_entries`,
+    /// called once after all tasks complete — see `flush_pending_entries`'s
+    /// doc comment for why a per-store or per-hit push would be
+    /// self-defeating.
+    ///
+    /// Deferring the merge is invisible within a run, with one caveat about
+    /// two tasks sharing an `input_key` — see `flush_pending_entries`'s doc
+    /// comment.
+    ///
+    /// It is *not* invisible across a run that never reaches its flush: a
+    /// process killed after `finish_store`/`refresh_entry` but before
+    /// `flush_pending_entries` leaves this map's entries un-merged forever
+    /// — their blobs and `entries/*.bin` are already on disk (and, for
+    /// stores, already enqueued for the remote), but no shard ever points at
+    /// them, so a later run treats them as a miss and redoes the work. This
+    /// is an accepted tradeoff, not an oversight: it already applied to
+    /// refreshes before this change, and a killed build losing its last few
+    /// stores' worth of index entries is far cheaper than the per-store
+    /// remote traffic this batching removes.
+    pending_entries: Mutex<HashMap<[u8; 32], SnapshotEntry>>,
+    /// The first refreshed entry recorded this run, if any — used by
+    /// `flush_pending_entries` for a best-effort blob/entry-meta catch-up
+    /// push. `None` for a run that only stores: see `pending_entries`'s doc
+    /// comment for why stores need no catch-up.
+    ///
+    /// One entry, not N. This is a token push for a single representative,
+    /// not general coverage of the run's refreshed artifacts: if a run
+    /// refreshes 40 entries, 39 of them still get no artifact push, and if
+    /// their blobs really are missing from this remote the next reader
+    /// degrades to a cache miss and re-stores them. A missing blob is a miss,
+    /// never an error, which is why one representative is enough and pushing
+    /// all N would be the per-hit remote traffic this batching removes.
+    /// Which refreshed entry ends up "first" doesn't matter, since the
+    /// snapshot-shard push itself is driven by the merge outcome, not by
+    /// this entry.
+    #[cfg(unix)]
+    pending_catchup_representative: Mutex<Option<SnapshotEntry>>,
 }
 
 pub(crate) fn blob_path(paths: &SharedCachePaths, outputs_hash: &[u8; 32]) -> PathBuf {
@@ -248,6 +294,26 @@ impl Drop for SharedCache {
             // is safe even if Drop runs inside build runtime async context.
             remote.flush_push_queue();
             remote.shutdown();
+        }
+
+        // Not unix-gated: a missed flush loses index entries on every
+        // platform. Nothing here fixes it — the merge needs the run's own
+        // call site (`run.rs`), not Drop, whose ordering relative to
+        // unwinding and cancellation is not something to depend on. But a
+        // call site that forgets `flush_pending_entries` otherwise fails
+        // completely silently: every store still reports
+        // `StoreOutcome::Stored`, the blobs and `entries/*.bin` are all
+        // there, and no shard points at any of them, so the next run misses
+        // on all of it. One line makes that diagnosable.
+        let pending = self
+            .pending_entries
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !pending.is_empty() {
+            eprintln!(
+                "debug: shared cache dropped with {} unflushed pending index entries",
+                pending.len()
+            );
         }
     }
 }
@@ -333,7 +399,9 @@ impl SharedCache {
             remote,
             index: OnceLock::new(),
             size_cap_bytes,
-            pending_refreshes: Mutex::new(HashMap::new()),
+            pending_entries: Mutex::new(HashMap::new()),
+            #[cfg(unix)]
+            pending_catchup_representative: Mutex::new(None),
         })
     }
 
@@ -362,7 +430,9 @@ impl SharedCache {
             remote: None,
             index: OnceLock::new(),
             size_cap_bytes,
-            pending_refreshes: Mutex::new(HashMap::new()),
+            pending_entries: Mutex::new(HashMap::new()),
+            #[cfg(unix)]
+            pending_catchup_representative: Mutex::new(None),
         })
     }
 
@@ -685,10 +755,9 @@ impl SharedCache {
         repo_root: &Path,
     ) -> io::Result<StoreOutcome> {
         // Check if cache is disabled (no write key).
-        let write_key = match &self.write_bucket_key {
-            Some(key) => key.clone(),
-            None => return Ok(StoreOutcome::Disabled),
-        };
+        if self.write_bucket_key.is_none() {
+            return Ok(StoreOutcome::Disabled);
+        }
 
         // Check if task succeeded.
         if !record.succeeded {
@@ -774,7 +843,6 @@ impl SharedCache {
         };
         self.finish_store(
             blob_result,
-            &write_key,
             #[cfg(unix)]
             input_key,
             #[cfg(unix)]
@@ -783,11 +851,22 @@ impl SharedCache {
         )
     }
 
-    /// Records the snapshot entry and pushes to the remote after a blob write.
+    /// Pushes this store's own artifacts immediately, then records the entry
+    /// for the once-per-run index merge.
+    ///
+    /// Only the artifact half (blob + entry meta) is immediate here; the
+    /// index half is deferred to `flush_pending_entries`, called once after
+    /// all tasks complete, the same way `refresh_entry` already defers it for
+    /// cache hits — see `pending_entries`'s doc comment for why one map and
+    /// one flush serve both, and `flush_pending_entries`'s doc comment for
+    /// why batching the merge is the point. Pushing the artifacts immediately
+    /// (rather than also deferring them) matters because a restore on
+    /// another machine must be able to find them whether or not this run's
+    /// index push has happened yet — see `enqueue_entry_artifacts`'s doc
+    /// comment.
     fn finish_store(
         &self,
         blob_result: BlobWriteResult,
-        write_key: &str,
         #[cfg(unix)] input_key: &[u8; 32],
         #[cfg(unix)] has_outputs: bool,
         entry: SnapshotEntry,
@@ -798,15 +877,8 @@ impl SharedCache {
             | BlobWriteResult::AlreadyExists
             | BlobWriteResult::NoOutputs => {
                 #[cfg(unix)]
-                let outputs_hash = entry.outputs_hash;
-                let merge = self
-                    .snapshot_store
-                    .merge_entry_with_outcome(write_key, entry);
-                if matches!(merge.result, MergeResult::SkippedLockUnavailable) {
-                    return Ok(StoreOutcome::SkippedLockUnavailable);
-                }
-                #[cfg(unix)]
-                self.enqueue_remote_push(write_key, outputs_hash, *input_key, has_outputs, merge);
+                self.enqueue_entry_artifacts(entry.outputs_hash, *input_key, has_outputs);
+                self.record_pending_entry(entry);
                 Ok(StoreOutcome::Stored)
             }
             BlobWriteResult::SkippedTooLarge { bytes } => {
@@ -815,14 +887,19 @@ impl SharedCache {
         }
     }
 
+    /// Enqueues the content-addressed blob (when `has_outputs`) and the
+    /// entry meta object for background push.
+    ///
+    /// Independent of [`enqueue_index_push`](Self::enqueue_index_push): a
+    /// restore on another machine needs these regardless of whether this
+    /// run's index push has happened, so callers may dispatch this half
+    /// without the other (see `RemoteSync::push_entry_artifacts`).
     #[cfg(unix)]
-    fn enqueue_remote_push(
+    fn enqueue_entry_artifacts(
         &self,
-        write_key: &str,
         outputs_hash: [u8; 32],
         input_key: [u8; 32],
         has_outputs: bool,
-        merge: MergeEntryOutcome,
     ) {
         let Some(remote) = &self.remote else {
             return;
@@ -830,12 +907,27 @@ impl SharedCache {
         if remote.is_disabled() {
             return;
         }
-        remote.enqueue_push_store_artifacts(remote::OwnedPushArtifacts {
+        remote.enqueue_entry_artifacts(remote::OwnedEntryArtifacts {
             paths: Arc::clone(&self.paths),
-            commit_key: write_key.to_string(),
             outputs_hash,
             input_key,
             has_outputs,
+        });
+    }
+
+    /// Enqueues the merged index shard (and its subsumed-shard deletes) for
+    /// background push. See [`enqueue_entry_artifacts`](Self::enqueue_entry_artifacts)
+    /// for why this is a separate dispatch from the blob/entry-meta push.
+    #[cfg(unix)]
+    fn enqueue_index_push(&self, write_key: &str, merge: MergeEntryOutcome) {
+        let Some(remote) = &self.remote else {
+            return;
+        };
+        if remote.is_disabled() {
+            return;
+        }
+        remote.enqueue_index_push(remote::OwnedIndexPush {
+            shard_key: write_key.to_string(),
             merge,
         });
     }
@@ -879,17 +971,31 @@ impl SharedCache {
     ///
     /// Exists so a test can pin "repeat `refresh_entry` calls for the same
     /// `input_key` collapse to one pending entry" at the collection itself,
-    /// before `flush_refreshes` runs. Asserting only on the post-flush
+    /// before `flush_pending_entries` runs. Asserting only on the post-flush
     /// shard doesn't discriminate this: `merge_entries_with_outcome` inserts
     /// into a `BTreeMap` keyed by `input_key`, so it would absorb a
     /// duplicate-preserving (e.g. `Vec`-based) pending collection into the
     /// same one-entry shard anyway.
     #[cfg(test)]
-    fn pending_refresh_count(&self) -> usize {
-        self.pending_refreshes
+    fn pending_entry_count(&self) -> usize {
+        self.pending_entries
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .len()
+    }
+
+    /// Shared insert behind `pending_entries`, used by both `finish_store`
+    /// (after a miss) and `refresh_entry` (after a hit). See
+    /// `pending_entries`'s doc comment for why one map serves both.
+    ///
+    /// Keys on `entry.input_key`, the same field `merge_entries_with_outcome`
+    /// re-keys on at flush time, so the map's dedup key and the shard's key
+    /// cannot drift apart.
+    fn record_pending_entry(&self, entry: SnapshotEntry) {
+        self.pending_entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(entry.input_key, entry);
     }
 
     /// Records an entry on a shared-cache hit for a later batched merge, and
@@ -903,12 +1009,18 @@ impl SharedCache {
     ///
     /// Only the mtime touch happens here, per hit. The merge into today's
     /// write bucket (and the remote push it enables) is deferred to
-    /// `flush_refreshes`, called once after all tasks complete: merging and
-    /// pushing per-hit self-defeats the feature -- see `flush_refreshes`'s
-    /// doc comment. The mtime touch itself stays immediate and per-entry:
-    /// it's a local file operation with no rclone involvement, and every
-    /// refreshed entry's meta file has to be touched regardless of how the
-    /// index-merge is batched.
+    /// `flush_pending_entries`, called once after all tasks complete: merging
+    /// and pushing per-hit self-defeats the feature -- see
+    /// `flush_pending_entries`'s doc comment. The mtime touch itself stays
+    /// immediate and per-entry: it's a local file operation with no rclone
+    /// involvement, and every refreshed entry's meta file has to be touched
+    /// regardless of how the index-merge is batched.
+    ///
+    /// Also records this entry as the catch-up representative if none is
+    /// queued yet -- unlike a store, a refreshed entry's artifacts may have
+    /// been pushed by an earlier run, possibly on another machine, so they
+    /// may be missing from this remote. See
+    /// `pending_catchup_representative`'s doc comment.
     ///
     /// Best-effort and infallible: the hit has already succeeded by the time
     /// this runs, so a refresh failure must never turn it into a miss or fail
@@ -916,10 +1028,18 @@ impl SharedCache {
     /// returns. Never re-stores the blob or the meta object — both are
     /// content-addressed and already correct.
     pub fn refresh_entry(&self, input_key: &[u8; 32], entry: &SnapshotEntry) {
-        self.pending_refreshes
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(*input_key, entry.clone());
+        self.record_pending_entry(entry.clone());
+
+        #[cfg(unix)]
+        {
+            let mut representative = self
+                .pending_catchup_representative
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if representative.is_none() {
+                *representative = Some(entry.clone());
+            }
+        }
 
         let path = entry_meta_path(&self.paths, input_key);
         match OpenOptions::new().write(true).open(&path) {
@@ -941,32 +1061,65 @@ impl SharedCache {
         }
     }
 
-    /// Flushes every entry `refresh_entry` recorded this run: exactly one
-    /// `merge_entries_with_outcome` call (one shard load, at most one
-    /// consolidated write) and, on unix, exactly one `enqueue_remote_push`
-    /// call, regardless of how many hits fed into it.
+    /// Flushes every entry `finish_store` or `refresh_entry` recorded this
+    /// run: exactly one `merge_entries_with_outcome` call (one shard load, at
+    /// most one consolidated write), and on unix at most one
+    /// `enqueue_entry_artifacts` catch-up call plus exactly one
+    /// `enqueue_index_push` call, regardless of how many stores or hits fed
+    /// into it.
     ///
     /// Round 2 of this feature pushed a merge to the remote on every single
     /// hit. That reached the remote correctly, but a build with N cache hits
     /// enqueues up to N pushes on the first run of a day -- and N is largest
-    /// exactly when the cache is working best. Saturating the rclone daemon
-    /// trips the `timeout_disable` circuit breaker, disabling the remote for
-    /// the rest of the build: the feature defeats itself under its own
-    /// success. Batching collapses that to one push per run, independent of
-    /// hit count, and also removes the per-hit shard reload
-    /// `merge_entry_with_outcome` (now `merge_entries_with_outcome`) pays to
-    /// even report `IdempotentNoop` -- one flush, one load.
+    /// exactly when the cache is working best. The same shape of problem hit
+    /// stores once the write bucket became date-keyed rather than
+    /// commit-keyed: `build_index` now pulls the whole day's shards, including
+    /// the write bucket, so a per-store merge-and-push reloads and re-uploads
+    /// the fleet's entire day of activity on every single store. Either way,
+    /// saturating the rclone daemon trips the `timeout_disable` circuit
+    /// breaker, disabling the remote for the rest of the build: the feature
+    /// defeats itself under its own success. Batching collapses both cases to
+    /// one push per run, independent of store or hit count, and also removes
+    /// the per-call shard reload `merge_entry_with_outcome` (now
+    /// `merge_entries_with_outcome`) pays to even report `IdempotentNoop` --
+    /// one flush, one load.
     ///
-    /// Batching is invisible within a run: `get_or_build_index` builds the
-    /// merged index once behind a `OnceLock`, so a mid-run merge was never
-    /// visible to a later lookup in the same process anyway.
+    /// The catch-up push is representative-driven and only fires when a
+    /// refresh queued one (see `pending_catchup_representative`'s doc
+    /// comment): a flush containing only stores has nothing to catch up --
+    /// `finish_store` already pushed each store's own artifacts immediately
+    /// -- so it does exactly one `enqueue_index_push` and no
+    /// `enqueue_entry_artifacts` call at all. When it does fire it covers one
+    /// entry, not every refreshed one: a token push for a single
+    /// representative, with the other N-1 left uncovered because a blob
+    /// missing from the remote degrades a later reader to a cache miss rather
+    /// than an error.
+    ///
+    /// Batching is invisible within a run, with one caveat: `get_or_build_index`
+    /// builds the merged index once behind a `OnceLock`, so a mid-run merge
+    /// was never visible to a later *index* lookup in the same process
+    /// anyway. The exception is a task that reaches `Decision::Run` before
+    /// the index is built at all (`dispatch.rs`): under the old eager merge
+    /// its entry was already in the shard, so a later lookup for the same
+    /// `input_key` in the same run could see it. Now it can't, and two tasks
+    /// sharing an `input_key` in one run each rebuild. That costs one
+    /// redundant rebuild of an identical result, never a wrong one.
     ///
     /// Best-effort and infallible, same as `refresh_entry`: called after all
     /// tasks complete, so nothing downstream depends on it succeeding.
-    pub fn flush_refreshes(&self) {
+    pub fn flush_pending_entries(&self) {
+        // Resolve the write key BEFORE draining: draining first and then
+        // bailing on a `None` key would discard the whole run's entries with
+        // nowhere for them to have gone. Unreachable today (a cache with no
+        // write key records nothing to flush), but the drain is destructive,
+        // so it happens only once the flush can actually proceed.
+        let Some(write_key) = self.write_bucket_key.as_deref() else {
+            return;
+        };
+
         let entries: Vec<SnapshotEntry> = {
             let mut pending = self
-                .pending_refreshes
+                .pending_entries
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if pending.is_empty() {
@@ -975,18 +1128,6 @@ impl SharedCache {
             std::mem::take(&mut *pending).into_values().collect()
         };
 
-        let Some(write_key) = self.write_bucket_key.as_deref() else {
-            return;
-        };
-
-        // Only needed for the `#[cfg(unix)]` push below, which needs some
-        // single entry's `outputs_hash`/`input_key` to size its (idempotent,
-        // best-effort) blob/entry-meta catch-up. Captured before `entries` is
-        // moved into `merge_entries_with_outcome`; which entry is picked
-        // doesn't matter, since the snapshot-shard push itself is driven by
-        // `merge.new_snapshot_upload`, not by this one.
-        #[cfg(unix)]
-        let representative = entries.first().cloned();
         let entry_count = entries.len();
 
         let merge = self
@@ -994,26 +1135,46 @@ impl SharedCache {
             .merge_entries_with_outcome(write_key, entries);
         match merge.result {
             MergeResult::SkippedLockUnavailable => {
+                // One batched merge means one lock failure now costs the
+                // whole run's index entries, not one entry's — worth a
+                // `warn:`, unlike the per-entry version this replaced.
                 eprintln!(
-                    "debug: shared cache refresh flush could not merge {entry_count} pending entries"
+                    "warn: shared cache could not lock its index shard; dropped {entry_count} index \
+                     entries for this run, so those tasks will be rebuilt next time"
                 );
             }
             MergeResult::Inserted
             | MergeResult::IdempotentNoop
-            | MergeResult::ConflictKeptExisting =>
-            {
+            | MergeResult::ConflictKeptExisting => {
                 #[cfg(unix)]
-                if let Some(representative) = representative {
-                    let has_outputs = read_entry_meta(&self.paths, &representative.input_key)
-                        .map(|meta| meta.has_outputs)
-                        .unwrap_or(false);
-                    self.enqueue_remote_push(
-                        write_key,
-                        representative.outputs_hash,
-                        representative.input_key,
-                        has_outputs,
-                        merge,
-                    );
+                {
+                    // Taken here rather than before the merge so a lock
+                    // failure doesn't consume it: the index entries are gone
+                    // either way, but the catch-up push is independent of
+                    // them and there's no reason to lose both.
+                    //
+                    // Only refreshes queue a representative (see
+                    // `pending_catchup_representative`'s doc comment): a
+                    // store-only flush must not manufacture a catch-up push
+                    // for an arbitrary entry, since `finish_store` already
+                    // pushed that entry's own artifacts immediately -- that's
+                    // exactly the remote traffic this task exists to remove.
+                    let representative = self
+                        .pending_catchup_representative
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .take();
+                    if let Some(representative) = representative {
+                        let has_outputs = read_entry_meta(&self.paths, &representative.input_key)
+                            .map(|meta| meta.has_outputs)
+                            .unwrap_or(false);
+                        self.enqueue_entry_artifacts(
+                            representative.outputs_hash,
+                            representative.input_key,
+                            has_outputs,
+                        );
+                    }
+                    self.enqueue_index_push(write_key, merge);
                 }
             }
         }
@@ -1143,6 +1304,9 @@ mod tests {
             )
             .unwrap();
         assert_eq!(result, StoreOutcome::Stored);
+        // The index merge is deferred to the end-of-run flush; a restore
+        // needs the merged index built, so simulate the run finishing here.
+        cache.flush_pending_entries();
 
         // Restore into a fresh directory.
         let restore_dir = temp_repo.path().join("restore");
@@ -1228,6 +1392,7 @@ mod tests {
                 temp_repo.path(),
             )
             .unwrap();
+        cache.flush_pending_entries();
 
         let restore_dir = temp_repo.path().join("restore");
         fs::create_dir_all(&restore_dir).unwrap();
@@ -1460,7 +1625,16 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn store_returns_skipped_when_snapshot_lock_unavailable() {
+    fn flush_pending_entries_is_best_effort_when_snapshot_lock_unavailable() {
+        // `store()` itself can no longer observe a snapshot-lock failure: the
+        // merge moved out of `finish_store` into `flush_pending_entries`, so
+        // `StoreOutcome::SkippedLockUnavailable` was removed as dead
+        // (unreachable from `store()`, its only consumers were an empty
+        // match arm and this test's old assertion). The underlying failure
+        // mode -- the snapshot shard dir being unwritable -- still has to be
+        // handled somewhere, and now it's here: `flush_pending_entries` must
+        // stay best-effort and infallible (no panic, no error propagated)
+        // when the merge it performs hits `MergeResult::SkippedLockUnavailable`.
         use std::os::unix::fs::PermissionsExt;
 
         let temp_repo = TempDir::new().unwrap();
@@ -1479,11 +1653,6 @@ mod tests {
         let package_dir = temp_repo.path().join("pkg");
         fs::create_dir_all(package_dir.join("dist")).unwrap();
         fs::write(package_dir.join("dist/main.js"), "content").unwrap();
-        fs::set_permissions(
-            &cache.paths.snapshots_dir,
-            fs::Permissions::from_mode(0o500),
-        )
-        .unwrap();
 
         let input_key = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32], [5; 32]);
         let record = sample_record(true, 200);
@@ -1502,8 +1671,42 @@ mod tests {
                 temp_repo.path(),
             )
             .unwrap();
+        assert_eq!(result, StoreOutcome::Stored);
+        assert_eq!(cache.pending_entry_count(), 1);
 
-        assert_eq!(result, StoreOutcome::SkippedLockUnavailable);
+        let write_bucket = cache.write_bucket_key().expect("write bucket").to_string();
+
+        fs::set_permissions(
+            &cache.paths.snapshots_dir,
+            fs::Permissions::from_mode(0o500),
+        )
+        .unwrap();
+
+        // Must not panic.
+        cache.flush_pending_entries();
+
+        // "Didn't panic" alone is equally true of the success path, so pin
+        // that the merge really did fail. Running as root (routine in CI
+        // containers) or on a filesystem that ignores mode bits makes the
+        // `chmod` above a no-op, `create_dir_all` succeeds, and the merge
+        // lands -- in which case this test never exercised the failure
+        // handling it exists for and must say so instead of passing.
+        // Read before restoring permissions, but assert after: a panic here
+        // would otherwise skip the restore and leave `snapshots_dir`
+        // unwritable, which `TempDir`'s drop can't clean up and silently
+        // swallows. `load` only needs `r-x`, so it works inside the window.
+        let merged = cache.snapshot_store().load(&write_bucket);
+
+        fs::set_permissions(
+            &cache.paths.snapshots_dir,
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+
+        assert!(
+            merged.is_none(),
+            "the merge must have failed; the permission trick was ineffective (running as root?)"
+        );
     }
 
     #[test]
@@ -1779,8 +1982,9 @@ mod tests {
         record.outputs = vec![];
         record.outputs_hash = empty_hash;
 
-        // Heavy same-day churn: 30 fresh stores, each landing in one of
-        // today's `SHARED_CACHE_SHARD_COUNT` shards.
+        // Heavy same-day churn: 30 fresh stores, each its own `luchta run`
+        // (its own `SharedCache` instance, flushed at the end like a real
+        // run) landing in one of today's `SHARED_CACHE_SHARD_COUNT` shards.
         for i in 0..30u8 {
             let cache = SharedCache::open_with_cache_dir(
                 temp_repo.path(),
@@ -1804,7 +2008,21 @@ mod tests {
                     temp_repo.path(),
                 )
                 .unwrap();
+            cache.flush_pending_entries();
         }
+
+        // The churn must actually have landed on disk, not just been
+        // recorded and silently dropped when each per-iteration `cache` was
+        // dropped unflushed -- otherwise the restore below would prove
+        // nothing about surviving churn.
+        let churn_snapshot_dirs = fs::read_dir(temp_cache.path().join("snapshots"))
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .count();
+        assert!(
+            churn_snapshot_dirs > 1,
+            "expected churn to produce shard directories beyond the seeded old bucket, got {churn_snapshot_dirs}"
+        );
 
         let cache = SharedCache::open_with_cache_dir(
             temp_repo.path(),
@@ -1867,6 +2085,7 @@ mod tests {
                 temp_repo.path(),
             )
             .unwrap();
+        cache.flush_pending_entries();
 
         // Concurrent restore threads.
         let initialized = Arc::new(AtomicBool::new(false));
@@ -1879,18 +2098,26 @@ mod tests {
             fs::create_dir_all(&restore_dir).unwrap();
 
             handles.push(thread::spawn(move || {
-                let result = cache
+                let found = cache
                     .try_restore_candidates("pkg#build", &input_key, &restore_dir)
-                    .next();
+                    .next()
+                    .is_some();
                 // Mark that we initialized the index.
                 initialized.store(cache.index.get().is_some(), Ordering::SeqCst);
-                result
+                found
             }));
         }
 
-        // All threads complete.
+        // All threads complete. Each must actually have found the stored
+        // entry -- with the merge left unflushed, the index would be empty
+        // and every thread's candidate iteration would silently yield
+        // `None`, leaving this test unable to exercise the concurrent
+        // restore path (`stage_entry` et al.) it's named for.
         for handle in handles {
-            handle.join().unwrap();
+            assert!(
+                handle.join().unwrap(),
+                "each concurrent restore thread must find the stored candidate"
+            );
         }
 
         // Index was initialized exactly once (OnceLock guarantee).
@@ -1933,6 +2160,7 @@ mod tests {
                 temp_repo.path(),
             )
             .unwrap();
+        cache.flush_pending_entries();
 
         let restore_dir = temp_repo.path().join("restore");
         fs::create_dir_all(&restore_dir).unwrap();
@@ -2023,7 +2251,9 @@ mod tests {
             "no outputs means no blob file"
         );
 
-        // NoOutputs is a success path: the entry must still be indexed.
+        // NoOutputs is a success path: the entry must still be indexed, once
+        // the deferred index merge is flushed.
+        cache.flush_pending_entries();
         let write_key = cache.write_bucket_key().expect("write key");
         let snapshot = cache
             .snapshot_store
@@ -2076,6 +2306,7 @@ mod tests {
                 temp_repo.path(),
             )
             .unwrap();
+        cache.flush_pending_entries();
 
         let restore_dir = temp_repo.path().join("restore");
         fs::create_dir_all(&restore_dir).unwrap();
@@ -2137,6 +2368,7 @@ mod tests {
                 temp_repo.path(),
             )
             .unwrap();
+        cache.flush_pending_entries();
 
         let restore_dir = temp_repo.path().join("restore");
         fs::create_dir_all(&restore_dir).unwrap();
@@ -2210,6 +2442,7 @@ mod tests {
             !blob_path(cache.paths(), &[7; 32]).exists(),
             "no blob should be written when the only declared output is absent"
         );
+        cache.flush_pending_entries();
 
         let restore_dir = temp_repo.path().join("restore");
         fs::create_dir_all(&restore_dir).unwrap();
@@ -2270,6 +2503,9 @@ mod tests {
                     temp_repo.path(),
                 )
                 .unwrap();
+            // Each iteration stands in for a whole separate `luchta run`
+            // invocation, which ends with exactly this flush.
+            cache.flush_pending_entries();
         }
 
         // A third instance must see both, regardless of which shards they landed in.
@@ -2472,14 +2708,14 @@ mod tests {
         cache.refresh_entry(&input_key, &entry);
         assert!(
             cache.snapshot_store().load(&write_bucket).is_none(),
-            "refresh_entry only records the entry; nothing is merged until flush_refreshes runs"
+            "refresh_entry only records the entry; nothing is merged until flush_pending_entries runs"
         );
-        cache.flush_refreshes();
+        cache.flush_pending_entries();
 
         let refreshed = cache
             .snapshot_store()
             .load(&write_bucket)
-            .expect("flush_refreshes must write the recorded entry into the current bucket");
+            .expect("flush_pending_entries must write the recorded entry into the current bucket");
         assert!(
             refreshed.entries.contains_key(&input_key_hex(input_key)),
             "the refreshed entry must be present in today's bucket, so it survives \
@@ -2520,7 +2756,14 @@ mod tests {
         let backdated = SystemTime::now() - Duration::from_secs(60 * 60 * 24 * 10);
         filetime::set_file_mtime(&path, filetime::FileTime::from_system_time(backdated)).unwrap();
 
-        cache.refresh_entry(&input_key, &sample_entry_with_seed(1, [7; 32]));
+        // The entry's own `input_key` must match the one whose meta we
+        // backdated: `refresh_entry` touches the meta by its parameter, but
+        // `record_pending_entry` keys the pending map on `entry.input_key`.
+        // Leaving them different would record the refresh under an unrelated
+        // key and still pass, since this test only checks the mtime.
+        let mut refreshed = sample_entry_with_seed(1, [7; 32]);
+        refreshed.input_key = input_key;
+        cache.refresh_entry(&input_key, &refreshed);
 
         let after = fs::metadata(&path).unwrap().modified().unwrap();
         assert!(
@@ -2531,9 +2774,9 @@ mod tests {
 
     #[test]
     fn repeat_hits_of_the_same_key_collapse_to_one_entry_before_flush() {
-        // `pending_refreshes` is keyed by `input_key` precisely so repeat
+        // `pending_entries` is keyed by `input_key` precisely so repeat
         // hits of the same key collapse to a single entry before a flush.
-        // `flush_refreshes_collapses_two_hits_into_a_single_push` (in
+        // `flush_pending_entries_collapses_two_hits_into_a_single_push` (in
         // `remote.rs`) proves N DISTINCT keys collapse into one push, but
         // that alone doesn't pin dedup-by-key: a Vec-based (or otherwise
         // duplicate-preserving) pending collection would also pass it, AND
@@ -2541,7 +2784,7 @@ mod tests {
         // `merge_entries_with_outcome` inserts into a `BTreeMap` keyed by
         // `input_key` and so absorbs same-key duplicates during the merge
         // itself. So the property has to be pinned at the pending
-        // collection, before any merge happens -- via `pending_refresh_count`.
+        // collection, before any merge happens -- via `pending_entry_count`.
         let temp_repo = TempDir::new().unwrap();
         setup_git_repo(temp_repo.path());
         create_commit(temp_repo.path());
@@ -2560,23 +2803,164 @@ mod tests {
         cache.refresh_entry(&input_key, &entry);
         cache.refresh_entry(&input_key, &entry);
         assert_eq!(
-            cache.pending_refresh_count(),
+            cache.pending_entry_count(),
             1,
             "two refresh_entry calls for the SAME input_key must collapse to one \
              pending entry before any flush/merge ever runs"
         );
 
-        cache.flush_refreshes();
+        cache.flush_pending_entries();
 
         let write_bucket = cache.write_bucket_key().unwrap().to_string();
         let snapshot = cache
             .snapshot_store()
             .load(&write_bucket)
-            .expect("flush_refreshes must write the recorded entry into the current bucket");
+            .expect("flush_pending_entries must write the recorded entry into the current bucket");
         assert_eq!(
             snapshot.entries.len(),
             1,
             "the flushed shard must contain exactly one entry for the repeated key"
+        );
+    }
+
+    #[test]
+    fn stores_do_not_merge_into_the_index_until_flush() {
+        let temp_repo = TempDir::new().unwrap();
+        setup_git_repo(temp_repo.path());
+        create_commit(temp_repo.path());
+        let temp_cache = TempDir::new().unwrap();
+        let cache = SharedCache::open_with_cache_dir(
+            temp_repo.path(),
+            1_000_000,
+            3,
+            Some(temp_cache.path()),
+        )
+        .unwrap();
+
+        let package_dir = temp_repo.path().join("pkg");
+        fs::create_dir_all(&package_dir).unwrap();
+        let empty_outputs = crate::resolve::combined_outputs_hash(&[]);
+        let write_bucket = cache.write_bucket_key().expect("write bucket").to_string();
+
+        for seed in 0u8..5 {
+            let mut record = sample_record(true, 200);
+            record.output_patterns = vec![];
+            record.outputs = vec![];
+            record.outputs_hash = empty_outputs;
+            record.task_spec_hash = [seed; 32];
+            let key = derive_input_key([seed; 32], [2; 32], [3; 32], [4; 32], [5; 32]);
+            let outcome = cache
+                .store(
+                    "pkg#build",
+                    &key,
+                    &empty_outputs,
+                    &package_dir,
+                    &[],
+                    &record,
+                    b"out",
+                    b"",
+                    &[],
+                    temp_repo.path(),
+                )
+                .unwrap();
+            assert_eq!(outcome, StoreOutcome::Stored);
+        }
+
+        // Nothing merged yet: the bucket has no shard until the flush.
+        assert!(
+            cache.snapshot_store().load(&write_bucket).is_none(),
+            "stores must not merge into the index before the flush"
+        );
+        assert_eq!(cache.pending_entry_count(), 5, "all five entries pending");
+
+        cache.flush_pending_entries();
+
+        let snapshot = cache
+            .snapshot_store()
+            .load(&write_bucket)
+            .expect("flush must write the bucket");
+        assert_eq!(
+            snapshot.entries.len(),
+            5,
+            "one merge carrying all five entries"
+        );
+
+        // A post-flush shard-file count was tried here and removed: it can't
+        // distinguish one batched merge from five eager ones, because
+        // `merge_entries_with_outcome` compacts (deletes) every shard it
+        // subsumes on each call -- five sequential single-entry merges and
+        // one five-entry merge both converge to exactly one file at rest.
+        // Nothing here counts merges, which is why the name says timing
+        // rather than counts: the pre-flush assertion above catches an eager
+        // per-store merge because no shard may exist yet, and the five
+        // post-flush entries show the batch carried all of them. Its remote
+        // counterpart is the pre-flush `remote_snapshot_files(...).is_empty()`
+        // check in `remote.rs`. The remote is not a second, count-based
+        // proof -- `push_index_merge` deletes each subsumed shard from the
+        // remote too, so the remote resting state converges to one shard
+        // under eager merges exactly as the local one does. Do not re-add a
+        // post-flush shard-file-count assertion on either side; it will pass
+        // under both behaviours and imply a proof it can't provide.
+    }
+
+    #[test]
+    fn store_writes_blob_and_entry_meta_immediately_before_any_flush() {
+        // The invariant most at risk from batching the index merge: a
+        // restore on another machine has to find a store's artifacts
+        // whether or not this run's index push (now deferred to
+        // `flush_pending_entries`) has happened. Pinned here at the local
+        // filesystem level -- no flush call anywhere in this test.
+        //
+        // A guard for that invariant only. It is not evidence of batching:
+        // an eager per-store merge writes the blob and entry meta at the same
+        // point, so every assertion below passes identically under it. The
+        // batching itself is pinned by
+        // `stores_do_not_merge_into_the_index_until_flush`.
+        let temp_repo = TempDir::new().unwrap();
+        setup_git_repo(temp_repo.path());
+        create_commit(temp_repo.path());
+        let temp_cache = TempDir::new().unwrap();
+        let cache = SharedCache::open_with_cache_dir(
+            temp_repo.path(),
+            1_000_000,
+            3,
+            Some(temp_cache.path()),
+        )
+        .unwrap();
+
+        let package_dir = temp_repo.path().join("pkg");
+        fs::create_dir_all(package_dir.join("dist")).unwrap();
+        fs::write(package_dir.join("dist/main.js"), "console.log('hi');").unwrap();
+
+        let input_key = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32], [5; 32]);
+        let outputs_hash = [7; 32];
+        let record = sample_record(true, 200);
+
+        let outcome = cache
+            .store(
+                "pkg#build",
+                &input_key,
+                &outputs_hash,
+                &package_dir,
+                &[PathBuf::from("dist/main.js")],
+                &record,
+                b"stdout",
+                b"stderr",
+                &[],
+                temp_repo.path(),
+            )
+            .unwrap();
+        assert_eq!(outcome, StoreOutcome::Stored);
+
+        // No flush anywhere above: the entry meta and blob must already be
+        // on disk, since only the index merge is deferred.
+        assert!(
+            read_entry_meta(cache.paths(), &input_key).is_some(),
+            "entry meta must be written immediately by store(), not deferred to flush"
+        );
+        assert!(
+            blob_path(cache.paths(), &outputs_hash).exists(),
+            "the blob must be written immediately by store(), not deferred to flush"
         );
     }
 }
