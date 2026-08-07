@@ -116,28 +116,36 @@ struct PushQueue {
 
 #[derive(Debug)]
 enum PushMsg {
-    Push(OwnedPushArtifacts),
+    EntryArtifacts(OwnedEntryArtifacts),
+    IndexMerge(OwnedIndexPush),
     #[cfg(any(test, doctest))]
     Flush(std::sync::mpsc::Sender<()>),
 }
 
+/// Owned inputs for [`RemoteSync::push_entry_artifacts`], queued so the push
+/// can happen off the caller's thread.
+///
+/// Content-addressed and independent of any shard: a restore on another
+/// machine needs the blob and entry meta regardless of whether this run's
+/// index push has happened, which is exactly why this is split out from
+/// [`OwnedIndexPush`] rather than bundled with it.
 #[derive(Debug)]
-pub(crate) struct OwnedPushArtifacts {
+pub(crate) struct OwnedEntryArtifacts {
     pub(crate) paths: Arc<SharedCachePaths>,
-    pub(crate) commit_key: String,
     pub(crate) outputs_hash: [u8; 32],
     pub(crate) input_key: [u8; 32],
     pub(crate) has_outputs: bool,
-    pub(crate) merge: MergeEntryOutcome,
 }
 
-/// Inputs for [`RemoteSync::push_store_artifacts`].
-pub(crate) struct PushArtifacts<'a> {
-    pub(crate) paths: &'a SharedCachePaths,
-    pub(crate) commit_key: &'a str,
-    pub(crate) outputs_hash: &'a [u8; 32],
-    pub(crate) input_key: &'a [u8; 32],
-    pub(crate) has_outputs: bool,
+/// Owned inputs for [`RemoteSync::push_index_merge`], queued so the push can
+/// happen off the caller's thread.
+///
+/// No `paths` field: unlike the entry-artifact push, the index push never
+/// reads from disk — `push_snapshot_upload` takes the shard bytes straight
+/// from `merge.new_snapshot_upload`.
+#[derive(Debug)]
+pub(crate) struct OwnedIndexPush {
+    pub(crate) shard_key: String,
     pub(crate) merge: MergeEntryOutcome,
 }
 
@@ -276,7 +284,8 @@ impl RemoteSync {
         let worker = std::thread::spawn(move || {
             for msg in rx {
                 match msg {
-                    PushMsg::Push(push) => worker_remote.push_store_artifacts_owned(push),
+                    PushMsg::EntryArtifacts(push) => worker_remote.push_entry_artifacts_owned(push),
+                    PushMsg::IndexMerge(push) => worker_remote.push_index_merge_owned(push),
                     #[cfg(any(test, doctest))]
                     PushMsg::Flush(ack) => {
                         let _ = ack.send(());
@@ -296,7 +305,7 @@ impl RemoteSync {
             .expect("push queue worker mutex poisoned") = Some(worker);
     }
 
-    pub(crate) fn enqueue_push_store_artifacts(&self, push: OwnedPushArtifacts) {
+    pub(crate) fn enqueue_entry_artifacts(&self, push: OwnedEntryArtifacts) {
         let Some(tx) = self
             .push_queue
             .tx
@@ -305,10 +314,27 @@ impl RemoteSync {
             .as_ref()
             .cloned()
         else {
-            self.push_store_artifacts_owned(push);
+            self.push_entry_artifacts_owned(push);
             return;
         };
-        if tx.send(PushMsg::Push(push)).is_err() {
+        if tx.send(PushMsg::EntryArtifacts(push)).is_err() {
+            eprintln!("debug: remote push queue closed before enqueue completed");
+        }
+    }
+
+    pub(crate) fn enqueue_index_push(&self, push: OwnedIndexPush) {
+        let Some(tx) = self
+            .push_queue
+            .tx
+            .lock()
+            .expect("push queue tx mutex poisoned")
+            .as_ref()
+            .cloned()
+        else {
+            self.push_index_merge_owned(push);
+            return;
+        };
+        if tx.send(PushMsg::IndexMerge(push)).is_err() {
             eprintln!("debug: remote push queue closed before enqueue completed");
         }
     }
@@ -349,15 +375,17 @@ impl RemoteSync {
         }
     }
 
-    fn push_store_artifacts_owned(&self, push: OwnedPushArtifacts) {
-        self.push_store_artifacts(PushArtifacts {
-            paths: &push.paths,
-            commit_key: &push.commit_key,
-            outputs_hash: &push.outputs_hash,
-            input_key: &push.input_key,
-            has_outputs: push.has_outputs,
-            merge: push.merge,
-        });
+    fn push_entry_artifacts_owned(&self, push: OwnedEntryArtifacts) {
+        self.push_entry_artifacts(
+            &push.paths,
+            &push.outputs_hash,
+            &push.input_key,
+            push.has_outputs,
+        );
+    }
+
+    fn push_index_merge_owned(&self, push: OwnedIndexPush) {
+        self.push_index_merge(&push.shard_key, &push.merge);
     }
 
     pub(crate) fn pull_snapshot_commit(&self, snapshot_store: &SnapshotStore, commit_key: &str) {
@@ -460,30 +488,46 @@ impl RemoteSync {
         Ok(())
     }
 
-    pub(crate) fn push_store_artifacts(&self, push: PushArtifacts<'_>) {
+    /// Pushes the content-addressed blob (when `has_outputs`) and the
+    /// `entries/<input_key>.bin` object.
+    ///
+    /// Independent of [`push_index_merge`](Self::push_index_merge): both the
+    /// blob and the entry meta are useful to a restore on another machine
+    /// whether or not this run's index push has happened yet, so this half
+    /// is dispatchable on its own.
+    pub(crate) fn push_entry_artifacts(
+        &self,
+        paths: &SharedCachePaths,
+        outputs_hash: &[u8; 32],
+        input_key: &[u8; 32],
+        has_outputs: bool,
+    ) {
         if self.is_disabled() {
             return;
         }
-        let PushArtifacts {
-            paths,
-            commit_key,
-            outputs_hash,
-            input_key,
-            has_outputs,
-            merge,
-        } = push;
 
         if has_outputs {
             self.push_blob_if_missing(paths, outputs_hash);
         }
         self.push_entry_meta_if_missing(paths, input_key);
+    }
 
+    /// Pushes the merged index shard (when the merge produced one) and then
+    /// deletes the shards it subsumed.
+    ///
+    /// Re-checks `is_disabled()` on entry: the artifact pushes this normally
+    /// follows can trip the circuit breaker, and this half must not attempt
+    /// an index push against a remote that just went dark. The subsumed
+    /// deletes only run if the replacement shard uploaded successfully
+    /// (`uploaded_new_shard`) — never reorder or drop that gate, or a delete
+    /// could remove a shard's data before its replacement is confirmed live.
+    pub(crate) fn push_index_merge(&self, shard_key: &str, merge: &MergeEntryOutcome) {
         if self.is_disabled() {
             return;
         }
 
         let uploaded_new_shard = match merge.new_snapshot_upload.as_ref() {
-            Some(upload) => self.push_snapshot_upload(commit_key, upload),
+            Some(upload) => self.push_snapshot_upload(shard_key, upload),
             None => false,
         };
 
@@ -495,8 +539,8 @@ impl RemoteSync {
             if self.is_disabled() {
                 break;
             }
-            self.delete_remote_snapshot_file(commit_key, shard_id, SNAPSHOT_FILE_EXTENSION);
-            self.delete_remote_snapshot_file(commit_key, shard_id, SNAPSHOT_MERGED_EXTENSION);
+            self.delete_remote_snapshot_file(shard_key, shard_id, SNAPSHOT_FILE_EXTENSION);
+            self.delete_remote_snapshot_file(shard_key, shard_id, SNAPSHOT_MERGED_EXTENSION);
         }
     }
 
@@ -915,14 +959,8 @@ mod tests {
             .snapshot_store
             .merge_entry_with_outcome(shard_key, entry);
         let shard_id = merge.new_snapshot_upload.as_ref().unwrap().shard_id.clone();
-        remote_seed.push_store_artifacts(PushArtifacts {
-            paths: seed_cache.paths(),
-            commit_key: shard_key,
-            outputs_hash: &outputs_hash,
-            input_key: &input_key,
-            has_outputs: true,
-            merge,
-        });
+        remote_seed.push_entry_artifacts(seed_cache.paths(), &outputs_hash, &input_key, true);
+        remote_seed.push_index_merge(shard_key, &merge);
         shard_id
     }
 
@@ -1145,12 +1183,13 @@ mod tests {
         let worker = thread::spawn(move || {
             for msg in rx {
                 match msg {
-                    PushMsg::Push(_) => {
+                    PushMsg::EntryArtifacts(_) => {
                         let count = processed_in_worker.fetch_add(1, Ordering::SeqCst);
                         started_tx.send(count).unwrap();
                         release_rx.recv().unwrap();
                         processed_tx.send(()).unwrap();
                     }
+                    PushMsg::IndexMerge(_) => {}
                     PushMsg::Flush(ack) => {
                         let _ = ack.send(());
                     }
@@ -1158,33 +1197,27 @@ mod tests {
             }
         });
 
-        let make_push = |n| OwnedPushArtifacts {
+        let make_push = |n| OwnedEntryArtifacts {
             paths: Arc::new(SharedCachePaths {
                 root: PathBuf::from(format!("/tmp/luchta-test-{n}")),
                 blobs_dir: PathBuf::from(format!("/tmp/luchta-test-{n}/blobs")),
                 snapshots_dir: PathBuf::from(format!("/tmp/luchta-test-{n}/snapshots")),
                 entries_dir: PathBuf::from(format!("/tmp/luchta-test-{n}/entries")),
             }),
-            commit_key: format!("commit-{n}"),
             outputs_hash: [n as u8; 32],
             input_key: [n as u8; 32],
             has_outputs: true,
-            merge: MergeEntryOutcome {
-                result: MergeResult::Inserted,
-                new_snapshot_upload: None,
-                subsumed_shard_ids: Vec::new(),
-            },
         };
 
-        tx.send(PushMsg::Push(make_push(1))).unwrap();
+        tx.send(PushMsg::EntryArtifacts(make_push(1))).unwrap();
         started_rx.recv().unwrap();
-        tx.send(PushMsg::Push(make_push(2))).unwrap();
+        tx.send(PushMsg::EntryArtifacts(make_push(2))).unwrap();
 
         let (send_result_tx, send_result_rx) = channel();
         let send_third = {
             let tx = tx.clone();
             thread::spawn(move || {
-                let sent = tx.send(PushMsg::Push(make_push(3))).is_ok();
+                let sent = tx.send(PushMsg::EntryArtifacts(make_push(3))).is_ok();
                 send_result_tx.send(sent).unwrap();
             })
         };
@@ -1287,14 +1320,10 @@ mod tests {
             .join(format!("subsuming-shard.{SNAPSHOT_FILE_EXTENSION}"));
         fs::create_dir_all(&blocking_path).unwrap();
         let input_key = derive_input_key([19; 32], [20; 32], [21; 32], [22; 32], [5; 32]);
-        harness.remote.push_store_artifacts(PushArtifacts {
-            paths: cache.paths(),
-            commit_key: &shard_key,
-            outputs_hash: &[23; 32],
-            input_key: &input_key,
-            has_outputs: true,
-            merge: merge3,
-        });
+        harness
+            .remote
+            .push_entry_artifacts(cache.paths(), &[23; 32], &input_key, true);
+        harness.remote.push_index_merge(&shard_key, &merge3);
         // The failed upload must not have disabled the remote permanently in a
         // way that hides a delete — but it must have skipped the subsumed-shard
         // deletes. Remove the blocking dir so the snapshot listing below only
@@ -1810,14 +1839,10 @@ mod tests {
         .unwrap();
 
         let input_key = derive_input_key([71; 32], [72; 32], [73; 32], [74; 32], [5; 32]);
-        harness.remote.push_store_artifacts(PushArtifacts {
-            paths: seed_cache.paths(),
-            commit_key: &shard_key,
-            outputs_hash: &[0x66; 32],
-            input_key: &input_key,
-            has_outputs: true,
-            merge: merge3,
-        });
+        harness
+            .remote
+            .push_entry_artifacts(seed_cache.paths(), &[0x66; 32], &input_key, true);
+        harness.remote.push_index_merge(&shard_key, &merge3);
         assert!(harness.remote.is_disabled_for_test());
         fs::remove_dir(&poisoned_file).unwrap();
         drop(seed_cache);
@@ -2046,14 +2071,8 @@ mod tests {
             format!(":local:{}", remote_root.path().display()),
             8,
         );
-        remote_seed.push_store_artifacts(PushArtifacts {
-            paths: &seed_paths,
-            commit_key: &remote_only_key,
-            outputs_hash: &[0; 32],
-            input_key: &input_key,
-            has_outputs: false,
-            merge,
-        });
+        remote_seed.push_entry_artifacts(&seed_paths, &[0; 32], &input_key, false);
+        remote_seed.push_index_merge(&remote_only_key, &merge);
 
         // Fresh local cache: it never wrote to `remote_only_key`, and that
         // key isn't its own write bucket either. The only way it can see
@@ -2079,7 +2098,7 @@ mod tests {
         }
 
         // A refresh must reach the remote, not just this machine's local
-        // index: `enqueue_push_store_artifacts` is the only path in this
+        // index: `enqueue_index_push` is the only path in this
         // crate that syncs a snapshot shard outward. A refresh that only
         // updated the local `SnapshotStore` would leave the day-window leak
         // open for every OTHER machine pulling from the same remote --
@@ -2264,5 +2283,68 @@ mod tests {
                 "both hits' entries must be present in the one pushed shard"
             );
         }
+    }
+
+    #[test]
+    fn entry_artifacts_and_index_push_are_independently_dispatchable() {
+        if !should_run_rclone_test() {
+            return;
+        }
+
+        let harness = RemoteHarness::new("console.log('split');\n");
+        let cache = harness.cache();
+        let input_key = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32], [5; 32]);
+        let outputs_hash = crate::resolve::combined_outputs_hash(&[]);
+
+        // A real entry always has a locally-readable meta object before its
+        // artifacts are pushed. Seed one directly instead of going through
+        // `cache.store()`: `finish_store` enqueues both halves back to back
+        // in this task (no behaviour change yet), so a `store()`-driven test
+        // couldn't tell a fused implementation from a split one. Enqueuing
+        // only the artifact half here does: it doesn't compile against the
+        // old fused `OwnedPushArtifacts` (which required a `merge` field),
+        // and it would leave a snapshot behind if the halves secretly shared
+        // state.
+        crate::shared::write_entry_meta(
+            cache.paths(),
+            &input_key,
+            &crate::shared::EntryMeta {
+                schema_version: crate::shared::ENTRY_META_SCHEMA_VERSION,
+                outputs_hash,
+                has_outputs: false,
+                record: Vec::new(),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                reports: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        harness.remote.enqueue_entry_artifacts(OwnedEntryArtifacts {
+            paths: Arc::new(cache.paths().clone()),
+            outputs_hash,
+            input_key,
+            has_outputs: false,
+        });
+        harness.remote.drain_push_queue();
+
+        // Entry artifacts reached the remote...
+        assert!(
+            harness
+                .remote_root
+                .path()
+                .join("entries")
+                .read_dir()
+                .unwrap()
+                .count()
+                > 0,
+            "entry meta must be pushed by the artifact half"
+        );
+        // ...while the index shard did not, because no index push was enqueued.
+        let snapshots = harness.remote_root.path().join("snapshots");
+        assert!(
+            !snapshots.exists() || snapshots.read_dir().unwrap().count() == 0,
+            "the index half must not run when only artifacts were enqueued"
+        );
     }
 }

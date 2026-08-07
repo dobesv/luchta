@@ -784,6 +784,13 @@ impl SharedCache {
     }
 
     /// Records the snapshot entry and pushes to the remote after a blob write.
+    ///
+    /// Enqueues both remote halves back to back: entry artifacts (blob +
+    /// entry meta), then the index merge. This task splits the push into two
+    /// independently dispatchable halves but changes no behaviour here — see
+    /// `enqueue_entry_artifacts`/`enqueue_index_push`'s doc comments. Moving
+    /// the index half to a once-per-run flush (as `flush_refreshes` already
+    /// does for cache hits) is a later change.
     fn finish_store(
         &self,
         blob_result: BlobWriteResult,
@@ -806,7 +813,10 @@ impl SharedCache {
                     return Ok(StoreOutcome::SkippedLockUnavailable);
                 }
                 #[cfg(unix)]
-                self.enqueue_remote_push(write_key, outputs_hash, *input_key, has_outputs, merge);
+                {
+                    self.enqueue_entry_artifacts(outputs_hash, *input_key, has_outputs);
+                    self.enqueue_index_push(write_key, merge);
+                }
                 Ok(StoreOutcome::Stored)
             }
             BlobWriteResult::SkippedTooLarge { bytes } => {
@@ -815,14 +825,19 @@ impl SharedCache {
         }
     }
 
+    /// Enqueues the content-addressed blob (when `has_outputs`) and the
+    /// entry meta object for background push.
+    ///
+    /// Independent of [`enqueue_index_push`](Self::enqueue_index_push): a
+    /// restore on another machine needs these regardless of whether this
+    /// run's index push has happened, so callers may dispatch this half
+    /// without the other (see `RemoteSync::push_entry_artifacts`).
     #[cfg(unix)]
-    fn enqueue_remote_push(
+    fn enqueue_entry_artifacts(
         &self,
-        write_key: &str,
         outputs_hash: [u8; 32],
         input_key: [u8; 32],
         has_outputs: bool,
-        merge: MergeEntryOutcome,
     ) {
         let Some(remote) = &self.remote else {
             return;
@@ -830,12 +845,27 @@ impl SharedCache {
         if remote.is_disabled() {
             return;
         }
-        remote.enqueue_push_store_artifacts(remote::OwnedPushArtifacts {
+        remote.enqueue_entry_artifacts(remote::OwnedEntryArtifacts {
             paths: Arc::clone(&self.paths),
-            commit_key: write_key.to_string(),
             outputs_hash,
             input_key,
             has_outputs,
+        });
+    }
+
+    /// Enqueues the merged index shard (and its subsumed-shard deletes) for
+    /// background push. See [`enqueue_entry_artifacts`](Self::enqueue_entry_artifacts)
+    /// for why this is a separate dispatch from the blob/entry-meta push.
+    #[cfg(unix)]
+    fn enqueue_index_push(&self, write_key: &str, merge: MergeEntryOutcome) {
+        let Some(remote) = &self.remote else {
+            return;
+        };
+        if remote.is_disabled() {
+            return;
+        }
+        remote.enqueue_index_push(remote::OwnedIndexPush {
+            shard_key: write_key.to_string(),
             merge,
         });
     }
@@ -943,8 +973,9 @@ impl SharedCache {
 
     /// Flushes every entry `refresh_entry` recorded this run: exactly one
     /// `merge_entries_with_outcome` call (one shard load, at most one
-    /// consolidated write) and, on unix, exactly one `enqueue_remote_push`
-    /// call, regardless of how many hits fed into it.
+    /// consolidated write) and, on unix, exactly one `enqueue_entry_artifacts`
+    /// call plus one `enqueue_index_push` call, regardless of how many hits
+    /// fed into it.
     ///
     /// Round 2 of this feature pushed a merge to the remote on every single
     /// hit. That reached the remote correctly, but a build with N cache hits
@@ -1007,13 +1038,12 @@ impl SharedCache {
                     let has_outputs = read_entry_meta(&self.paths, &representative.input_key)
                         .map(|meta| meta.has_outputs)
                         .unwrap_or(false);
-                    self.enqueue_remote_push(
-                        write_key,
+                    self.enqueue_entry_artifacts(
                         representative.outputs_hash,
                         representative.input_key,
                         has_outputs,
-                        merge,
                     );
+                    self.enqueue_index_push(write_key, merge);
                 }
             }
         }
