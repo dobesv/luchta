@@ -9,7 +9,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use luchta_cache::shared::{maybe_run_gc, SharedCache, DEFAULT_GC_RETENTION, DEFAULT_GC_THROTTLE};
+use luchta_cache::shared::{
+    maybe_run_gc, SharedCache, DEFAULT_GC_RETENTION, DEFAULT_GC_THROTTLE,
+    DEFAULT_SHARED_CACHE_DAY_WINDOW,
+};
 #[cfg(unix)]
 use luchta_cache::shared::{OpenExtras, RemoteConfig};
 use luchta_cache::{Cache, ListingCache};
@@ -164,8 +167,6 @@ pub(crate) const NO_CACHE_ENV: &str = "LUCHTA_NO_CACHE";
 
 /// Default shared cache size cap in megabytes.
 const DEFAULT_SHARED_CACHE_SIZE_CAP_MB: u64 = 250;
-/// Default shared cache history length (number of commits).
-const DEFAULT_SHARED_CACHE_HISTORY_LEN: usize = 20;
 
 fn parse_truthy_env_value(value: Option<&str>) -> bool {
     matches!(value.map(str::trim), Some(raw) if raw.eq_ignore_ascii_case("1") || raw.eq_ignore_ascii_case("true") || raw.eq_ignore_ascii_case("on"))
@@ -292,11 +293,20 @@ fn shared_cache_size_cap_bytes() -> u64 {
     mb.saturating_mul(1024 * 1024)
 }
 
+/// Days of shared-cache history to read (`SharedCache`'s `day_window`), not a
+/// count of commits or shards: computed bucket keys replaced the old
+/// commit/shard discovery scheme. Defaults to
+/// `luchta_cache::shared::DEFAULT_SHARED_CACHE_DAY_WINDOW`, not a local
+/// constant, so the CLI default can't drift from the crate's own default.
+///
+/// The name (and the env var, `LUCHTA_SHARED_CACHE_HISTORY`) still says
+/// "history" rather than "day window" — left as-is here since renaming both
+/// is a separate task; only the *value* fed in changed.
 fn shared_cache_history_len() -> usize {
     non_zero_env_u64_or(
         SHARED_CACHE_HISTORY_ENV,
         std::env::var(SHARED_CACHE_HISTORY_ENV).ok().as_deref(),
-        DEFAULT_SHARED_CACHE_HISTORY_LEN as u64,
+        DEFAULT_SHARED_CACHE_DAY_WINDOW as u64,
     ) as usize
 }
 
@@ -400,6 +410,7 @@ pub(crate) fn build_execution_resources(
 mod tests {
     use super::*;
     use crate::memory_pressure::MemorySample;
+    use luchta_cache::shared::SHARED_CACHE_SHARD_COUNT;
     use luchta_test_support::require_nextest;
     use std::sync::Mutex;
 
@@ -619,27 +630,27 @@ mod tests {
             non_zero_env_u64_or(
                 SHARED_CACHE_HISTORY_ENV,
                 None,
-                DEFAULT_SHARED_CACHE_HISTORY_LEN as u64
+                DEFAULT_SHARED_CACHE_DAY_WINDOW as u64
             ),
-            20
+            3
         );
         assert_eq!(
             non_zero_env_u64_or(
                 SHARED_CACHE_HISTORY_ENV,
                 Some("64"),
-                DEFAULT_SHARED_CACHE_HISTORY_LEN as u64
+                DEFAULT_SHARED_CACHE_DAY_WINDOW as u64
             ),
             64
         );
-        // "0" would otherwise make rank_shard_candidates select nothing,
-        // silently disabling shared-cache reads — fall back to the default.
+        // "0" would otherwise make `bucket_keys_for` return an empty read
+        // set, silently disabling shared-cache reads — fall back to the default.
         assert_eq!(
             non_zero_env_u64_or(
                 SHARED_CACHE_HISTORY_ENV,
                 Some("0"),
-                DEFAULT_SHARED_CACHE_HISTORY_LEN as u64
+                DEFAULT_SHARED_CACHE_DAY_WINDOW as u64
             ),
-            20
+            3
         );
     }
 
@@ -648,7 +659,27 @@ mod tests {
         require_nextest();
         let _lock = ENV_LOCK.lock().unwrap();
         let _guard = EnvVarGuard::set(SHARED_CACHE_HISTORY_ENV, "0");
-        assert_eq!(shared_cache_history_len(), DEFAULT_SHARED_CACHE_HISTORY_LEN);
+        assert_eq!(shared_cache_history_len(), DEFAULT_SHARED_CACHE_DAY_WINDOW);
+    }
+
+    #[test]
+    fn shared_cache_day_window_default_is_three_days_of_six_shards_each() {
+        // Pins both constants together: a future change to either one that
+        // isn't deliberate would silently inflate (or shrink) the number of
+        // buckets fetched per restore. Also guards against the CLI's default
+        // drifting from `luchta-cache`'s own default the way it did before
+        // this test existed (`DEFAULT_SHARED_CACHE_HISTORY_LEN = 20` fed into
+        // what is now `day_window`, an 18-vs-120-key blow-up).
+        require_nextest();
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvVarGuard::remove(SHARED_CACHE_HISTORY_ENV);
+        assert_eq!(DEFAULT_SHARED_CACHE_DAY_WINDOW, 3);
+        assert_eq!(shared_cache_history_len(), DEFAULT_SHARED_CACHE_DAY_WINDOW);
+        assert_eq!(
+            shared_cache_history_len() * SHARED_CACHE_SHARD_COUNT,
+            18,
+            "default read set must be 18 computed bucket keys"
+        );
     }
 
     #[test]
