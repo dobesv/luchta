@@ -37,11 +37,11 @@ Three observations drive it:
 - **`SHARED_CACHE_SHARD_COUNT` is a wire-compatibility constant, not a tunable.** If one machine writes with 12 shards and another reads 6, the reader silently misses everything in shards 6–11. Decreasing is safe; increasing is not. It must not be env-configurable. Changing it is a coordinated fleet-wide change tied to a schema bump.
 - **The day window may be env-configurable.** Reading more or fewer days changes only local breadth and cannot desynchronise machines.
 - **Dates are UTC.** Machines in different zones would otherwise compute different keys around midnight.
-- **Input patterns must come from the task definition, not the record.** An inputs hash is undefined if you need the record to know which patterns to hash — that is circular. `dispatch.rs` hardcodes `detected_input_patterns: false` today, so this holds; Task R3 makes the dependency explicit rather than accidental.
+- **Input patterns must come from the task definition, not the record.** An inputs hash is undefined if you need the record to know which patterns to hash — that is circular. `dispatch.rs` hardcodes `detected_input_patterns: false` today, so this holds; Task 4 makes the dependency explicit rather than accidental.
 
 ## Migration
 
-Changing both the shard key format and the entry key derivation makes every existing shared-cache object unreachable: old `<commit>` and `<unix_ms>-<nonce>` shard directories are simply never in the computed read set, and old `entries/<key>.bin` objects sit at keys nothing will ask for. Both age out through the existing GC. This is a clean, one-time cache reset with no dual-read path, and it is acceptable because nothing has shipped. Task R5 documents it.
+Changing both the shard key format and the entry key derivation makes every existing shared-cache object unreachable: old `<commit>` and `<unix_ms>-<nonce>` shard directories are simply never in the computed read set, and old `entries/<key>.bin` objects sit at keys nothing will ask for. Both age out through the existing GC. This is a clean, one-time cache reset with no dual-read path, and it is acceptable because nothing has shipped. Task 6 documents it.
 
 ---
 
@@ -66,7 +66,7 @@ Changing both the shard key format and the entry key derivation makes every exis
 
 ---
 
-## Task R0: Unblock CI and close the standalone review findings
+## Task 1: Unblock CI and close the standalone review findings
 
 These are small, independent, and survive the rework. Doing them first keeps the branch from sitting red while the larger changes land.
 
@@ -118,7 +118,7 @@ For `let mut candidates`, whose only mutation is inside a `#[cfg(unix)]` block:
         let mut candidates = ...;
 ```
 
-Note: Task R2 deletes `candidate_keys_with_remote` entirely, so that second fix is temporary. Do it anyway — the branch should not be red in the interim.
+Note: Task 3 deletes `candidate_keys_with_remote` entirely, so that second fix is temporary. Do it anyway — the branch should not be red in the interim.
 
 - [ ] **Step 3: Verify the non-unix build is clean**
 
@@ -162,7 +162,7 @@ git add -A && git commit -m "fix non-unix build warnings and test portability"
 
 ---
 
-## Task R1: Computable date+shard bucket keys
+## Task 2: Computable date+shard bucket keys
 
 **Files:**
 - Modify: `crates/luchta-cache/src/shared/discovery.rs`
@@ -359,9 +359,9 @@ Expected: PASS, 6 tests.
 
 In `shared/mod.rs`, replace `candidate_keys`'s body so it returns `bucket_keys_for(now_unix_ms(), self.day_window)`, and set `write_commit_key` from `write_bucket_key`. Rename the field to `write_bucket_key` and `history_len` to `day_window` while you are here — the old names now describe nothing.
 
-Delete the write-key injection: with computed buckets the write bucket is already in the read set by construction, so the special case is dead. The Task R1 test `write_bucket_is_always_inside_the_read_set` is what guards that property now.
+Delete the write-key injection: with computed buckets the write bucket is already in the read set by construction, so the special case is dead. The Task 2 test `write_bucket_is_always_inside_the_read_set` is what guards that property now.
 
-Leave `rank_shard_candidates` and the rest of the old apparatus in place but unreferenced — Task R2 deletes them, and separating the two keeps this diff about the key scheme.
+Leave `rank_shard_candidates` and the rest of the old apparatus in place but unreferenced — Task 3 deletes them, and separating the two keeps this diff about the key scheme.
 
 - [ ] **Step 6: Add an integration test for bucket accumulation**
 
@@ -430,9 +430,9 @@ git commit -m "compute shard bucket keys from the utc date instead of discoverin
 
 ---
 
-## Task R2: Delete the recency, listing, and rollup apparatus
+## Task 3: Delete the recency, listing, and rollup apparatus
 
-Pure deletion. Everything here exists to answer "which shards?", which Task R1 made arithmetic.
+Pure deletion. Everything here exists to answer "which shards?", which Task 2 made arithmetic.
 
 **Files:**
 - Modify: `crates/luchta-cache/src/shared/discovery.rs` — remove `ShardCandidate`, `rank_shard_candidates`, `local_shard_candidates_for`, `discover_recent_shard_keys`, `DEFAULT_SHARD_MAX_AGE_MS`, `DEFAULT_SHARD_BYTE_BUDGET`, `rollup_pressure_threshold`
@@ -457,7 +457,7 @@ Expected: no hits outside comments describing history.
 
 - [ ] **Step 3: Verify the non-unix build**
 
-Use the cfg-substitution technique from Task R0 Step 1. Deleting `#[cfg(unix)]` code is exactly where imbalance appears.
+Use the cfg-substitution technique from Task 1 Step 1. Deleting `#[cfg(unix)]` code is exactly where imbalance appears.
 
 - [ ] **Step 4: Run both suites and commit**
 
@@ -467,7 +467,7 @@ git commit -m "delete shard ranking, remote listing, and rollup packs"
 
 ---
 
-## Task R3: Fold the resolved inputs into the cache key
+## Task 4: Fold the resolved inputs into the cache key
 
 **Files:**
 - Modify: `crates/luchta-cache/src/resolve.rs` — add `combined_inputs_hash`
@@ -590,7 +590,7 @@ git commit -m "fold resolved input state into the shared cache key"
 
 ---
 
-## Task R4: Refresh entries on a cache hit
+## Task 5: Refresh entries on a cache hit
 
 Without this the day window is a trap. A stable package's entry is written once; three days later it falls out of the window, every build misses it, everyone rebuilds, and it is rewritten — a rebuild sawtooth on precisely the packages the cache exists to serve, worst for the ones that change least.
 
@@ -703,7 +703,7 @@ git commit -m "refresh shared cache entries on a hit so hot entries survive the 
 
 ---
 
-## Task R5: Documentation, CI coverage, and the migration note
+## Task 6: Documentation, CI coverage, and the migration note
 
 **Files:**
 - Modify: `README.md` — shared-cache section
@@ -751,7 +751,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-Plus the non-unix check from Task R0 Step 1.
+Plus the non-unix check from Task 1 Step 1.
 
 Then, by hand against a real repo with `LUCHTA_SHARED_CACHE=1`:
 
