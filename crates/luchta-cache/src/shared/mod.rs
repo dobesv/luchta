@@ -48,9 +48,11 @@ pub use snapshot::{
 use std::collections::HashSet;
 #[cfg(unix)]
 use std::collections::VecDeque;
+use std::fs::OpenOptions;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
+use std::time::SystemTime;
 
 #[cfg(unix)]
 use tokio::task::JoinSet;
@@ -858,38 +860,85 @@ impl SharedCache {
     }
 
     /// Refreshes an entry on a shared-cache hit: re-merges it into today's
-    /// write bucket and advances `entries/<input_key>.bin`'s mtime.
+    /// write bucket, pushes that merge to the remote (mirroring `store()`),
+    /// and advances `entries/<input_key>.bin`'s mtime.
     ///
     /// Without this, a stable entry written once falls out of the day window
     /// a few days later (every build then misses it, rebuilds, and rewrites
     /// it — a sawtooth on exactly the packages the cache exists to serve),
     /// and separately, `gc_entries_dir` ages its meta out by mtime alone
-    /// since a hit doesn't otherwise touch the file.
+    /// since a hit doesn't otherwise touch the file. Skipping the remote push
+    /// would leave both problems in place for every machine but the one that
+    /// happened to refresh: `enqueue_push_store_artifacts` is the only path
+    /// in this crate that syncs a snapshot shard outward, so a refresh that
+    /// only updates `self.snapshot_store` locally never leaves this machine.
     ///
     /// Best-effort and infallible: the hit has already succeeded by the time
     /// this runs, so a refresh failure must never turn it into a miss or fail
-    /// the build. Both failure paths just log at `debug:` and return. Never
-    /// re-stores the blob or the meta object — both are content-addressed
-    /// and already correct, so only a small index entry and an mtime move.
+    /// the build. Every failure path here just logs at `debug:` and returns.
+    /// Never re-stores the blob or the meta object — both are content-
+    /// addressed and already correct, so only a small index entry, an mtime,
+    /// and (at most once per `input_key` per day — see below) a remote push
+    /// of that index entry move.
     pub fn refresh_entry(&self, input_key: &[u8; 32], entry: &SnapshotEntry) {
         if let Some(write_key) = self.write_bucket_key.as_deref() {
-            match self.snapshot_store.merge_entry(write_key, entry.clone()) {
-                MergeResult::Inserted | MergeResult::IdempotentNoop => {}
-                MergeResult::ConflictKeptExisting | MergeResult::SkippedLockUnavailable => {
+            let merge = self
+                .snapshot_store
+                .merge_entry_with_outcome(write_key, entry.clone());
+            match merge.result {
+                MergeResult::SkippedLockUnavailable => {
                     eprintln!(
                         "debug: shared cache refresh could not merge entry for input_key={}",
                         hex_hash(*input_key)
                     );
                 }
+                MergeResult::Inserted
+                | MergeResult::IdempotentNoop
+                | MergeResult::ConflictKeptExisting => {
+                    // Same push path `finish_store` feeds after `store()`'s own
+                    // merge. `merge.new_snapshot_upload` is `None` on
+                    // `IdempotentNoop`/`ConflictKeptExisting` (the common case:
+                    // the entry already lived in today's bucket, or a refresh
+                    // raced another writer), so the snapshot-shard push itself
+                    // fires at most once per `input_key` per day, on whichever
+                    // hit is first to actually add it. `push_blob_if_missing`
+                    // and `push_entry_meta_if_missing` (called unconditionally
+                    // inside that push, same as for a fresh `store()`) already
+                    // no-op once the remote copy exists.
+                    #[cfg(unix)]
+                    {
+                        let has_outputs = read_entry_meta(&self.paths, input_key)
+                            .map(|meta| meta.has_outputs)
+                            .unwrap_or(false);
+                        self.enqueue_remote_push(
+                            write_key,
+                            entry.outputs_hash,
+                            *input_key,
+                            has_outputs,
+                            merge,
+                        );
+                    }
+                }
             }
         }
 
         let path = entry_meta_path(&self.paths, input_key);
-        if let Err(err) = filetime::set_file_mtime(&path, filetime::FileTime::now()) {
-            eprintln!(
-                "debug: shared cache refresh could not advance meta mtime for input_key={}: {err}",
-                hex_hash(*input_key)
-            );
+        match OpenOptions::new().write(true).open(&path) {
+            Ok(file) => {
+                let times = std::fs::FileTimes::new().set_modified(SystemTime::now());
+                if let Err(err) = file.set_times(times) {
+                    eprintln!(
+                        "debug: shared cache refresh could not advance meta mtime for input_key={}: {err}",
+                        hex_hash(*input_key)
+                    );
+                }
+            }
+            Err(err) => {
+                eprintln!(
+                    "debug: shared cache refresh could not advance meta mtime for input_key={}: {err}",
+                    hex_hash(*input_key)
+                );
+            }
         }
     }
 }
