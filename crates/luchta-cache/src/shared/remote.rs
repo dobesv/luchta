@@ -2103,7 +2103,7 @@ mod tests {
     }
 
     #[test]
-    fn flush_refreshes_on_remote_backed_cache_pushes_the_merge_and_entry_meta() {
+    fn flush_pending_entries_on_remote_backed_cache_pushes_the_merge_and_entry_meta() {
         if !should_run_rclone_test() {
             eprintln!("skipping rclone-gated shared-cache refresh push test; rclone not on PATH or LUCHTA_TEST_RCLONE disabled");
             return;
@@ -2195,7 +2195,7 @@ mod tests {
     }
 
     #[test]
-    fn flush_refreshes_collapses_two_hits_into_a_single_push() {
+    fn flush_pending_entries_collapses_two_hits_into_a_single_push() {
         if !should_run_rclone_test() {
             eprintln!("skipping rclone-gated shared-cache refresh-batching test; rclone not on PATH or LUCHTA_TEST_RCLONE disabled");
             return;
@@ -2309,29 +2309,42 @@ mod tests {
         // store's blob/entry-meta artifacts whether or not this run's index
         // push has happened. Proven here directly against the remote, with
         // no `flush_pending_entries` call before the artifact assertions.
+        // Three distinct stores (not one) so the post-flush assertion can
+        // pin an exact shard count: `entries.len()` alone can't distinguish
+        // one consolidated shard from three separate ones, since
+        // `SnapshotStore::load` merges every shard file in the bucket.
         let harness = RemoteHarness::new("console.log('defer');\n");
         let cache = harness.cache();
-        let input_key = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32], [5; 32]);
-        let outputs_hash = [0x99; 32];
+        let mut outputs_hashes = Vec::new();
 
-        let outcome = cache
-            .store(
-                "pkg#build",
-                &input_key,
-                &outputs_hash,
-                &harness.package_dir,
-                &[PathBuf::from("dist/main.js")],
-                &sample_record(true, 300),
-                b"stdout-defer",
-                b"stderr-defer",
-                &[],
-                harness.temp_repo.path(),
-            )
-            .unwrap();
-        assert_eq!(outcome, StoreOutcome::Stored);
+        for seed in 0u8..3 {
+            let input_key = derive_input_key([seed; 32], [2; 32], [3; 32], [4; 32], [5; 32]);
+            let outputs_hash = [0x99 + seed; 32];
+            let outcome = cache
+                .store(
+                    "pkg#build",
+                    &input_key,
+                    &outputs_hash,
+                    &harness.package_dir,
+                    &[PathBuf::from("dist/main.js")],
+                    &sample_record(true, 300),
+                    b"stdout-defer",
+                    b"stderr-defer",
+                    &[],
+                    harness.temp_repo.path(),
+                )
+                .unwrap();
+            assert_eq!(outcome, StoreOutcome::Stored);
+            outputs_hashes.push(outputs_hash);
+        }
+        // The artifact pushes are queued to a background rclone worker;
+        // drain the queue once before checking the remote landed all three,
+        // still without any `flush_pending_entries` call.
         cache.flush_push_queue();
+        for outputs_hash in &outputs_hashes {
+            assert_remote_has_blob(harness.remote_root.path(), outputs_hash);
+        }
 
-        assert_remote_has_blob(harness.remote_root.path(), &outputs_hash);
         assert!(
             harness
                 .remote_root
@@ -2353,10 +2366,8 @@ mod tests {
         cache.flush_pending_entries();
         cache.flush_push_queue();
 
-        assert!(
-            !remote_snapshot_files(harness.remote_root.path(), &write_key).is_empty(),
-            "flush_pending_entries must push the merged snapshot shard for a stored entry too"
-        );
+        let files = remote_snapshot_files(harness.remote_root.path(), &write_key);
+        assert_snapshot_shard_count(&files, 1, 1);
     }
 
     #[test]
@@ -2372,13 +2383,14 @@ mod tests {
 
         // A real entry always has a locally-readable meta object before its
         // artifacts are pushed. Seed one directly instead of going through
-        // `cache.store()`: `finish_store` enqueues both halves back to back
-        // in this task (no behaviour change yet), so a `store()`-driven test
-        // couldn't tell a fused implementation from a split one. Enqueuing
-        // only the artifact half here does: it doesn't compile against the
-        // old fused `OwnedPushArtifacts` (which required a `merge` field),
-        // and it would leave a snapshot behind if the halves secretly shared
-        // state.
+        // `cache.store()`: as of the batching change, `finish_store` only
+        // ever enqueues the artifact half itself (the index half is deferred
+        // to `flush_pending_entries`), so a `store()`-driven test couldn't
+        // exercise the index half of this dispatch at all. Enqueuing only
+        // the artifact half here still pins the point of this test: it
+        // doesn't compile against the old fused `OwnedPushArtifacts` (which
+        // required a `merge` field), and it would leave a snapshot behind if
+        // the halves secretly shared state.
         crate::shared::write_entry_meta(
             cache.paths(),
             &input_key,

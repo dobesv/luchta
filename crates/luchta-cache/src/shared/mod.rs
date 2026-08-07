@@ -240,6 +240,17 @@ pub struct SharedCache {
     /// Deferring the merge is invisible within a run: `get_or_build_index`
     /// builds the merged index once behind a `OnceLock`, so a mid-run merge
     /// was never visible to a later lookup in the same process anyway.
+    ///
+    /// It is *not* invisible across a run that never reaches its flush: a
+    /// process killed after `finish_store`/`refresh_entry` but before
+    /// `flush_pending_entries` leaves this map's entries un-merged forever
+    /// — their blobs and `entries/*.bin` are already on disk (and, for
+    /// stores, already pushed to the remote), but no shard ever points at
+    /// them, so a later run treats them as a miss and redoes the work. This
+    /// is an accepted tradeoff, not an oversight: it already applied to
+    /// refreshes before this change, and a killed build losing its last few
+    /// stores' worth of index entries is far cheaper than the per-store
+    /// remote traffic this batching removes.
     pending_entries: Mutex<HashMap<[u8; 32], SnapshotEntry>>,
     /// The first refreshed entry recorded this run, if any — used by
     /// `flush_pending_entries` to size a best-effort blob/entry-meta
@@ -1914,8 +1925,9 @@ mod tests {
         record.outputs = vec![];
         record.outputs_hash = empty_hash;
 
-        // Heavy same-day churn: 30 fresh stores, each landing in one of
-        // today's `SHARED_CACHE_SHARD_COUNT` shards.
+        // Heavy same-day churn: 30 fresh stores, each its own `luchta run`
+        // (its own `SharedCache` instance, flushed at the end like a real
+        // run) landing in one of today's `SHARED_CACHE_SHARD_COUNT` shards.
         for i in 0..30u8 {
             let cache = SharedCache::open_with_cache_dir(
                 temp_repo.path(),
@@ -1939,7 +1951,21 @@ mod tests {
                     temp_repo.path(),
                 )
                 .unwrap();
+            cache.flush_pending_entries();
         }
+
+        // The churn must actually have landed on disk, not just been
+        // recorded and silently dropped when each per-iteration `cache` was
+        // dropped unflushed -- otherwise the restore below would prove
+        // nothing about surviving churn.
+        let churn_snapshot_dirs = fs::read_dir(temp_cache.path().join("snapshots"))
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .count();
+        assert!(
+            churn_snapshot_dirs > 1,
+            "expected churn to produce shard directories beyond the seeded old bucket, got {churn_snapshot_dirs}"
+        );
 
         let cache = SharedCache::open_with_cache_dir(
             temp_repo.path(),
@@ -2002,6 +2028,7 @@ mod tests {
                 temp_repo.path(),
             )
             .unwrap();
+        cache.flush_pending_entries();
 
         // Concurrent restore threads.
         let initialized = Arc::new(AtomicBool::new(false));
@@ -2014,18 +2041,26 @@ mod tests {
             fs::create_dir_all(&restore_dir).unwrap();
 
             handles.push(thread::spawn(move || {
-                let result = cache
+                let found = cache
                     .try_restore_candidates("pkg#build", &input_key, &restore_dir)
-                    .next();
+                    .next()
+                    .is_some();
                 // Mark that we initialized the index.
                 initialized.store(cache.index.get().is_some(), Ordering::SeqCst);
-                result
+                found
             }));
         }
 
-        // All threads complete.
+        // All threads complete. Each must actually have found the stored
+        // entry -- with the merge left unflushed, the index would be empty
+        // and every thread's candidate iteration would silently yield
+        // `None`, leaving this test unable to exercise the concurrent
+        // restore path (`stage_entry` et al.) it's named for.
         for handle in handles {
-            handle.join().unwrap();
+            assert!(
+                handle.join().unwrap(),
+                "each concurrent restore thread must find the stored candidate"
+            );
         }
 
         // Index was initialized exactly once (OnceLock guarantee).
@@ -2677,7 +2712,7 @@ mod tests {
     fn repeat_hits_of_the_same_key_collapse_to_one_entry_before_flush() {
         // `pending_entries` is keyed by `input_key` precisely so repeat
         // hits of the same key collapse to a single entry before a flush.
-        // `flush_refreshes_collapses_two_hits_into_a_single_push` (in
+        // `flush_pending_entries_collapses_two_hits_into_a_single_push` (in
         // `remote.rs`) proves N DISTINCT keys collapse into one push, but
         // that alone doesn't pin dedup-by-key: a Vec-based (or otherwise
         // duplicate-preserving) pending collection would also pass it, AND
