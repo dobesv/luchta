@@ -2904,6 +2904,98 @@ mod tests {
     }
 
     #[test]
+    fn a_second_flush_merges_entries_recorded_after_the_first() {
+        // `run.rs` flushes twice per cycle: once when the dispatch loop
+        // returns, then again after the walker drain and worker kill. The
+        // second call exists for tasks that were still in flight during the
+        // first one (#287), which happens on the SIGINT/SIGTERM and
+        // watch-cancel paths. That only helps if a flush after a flush
+        // actually merges the late arrival instead of being a no-op, which
+        // is what this pins.
+        let temp_repo = TempDir::new().unwrap();
+        setup_git_repo(temp_repo.path());
+        create_commit(temp_repo.path());
+        let temp_cache = TempDir::new().unwrap();
+        let cache = SharedCache::open_with_cache_dir(
+            temp_repo.path(),
+            1_000_000,
+            3,
+            Some(temp_cache.path()),
+        )
+        .unwrap();
+
+        let package_dir = temp_repo.path().join("pkg");
+        fs::create_dir_all(&package_dir).unwrap();
+        let empty_outputs = crate::resolve::combined_outputs_hash(&[]);
+        let write_bucket = cache.write_bucket_key().expect("write bucket").to_string();
+
+        let store_seed = |seed: u8| {
+            let mut record = sample_record(true, 200);
+            record.output_patterns = vec![];
+            record.outputs = vec![];
+            record.outputs_hash = empty_outputs;
+            record.task_spec_hash = [seed; 32];
+            let key = derive_input_key([seed; 32], [2; 32], [3; 32], [4; 32], [5; 32]);
+            let outcome = cache
+                .store(
+                    "pkg#build",
+                    &key,
+                    &empty_outputs,
+                    &package_dir,
+                    &[],
+                    &record,
+                    b"out",
+                    b"",
+                    &[],
+                    temp_repo.path(),
+                )
+                .unwrap();
+            assert_eq!(outcome, StoreOutcome::Stored);
+        };
+
+        // The tasks that finished before the dispatch loop returned.
+        store_seed(0);
+        store_seed(1);
+        cache.flush_pending_entries();
+        assert_eq!(
+            cache
+                .snapshot_store()
+                .load(&write_bucket)
+                .expect("first flush must write the bucket")
+                .entries
+                .len(),
+            2,
+            "first flush carries the tasks that had already completed"
+        );
+
+        // The straggler: still running when the first flush happened, lands
+        // while `finalize_and_report` is draining.
+        store_seed(2);
+        assert_eq!(
+            cache.pending_entry_count(),
+            1,
+            "the late store must be pending again after the first flush drained the map"
+        );
+
+        cache.flush_pending_entries();
+
+        let snapshot = cache
+            .snapshot_store()
+            .load(&write_bucket)
+            .expect("bucket must still be readable after the second flush");
+        assert_eq!(
+            snapshot.entries.len(),
+            3,
+            "the second flush must add the straggler without dropping the first flush's entries"
+        );
+        assert_eq!(
+            cache.pending_entry_count(),
+            0,
+            "the second flush must drain the map too"
+        );
+    }
+
+    #[test]
     fn store_writes_blob_and_entry_meta_immediately_before_any_flush() {
         // The invariant most at risk from batching the index merge: a
         // restore on another machine has to find a store's artifacts
