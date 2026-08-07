@@ -2380,15 +2380,17 @@ pub(crate) fn run_cycle<'a>(
         // watch-mode cancellation it is not: `run_dispatch_with_cancel`
         // returns while detached task futures are still in flight, and the
         // walker drain and worker kill happen below in
-        // `finalize_and_report`, after this flush. A task that finishes just
-        // after this line records into `pending_entries` and is dropped
-        // un-merged, costing a re-run of that one task next time. The
-        // `SharedCache::drop` log is what makes that visible.
+        // `finalize_and_report`, after this flush. The second flush after
+        // that call is what picks those stragglers up.
+        //
+        // Kept here as well as there because `finalize_and_report` can
+        // return early on a walker panic, and a run's index entries
+        // shouldn't depend on the reporting path succeeding.
         if let Some(shared_cache) = &resources.shared_cache {
             shared_cache.flush_pending_entries();
         }
 
-        finalize_and_report(FinalizeCycle {
+        let cycle_result = finalize_and_report(FinalizeCycle {
             run,
             walker,
             receiver_option,
@@ -2399,7 +2401,24 @@ pub(crate) fn run_cycle<'a>(
             reporter: &reporter,
             pressure_state: &pressure_state,
         })
-        .await
+        .await;
+
+        // Second flush, for tasks that were still in flight when the first
+        // one ran (#287). `finalize_and_report` has now drained the walker
+        // and, on interrupt, killed the workers, so those tasks have had
+        // their chance to finish and record. On the normal path the pending
+        // map is already empty and this returns without touching the disk.
+        //
+        // Best-effort, not a guarantee: nothing here joins the detached task
+        // futures, so a task completing after this line still loses its
+        // index entry and re-runs next time. Making that airtight means
+        // tracking every spawned task and waiting on it, which costs watch
+        // mode its responsiveness for a case that only drops one entry.
+        if let Some(shared_cache) = &resources.shared_cache {
+            shared_cache.flush_pending_entries();
+        }
+
+        cycle_result
     }
 }
 
