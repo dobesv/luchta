@@ -1032,6 +1032,7 @@ The shared build cache is a cross-worktree, cross-clone cache that restores task
 - **Content-Addressed Blobs:** Build outputs are compressed and stored in a deduped blob store, addressed by `outputs_hash`.
 - **Read Window:** On cache lookup, Luchta fetches every shard from the last `LUCHTA_SHARED_CACHE_DAYS` UTC days (default 3) directly — `day_window * 6` key fetches, no object-store listing involved.
 - **Refresh on Hit:** A cache hit re-inserts its entry into today's shard, and, with remote sync on, re-pushes that shard, so a hot entry keeps getting a fresh day stamp instead of aging out of the read window on a fixed schedule. The remote `entries/<input_key>.bin` object itself is not re-pushed — it's pushed once, the first time an entry is stored, and left alone after that. See the `entries/` note under Garbage Collection below.
+- **Batched Index Writes:** A store writes its blob and entry metadata as soon as the task finishes, so a restore on another machine can find them right away. The index shard — the thing a lookup actually reads — is written once at the end of the run, covering every task stored or refreshed since, instead of once per task. If the process is killed before that final flush, the blob and entry metadata are already on disk (and, for stores, already pushed to the remote) but no shard points at them, so the next run treats those tasks as misses and redoes the work. Nothing is corrupted, just repeated.
 - **Remote Synchronization:** Opt-in synchronization with S3 or other object stores via `rclone`.
 
 #### Layout

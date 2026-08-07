@@ -2309,10 +2309,13 @@ mod tests {
         // store's blob/entry-meta artifacts whether or not this run's index
         // push has happened. Proven here directly against the remote, with
         // no `flush_pending_entries` call before the artifact assertions.
-        // Three distinct stores (not one) so the post-flush assertion can
-        // pin an exact shard count: `entries.len()` alone can't distinguish
-        // one consolidated shard from three separate ones, since
-        // `SnapshotStore::load` merges every shard file in the bucket.
+        // Three distinct stores (not one) so the entry-meta count can be an
+        // exact 3, catching silently dropped artifact pushes. The post-flush
+        // shard count is a resting-state invariant only -- it does NOT prove
+        // the merge was batched, because `push_index_merge` deletes each
+        // subsumed shard from the remote, so N eager merges also settle at
+        // one shard. What catches a reinstated eager push is the pre-flush
+        // `remote_snapshot_files` emptiness check below.
         let harness = RemoteHarness::new("console.log('defer');\n");
         let cache = harness.cache();
         let mut outputs_hashes = Vec::new();
@@ -2345,16 +2348,17 @@ mod tests {
             assert_remote_has_blob(harness.remote_root.path(), outputs_hash);
         }
 
-        assert!(
+        assert_eq!(
             harness
                 .remote_root
                 .path()
                 .join("entries")
                 .read_dir()
                 .unwrap()
-                .count()
-                > 0,
-            "entry meta must reach the remote immediately, before any index flush"
+                .count(),
+            3,
+            "three distinct stores must produce three entry-meta objects on the remote, \
+             before any index flush"
         );
 
         let write_key = cache.write_bucket_key().expect("write key").to_string();

@@ -2820,6 +2820,22 @@ mod tests {
             5,
             "one merge carrying all five entries"
         );
+
+        // A post-flush shard-file count was tried here and removed: it can't
+        // distinguish one batched merge from five eager ones, because
+        // `merge_entries_with_outcome` compacts (deletes) every shard it
+        // subsumes on each call -- five sequential single-entry merges and
+        // one five-entry merge both converge to exactly one file at rest. The
+        // discrimination this test's name promises comes from timing, not
+        // from counting: the pre-flush assertion above catches an eager
+        // per-store merge because no shard may exist yet, and its remote
+        // counterpart is the pre-flush `remote_snapshot_files(...).is_empty()`
+        // check in `remote.rs`. The remote is not a second, count-based
+        // proof -- `push_index_merge` deletes each subsumed shard from the
+        // remote too, so the remote resting state converges to one shard
+        // under eager merges exactly as the local one does. Do not re-add a
+        // post-flush shard-file-count assertion on either side; it will pass
+        // under both behaviours and imply a proof it can't provide.
     }
 
     #[test]
