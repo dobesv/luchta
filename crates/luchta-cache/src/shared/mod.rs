@@ -1128,18 +1128,6 @@ impl SharedCache {
             std::mem::take(&mut *pending).into_values().collect()
         };
 
-        // Only refreshes queue a representative (see
-        // `pending_catchup_representative`'s doc comment): a store-only flush
-        // must not manufacture a catch-up push for an arbitrary entry, since
-        // `finish_store` already pushed that entry's own artifacts
-        // immediately -- that's exactly the remote traffic this task exists
-        // to remove.
-        #[cfg(unix)]
-        let representative = self
-            .pending_catchup_representative
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take();
         let entry_count = entries.len();
 
         let merge = self
@@ -1160,6 +1148,22 @@ impl SharedCache {
             | MergeResult::ConflictKeptExisting => {
                 #[cfg(unix)]
                 {
+                    // Taken here rather than before the merge so a lock
+                    // failure doesn't consume it: the index entries are gone
+                    // either way, but the catch-up push is independent of
+                    // them and there's no reason to lose both.
+                    //
+                    // Only refreshes queue a representative (see
+                    // `pending_catchup_representative`'s doc comment): a
+                    // store-only flush must not manufacture a catch-up push
+                    // for an arbitrary entry, since `finish_store` already
+                    // pushed that entry's own artifacts immediately -- that's
+                    // exactly the remote traffic this task exists to remove.
+                    let representative = self
+                        .pending_catchup_representative
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .take();
                     if let Some(representative) = representative {
                         let has_outputs = read_entry_meta(&self.paths, &representative.input_key)
                             .map(|meta| meta.has_outputs)
