@@ -74,6 +74,45 @@ jobs:
       - name: Test workspace
         run: cargo nextest run --workspace
 
+  rclone:
+    name: Shared Cache (rclone)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      - name: Install rclone
+        run: sudo apt-get update && sudo apt-get install -y rclone
+
+      # These tests exercise the real remote-sync path (blob/entry push and
+      # pull, rcd lifecycle) against rclone's built-in `:local:` filesystem
+      # remote, so no cloud credentials are needed. They're gated on
+      # `LUCHTA_TEST_RCLONE=1` and skipped everywhere else, which is exactly
+      # why CI needs to set it explicitly — nothing else does.
+      - name: Test shared cache remote sync (rclone)
+        run: LUCHTA_TEST_RCLONE=1 cargo nextest run -p luchta-cache
+
+      # Known pre-existing leak, not introduced by this change: the gated
+      # suite leaks roughly 6 `rclone rcd` daemons per run even on a clean
+      # pass (measured 0 -> 6 -> 12 -> 18 across three back-to-back local
+      # runs). Harmless here since GitHub-hosted runners are torn down after
+      # the job, but this best-effort cleanup keeps a self-hosted or reused
+      # runner from accumulating them silently.
+      - name: Clean up any leaked rclone daemons
+        if: always()
+        run: pkill -f 'rclone rcd' || true
+
   fmt:
     name: Format
     runs-on: ubuntu-latest

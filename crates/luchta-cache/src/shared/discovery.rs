@@ -30,7 +30,7 @@ pub const DEFAULT_SHARED_CACHE_DAY_WINDOW: usize = 3;
 
 /// Hard ceiling on `day_window`, applied by `bucket_keys_for` regardless of
 /// caller input. `day_window` reaches here straight from an env var
-/// (`LUCHTA_SHARED_CACHE_HISTORY`) with no upper-bound check of its own, and
+/// (`LUCHTA_SHARED_CACHE_DAYS`) with no upper-bound check of its own, and
 /// unlike the old discovery-based scheme — where an oversized value was inert,
 /// just a higher cap on top of a byte budget that did the real limiting — it
 /// now directly sizes a `Vec::with_capacity` allocation and multiplies into

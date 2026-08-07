@@ -1027,15 +1027,28 @@ Use `luchta logs --show-cache-nonce` to view the resolved nonce string persisted
 The shared build cache is a cross-worktree, cross-clone cache that restores task **outputs** and logs from prior builds. While the standard [Build Cache](#build-cache) is local to a single workspace, the shared cache allows developers and CI to reuse results across different checkouts of the same repository.
 
 #### Concept
-- **Commit-Keyed:** Results are indexed by git commit hash.
-- **Content-Addressed Blobs:** Build outputs are compressed and stored in a deduped blob store.
-- **Read Window:** On cache lookup, Luchta consults the last 20 commits (configurable) to find a match.
+- **Computed Keys, Not Discovered:** Shard keys are `<YYYYMMDD>-<shard>`, derived from the UTC wall clock and a fixed shard count — never listed or walked. The previous design indexed by git commit hash, discovered by walking first-parent ancestry from `HEAD`. That never matched across pull requests, because CI builds run on feature branches and ephemeral merge commits that no other build shares (GitHub #277).
+- **Input-Keyed Entries:** The cache key (`input_key`) folds in the task spec, environment, package-dependency versions, upstream task outputs, and the resolved content of the task's own inputs. Two branches that change a task's source differently land in distinct entries instead of racing for one shared slot — both stay cached and reusable, and reverting one back to the other's state is a hit, not a miss.
+- **Content-Addressed Blobs:** Build outputs are compressed and stored in a deduped blob store, addressed by `outputs_hash`.
+- **Read Window:** On cache lookup, Luchta fetches every shard from the last `LUCHTA_SHARED_CACHE_DAYS` UTC days (default 3) directly — `day_window * 6` key fetches, no object-store listing involved.
+- **Refresh on Hit:** A cache hit re-inserts its entry into today's shard (and, with remote sync on, re-pushes it), so a hot entry keeps getting a fresh day stamp instead of aging out of the read window on a fixed schedule.
 - **Remote Synchronization:** Opt-in synchronization with S3 or other object stores via `rclone`.
 
 #### Layout
-By default, the cache is stored at `~/.cache/luchta` (on Linux/macOS):
+By default, the cache is stored at `~/.cache/luchta` (on Linux/macOS), under three prefixes:
 - `blobs/<outputs_hash>.tar.zst` — Content-addressed compressed output archives.
-- `snapshots/<commit>/<shard_id>.bincode` — Metadata snapshots, stored as append-only content-addressed shards (zstd-compressed at rest; the `<shard_id>` is the BLAKE3 hash of the uncompressed bincode bytes).
+- `snapshots/<YYYYMMDD>-<shard>/<shard_id>.bincode` — Metadata index shards, one directory per UTC day and shard number (`00`-`05`), holding append-only content-addressed files (zstd-compressed at rest; `<shard_id>` is the BLAKE3 hash of the uncompressed bincode bytes) plus a `.merged` sidecar recording which files a compaction has subsumed.
+- `entries/<input_key>.bin` — Per-entry metadata (the run record, captured stdout/stderr, and reports), keyed by the BLAKE3 hash of `input_key`. Split out from the outputs blob (GitHub #278) because every task with no outputs shares the same `outputs_hash`, and bundling meta into that blob meant they all collided on one object.
+
+The date baked into each `snapshots/` directory name makes lifecycle rules straightforward to write: target `snapshots/<date>-*` prefixes for a given cutoff directly, no need to inspect individual object ages. `blobs/` and `entries/` have no date in their keys, so expire those by object age instead — matching `LUCHTA_SHARED_CACHE_GC_DAYS` keeps remote retention roughly in step with local GC.
+
+**Shard count is fixed, not configurable.** Six shards per day (`SHARED_CACHE_SHARD_COUNT`) is a wire-compatibility constant: the read set is exactly `day_window * 6` keys, computed independently on every machine. A machine writing with a higher shard count would put entries in shard numbers a machine reading with a lower count never asks for, and that loss is silent — no error, just a quieter cache. Decreasing the shard count fleet-wide is safe (the old, now-unreachable high-numbered shards just age out via GC); increasing it is not, unless every machine changes at once. That asymmetry is why it isn't exposed as an env var.
+
+**Day window is safely tunable per machine.** Unlike the shard count, `LUCHTA_SHARED_CACHE_DAYS` only changes how far back one machine looks; it can't desynchronize writers from readers. Raise it to widen the lookback for a slow-moving repo, or lower it to cut down on shard fetches per build.
+
+#### One-time cache reset on upgrade
+
+Both the shard key format and the entry key derivation changed in this design. `<YYYYMMDD>-<shard>` replaces the old `<commit>` (and, briefly, `<unix_ms>-<nonce>`) discovery scheme, and `entries/<input_key>.bin` is a prefix that didn't exist before. There is no dual-read path: nothing will ever ask for an old `snapshots/<commit>/` directory or an old-format `entries/` object again. The first build against a cache that predates this change misses every prior entry and rebuilds from scratch; results accumulate under the new keys from that point on. This is deliberate and one-time — acceptable because nothing had shipped yet on the old scheme. The stale objects aren't cleaned up proactively; they age out through the same GC as everything else (`LUCHTA_SHARED_CACHE_GC_DAYS` locally, your S3 lifecycle rules remotely).
 
 #### Configuration (Environment Variables)
 The shared cache is **OPT-IN** and is configured exclusively via environment variables:
@@ -1048,7 +1061,7 @@ The shared cache is **OPT-IN** and is configured exclusively via environment var
 - `LUCHTA_SHARED_CACHE_SYNC_TIMEOUT` — Maximum seconds for the initial remote sync. Default: `30`.
 - `LUCHTA_SHARED_CACHE_GC_DAYS` — Retention period for local cache entries. Default: `14`.
 - `LUCHTA_SHARED_CACHE_MAX_OUTPUT_MB` — Maximum size for a single task's output to be cached. Default: `250`.
-- `LUCHTA_SHARED_CACHE_HISTORY` — Number of recent commits to check for snapshots. Default: `20`.
+- `LUCHTA_SHARED_CACHE_DAYS` — Number of UTC days of shard history to read. Default: `3`. Deprecated alias `LUCHTA_SHARED_CACHE_HISTORY` (which counted commits, not days) is still read for one release; setting it prints a deprecation warning, and if both are set, `LUCHTA_SHARED_CACHE_DAYS` wins.
 
 Invalid numeric values will trigger a warning and fall back to their defaults.
 
@@ -1067,8 +1080,8 @@ Luchta can synchronize the shared cache with a remote object store (like S3, GCS
 1. **Setup:** Run `rclone config` to create and name a remote (e.g., `my-s3`).
 2. **Enable:** Set `LUCHTA_SHARED_CACHE=rclone:<remote-name>:<bucket>/<prefix>`.
    - Example: `rclone:my-s3:my-bucket/luchta-cache`.
-   - Luchta appends `blobs/` and `snapshots/` beneath this base, so a dedicated
-     bucket or prefix is recommended.
+   - Luchta appends `blobs/`, `snapshots/`, and `entries/` beneath this base,
+     so a dedicated bucket or prefix is recommended.
    - For S3 (and other bucket-based backends) you **must** include the bucket
      name — pointing at the bare remote root (`rclone:my-s3`) is not a valid
      write target.
@@ -1077,7 +1090,7 @@ Luchta can synchronize the shared cache with a remote object store (like S3, GCS
 **Resilience & Performance:**
 - **Build Safety:** Remote cache problems (timeouts or rclone errors) never fail a build. If an error occurs, Luchta issues a warning, disables the remote cache for the rest of the run, and continues using only the local cache.
 - **No CAS Required:** Snapshots are stored as append-only content-addressed shards, eliminating the need for complex "Compare-and-Swap" operations on the remote store.
-- **Garbage Collection:** Remote GC is not managed by Luchta. Use S3 bucket lifecycle rules or similar object store features to expire old objects.
+- **Garbage Collection:** Remote GC is not managed by Luchta. Use S3 bucket lifecycle rules or similar object store features to expire old objects under all three prefixes — `blobs/`, `snapshots/`, *and* `entries/`. Leaving `entries/` out of those rules lets it grow without bound, since nothing else ever deletes those objects remotely.
 
 #### Cacheability
 A task is eligible for the shared cache if all the following are true:
@@ -1085,10 +1098,11 @@ A task is eligible for the shared cache if all the following are true:
 - It took at least 100ms to run.
 - Its total output size is within the `LUCHTA_SHARED_CACHE_MAX_OUTPUT_MB` limit.
 - All its outputs are contained within its own package directory (outputs escaping the repository root are a hard error).
-- The working tree is "clean" (bare `<commit>` key) or "dirty" (staged or unstaged changes to tracked files; ignored files don't count). Both clean and dirty entries are reusable (content-validated on restore), though dirty entries are kept out of any future remote sync.
+
+The working tree's git status plays no part in eligibility: uncommitted changes are simply reflected in the resolved input hash that makes up part of `input_key`, so a dirty and a clean build of the same task land in distinct, independently cacheable entries rather than one being excluded.
 
 #### Maintenance
-Luchta automatically performs throttled garbage collection of old local cache entries and blobs (those older than `LUCHTA_SHARED_CACHE_GC_DAYS`). The cache is read-tolerant; if a blob is missing due to GC or other reasons, it is treated as a cache miss.
+Luchta automatically performs throttled garbage collection of old local cache entries, snapshot shards, and blobs (those older than `LUCHTA_SHARED_CACHE_GC_DAYS`). The cache is read-tolerant; if a blob or entry is missing due to GC or other reasons, it is treated as a cache miss.
 
 #### Stats
 Shared cache hits are shown in the build summary: `📥 <n>`.
