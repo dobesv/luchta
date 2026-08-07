@@ -72,7 +72,7 @@ jobs:
           tool: cargo-nextest
 
       - name: Test workspace
-        run: cargo nextest run --workspace
+        run: cargo nextest run --workspace --no-fail-fast
 
   rclone:
     name: Shared Cache (rclone)

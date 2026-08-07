@@ -184,8 +184,9 @@ impl RemoteSync {
 
     /// Flip the run-wide disable flag from a typed rclone error and warn once.
     ///
-    /// A `404` (object/directory not found) is a normal cache MISS — the commit
-    /// simply has no remote shards/blob yet — and must NOT disable the remote.
+    /// A `404` (object/directory not found) is a normal cache MISS — the
+    /// bucket simply has no remote shards/blob yet — and must NOT disable
+    /// the remote.
     /// Only genuine health failures (timeout, unavailable, process/request
     /// errors, other HTTP statuses) trip the run-wide disable flag.
     fn record_remote_error(&self, err: &rclone::RcloneError) {

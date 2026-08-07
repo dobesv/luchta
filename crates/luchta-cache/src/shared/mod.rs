@@ -147,7 +147,7 @@ pub enum StoreOutcome {
     SkippedCrossPackage,
     /// Skipped: shared snapshot merge could not take lock or write snapshot metadata.
     SkippedLockUnavailable,
-    /// Skipped: shared cache disabled (no write commit key).
+    /// Skipped: shared cache disabled (no write bucket key).
     Disabled,
 }
 
@@ -379,7 +379,7 @@ impl SharedCache {
     /// There is at most one candidate per input_key: `stage_entry` resolves
     /// everything (record, outputs_hash, stdout/stderr) from the single
     /// `entries/<input_key>` object, so trying a different `SnapshotEntry` for
-    /// the same input_key across commits can never produce a different
+    /// the same input_key across buckets can never produce a different
     /// result. A blob that's been GC'd is a rebuild, not a fallback.
     pub fn try_restore_candidates(
         &self,
@@ -642,7 +642,7 @@ impl SharedCache {
         });
     }
 
-    /// Pull (if remote-enabled) and merge a single commit's snapshot into the index.
+    /// Pull (if remote-enabled) and merge a single bucket's snapshot into the index.
     fn load_commit_into_index(
         &self,
         merged: &mut MergedIndex,
