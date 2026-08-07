@@ -97,13 +97,17 @@ jobs:
       # it starts — it predates unix-socket support for `--rc-addr`, which is
       # how Luchta talks to it — and all 17 remote-sync tests fail. 1.74.3 is
       # the version this code was developed and live-probed against.
+      # The version lives in a shell variable, deliberately not a job-level
+      # `env:` entry. rclone maps `RCLONE_<FLAG>` environment variables onto
+      # its own flags, so an `RCLONE_VERSION` env var is read as the boolean
+      # `--version` flag and every rclone invocation dies with
+      # `strconv.ParseBool: parsing "v1.74.3"`. Don't "tidy" this into `env:`.
       - name: Install rclone
-        env:
-          RCLONE_VERSION: v1.74.3
         run: |
-          curl -fsSL "https://downloads.rclone.org/${RCLONE_VERSION}/rclone-${RCLONE_VERSION}-linux-amd64.zip" -o /tmp/rclone.zip
+          version=v1.74.3
+          curl -fsSL "https://downloads.rclone.org/${version}/rclone-${version}-linux-amd64.zip" -o /tmp/rclone.zip
           unzip -q /tmp/rclone.zip -d /tmp
-          sudo install -m 755 "/tmp/rclone-${RCLONE_VERSION}-linux-amd64/rclone" /usr/local/bin/rclone
+          sudo install -m 755 "/tmp/rclone-${version}-linux-amd64/rclone" /usr/local/bin/rclone
           rclone version
 
       # These tests exercise the real remote-sync path (blob/entry push and
