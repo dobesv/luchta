@@ -193,6 +193,19 @@ pub struct SharedCache {
     /// day contributes `SHARED_CACHE_SHARD_COUNT` bucket keys, so the read set
     /// has exactly `day_window * SHARED_CACHE_SHARD_COUNT` keys — computed,
     /// not discovered.
+    ///
+    /// Clamped to at least `discovery::MIN_SHARED_CACHE_DAY_WINDOW` (2) at
+    /// construction, not left to the caller: `write_bucket_key` is computed
+    /// once, at `open()`, but the read set is recomputed fresh on every
+    /// `candidate_keys()` call (including the first `build_index()`, which
+    /// can run arbitrarily later). If a UTC midnight falls in between, the
+    /// write key is *yesterday's* date — still inside the read set only
+    /// because the window covers at least two days. A `day_window` of 1
+    /// (or, without this clamp, 0 — reachable through this library's own
+    /// `open()`/`open_with_cache_dir()`/`open_with_remote()`, which take a
+    /// bare `usize` with no floor of their own; only the CLI's env parsing
+    /// guards against it) would make that midnight race silently drop the
+    /// process's own just-stored entries from its own later restores.
     day_window: usize,
     /// Snapshot store for merge_entry.
     snapshot_store: SnapshotStore,
@@ -307,7 +320,7 @@ impl SharedCache {
         Some(Self {
             paths,
             write_bucket_key,
-            day_window,
+            day_window: day_window.max(discovery::MIN_SHARED_CACHE_DAY_WINDOW),
             snapshot_store,
             #[cfg(unix)]
             remote,
@@ -335,7 +348,7 @@ impl SharedCache {
         Some(Self {
             paths: Arc::new(paths),
             write_bucket_key,
-            day_window,
+            day_window: day_window.max(discovery::MIN_SHARED_CACHE_DAY_WINDOW),
             snapshot_store,
             #[cfg(unix)]
             remote: None,
@@ -872,7 +885,8 @@ impl SharedCache {
     /// no ranking. The read set is exactly `bucket_keys_for(now, day_window)`
     /// — `day_window * SHARED_CACHE_SHARD_COUNT` keys, always. `write_bucket_key`
     /// is always inside this set by construction (it's today's date, and
-    /// today's shards are always in the window), so unlike the old
+    /// today's shards are always in the window — see the `day_window` field
+    /// doc for why that needs a floor of 2, not 1), so unlike the old
     /// discovery-based scheme there's no need to special-case injecting the
     /// write key: see `discovery::tests::write_bucket_is_always_inside_the_read_set`.
     #[must_use]
@@ -2256,5 +2270,35 @@ mod tests {
                 .is_some(),
             "entry from the second run must be discoverable"
         );
+    }
+
+    #[test]
+    fn day_window_is_clamped_to_a_floor_of_two_at_construction() {
+        // A `day_window` of 0 or 1 would let a UTC-midnight race between
+        // `write_bucket_key`'s computation (at `open()`) and the first
+        // `candidate_keys()` call put the write key outside the read
+        // window. `open()`/`open_with_cache_dir()`/`open_with_remote()` take
+        // a bare `usize` with no floor of their own -- only the CLI's env
+        // parsing guards against 0 -- so the clamp has to live here.
+        let temp_repo = TempDir::new().unwrap();
+        setup_git_repo(temp_repo.path());
+        create_commit(temp_repo.path());
+        let temp_cache = TempDir::new().unwrap();
+
+        for requested in [0, 1] {
+            let cache = SharedCache::open_with_cache_dir(
+                temp_repo.path(),
+                1_000_000,
+                requested,
+                Some(temp_cache.path()),
+            )
+            .unwrap();
+            assert_eq!(
+                cache.candidate_keys().len(),
+                discovery::MIN_SHARED_CACHE_DAY_WINDOW * SHARED_CACHE_SHARD_COUNT,
+                "day_window={requested} should be clamped up to the floor of {}",
+                discovery::MIN_SHARED_CACHE_DAY_WINDOW
+            );
+        }
     }
 }
