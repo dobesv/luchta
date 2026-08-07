@@ -162,10 +162,15 @@ impl SnapshotStore {
         self.load_merged_snapshot_from_shards(shard_key, shards)
     }
 
+    /// Single-entry convenience wrapper over `merge_entries_with_outcome`,
+    /// kept for tests. No production caller left since the store-side merge
+    /// moved into `SharedCache::flush_pending_entries`, which always batches.
     pub fn merge_entry(&self, shard_key: &str, entry: SnapshotEntry) -> MergeResult {
         self.merge_entry_with_outcome(shard_key, entry).result
     }
 
+    /// Single-entry convenience wrapper over `merge_entries_with_outcome`,
+    /// kept for tests — see `merge_entry`.
     pub fn merge_entry_with_outcome(
         &self,
         shard_key: &str,

@@ -2206,7 +2206,14 @@ mod tests {
         // exactly the runs where the cache works best, saturating the rclone
         // daemon and tripping its timeout-disable circuit breaker. Batching
         // must collapse any number of hits in one run into exactly one
-        // push -- proven here with two hits for two distinct keys.
+        // push -- shown here with two hits for two distinct keys.
+        //
+        // The discriminating assertion is the pre-flush emptiness check
+        // below, not the post-flush `assert_snapshot_shard_count(&files, 1, 1)`:
+        // `push_index_merge` deletes each subsumed shard from the remote, so
+        // two eager per-hit pushes also settle at one shard. Same reasoning as
+        // `store_pushes_artifacts_immediately_but_defers_the_index_push_to_flush`
+        // and its local counterpart in `mod.rs`.
         let harness = RemoteHarness::new("console.log('flush-collapse');\n");
         let cache = harness.cache();
 
@@ -2377,6 +2384,7 @@ mod tests {
     #[test]
     fn entry_artifacts_and_index_push_are_independently_dispatchable() {
         if !should_run_rclone_test() {
+            eprintln!("skipping rclone-gated split-push-dispatch test; rclone not on PATH or LUCHTA_TEST_RCLONE disabled");
             return;
         }
 
@@ -2390,11 +2398,15 @@ mod tests {
         // `cache.store()`: as of the batching change, `finish_store` only
         // ever enqueues the artifact half itself (the index half is deferred
         // to `flush_pending_entries`), so a `store()`-driven test couldn't
-        // exercise the index half of this dispatch at all. Enqueuing only
-        // the artifact half here still pins the point of this test: it
-        // doesn't compile against the old fused `OwnedPushArtifacts` (which
-        // required a `merge` field), and it would leave a snapshot behind if
-        // the halves secretly shared state.
+        // exercise the index half of this dispatch at all.
+        //
+        // Half the point of this test is compile-time: this
+        // `OwnedEntryArtifacts` literal does not compile against the old
+        // fused `OwnedPushArtifacts`, which required a `merge` field. The
+        // runtime assertions below are the weaker half -- they would also
+        // hold for the old fused struct handed a no-op merge -- so read them
+        // as "the halves don't secretly share state", not as proof the struct
+        // was split.
         crate::shared::write_entry_meta(
             cache.paths(),
             &input_key,
@@ -2435,6 +2447,80 @@ mod tests {
         assert!(
             !snapshots.exists() || snapshots.read_dir().unwrap().count() == 0,
             "the index half must not run when only artifacts were enqueued"
+        );
+    }
+
+    #[test]
+    fn a_store_only_flush_pushes_no_catchup_entry_artifacts() {
+        if !should_run_rclone_test() {
+            eprintln!("skipping rclone-gated store-only catch-up test; rclone not on PATH or LUCHTA_TEST_RCLONE disabled");
+            return;
+        }
+
+        // A store already pushed its own blob and entry meta in
+        // `finish_store`, so the flush has nothing to catch up for it --
+        // only a refreshed entry, whose artifacts may have been pushed by an
+        // earlier run on another machine, queues a catch-up representative.
+        // A store-only flush that picked an arbitrary pending entry as the
+        // representative would re-push artifacts it just pushed: pointless
+        // remote traffic on exactly the path batching exists to make cheaper.
+        //
+        // Observed from the remote rather than from
+        // `pending_catchup_representative`: deleting the remote entry-meta
+        // object first makes the catch-up push, if it happens, restore the
+        // file. Asserting the private field instead stays green under the
+        // pre-batching `entries.first().cloned()` representative, because
+        // that never touched the field.
+        let harness = RemoteHarness::new("console.log('store-only-catchup');\n");
+        let cache = harness.cache();
+        let input_key = derive_input_key([61; 32], [62; 32], [63; 32], [64; 32], [65; 32]);
+        let outputs_hash = [0x5a; 32];
+
+        let outcome = cache
+            .store(
+                "pkg#build",
+                &input_key,
+                &outputs_hash,
+                &harness.package_dir,
+                &[PathBuf::from("dist/main.js")],
+                &sample_record(true, 300),
+                b"stdout-store-only",
+                b"stderr-store-only",
+                &[],
+                harness.temp_repo.path(),
+            )
+            .unwrap();
+        assert_eq!(outcome, StoreOutcome::Stored);
+
+        // Drain the artifact push `finish_store` enqueued, so the remote
+        // entry-meta object exists to be deleted.
+        cache.flush_push_queue();
+        let remote_entry = harness
+            .remote_root
+            .path()
+            .join("entries")
+            .join(format!("{}.bin", hex_hash(input_key)));
+        assert!(
+            remote_entry.exists(),
+            "store() must push its own entry meta immediately, before any flush"
+        );
+        fs::remove_file(&remote_entry).unwrap();
+
+        cache.flush_pending_entries();
+        cache.flush_push_queue();
+
+        assert!(
+            !remote_entry.exists(),
+            "a store-only flush must not push catch-up entry artifacts; the deleted \
+             entry meta was re-uploaded, so the flush picked a representative it \
+             should not have"
+        );
+        // The index push itself still has to happen -- this test must fail
+        // for the catch-up push, not because the flush did nothing at all.
+        let write_key = cache.write_bucket_key().expect("write key").to_string();
+        assert!(
+            !remote_snapshot_files(harness.remote_root.path(), &write_key).is_empty(),
+            "the flush must still push the merged index shard"
         );
     }
 }

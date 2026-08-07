@@ -2366,15 +2366,24 @@ pub(crate) fn run_cycle<'a>(
         )
         .await;
 
-        // All tasks for this cycle have finished (successfully, with
-        // failures, or cancelled) -- flush this cycle's pending shared-cache
-        // entries now, in one batched merge and push, rather than one merge
-        // and push per store or per cache-hit refresh as tasks completed.
-        // See `SharedCache::flush_pending_entries`'s doc comment for why
+        // Flush this cycle's pending shared-cache entries in one batched
+        // merge and push, rather than one merge and push per store or per
+        // cache-hit refresh as tasks completed. See
+        // `SharedCache::flush_pending_entries`'s doc comment for why
         // per-store/per-hit pushing self-defeats the feature. Not hooked via
         // `Drop`: ordering relative to unwinding/cancellation would be
         // fragile, and this needs to run exactly once per cycle regardless
         // of outcome, which an explicit call site guarantees.
+        //
+        // This covers every task that completed before this point, which on
+        // the normal path is all of them. On the SIGINT/SIGTERM path and on
+        // watch-mode cancellation it is not: `run_dispatch_with_cancel`
+        // returns while detached task futures are still in flight, and the
+        // walker drain and worker kill happen below in
+        // `finalize_and_report`, after this flush. A task that finishes just
+        // after this line records into `pending_entries` and is dropped
+        // un-merged, costing a re-run of that one task next time. The
+        // `SharedCache::drop` log is what makes that visible.
         if let Some(shared_cache) = &resources.shared_cache {
             shared_cache.flush_pending_entries();
         }
