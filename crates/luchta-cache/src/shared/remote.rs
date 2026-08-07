@@ -894,6 +894,10 @@ mod tests {
                 harness.temp_repo.path(),
             )
             .unwrap();
+        // The index merge/push is deferred to the end-of-run flush; a
+        // caller of this helper expects a fully "landed" remote store, same
+        // as before batching, so simulate the run ending here.
+        cache.flush_pending_entries();
         cache.flush_push_queue();
         assert!(matches!(outcome, StoreOutcome::Stored));
         StoredRemoteCase {
@@ -1662,8 +1666,13 @@ mod tests {
                 .unwrap()
                 .count()
                 > 0,
-            "entry meta should be uploaded"
+            "entry meta should be uploaded immediately, before any index flush"
         );
+
+        // The index merge/push is deferred to the end-of-run flush -- machine
+        // B's restore below needs it, so simulate machine A's run ending.
+        cache_a.flush_pending_entries();
+        cache_a.flush_push_queue();
 
         // Same remote, fresh local cache: stands in for a second machine.
         let cache_b = open_cache_with_remote(repo.path(), machine_b_cache.path(), &remote);
@@ -1914,6 +1923,9 @@ mod tests {
                 harness.temp_repo.path(),
             )
             .unwrap();
+        // The index merge (and the compaction it drives) is deferred to the
+        // end-of-run flush.
+        cache.flush_pending_entries();
         cache.flush_push_queue();
         assert!(matches!(outcome, StoreOutcome::Stored));
         drop(seed_cache);
@@ -2112,7 +2124,7 @@ mod tests {
         // A real hit always has a locally-readable meta object before
         // `refresh_entry` is ever called -- `try_restore_candidates` requires
         // `read_entry_meta` to succeed to produce a candidate at all -- so
-        // seed one here for `flush_refreshes` to read `has_outputs` from.
+        // seed one here for `flush_pending_entries` to read `has_outputs` from.
         let record_bytes = bincode::serde::encode_to_vec(
             sample_record(true, 200),
             crate::serialization::bincode_config(),
@@ -2148,7 +2160,7 @@ mod tests {
 
         // `refresh_entry` only records the entry and touches its local
         // mtime -- nothing reaches the remote (or even the local index)
-        // until `flush_refreshes` runs.
+        // until `flush_pending_entries` runs.
         cache.refresh_entry(&input_key, &entry);
         cache.flush_push_queue();
         let write_key = cache.write_bucket_key().unwrap().to_string();
@@ -2160,15 +2172,15 @@ mod tests {
         // Nothing has been merged into today's write bucket yet, so this
         // flush is the day's first hit that adds the key: the merge outcome
         // is `Inserted`, which is exactly the case that must trigger a real
-        // remote push (see `flush_refreshes`'s doc comment for why
+        // remote push (see `flush_pending_entries`'s doc comment for why
         // `IdempotentNoop`/`ConflictKeptExisting` push at most the entry
         // meta/blob, not a fresh snapshot shard).
-        cache.flush_refreshes();
+        cache.flush_pending_entries();
         cache.flush_push_queue();
 
         assert!(
             !remote_snapshot_files(harness.remote_root.path(), &write_key).is_empty(),
-            "flush_refreshes must push the merged snapshot shard to the remote, \
+            "flush_pending_entries must push the merged snapshot shard to the remote, \
              not just merge it into the local index"
         );
         assert!(
@@ -2178,7 +2190,7 @@ mod tests {
                 .join("entries")
                 .join(format!("{}.bin", hex_hash(input_key)))
                 .exists(),
-            "flush_refreshes must push the entry meta object to the remote too"
+            "flush_pending_entries must push the entry meta object to the remote too"
         );
     }
 
@@ -2257,7 +2269,7 @@ mod tests {
             "two hits with no flush yet must not have reached the remote"
         );
 
-        cache.flush_refreshes();
+        cache.flush_pending_entries();
         cache.flush_push_queue();
 
         let files = remote_snapshot_files(harness.remote_root.path(), &write_key);
@@ -2283,6 +2295,68 @@ mod tests {
                 "both hits' entries must be present in the one pushed shard"
             );
         }
+    }
+
+    #[test]
+    fn store_pushes_artifacts_immediately_but_defers_the_index_push_to_flush() {
+        if !should_run_rclone_test() {
+            eprintln!("skipping rclone-gated store-defers-index-push test; rclone not on PATH or LUCHTA_TEST_RCLONE disabled");
+            return;
+        }
+
+        // The invariant most at risk from batching the index merge out of
+        // `store()`: a restore on another machine must be able to find a
+        // store's blob/entry-meta artifacts whether or not this run's index
+        // push has happened. Proven here directly against the remote, with
+        // no `flush_pending_entries` call before the artifact assertions.
+        let harness = RemoteHarness::new("console.log('defer');\n");
+        let cache = harness.cache();
+        let input_key = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32], [5; 32]);
+        let outputs_hash = [0x99; 32];
+
+        let outcome = cache
+            .store(
+                "pkg#build",
+                &input_key,
+                &outputs_hash,
+                &harness.package_dir,
+                &[PathBuf::from("dist/main.js")],
+                &sample_record(true, 300),
+                b"stdout-defer",
+                b"stderr-defer",
+                &[],
+                harness.temp_repo.path(),
+            )
+            .unwrap();
+        assert_eq!(outcome, StoreOutcome::Stored);
+        cache.flush_push_queue();
+
+        assert_remote_has_blob(harness.remote_root.path(), &outputs_hash);
+        assert!(
+            harness
+                .remote_root
+                .path()
+                .join("entries")
+                .read_dir()
+                .unwrap()
+                .count()
+                > 0,
+            "entry meta must reach the remote immediately, before any index flush"
+        );
+
+        let write_key = cache.write_bucket_key().expect("write key").to_string();
+        assert!(
+            remote_snapshot_files(harness.remote_root.path(), &write_key).is_empty(),
+            "the index merge must not reach the remote until flush_pending_entries runs"
+        );
+
+        cache.flush_pending_entries();
+        cache.flush_push_queue();
+
+        assert!(
+            !remote_snapshot_files(harness.remote_root.path(), &write_key).is_empty(),
+            "flush_pending_entries must push the merged snapshot shard for a stored entry too"
+        );
     }
 
     #[test]

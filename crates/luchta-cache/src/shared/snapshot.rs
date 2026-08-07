@@ -183,11 +183,12 @@ impl SnapshotStore {
     /// `merge_entry_with_outcome` is the `entries.len() == 1` case of this,
     /// not a separate code path.
     ///
-    /// Used by `SharedCache::flush_refreshes` to collapse a run's worth of
-    /// cache-hit refreshes into a single remote push instead of one push per
-    /// hit: pushing on every hit saturates the rclone daemon on exactly the
-    /// runs where the cache has the most hits, tripping the timeout-disable
-    /// circuit breaker and defeating the feature under its own success.
+    /// Used by `SharedCache::flush_pending_entries` to collapse a run's worth
+    /// of stores and cache-hit refreshes into a single remote push instead of
+    /// one push per store or hit: pushing on every store/hit saturates the
+    /// rclone daemon on exactly the runs where the cache is doing the most
+    /// work, tripping the timeout-disable circuit breaker and defeating the
+    /// feature under its own success.
     pub fn merge_entries_with_outcome(
         &self,
         shard_key: &str,

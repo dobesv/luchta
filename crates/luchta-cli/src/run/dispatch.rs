@@ -954,7 +954,6 @@ async fn write_run_record(
                     Ok(StoreOutcome::SkippedTooFast { duration_ms: _ }) => {}
                     Ok(StoreOutcome::SkippedTooLarge { bytes: _ }) => {}
                     Ok(StoreOutcome::SkippedCrossPackage) => {}
-                    Ok(StoreOutcome::SkippedLockUnavailable) => {}
                     Ok(StoreOutcome::Disabled) => {}
                     Err(e) => {
                         if e.kind() == std::io::ErrorKind::InvalidData {
