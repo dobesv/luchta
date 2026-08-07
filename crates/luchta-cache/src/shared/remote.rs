@@ -240,6 +240,13 @@ impl RemoteSync {
     ///
     /// Returns an empty list on any error — discovery then falls back to
     /// whatever local shard directories are already on disk.
+    ///
+    /// Unreferenced as of the switch to computed bucket keys: readers no
+    /// longer list the remote, they compute the exact keys they want and
+    /// fetch them directly. Kept in place rather than deleted here so the
+    /// diff that introduces computed buckets stays reviewable separately
+    /// from the deletion of what they replace. A later task removes it.
+    #[allow(dead_code)]
     pub(crate) fn list_shard_candidates(&self) -> Vec<ShardCandidate> {
         if self.is_disabled() {
             return Vec::new();
@@ -892,12 +899,11 @@ mod tests {
         }
 
         /// Builds a `SharedCache` pointed at this harness's remote and local
-        /// cache dir. Since Task 7, the cache writes to a session-generated
-        /// `<unix_ms>-<nonce>` shard key it picks for itself — there is no
-        /// longer any commit-derived key a test can predict up front, so
-        /// callers that need to know where a `store()` on this cache landed
-        /// must read it back via `write_commit_key()` (see `StoredRemoteCase::
-        /// shard_key`).
+        /// cache dir. The cache writes to a computed `<YYYYMMDD>-<shard>`
+        /// bucket key (today's date, a nonce-selected shard) — there is no
+        /// commit-derived key a test can predict up front, so callers that
+        /// need to know where a `store()` on this cache landed must read it
+        /// back via `write_bucket_key()` (see `StoredRemoteCase::shard_key`).
         fn cache(&self) -> SharedCache {
             open_cache_with_remote(self.temp_repo.path(), self.local_cache.path(), &self.remote)
         }
@@ -913,7 +919,7 @@ mod tests {
     impl StoredRemoteCase {
         /// The shard key `cache` actually wrote its entry to.
         fn shard_key(&self) -> &str {
-            self.cache.write_commit_key().expect("write key")
+            self.cache.write_bucket_key().expect("write key")
         }
     }
 
@@ -1335,7 +1341,7 @@ mod tests {
 
         let harness = RemoteHarness::new("console.log('guard');\n");
         let cache = harness.cache();
-        let shard_key = cache.write_commit_key().expect("write key").to_string();
+        let shard_key = cache.write_bucket_key().expect("write key").to_string();
         let (seed_cache, _merge1_id, merge2_id) = seed_remote_snapshot_entries(
             harness.temp_repo.path(),
             &shard_key,
@@ -1949,7 +1955,7 @@ mod tests {
         // cache picks its own write key at construction, so there is no
         // predictable key to seed ahead of time otherwise.
         let cache = harness.cache();
-        let shard_key = cache.write_commit_key().expect("write key").to_string();
+        let shard_key = cache.write_bucket_key().expect("write key").to_string();
         let (seed_cache, merge1_id, merge2_id) = seed_remote_snapshot_entries(
             harness.temp_repo.path(),
             &shard_key,

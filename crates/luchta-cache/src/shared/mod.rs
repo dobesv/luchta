@@ -18,8 +18,9 @@ pub use blob::{
     StagedRestore,
 };
 pub use discovery::{
-    current_session_shard_key, new_session_shard_key, rank_shard_candidates, ShardCandidate,
-    DEFAULT_SHARD_BYTE_BUDGET, DEFAULT_SHARD_MAX_AGE_MS,
+    bucket_key, bucket_keys_for, current_session_shard_key, new_session_shard_key,
+    rank_shard_candidates, write_bucket_key, ShardCandidate, DEFAULT_SHARD_BYTE_BUDGET,
+    DEFAULT_SHARD_MAX_AGE_MS, DEFAULT_SHARED_CACHE_DAY_WINDOW, SHARED_CACHE_SHARD_COUNT,
 };
 pub use entry_meta::{
     encode_entry_meta, entry_meta_path, read_entry_meta, write_entry_meta, EntryMeta,
@@ -185,15 +186,14 @@ impl MergedIndex {
 pub struct SharedCache {
     /// Resolved paths for the cache.
     paths: Arc<SharedCachePaths>,
-    /// Session shard key to write this process's entries under.
-    write_commit_key: Option<String>,
-    /// Hard upper bound on how many candidate shards `candidate_keys()`
-    /// returns, on top of the byte budget (see `DEFAULT_SHARD_BYTE_BUDGET`)
-    /// that `rank_shard_candidates` applies in the same pass.
-    ///
-    /// See `candidate_keys()` for why this isn't resolved into a fixed list at
-    /// `open()` time.
-    history_len: usize,
+    /// Bucket key this process writes its entries under: today's UTC date and
+    /// a nonce-selected shard (see `discovery::write_bucket_key`).
+    write_bucket_key: Option<String>,
+    /// Number of days of history `candidate_keys()` reads, newest first. Each
+    /// day contributes `SHARED_CACHE_SHARD_COUNT` bucket keys, so the read set
+    /// has exactly `day_window * SHARED_CACHE_SHARD_COUNT` keys — computed,
+    /// not discovered.
+    day_window: usize,
     /// Snapshot store for merge_entry.
     snapshot_store: SnapshotStore,
     /// Optional remote sync for on-demand restore pull.
@@ -249,13 +249,8 @@ impl SharedCache {
     /// Opens the shared cache for a repo.
     ///
     /// Returns `None` if the shared cache directory cannot be created.
-    pub fn open(repo_root: &Path, size_cap_bytes: u64, history_len: usize) -> Option<Self> {
-        Self::open_with_remote(
-            repo_root,
-            size_cap_bytes,
-            history_len,
-            OpenExtras::default(),
-        )
+    pub fn open(repo_root: &Path, size_cap_bytes: u64, day_window: usize) -> Option<Self> {
+        Self::open_with_remote(repo_root, size_cap_bytes, day_window, OpenExtras::default())
     }
 
     /// Opens the shared cache with an optional explicit cache directory.
@@ -265,13 +260,13 @@ impl SharedCache {
     pub fn open_with_cache_dir(
         repo_root: &Path,
         size_cap_bytes: u64,
-        history_len: usize,
+        day_window: usize,
         cache_dir: Option<&Path>,
     ) -> Option<Self> {
         Self::open_with_remote(
             repo_root,
             size_cap_bytes,
-            history_len,
+            day_window,
             OpenExtras {
                 cache_dir,
                 #[cfg(unix)]
@@ -284,7 +279,7 @@ impl SharedCache {
     pub fn open_with_remote(
         repo_root: &Path,
         size_cap_bytes: u64,
-        history_len: usize,
+        day_window: usize,
         extras: OpenExtras<'_>,
     ) -> Option<Self> {
         let _ = repo_root;
@@ -294,7 +289,7 @@ impl SharedCache {
             .unwrap_or_else(resolve_shared_cache_dir);
         let paths = Arc::new(open_shared_paths(&cache_path).ok()?);
 
-        let write_commit_key = Some(current_session_shard_key());
+        let write_bucket_key = Some(discovery::current_write_bucket_key());
 
         let snapshot_store = SnapshotStore::new((*paths).clone());
         #[cfg(unix)]
@@ -311,8 +306,8 @@ impl SharedCache {
 
         Some(Self {
             paths,
-            write_commit_key,
-            history_len,
+            write_bucket_key,
+            day_window,
             snapshot_store,
             #[cfg(unix)]
             remote,
@@ -329,18 +324,18 @@ impl SharedCache {
     pub fn from_parts_for_test(
         repo_root: &Path,
         size_cap_bytes: u64,
-        history_len: usize,
+        day_window: usize,
         snapshot_store: SnapshotStore,
     ) -> Option<Self> {
         let _ = repo_root;
         let paths = snapshot_store.paths().clone();
 
-        let write_commit_key = Some(current_session_shard_key());
+        let write_bucket_key = Some(discovery::current_write_bucket_key());
 
         Some(Self {
             paths: Arc::new(paths),
-            write_commit_key,
-            history_len,
+            write_bucket_key,
+            day_window,
             snapshot_store,
             #[cfg(unix)]
             remote: None,
@@ -506,22 +501,19 @@ impl SharedCache {
     }
 
     fn build_index(&self, #[cfg(unix)] remote: Option<&RemoteSync>) -> MergedIndex {
-        // Discovered fresh here, not cached from `open()`: entries this same
-        // process just wrote (its own write shard, or shards a test wrote
-        // directly) don't have a directory on disk until after `open()` runs,
-        // so discovery has to happen at first use, not eagerly at open time.
-        let (candidate_keys, candidates_since_last_rollup) = self.discover_candidates(
-            #[cfg(unix)]
-            remote,
-        );
+        // Computed, not discovered: entries this same process just wrote (its
+        // own write bucket, or a bucket a test wrote directly) always fall
+        // inside `candidate_keys()` by construction (see
+        // `discovery::write_bucket_key`), even before their directory exists
+        // on disk. So unlike the old discovery-based scheme, there's no
+        // ordering requirement between `open()` and this first build.
+        let candidate_keys = self.candidate_keys();
 
         #[cfg(unix)]
         self.pull_candidate_commits(remote, &candidate_keys);
 
         let mut merged = MergedIndex::new();
-
-        // Iterate in reverse order (oldest first) so that newest overwrites.
-        for commit_key in candidate_keys.iter().rev() {
+        for commit_key in &candidate_keys {
             self.load_commit_into_index(
                 &mut merged,
                 commit_key,
@@ -530,34 +522,24 @@ impl SharedCache {
             );
         }
 
-        self.maybe_write_rollup(&candidate_keys, candidates_since_last_rollup);
-
         merged
     }
 
     /// Roll the currently-discoverable shards into one merged shard.
     ///
-    /// Throttled independently of GC (see `gc::should_run_rollup`), so it
-    /// doesn't re-serialize the whole index on every store — only when the
-    /// 24h throttle window has elapsed, or `candidates_since_last_rollup`
-    /// exceeds `gc::rollup_pressure_threshold(self.history_len)` — and there
-    /// is more than one source shard to merge. The pressure trigger is what
-    /// keeps a burst of local churn from filling the shard-count `limit`
-    /// before a rollup ever gets a chance to fold an older shard in: the
-    /// threshold is derived from `self.history_len` so it sits below the
-    /// limit precisely so the rollup fires while there's still headroom, not
-    /// after the limit has already done the evicting — even when
-    /// `history_len` isn't the default (it's user-configurable via
-    /// `LUCHTA_SHARED_CACHE_HISTORY`). Runs on every platform: collapsing
-    /// many small local shards into one is useful even with no remote
-    /// configured. Pushing the result upstream is unix-only, like the rest
-    /// of remote sync, so that part is split into its own cfg-gated helper.
+    /// Unreferenced as of the switch to computed bucket keys: with a fixed,
+    /// small read set (`day_window * SHARED_CACHE_SHARD_COUNT` keys) there's
+    /// no unbounded shard sprawl for a rollup to bound. Kept in place rather
+    /// than deleted here so the diff that introduces computed buckets stays
+    /// reviewable separately from the deletion of what they replace (see the
+    /// module doc on `discovery`). A later task removes it.
+    #[allow(dead_code)]
     fn maybe_write_rollup(&self, keys: &[String], candidates_since_last_rollup: usize) {
         if keys.len() < 2
             || !gc::should_run_rollup(
                 &self.paths,
                 gc::DEFAULT_GC_THROTTLE,
-                self.history_len,
+                self.day_window,
                 candidates_since_last_rollup,
             )
         {
@@ -571,6 +553,7 @@ impl SharedCache {
     }
 
     #[cfg(unix)]
+    #[allow(dead_code)]
     fn maybe_push_rollup_upload(&self, rollup_key: String, upload: SnapshotUpload) {
         let Some(remote) = &self.remote else {
             return;
@@ -582,6 +565,7 @@ impl SharedCache {
     }
 
     #[cfg(not(unix))]
+    #[allow(dead_code)]
     fn maybe_push_rollup_upload(&self, _rollup_key: String, _upload: SnapshotUpload) {}
 
     #[cfg(unix)]
@@ -698,7 +682,7 @@ impl SharedCache {
     ///
     /// Stores:
     /// - Blob with meta files (.luchta-meta/{stdout.log,stderr.log,meta.bincode})
-    /// - Snapshot entry via merge_entry to write_commit_key
+    /// - Snapshot entry via merge_entry to write_bucket_key
     #[allow(clippy::too_many_arguments)]
     pub fn store(
         &self,
@@ -714,7 +698,7 @@ impl SharedCache {
         repo_root: &Path,
     ) -> io::Result<StoreOutcome> {
         // Check if cache is disabled (no write key).
-        let write_key = match &self.write_commit_key {
+        let write_key = match &self.write_bucket_key {
             Some(key) => key.clone(),
             None => return Ok(StoreOutcome::Disabled),
         };
@@ -876,111 +860,24 @@ impl SharedCache {
         }
     }
 
-    /// Returns the write commit key for this cache.
+    /// Returns the write bucket key for this cache.
     #[must_use]
-    pub fn write_commit_key(&self) -> Option<&str> {
-        self.write_commit_key.as_deref()
+    pub fn write_bucket_key(&self) -> Option<&str> {
+        self.write_bucket_key.as_deref()
     }
 
-    /// Discovers the candidate shard keys for this cache, newest-first.
+    /// Computes the candidate bucket keys for this cache, newest day first.
     ///
-    /// The method itself does a fresh directory listing (and, if a remote is
-    /// configured, a fresh remote listing) on every call, but its only
-    /// production caller is `build_index()`, which runs inside `self.index`'s
-    /// `OnceLock::get_or_init` — so in practice this resolves once per
-    /// process, on the first restore attempt. `store()` never invalidates
-    /// that `OnceLock`, so entries this process writes *after* its first
-    /// restore attempt are not picked up by later restores in the same
-    /// process; only a fresh `SharedCache` (a new process) sees them. This is
-    /// deliberately later than `open()`, not "live": it exists so that shards
-    /// seeded after `open()` — chiefly by tests, which often store before ever
-    /// calling `try_restore_candidates` — are still found.
-    ///
-    /// Remote-only shards (a shard written by another machine, with no local
-    /// directory) are merged in before ranking: local and remote candidates
-    /// are deduplicated by key and passed through the same
-    /// `rank_shard_candidates` call, so age filtering, the history-length
-    /// cap, and the byte budget all apply uniformly regardless of where a
-    /// shard was discovered.
-    ///
-    /// This process's own write shard is always included even if nothing has
-    /// been stored to it yet: its directory may not exist on disk at the time
-    /// of the first lookup (e.g. a restore attempted before any store), so it
-    /// can't be found by directory discovery alone. This is load-bearing for
-    /// `remote_unreachable_trips_disable_flag_and_build_continues`: with zero
-    /// local shards, the write key is the only candidate a remote-pull attempt
-    /// has to probe, and that probe is what trips the disable flag. Don't
-    /// drop it as a "no-op" without checking that test. It's injected after
-    /// ranking, not before: a freshly generated session key would otherwise be
-    /// age-filtered or truncated away by the history-length cap.
+    /// Computed, not discovered: no directory listing, no remote listing,
+    /// no ranking. The read set is exactly `bucket_keys_for(now, day_window)`
+    /// — `day_window * SHARED_CACHE_SHARD_COUNT` keys, always. `write_bucket_key`
+    /// is always inside this set by construction (it's today's date, and
+    /// today's shards are always in the window), so unlike the old
+    /// discovery-based scheme there's no need to special-case injecting the
+    /// write key: see `discovery::tests::write_bucket_is_always_inside_the_read_set`.
     #[must_use]
     pub fn candidate_keys(&self) -> Vec<String> {
-        self.discover_candidates(
-            #[cfg(unix)]
-            self.remote.as_ref(),
-        )
-        .0
-    }
-
-    /// Discovers and ranks candidate shard keys, alongside a count of how
-    /// many discovered candidates (before ranking/truncation) were modified
-    /// after the last rollup fired.
-    ///
-    /// That count is the shard-count-pressure signal `maybe_write_rollup`
-    /// uses to decide whether to fire a rollup early, independent of the 24h
-    /// throttle — see `gc::should_run_rollup`. It has to be computed here,
-    /// from the pre-ranking candidate set, rather than recomputed later from
-    /// the already-ranked `candidate_keys()`: by the time ranking has
-    /// truncated the list, an evicted candidate can no longer be counted
-    /// (and there's no reason to redo the local directory listing, or worse,
-    /// a second remote listing call, just to get it).
-    fn discover_candidates(
-        &self,
-        #[cfg(unix)] remote: Option<&RemoteSync>,
-    ) -> (Vec<String>, usize) {
-        #[cfg_attr(not(unix), allow(unused_mut))]
-        let mut candidates = discovery::local_shard_candidates_for(&self.paths);
-
-        // Remote-only shards are the whole point of #277: a shard written by
-        // another machine has no local directory to discover.
-        #[cfg(unix)]
-        if let Some(remote) = remote {
-            let known: HashSet<&str> = candidates.iter().map(|c| c.key.as_str()).collect();
-            let extra: Vec<ShardCandidate> = remote
-                .list_shard_candidates()
-                .into_iter()
-                .filter(|c| !known.contains(c.key.as_str()))
-                .collect();
-            candidates.extend(extra);
-        }
-
-        let rollup_marker_unix_ms = gc::rollup_marker_modified_unix_ms(&self.paths);
-        let candidates_since_last_rollup = candidates
-            .iter()
-            .filter(|candidate| match rollup_marker_unix_ms {
-                Some(since) => candidate.modified_unix_ms > since,
-                None => true,
-            })
-            .count();
-
-        let now_unix_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|elapsed| elapsed.as_millis() as u64)
-            .unwrap_or(0);
-        let mut keys = rank_shard_candidates(
-            candidates,
-            self.history_len,
-            DEFAULT_SHARD_BYTE_BUDGET,
-            Some(DEFAULT_SHARD_MAX_AGE_MS),
-            now_unix_ms,
-        );
-
-        if let Some(write_key) = &self.write_commit_key {
-            if !keys.iter().any(|key| key == write_key) {
-                keys.insert(0, write_key.clone());
-            }
-        }
-        (keys, candidates_since_last_rollup)
+        discovery::bucket_keys_for(discovery::now_unix_ms(), self.day_window)
     }
 }
 
@@ -1479,7 +1376,7 @@ mod tests {
         // `move_non_meta_files` filters `.luchta-meta` out on commit.
         let temp_repo = TempDir::new().unwrap();
         setup_git_repo(temp_repo.path());
-        let commit = create_commit(temp_repo.path());
+        create_commit(temp_repo.path());
 
         let temp_cache = TempDir::new().unwrap();
         let cache = SharedCache::open_with_cache_dir(
@@ -1509,7 +1406,12 @@ mod tests {
             cached_at_unix_ms: 1_000_000_000_000,
             tool_version: None,
         };
-        cache.snapshot_store.merge_entry(&commit, entry);
+        // Must land in a computed bucket key, not an arbitrary string (e.g. a
+        // git commit hash): `candidate_keys()` only ever asks for keys
+        // `bucket_keys_for` computes, so anything else is never read back.
+        // `write_bucket_key()` is guaranteed to be one of them by construction.
+        let write_key = cache.write_bucket_key().unwrap().to_string();
+        cache.snapshot_store.merge_entry(&write_key, entry);
 
         // Legacy blob: meta embedded via write_blob_with_meta (pre-Task-2 format).
         let meta = MetaFiles {
@@ -1584,16 +1486,24 @@ mod tests {
 
         let temp_repo = TempDir::new().unwrap();
         setup_git_repo(temp_repo.path());
-        let commit1 = create_commit(temp_repo.path());
-        let commit2 = create_commit(temp_repo.path());
+        create_commit(temp_repo.path());
         let temp_cache = TempDir::new().unwrap();
         let snapshot_dir = temp_cache.path().join("snapshots");
         let input_key1 = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32]);
         let input_key2 = derive_input_key([5; 32], [6; 32], [7; 32], [8; 32]);
 
+        // Keys must be valid computed bucket keys (`<YYYYMMDD>-<shard>`), not
+        // arbitrary strings: `candidate_keys()` no longer discovers whatever
+        // directories happen to exist under `snapshots/`, it only ever asks
+        // for the keys `bucket_keys_for` computes. Two different shards of
+        // "today" both fall inside the default read window.
+        let now = discovery::now_unix_ms();
+        let bucket1 = discovery::bucket_key(now, 0);
+        let bucket2 = discovery::bucket_key(now, 1);
+
         write_snapshot_fixture(
             &snapshot_dir,
-            &commit1,
+            &bucket1,
             SnapshotEntry {
                 task_id: "pkg#build".to_string(),
                 input_key: input_key1,
@@ -1609,7 +1519,7 @@ mod tests {
         );
         write_snapshot_fixture(
             &snapshot_dir,
-            &commit2,
+            &bucket2,
             SnapshotEntry {
                 task_id: "pkg#build".to_string(),
                 input_key: input_key2,
@@ -1625,12 +1535,10 @@ mod tests {
         );
 
         let paths = open_shared_paths(temp_cache.path()).unwrap();
-        // Pre-stamp the rollup throttle so `build_index`'s own rollup pass
-        // doesn't fire during this test and re-read both fixtures a second
-        // time on top of the load this test is counting. Rollup re-reads are
-        // covered on their own in `snapshot::tests`; this test is only about
-        // proving the merged index isn't rebuilt per restore call.
-        let _ = gc::should_run_rollup(&paths, std::time::Duration::from_secs(3600), 10, 0);
+        // No rollup pre-stamp needed here: `build_index` no longer runs a
+        // rollup pass at all under computed bucket keys (see
+        // `maybe_write_rollup`'s doc), so there's nothing that would re-read
+        // either fixture a second time on top of the load this test counts.
         let (snapshot_store, load_counter) = SnapshotStore::new_with_counter(paths);
         let cache =
             SharedCache::from_parts_for_test(temp_repo.path(), 1_000_000, 10, snapshot_store)
@@ -1770,6 +1678,18 @@ mod tests {
         // enough newer, tiny local shards to exceed the shard-count `limit`
         // on their own. Without the pressure trigger, the count cap alone
         // would evict the pack before any rollup got a chance to fold it in.
+        //
+        // Still passes under computed bucket keys, but no longer for the
+        // reason described above: `build_index` no longer calls
+        // `maybe_write_rollup` at all (see its doc), so no rollup ever fires
+        // here. The assertion holds instead because every write in this test
+        // happens "today", and today's shards are always in the computed
+        // read window regardless of how many local shard directories pile
+        // up — the shard-count cap this test was probing doesn't exist
+        // anymore. Left in place because it still exercises a real
+        // production path (`store()` / `try_restore_candidates()`) under
+        // heavy churn; the doc comment above is kept for history, not as a
+        // claim about current behavior.
         let temp_repo = TempDir::new().unwrap();
         setup_git_repo(temp_repo.path());
         create_commit(temp_repo.path());
@@ -2063,7 +1983,7 @@ mod tests {
         );
 
         // NoOutputs is a success path: the entry must still be indexed.
-        let write_key = cache.write_commit_key().expect("write key");
+        let write_key = cache.write_bucket_key().expect("write key");
         let snapshot = cache
             .snapshot_store
             .load(write_key)
@@ -2264,6 +2184,77 @@ mod tests {
         assert!(
             written_paths.is_empty(),
             "nothing to write when the declared output was never produced"
+        );
+    }
+
+    #[test]
+    fn entries_written_by_separate_runs_are_both_found_by_a_later_run() {
+        let temp_repo = TempDir::new().unwrap();
+        setup_git_repo(temp_repo.path());
+        create_commit(temp_repo.path());
+        let temp_cache = TempDir::new().unwrap();
+
+        let package_dir = temp_repo.path().join("pkg");
+        fs::create_dir_all(&package_dir).unwrap();
+
+        // Two SharedCache instances over one cache dir, as two separate
+        // `luchta run` invocations would be. Each picks its own write shard.
+        let key_a = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32]);
+        let key_b = derive_input_key([5; 32], [6; 32], [7; 32], [8; 32]);
+
+        for (task, key, spec) in [("pkg#a", key_a, [1u8; 32]), ("pkg#b", key_b, [5u8; 32])] {
+            let cache = SharedCache::open_with_cache_dir(
+                temp_repo.path(),
+                1_000_000,
+                3,
+                Some(temp_cache.path()),
+            )
+            .unwrap();
+            let mut record = sample_record(true, 200);
+            record.output_patterns = vec![];
+            record.outputs = vec![];
+            record.outputs_hash = crate::resolve::combined_outputs_hash(&[]);
+            record.task_spec_hash = spec;
+            cache
+                .store(
+                    task,
+                    &key,
+                    &record.outputs_hash,
+                    &package_dir,
+                    &[],
+                    &record,
+                    b"out",
+                    b"",
+                    &[],
+                    temp_repo.path(),
+                )
+                .unwrap();
+        }
+
+        // A third instance must see both, regardless of which shards they landed in.
+        let reader = SharedCache::open_with_cache_dir(
+            temp_repo.path(),
+            1_000_000,
+            3,
+            Some(temp_cache.path()),
+        )
+        .unwrap();
+        let restore_dir = temp_repo.path().join("restore");
+        fs::create_dir_all(&restore_dir).unwrap();
+
+        assert!(
+            reader
+                .try_restore_candidates("pkg#a", &key_a, &restore_dir)
+                .next()
+                .is_some(),
+            "entry from the first run must be discoverable"
+        );
+        assert!(
+            reader
+                .try_restore_candidates("pkg#b", &key_b, &restore_dir)
+                .next()
+                .is_some(),
+            "entry from the second run must be discoverable"
         );
     }
 }
