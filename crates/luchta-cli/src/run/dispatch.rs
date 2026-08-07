@@ -1146,8 +1146,11 @@ fn try_shared_cache_skip(
     // prior, is neutral on a warm dev machine (same file states, same hash
     // reuse) and strictly cheaper on a fresh CI checkout (every mtime differs
     // from any prior anyway, so every input gets hashed regardless -- doing
-    // that before the network round trip instead of after, inside
-    // `decide_shared_restore`, skips the fetch entirely on a miss).
+    // that before the network round trip instead of after skips the fetch
+    // entirely on a miss). This is also the ONLY resolve for this task:
+    // `decide_shared_restore` below compares hashes against `inputs_hash`
+    // rather than re-resolving, so a shared-cache HIT doesn't pay to hash
+    // every input twice.
     //
     // `current.declared_input_patterns` is the task-definition pattern list,
     // which is the only sound thing to hash here: an inputs hash requires
@@ -1183,8 +1186,10 @@ fn try_shared_cache_skip(
     {
         // VALIDATE: Use decide_shared_restore to check if this candidate matches current tree state.
         // Unlike full decide(), this does NOT require outputs to exist in the tree —
-        // we're ABOUT to restore outputs from the blob.
-        if decide_shared_restore(&candidate.record, current) {
+        // we're ABOUT to restore outputs from the blob. `inputs_hash` was already
+        // computed above from a live resolve; decide_shared_restore compares it
+        // against the candidate's recorded inputs instead of re-resolving.
+        if decide_shared_restore(&candidate.record, current, inputs_hash) {
             // Candidate is VALID - inputs match current tree.
             // Commit the staged restore.
             match candidate.commit() {

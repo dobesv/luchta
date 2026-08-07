@@ -110,19 +110,6 @@ impl Default for Snapshot {
     }
 }
 
-impl SnapshotEntry {
-    #[must_use]
-    pub fn dep_outputs_hash(&self) -> [u8; 32] {
-        derive_input_key(
-            self.task_spec_hash,
-            self.env_hash,
-            self.pkg_dep_hash,
-            [0; 32],
-            [0; 32],
-        )
-    }
-}
-
 impl SnapshotStore {
     #[must_use]
     pub fn new(paths: SharedCachePaths) -> Self {

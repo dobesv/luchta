@@ -32,6 +32,24 @@ const COMBINED_INPUTS_HASH_DOMAIN: &[u8] = b"luchta-cache:combined-inputs:v1";
 /// `resolve_cache_outputs` in the CLI) — so producer/consumer output flow is
 /// driven by dependency output hashes, not by re-listing a directory mid-run.
 ///
+/// This read/write asymmetry now reaches further than a same-vs-changed
+/// comparison: the shared-cache *key* itself is derived from a
+/// `combined_inputs_hash` computed on each side independently.
+/// `try_shared_cache_skip` resolves against this cache (a listing snapshot
+/// taken at the start of the run) to compute the key it looks up **before**
+/// the task runs; `write_run_record` hashes the record's inputs (a fresh,
+/// uncached resolve taken **after** the task runs, effectively the
+/// pre-execution snapshot on the success path — see `check_input_stability`)
+/// to compute the key it stores under. If a file the task declares as an
+/// input appears, disappears, or changes between those two points in the
+/// same run, the two keys disagree and the store the task just performed is
+/// simply never found by that run's own prior lookup (which already
+/// happened). This is pre-existing behavior (the same gap existed for the
+/// old comparison-based check) and self-correcting on the very next run,
+/// once both sides observe the same settled tree — but it is worth stating
+/// explicitly now that the asymmetry can produce two different *keys*
+/// instead of just two different comparison outcomes.
+///
 /// Because of this, a `ListingCache` MUST be created fresh per run and dropped
 /// when the run ends. It must never be a process-lifetime `static`: reusing a
 /// listing across separate runs (or across `watch` rebuild cycles) would hide
@@ -562,13 +580,18 @@ fn strip_suffix_components(path: &Path, suffix: &Path) -> PathBuf {
     result
 }
 
-#[must_use]
-pub fn combined_outputs_hash(entries: &[FileEntry]) -> [u8; 32] {
+/// Common framing for `combined_outputs_hash` and `combined_inputs_hash`:
+/// sort by path, then hash a length-prefixed path, the absent flag, and the
+/// content hash for each entry. `domain` is the only thing that may differ
+/// between callers — keeping the framing in one place means the two hashes
+/// can never drift apart field-for-field while still landing in genuinely
+/// distinct hash spaces.
+fn combined_entries_hash(domain: &[u8], entries: &[FileEntry]) -> [u8; 32] {
     let mut sorted = entries.to_vec();
     sorted.sort_by(|left, right| left.path.cmp(&right.path));
 
     let mut hasher = blake3::Hasher::new();
-    hasher.update(COMBINED_OUTPUTS_HASH_DOMAIN);
+    hasher.update(domain);
     hasher.update(&(sorted.len() as u64).to_le_bytes());
 
     for entry in sorted {
@@ -582,31 +605,20 @@ pub fn combined_outputs_hash(entries: &[FileEntry]) -> [u8; 32] {
     *hasher.finalize().as_bytes()
 }
 
+#[must_use]
+pub fn combined_outputs_hash(entries: &[FileEntry]) -> [u8; 32] {
+    combined_entries_hash(COMBINED_OUTPUTS_HASH_DOMAIN, entries)
+}
+
 /// Combines a task's resolved input entries into a single hash, so the shared
 /// cache key can distinguish two source states that share the same task
 /// definition, env, package deps, and dependency outputs but differ in file
-/// content. Mirrors `combined_outputs_hash` field-for-field (sort by path,
-/// length-prefixed path, absent flag, content hash) but uses its own domain
-/// string — inputs and outputs must never hash to the same value for the same
-/// entry list.
+/// content. Shares its framing with `combined_outputs_hash` (see
+/// `combined_entries_hash`) but uses its own domain string — inputs and
+/// outputs must never hash to the same value for the same entry list.
 #[must_use]
 pub fn combined_inputs_hash(entries: &[FileEntry]) -> [u8; 32] {
-    let mut sorted = entries.to_vec();
-    sorted.sort_by(|left, right| left.path.cmp(&right.path));
-
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(COMBINED_INPUTS_HASH_DOMAIN);
-    hasher.update(&(sorted.len() as u64).to_le_bytes());
-
-    for entry in sorted {
-        let path = entry.path.as_bytes();
-        hasher.update(&(path.len() as u64).to_le_bytes());
-        hasher.update(path);
-        hasher.update(&[u8::from(entry.absent)]);
-        hasher.update(&entry.hash);
-    }
-
-    *hasher.finalize().as_bytes()
+    combined_entries_hash(COMBINED_INPUTS_HASH_DOMAIN, entries)
 }
 
 fn resolve_with(

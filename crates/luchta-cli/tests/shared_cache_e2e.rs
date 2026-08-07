@@ -739,13 +739,17 @@ fn cross_worktree_shared_cache_hit() {
 /// Test: a dirty-tree build's entry is not reused by a later clean build.
 ///
 /// Session shard keys carry no notion of git state, so a clean build can now
-/// discover a dirty build's shard just like any other candidate — nothing
-/// about the shard's name keeps them apart anymore. Isolation instead comes
-/// from content validation: the candidate is found (its input_key is scoped
-/// to the task/env/deps, not to file content), but `decide_shared_restore`
-/// compares the candidate's recorded `record.inputs` against the current
-/// working tree and rejects it once the tree no longer matches what the
-/// dirty build actually saw.
+/// land in the same shard as a dirty build's entry just like any other
+/// candidate — nothing about the shard's name keeps them apart anymore.
+/// Isolation instead comes from the `input_key` itself: `derive_input_key`
+/// folds in `inputs_hash`, a hash of the task's resolved input CONTENT, so
+/// the dirty build's key and the clean build's key differ once the file
+/// content differs. The clean build's shared-cache lookup for ITS key simply
+/// finds no candidate — `decide_shared_restore` (which compares a found
+/// candidate's recorded inputs against the caller's already-resolved
+/// `inputs_hash`, see its doc comment) is never reached, because
+/// `try_restore_candidates` never returns the dirty build's entry for a
+/// different key in the first place.
 #[test]
 fn dirty_tree_entry_is_not_reused_by_clean_build() {
     let shared_cache_dir = tempfile::tempdir().unwrap();
@@ -796,9 +800,10 @@ fn dirty_tree_entry_is_not_reused_by_clean_build() {
     temp.child("packages/app/counter.txt").assert("1\n");
 
     // Finalize with content DIFFERENT from what was dirty-built, and commit
-    // it. The task-level candidate is still found (same task, env, deps —
-    // input_key doesn't depend on file content), but its recorded inputs no
-    // longer match the tree.
+    // it. Same task, env, and deps as the dirty build, but different file
+    // content means a different `inputs_hash` and therefore a different
+    // `input_key` — the dirty build's entry lives under a key this build
+    // will never look up.
     temp.child("packages/app/src.txt")
         .write_str("final change\n")
         .unwrap();
@@ -807,9 +812,10 @@ fn dirty_tree_entry_is_not_reused_by_clean_build() {
     // Wipe local cache so the second build has to go through the shared cache.
     std::fs::remove_dir_all(temp.child(".luchta/cache").path()).unwrap();
 
-    // Second, clean build must NOT reuse the dirty build's entry: its
-    // recorded inputs (the dirty content) don't match the now-committed tree,
-    // so this is a genuine miss and the task runs again.
+    // Second, clean build must NOT reuse the dirty build's entry: its own
+    // input_key (content-keyed) differs from the dirty build's, so the
+    // shared-cache lookup finds no candidate at all — a genuine miss — and
+    // the task runs again.
     let second = Command::cargo_bin("luchta")
         .unwrap()
         .arg("run")
