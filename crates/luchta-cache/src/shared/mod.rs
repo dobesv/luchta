@@ -1687,16 +1687,22 @@ mod tests {
         // `chmod` above a no-op, `create_dir_all` succeeds, and the merge
         // lands -- in which case this test never exercised the failure
         // handling it exists for and must say so instead of passing.
-        assert!(
-            cache.snapshot_store().load(&write_bucket).is_none(),
-            "the merge must have failed; the permission trick was ineffective (running as root?)"
-        );
+        // Read before restoring permissions, but assert after: a panic here
+        // would otherwise skip the restore and leave `snapshots_dir`
+        // unwritable, which `TempDir`'s drop can't clean up and silently
+        // swallows. `load` only needs `r-x`, so it works inside the window.
+        let merged = cache.snapshot_store().load(&write_bucket);
 
         fs::set_permissions(
             &cache.paths.snapshots_dir,
             fs::Permissions::from_mode(0o700),
         )
         .unwrap();
+
+        assert!(
+            merged.is_none(),
+            "the merge must have failed; the permission trick was ineffective (running as root?)"
+        );
     }
 
     #[test]
@@ -2746,7 +2752,14 @@ mod tests {
         let backdated = SystemTime::now() - Duration::from_secs(60 * 60 * 24 * 10);
         filetime::set_file_mtime(&path, filetime::FileTime::from_system_time(backdated)).unwrap();
 
-        cache.refresh_entry(&input_key, &sample_entry_with_seed(1, [7; 32]));
+        // The entry's own `input_key` must match the one whose meta we
+        // backdated: `refresh_entry` touches the meta by its parameter, but
+        // `record_pending_entry` keys the pending map on `entry.input_key`.
+        // Leaving them different would record the refresh under an unrelated
+        // key and still pass, since this test only checks the mtime.
+        let mut refreshed = sample_entry_with_seed(1, [7; 32]);
+        refreshed.input_key = input_key;
+        cache.refresh_entry(&input_key, &refreshed);
 
         let after = fs::metadata(&path).unwrap().modified().unwrap();
         assert!(
