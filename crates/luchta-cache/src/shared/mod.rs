@@ -867,6 +867,23 @@ impl SharedCache {
         &self.snapshot_store
     }
 
+    /// Test-only accessor for how many entries are pending a flush.
+    ///
+    /// Exists so a test can pin "repeat `refresh_entry` calls for the same
+    /// `input_key` collapse to one pending entry" at the collection itself,
+    /// before `flush_refreshes` runs. Asserting only on the post-flush
+    /// shard doesn't discriminate this: `merge_entries_with_outcome` inserts
+    /// into a `BTreeMap` keyed by `input_key`, so it would absorb a
+    /// duplicate-preserving (e.g. `Vec`-based) pending collection into the
+    /// same one-entry shard anyway.
+    #[cfg(test)]
+    fn pending_refresh_count(&self) -> usize {
+        self.pending_refreshes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+    }
+
     /// Records an entry on a shared-cache hit for a later batched merge, and
     /// immediately advances `entries/<input_key>.bin`'s mtime.
     ///
@@ -2501,6 +2518,57 @@ mod tests {
         assert!(
             after > backdated,
             "a hit must advance the meta mtime so GC does not expire an entry in active use"
+        );
+    }
+
+    #[test]
+    fn repeat_hits_of_the_same_key_collapse_to_one_entry_before_flush() {
+        // `pending_refreshes` is keyed by `input_key` precisely so repeat
+        // hits of the same key collapse to a single entry before a flush.
+        // `flush_refreshes_collapses_two_hits_into_a_single_push` (in
+        // `remote.rs`) proves N DISTINCT keys collapse into one push, but
+        // that alone doesn't pin dedup-by-key: a Vec-based (or otherwise
+        // duplicate-preserving) pending collection would also pass it, AND
+        // would also produce a one-entry final shard here, since
+        // `merge_entries_with_outcome` inserts into a `BTreeMap` keyed by
+        // `input_key` and so absorbs same-key duplicates during the merge
+        // itself. So the property has to be pinned at the pending
+        // collection, before any merge happens -- via `pending_refresh_count`.
+        let temp_repo = TempDir::new().unwrap();
+        setup_git_repo(temp_repo.path());
+        create_commit(temp_repo.path());
+        let temp_cache = TempDir::new().unwrap();
+        let cache = SharedCache::open_with_cache_dir(
+            temp_repo.path(),
+            1_000_000,
+            3,
+            Some(temp_cache.path()),
+        )
+        .unwrap();
+
+        let entry = sample_entry_with_seed(1, [7; 32]);
+        let input_key = entry.input_key;
+
+        cache.refresh_entry(&input_key, &entry);
+        cache.refresh_entry(&input_key, &entry);
+        assert_eq!(
+            cache.pending_refresh_count(),
+            1,
+            "two refresh_entry calls for the SAME input_key must collapse to one \
+             pending entry before any flush/merge ever runs"
+        );
+
+        cache.flush_refreshes();
+
+        let write_bucket = cache.write_bucket_key().unwrap().to_string();
+        let snapshot = cache
+            .snapshot_store()
+            .load(&write_bucket)
+            .expect("flush_refreshes must write the recorded entry into the current bucket");
+        assert_eq!(
+            snapshot.entries.len(),
+            1,
+            "the flushed shard must contain exactly one entry for the repeated key"
         );
     }
 }
