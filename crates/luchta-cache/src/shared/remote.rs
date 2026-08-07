@@ -367,7 +367,7 @@ impl RemoteSync {
         let remote_fs = self.snapshots_fs(commit_key);
         let local_dir = snapshot_store.paths().snapshots_dir.join(commit_key);
         if let Err(err) = fs::create_dir_all(&local_dir) {
-            eprintln!("debug: local snapshot dir prep failed for commit={commit_key}: {err}");
+            eprintln!("debug: local snapshot dir prep failed for bucket={commit_key}: {err}");
             return;
         }
         let local_fs = format!(":local:{}", local_dir.display());
@@ -376,7 +376,7 @@ impl RemoteSync {
             .copy_dir(&remote_fs, &local_fs, self.rclone.default_timeout())
         {
             self.record_remote_error(&err);
-            eprintln!("debug: remote snapshot copy failed for commit={commit_key}: {err}");
+            eprintln!("debug: remote snapshot copy failed for bucket={commit_key}: {err}");
         } else {
             self.record_remote_success();
         }
@@ -568,7 +568,7 @@ impl RemoteSync {
         if let Err(err) = self.copy_bytes_up(&upload.shard_bytes, &remote_fs, &shard_name) {
             self.record_remote_error(&err);
             eprintln!(
-                "warn: shared cache remote snapshot upload failed for commit={commit_key} file={shard_name}: {err}"
+                "warn: shared cache remote snapshot upload failed for bucket={commit_key} file={shard_name}: {err}"
             );
             return false;
         }
@@ -578,7 +578,7 @@ impl RemoteSync {
         if let Err(err) = self.copy_bytes_up(&upload.merged_bytes, &remote_fs, &merged_name) {
             self.record_remote_error(&err);
             eprintln!(
-                "warn: shared cache remote snapshot upload failed for commit={commit_key} file={merged_name}: {err}"
+                "warn: shared cache remote snapshot upload failed for bucket={commit_key} file={merged_name}: {err}"
             );
             return false;
         }
@@ -603,7 +603,7 @@ impl RemoteSync {
             }
             self.record_remote_error(&err);
             eprintln!(
-                "warn: shared cache remote snapshot delete failed for commit={commit_key} file={remote_name}: {err}"
+                "warn: shared cache remote snapshot delete failed for bucket={commit_key} file={remote_name}: {err}"
             );
         } else {
             self.record_remote_success();
