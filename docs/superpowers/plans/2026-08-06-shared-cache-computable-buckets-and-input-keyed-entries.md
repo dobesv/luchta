@@ -29,7 +29,7 @@ Three observations drive it:
 - On-disk record formats use zstd-compressed bincode via `crate::serialization::bincode_config()` (fixed int encoding). `snapshot_bincode_config()` (standard) is for snapshots only. Do not mix them.
 - All shared-cache file writes go through `atomic_write` or `streaming_atomic_write`.
 - `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets` must be clean.
-- **Windows is a live target** — `ci.yml` builds `windows-latest` and runs clippy with `-D warnings` (production targets, so `--lib` is in scope); `release.yaml` ships three `*-pc-windows-msvc` triples. Remote code is `#[cfg(unix)]` gated. To check the non-unix build locally without a Windows toolchain, copy the crate to a scratch worktree, substitute `cfg(unix)` → `cfg(any())` and `cfg(not(unix))` → `cfg(all())`, and run `cargo check -p luchta-cache --lib`. This technique found a real CI-breaking warning on the previous branch in about 90 seconds.
+- **Windows is a live target** — `ci.yml` builds `windows-latest` and runs clippy with `-D warnings` (production targets, so `--lib` is in scope); `release.yaml` ships three `*-pc-windows-msvc` triples. Remote code is `#[cfg(unix)]` gated. To check the non-unix build locally without a Windows toolchain, copy the crate to a scratch worktree, substitute the cfg predicates (including the `cfg_attr` forms — see Task 1 Step 1 for the exact sed) and run `cargo check -p luchta-cache --lib`. This technique found a real CI-breaking warning on the previous branch in about 90 seconds.
 - Commit with a **lowercase imperative** subject. **No AI attribution footers** — no "Co-Authored-By", no "Generated with". This repo forbids them.
 
 ## Compatibility rules that bind the whole plan
@@ -87,8 +87,11 @@ Copy the crate into a scratch worktree, substitute the cfg predicates, and compi
 WT=$(mktemp -d)
 git worktree add -q --detach "$WT" HEAD
 cd "$WT"
-grep -rl 'cfg(unix)\|cfg(not(unix))' crates/luchta-cache/src | \
-  xargs sed -i 's/cfg(not(unix))/cfg(all())/g; s/cfg(unix)/cfg(any())/g'
+grep -rl 'unix' crates/luchta-cache/src | xargs sed -i \
+  -e 's/cfg_attr(not(unix),/cfg_attr(all(),/g' \
+  -e 's/cfg(not(unix))/cfg(all())/g' \
+  -e 's/cfg_attr(unix,/cfg_attr(any(),/g' \
+  -e 's/cfg(unix)/cfg(any())/g'
 cargo check -p luchta-cache --lib
 ```
 
