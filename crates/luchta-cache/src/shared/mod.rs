@@ -804,6 +804,7 @@ impl SharedCache {
         self.finish_store(
             blob_result,
             &write_key,
+            #[cfg(unix)]
             input_key,
             #[cfg(unix)]
             meta.has_outputs,
@@ -816,7 +817,7 @@ impl SharedCache {
         &self,
         blob_result: BlobWriteResult,
         write_key: &str,
-        input_key: &[u8; 32],
+        #[cfg(unix)] input_key: &[u8; 32],
         #[cfg(unix)] has_outputs: bool,
         entry: SnapshotEntry,
     ) -> io::Result<StoreOutcome> {
@@ -937,6 +938,7 @@ impl SharedCache {
         &self,
         #[cfg(unix)] remote: Option<&RemoteSync>,
     ) -> (Vec<String>, usize) {
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut candidates = discovery::local_shard_candidates_for(&self.paths);
 
         // Remote-only shards are the whole point of #277: a shard written by

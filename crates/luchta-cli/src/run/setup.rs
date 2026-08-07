@@ -293,7 +293,7 @@ fn shared_cache_size_cap_bytes() -> u64 {
 }
 
 fn shared_cache_history_len() -> usize {
-    parse_env_u64_or(
+    non_zero_env_u64_or(
         SHARED_CACHE_HISTORY_ENV,
         std::env::var(SHARED_CACHE_HISTORY_ENV).ok().as_deref(),
         DEFAULT_SHARED_CACHE_HISTORY_LEN as u64,
@@ -616,7 +616,7 @@ mod tests {
     #[test]
     fn parse_shared_cache_history_defaults_and_overrides() {
         assert_eq!(
-            parse_env_u64_or(
+            non_zero_env_u64_or(
                 SHARED_CACHE_HISTORY_ENV,
                 None,
                 DEFAULT_SHARED_CACHE_HISTORY_LEN as u64
@@ -624,13 +624,31 @@ mod tests {
             20
         );
         assert_eq!(
-            parse_env_u64_or(
+            non_zero_env_u64_or(
                 SHARED_CACHE_HISTORY_ENV,
                 Some("64"),
                 DEFAULT_SHARED_CACHE_HISTORY_LEN as u64
             ),
             64
         );
+        // "0" would otherwise make rank_shard_candidates select nothing,
+        // silently disabling shared-cache reads — fall back to the default.
+        assert_eq!(
+            non_zero_env_u64_or(
+                SHARED_CACHE_HISTORY_ENV,
+                Some("0"),
+                DEFAULT_SHARED_CACHE_HISTORY_LEN as u64
+            ),
+            20
+        );
+    }
+
+    #[test]
+    fn shared_cache_history_len_treats_zero_as_default() {
+        require_nextest();
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvVarGuard::set(SHARED_CACHE_HISTORY_ENV, "0");
+        assert_eq!(shared_cache_history_len(), DEFAULT_SHARED_CACHE_HISTORY_LEN);
     }
 
     #[test]

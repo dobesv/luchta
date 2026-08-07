@@ -53,10 +53,25 @@ fn cache_written_on_one_branch_is_found_from_an_unrelated_branch() {
         .unwrap();
     init_git(&temp);
 
-    // Build on a feature branch, one commit ahead of master. The extra commit
+    // Capture the initial branch's tip before diverging. `init_git` runs a
+    // bare `git init`, so the initial branch name comes from
+    // `init.defaultBranch` and can't be assumed to be "master".
+    let base = String::from_utf8(
+        std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(temp.path())
+            .output()
+            .expect("rev-parse")
+            .stdout,
+    )
+    .expect("utf8")
+    .trim()
+    .to_string();
+
+    // Build on a feature branch, one commit ahead of base. The extra commit
     // touches nothing the task reads, so it can't affect the cache decision —
     // its only purpose is to make feature-one's HEAD a genuinely different,
-    // non-ancestor commit from master's. Without this, `checkout -b` alone
+    // non-ancestor commit from base's. Without this, `checkout -b` alone
     // leaves feature-one and feature-two pointing at the identical commit,
     // and the old ancestry-walk discovery would trivially "find" it again —
     // proving nothing about cross-branch discovery.
@@ -73,7 +88,7 @@ fn cache_written_on_one_branch_is_found_from_an_unrelated_branch() {
 
     // Move to a sibling branch whose history does NOT contain feature-one's commit,
     // and drop the local cache so only the shared cache can serve the task.
-    git(&temp, &["checkout", "-b", "feature-two", "master"]);
+    git(&temp, &["checkout", "-b", "feature-two", &base]);
     std::fs::remove_dir_all(temp.path().join(".luchta/cache")).unwrap();
     std::fs::remove_file(temp.path().join("packages/app/out.txt")).ok();
 
