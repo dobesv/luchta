@@ -849,6 +849,49 @@ impl SharedCache {
     pub fn candidate_keys(&self) -> Vec<String> {
         discovery::bucket_keys_for(discovery::now_unix_ms(), self.day_window)
     }
+
+    /// Test-only accessor for the snapshot store, so tests can seed and read
+    /// back buckets directly without a public production API for it.
+    #[cfg(test)]
+    fn snapshot_store(&self) -> &SnapshotStore {
+        &self.snapshot_store
+    }
+
+    /// Refreshes an entry on a shared-cache hit: re-merges it into today's
+    /// write bucket and advances `entries/<input_key>.bin`'s mtime.
+    ///
+    /// Without this, a stable entry written once falls out of the day window
+    /// a few days later (every build then misses it, rebuilds, and rewrites
+    /// it — a sawtooth on exactly the packages the cache exists to serve),
+    /// and separately, `gc_entries_dir` ages its meta out by mtime alone
+    /// since a hit doesn't otherwise touch the file.
+    ///
+    /// Best-effort and infallible: the hit has already succeeded by the time
+    /// this runs, so a refresh failure must never turn it into a miss or fail
+    /// the build. Both failure paths just log at `debug:` and return. Never
+    /// re-stores the blob or the meta object — both are content-addressed
+    /// and already correct, so only a small index entry and an mtime move.
+    pub fn refresh_entry(&self, input_key: &[u8; 32], entry: &SnapshotEntry) {
+        if let Some(write_key) = self.write_bucket_key.as_deref() {
+            match self.snapshot_store.merge_entry(write_key, entry.clone()) {
+                MergeResult::Inserted | MergeResult::IdempotentNoop => {}
+                MergeResult::ConflictKeptExisting | MergeResult::SkippedLockUnavailable => {
+                    eprintln!(
+                        "debug: shared cache refresh could not merge entry for input_key={}",
+                        hex_hash(*input_key)
+                    );
+                }
+            }
+        }
+
+        let path = entry_meta_path(&self.paths, input_key);
+        if let Err(err) = filetime::set_file_mtime(&path, filetime::FileTime::now()) {
+            eprintln!(
+                "debug: shared cache refresh could not advance meta mtime for input_key={}: {err}",
+                hex_hash(*input_key)
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -860,6 +903,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::thread;
+    use std::time::{Duration, SystemTime};
     use tempfile::TempDir;
 
     pub(crate) fn setup_git_repo(repo_root: &Path) {
@@ -2238,6 +2282,119 @@ mod tests {
         assert_eq!(
             read_entry_meta(cache.paths(), &key_b).unwrap().stdout,
             b"variant-b"
+        );
+    }
+
+    fn sample_entry_with_seed(seed: u8, outputs_hash: [u8; 32]) -> SnapshotEntry {
+        let task_spec_hash = [seed; 32];
+        let env_hash = [seed.wrapping_add(1); 32];
+        let pkg_dep_hash = [seed.wrapping_add(2); 32];
+        let dep_outputs_hash = [seed.wrapping_add(3); 32];
+        let inputs_hash = [seed.wrapping_add(4); 32];
+        SnapshotEntry {
+            task_id: format!("pkg-{seed}#build"),
+            input_key: derive_input_key(
+                task_spec_hash,
+                env_hash,
+                pkg_dep_hash,
+                dep_outputs_hash,
+                inputs_hash,
+            ),
+            outputs_hash,
+            task_spec_hash,
+            env_hash,
+            pkg_dep_hash,
+            duration_ms: 100 + u64::from(seed),
+            output_bytes: 1_000 + u64::from(seed),
+            cached_at_unix_ms: 1_700_000_000_000 + u64::from(seed),
+            tool_version: Some("0.1.0".to_owned()),
+        }
+    }
+
+    #[test]
+    fn a_shared_hit_refreshes_the_entry_into_the_current_write_bucket() {
+        let temp_repo = TempDir::new().unwrap();
+        setup_git_repo(temp_repo.path());
+        create_commit(temp_repo.path());
+        let temp_cache = TempDir::new().unwrap();
+        let cache = SharedCache::open_with_cache_dir(
+            temp_repo.path(),
+            1_000_000,
+            3,
+            Some(temp_cache.path()),
+        )
+        .unwrap();
+
+        // Seed the entry into an OLDER bucket only, as a build two days ago would have.
+        let stale_bucket = bucket_key(discovery::now_unix_ms() - 2 * 24 * 60 * 60 * 1000, 0);
+        let write_bucket = cache.write_bucket_key().expect("write bucket").to_string();
+        assert_ne!(
+            stale_bucket, write_bucket,
+            "fixture must seed a different bucket"
+        );
+
+        let entry = sample_entry_with_seed(1, [7; 32]);
+        let input_key = entry.input_key;
+        cache
+            .snapshot_store()
+            .merge_entry(&stale_bucket, entry.clone());
+        assert!(
+            cache.snapshot_store().load(&write_bucket).is_none(),
+            "write bucket must start empty"
+        );
+
+        cache.refresh_entry(&input_key, &entry);
+
+        let refreshed = cache
+            .snapshot_store()
+            .load(&write_bucket)
+            .expect("refresh must write into the current bucket");
+        assert!(
+            refreshed.entries.contains_key(&input_key_hex(input_key)),
+            "the refreshed entry must be present in today's bucket, so it survives \
+             the day window moving past the bucket it was originally written to"
+        );
+    }
+
+    #[test]
+    fn a_shared_hit_advances_the_entry_meta_mtime() {
+        // gc_entries_dir ages out entries/*.bin by mtime and a hit does not
+        // rewrite the file, so without this an entry in active use has its
+        // meta deleted while its index key stays live.
+        let temp_repo = TempDir::new().unwrap();
+        setup_git_repo(temp_repo.path());
+        create_commit(temp_repo.path());
+        let temp_cache = TempDir::new().unwrap();
+        let cache = SharedCache::open_with_cache_dir(
+            temp_repo.path(),
+            1_000_000,
+            3,
+            Some(temp_cache.path()),
+        )
+        .unwrap();
+
+        let input_key = [3u8; 32];
+        let meta = EntryMeta {
+            schema_version: ENTRY_META_SCHEMA_VERSION,
+            outputs_hash: [7; 32],
+            has_outputs: false,
+            record: vec![1, 2, 3],
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            reports: Vec::new(),
+        };
+        write_entry_meta(cache.paths(), &input_key, &meta).unwrap();
+
+        let path = entry_meta_path(cache.paths(), &input_key);
+        let backdated = SystemTime::now() - Duration::from_secs(60 * 60 * 24 * 10);
+        filetime::set_file_mtime(&path, filetime::FileTime::from_system_time(backdated)).unwrap();
+
+        cache.refresh_entry(&input_key, &sample_entry_with_seed(1, [7; 32]));
+
+        let after = fs::metadata(&path).unwrap().modified().unwrap();
+        assert!(
+            after > backdated,
+            "a hit must advance the meta mtime so GC does not expire an entry in active use"
         );
     }
 }

@@ -11,7 +11,7 @@ use super::*;
 use crate::cache_ctx::gather_pkg_dep_pairs_filtered;
 
 use luchta_cache::shared::{
-    combined_dep_outputs_hash, derive_input_key, RestoredHit, StoreOutcome,
+    combined_dep_outputs_hash, derive_input_key, RestoredHit, SnapshotEntry, StoreOutcome,
 };
 use luchta_cache::{
     combined_inputs_hash, decide_shared_restore, task_cache_key, CurrentState, FileEntry,
@@ -1209,9 +1209,15 @@ fn try_shared_cache_skip(
                     // (c) Replay the restored task's captured stdout/stderr so a
                     // shared-cache hit produces the same visible output as on main.
                     replay_logs(&hit, &ctx.reporter);
-                    // (d) Record output hash for downstream invalidation.
+                    // (d) Refresh the entry so it survives the day window: a
+                    // hit re-merges it into today's write bucket (already in
+                    // the read set by construction) and advances the meta's
+                    // mtime, so gc_entries_dir doesn't age out an entry still
+                    // in active use. Best-effort -- see `refresh_entry`.
+                    refresh_shared_cache_entry(shared_cache, task_id, &input_key, &hit);
+                    // (e) Record output hash for downstream invalidation.
                     record_output_hash(&ctx.output_hashes, task_id, hit.outputs_hash);
-                    // (e) Return dedicated shared-hit decision so dispatcher can count it.
+                    // (f) Return dedicated shared-hit decision so dispatcher can count it.
                     return Some(Decision::SharedHit);
                 }
                 Err(e) => {
@@ -1897,6 +1903,38 @@ pub(super) fn replay_logs(hit: &RestoredHit, _reporter: &Arc<ProgressReporter>) 
             }
         }
     }
+}
+
+/// Refresh a shared-cache entry on a hit: re-merge it into today's write
+/// bucket and advance its meta's mtime (see `SharedCache::refresh_entry`).
+///
+/// The fields below are read from `hit.record` rather than the caller's
+/// `CurrentState`, but they're the same values: `decide_shared_restore`
+/// already required `record.task_spec_hash == current.task_spec_hash` (and
+/// likewise for `env_hash`/`pkg_dep_hash`) for this to be a hit at all.
+fn refresh_shared_cache_entry(
+    shared_cache: &SharedCache,
+    task_id: &TaskId,
+    input_key: &[u8; 32],
+    hit: &RestoredHit,
+) {
+    let output_bytes: u64 = hit.record.outputs.iter().map(|file| file.size).sum();
+    let entry = SnapshotEntry {
+        task_id: task_id.to_string(),
+        input_key: *input_key,
+        outputs_hash: hit.outputs_hash,
+        task_spec_hash: hit.record.task_spec_hash,
+        env_hash: hit.record.env_hash,
+        pkg_dep_hash: hit.record.pkg_dep_hash,
+        duration_ms: hit
+            .record
+            .end_unix_ms
+            .saturating_sub(hit.record.start_unix_ms),
+        output_bytes,
+        cached_at_unix_ms: hit.record.end_unix_ms,
+        tool_version: None,
+    };
+    shared_cache.refresh_entry(input_key, &entry);
 }
 
 #[cfg(test)]
