@@ -414,7 +414,7 @@ impl SnapshotStore {
                 Ok(snapshot) => snapshot,
                 Err(err) => {
                     eprintln!(
-                        "warning: failed to decode snapshot shard {} for commit {shard_key}: {err}; skipping shard",
+                        "warning: failed to decode snapshot shard {} for bucket {shard_key}: {err}; skipping shard",
                         shard.path().display()
                     );
                     continue;
@@ -561,6 +561,21 @@ pub fn input_key_hex(input_key: [u8; 32]) -> String {
 /// `detected_input_patterns: false` (see `TaskRunRecord::detected_input_patterns`
 /// and `assemble_run_record` in `luchta-cli`); enabling worker-detected input
 /// patterns requires reworking this key derivation first.
+///
+/// This key assumes the task is a pure function of `task_spec_hash`,
+/// `env_hash`, `pkg_dep_hash`, `dep_outputs_hash`, and `inputs_hash`. Neither
+/// the task id nor any package identity is folded in, and `inputs_hash`
+/// (`combined_inputs_hash`) hashes package-relative paths, not absolute
+/// ones. So two different packages running the same task with identical
+/// declared deps and byte-identical declared inputs compute the same key and
+/// share one shared-cache entry. That's correct for a task whose output
+/// depends only on its declared inputs and spec. It's wrong for a task whose
+/// behaviour also depends on something outside its declared inputs — the
+/// package name or directory, an unpattern-matched `package.json` field, a
+/// generated artifact that embeds its own path — and such a task will read
+/// back another package's cached result. If you're adding a task type,
+/// checking that its declared inputs fully determine its output is the
+/// caller's job; this function has no way to catch the omission.
 #[must_use]
 pub fn derive_input_key(
     task_spec_hash: [u8; 32],

@@ -432,8 +432,8 @@ impl SharedCache {
         #[cfg(unix)] remote: Option<&RemoteSync>,
     ) -> Option<StagedCandidate> {
         #[cfg(unix)]
-        if read_entry_meta(paths, input_key).is_none() {
-            if let Some(remote) = remote {
+        if let Some(remote) = remote {
+            if !entry_meta_path(paths, input_key).exists() {
                 if let Err(err) = remote.pull_entry_meta(paths, input_key) {
                     eprintln!(
                         "debug: remote entry meta pull failed for input_key={}: {err}",
@@ -458,15 +458,23 @@ impl SharedCache {
             .collect();
 
         if !meta.has_outputs {
-            return StagedCandidate::empty_outputs(
+            return match StagedCandidate::empty_outputs(
                 meta.outputs_hash,
                 record,
                 meta.stdout,
                 meta.stderr,
                 reports,
                 package_dir,
-            )
-            .ok();
+            ) {
+                Ok(candidate) => Some(candidate),
+                Err(err) => {
+                    eprintln!(
+                        "debug: shared cache no-output restore failed for input_key={}: {err}",
+                        hex_hash(*input_key)
+                    );
+                    None
+                }
+            };
         }
 
         if !blob_path(paths, &meta.outputs_hash).is_file() {

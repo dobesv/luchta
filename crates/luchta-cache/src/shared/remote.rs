@@ -243,8 +243,9 @@ impl RemoteSync {
     }
 }
 
-/// Splits a remote snapshot-dir listing into shard file names and the set of
-/// `.merged` sidecar names present, ignoring directories and other entries.
+/// Turns an rclone error into a short, human-readable reason string, used by
+/// `record_remote_error` when it records a timeout or disables the remote
+/// cache for the rest of the run.
 fn remote_disable_reason(err: &rclone::RcloneError) -> String {
     match err {
         rclone::RcloneError::Timeout { timeout } => {

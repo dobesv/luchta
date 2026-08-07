@@ -101,7 +101,7 @@ jobs:
       # `LUCHTA_TEST_RCLONE=1` and skipped everywhere else, which is exactly
       # why CI needs to set it explicitly — nothing else does.
       - name: Test shared cache remote sync (rclone)
-        run: LUCHTA_TEST_RCLONE=1 cargo nextest run -p luchta-cache
+        run: LUCHTA_TEST_RCLONE=1 cargo nextest run -p luchta-cache --no-fail-fast
 
       # Known pre-existing leak, not introduced by this change: the gated
       # suite leaks roughly 6 `rclone rcd` daemons per run even on a clean

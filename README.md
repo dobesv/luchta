@@ -1031,7 +1031,7 @@ The shared build cache is a cross-worktree, cross-clone cache that restores task
 - **Input-Keyed Entries:** The cache key (`input_key`) folds in the task spec, environment, package-dependency versions, upstream task outputs, and the resolved content of the task's own inputs. Two branches that change a task's source differently land in distinct entries instead of racing for one shared slot — both stay cached and reusable, and reverting one back to the other's state is a hit, not a miss.
 - **Content-Addressed Blobs:** Build outputs are compressed and stored in a deduped blob store, addressed by `outputs_hash`.
 - **Read Window:** On cache lookup, Luchta fetches every shard from the last `LUCHTA_SHARED_CACHE_DAYS` UTC days (default 3) directly — `day_window * 6` key fetches, no object-store listing involved.
-- **Refresh on Hit:** A cache hit re-inserts its entry into today's shard (and, with remote sync on, re-pushes it), so a hot entry keeps getting a fresh day stamp instead of aging out of the read window on a fixed schedule.
+- **Refresh on Hit:** A cache hit re-inserts its entry into today's shard, and, with remote sync on, re-pushes that shard, so a hot entry keeps getting a fresh day stamp instead of aging out of the read window on a fixed schedule. The remote `entries/<input_key>.bin` object itself is not re-pushed — it's pushed once, the first time an entry is stored, and left alone after that. See the `entries/` note under Garbage Collection below.
 - **Remote Synchronization:** Opt-in synchronization with S3 or other object stores via `rclone`.
 
 #### Layout
@@ -1091,6 +1091,7 @@ Luchta can synchronize the shared cache with a remote object store (like S3, GCS
 - **Build Safety:** Remote cache problems (timeouts or rclone errors) never fail a build. If an error occurs, Luchta issues a warning, disables the remote cache for the rest of the run, and continues using only the local cache.
 - **No CAS Required:** Snapshots are stored as append-only content-addressed shards, eliminating the need for complex "Compare-and-Swap" operations on the remote store.
 - **Garbage Collection:** Remote GC is not managed by Luchta. Use S3 bucket lifecycle rules or similar object store features to expire old objects under all three prefixes — `blobs/`, `snapshots/`, *and* `entries/`. Leaving `entries/` out of those rules lets it grow without bound, since nothing else ever deletes those objects remotely.
+  Set the `entries/` cutoff generously relative to the day window (`LUCHTA_SHARED_CACHE_DAYS`), or use last-access-based expiry if your object store supports it. A hit refreshes the index shard, not the remote `entries/` object's timestamp, so an entry that gets hit daily for a month can still age past an object-age cutoff while its index key stays discoverable. When that happens the next lookup finds the key, gets a 404 fetching the meta object, and misses — the task reruns and re-stores, so it self-heals, but an age cutoff close to the day window turns your hottest entries into a periodic fleet-wide rebuild.
 
 #### Cacheability
 A task is eligible for the shared cache if all the following are true:

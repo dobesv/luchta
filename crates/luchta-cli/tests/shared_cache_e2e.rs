@@ -738,9 +738,9 @@ fn cross_worktree_shared_cache_hit() {
 
 /// Test: a dirty-tree build's entry is not reused by a later clean build.
 ///
-/// Session shard keys carry no notion of git state, so a clean build can now
-/// land in the same shard as a dirty build's entry just like any other
-/// candidate — nothing about the shard's name keeps them apart anymore.
+/// Bucket keys carry no notion of git state, so a clean build can now land
+/// in the same bucket as a dirty build's entry just like any other
+/// candidate — nothing about the bucket's name keeps them apart anymore.
 /// Isolation instead comes from the `input_key` itself: `derive_input_key`
 /// folds in `inputs_hash`, a hash of the task's resolved input CONTENT, so
 /// the dirty build's key and the clean build's key differ once the file
@@ -781,8 +781,8 @@ fn dirty_tree_entry_is_not_reused_by_clean_build() {
         .unwrap();
     // Do NOT commit — tree is dirty
 
-    // Build in dirty state — counter advances to 1. The entry lands in this
-    // process's own shard, recorded against the dirty content.
+    // Build in dirty state — counter advances to 1. The entry is recorded
+    // against the dirty content's input_key.
     Command::cargo_bin("luchta")
         .unwrap()
         .arg("run")
@@ -1020,10 +1020,11 @@ fn cross_commit_shared_cache_hit() {
 
 /// Test: entries from separate `luchta run` invocations are both discoverable.
 ///
-/// Session shard keys are per-invocation, not per-commit: running `lint` then
-/// `test` produces two separate shard directories, not one shared snapshot
-/// like the old commit-keyed scheme. What survives is that recency discovery
-/// surfaces both shards, so a later build can restore either task's entry.
+/// Each write picks its bucket as `<YYYYMMDD>-<shard>` from a nonce, so
+/// `lint` and `test` may land in the same bucket or different ones — nothing
+/// here pins them apart. What matters is that a build's read window covers
+/// every bucket it could have written to, so a later build can restore
+/// either task's entry regardless of which bucket each landed in.
 #[test]
 fn entries_from_separate_runs_are_both_discoverable() {
     let shared_cache_dir = tempfile::tempdir().unwrap();
@@ -1053,7 +1054,7 @@ fn entries_from_separate_runs_are_both_discoverable() {
         .unwrap();
     init_git(&temp);
 
-    // Run lint — its own shard.
+    // Run lint.
     Command::cargo_bin("luchta")
         .unwrap()
         .arg("run")
@@ -1069,7 +1070,7 @@ fn entries_from_separate_runs_are_both_discoverable() {
         .success();
     temp.child("packages/app/lint-counter.txt").assert("1\n");
 
-    // Run test — a separate invocation, a separate shard.
+    // Run test — a separate invocation.
     Command::cargo_bin("luchta")
         .unwrap()
         .arg("run")
@@ -1088,7 +1089,7 @@ fn entries_from_separate_runs_are_both_discoverable() {
     // Wipe local cache so both re-runs have to go through the shared cache.
     std::fs::remove_dir_all(temp.child(".luchta/cache").path()).unwrap();
 
-    // Re-run lint: restored from its shard, counter unchanged.
+    // Re-run lint: restored from the shared cache, counter unchanged.
     let lint_rerun = Command::cargo_bin("luchta")
         .unwrap()
         .arg("run")
@@ -1112,7 +1113,7 @@ fn entries_from_separate_runs_are_both_discoverable() {
     );
     temp.child("packages/app/lint-counter.txt").assert("1\n");
 
-    // Re-run test: restored from its own (different) shard, counter unchanged.
+    // Re-run test: restored from the shared cache, counter unchanged.
     let test_rerun = Command::cargo_bin("luchta")
         .unwrap()
         .arg("run")
@@ -1209,7 +1210,7 @@ fn over_size_cap_task_not_cached() {
     // The key invariant: no blob was written for over-size output
 }
 
-/// Recursively list snapshot shard files under snapshots/<commit>/*.bincode.
+/// Recursively list snapshot shard files under snapshots/<YYYYMMDD>-<shard>/*.bincode.
 fn snapshot_shard_paths(root: &Path) -> Vec<PathBuf> {
     let mut shards = Vec::new();
     collect_snapshot_shards(root, &mut shards);
