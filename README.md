@@ -1077,6 +1077,10 @@ Invalid numeric values will trigger a warning and fall back to their defaults.
 #### Remote Synchronization (S3/rclone)
 Luchta can synchronize the shared cache with a remote object store (like S3, GCS, or Azure) using [rclone](https://rclone.org/).
 
+**Needs a recent rclone.** Luchta drives rclone through a persistent `rclone rcd` daemon listening on a unix socket (`--rc-addr unix://…`), which older builds don't support. Ubuntu 24.04's packaged 1.60.1 is known not to work — the daemon exits immediately on startup. Luchta is developed and tested against 1.74.3; if your distro package is older, install from [rclone.org/downloads](https://rclone.org/downloads/).
+
+This fails safe: when the daemon won't start, Luchta records the error, disables remote sync for the run, and the build continues against the local cache. You get no remote sharing rather than a broken build, so it's worth checking `rclone version` if remote hits never materialize.
+
 1. **Setup:** Run `rclone config` to create and name a remote (e.g., `my-s3`).
 2. **Enable:** Set `LUCHTA_SHARED_CACHE=rclone:<remote-name>:<bucket>/<prefix>`.
    - Example: `rclone:my-s3:my-bucket/luchta-cache`.

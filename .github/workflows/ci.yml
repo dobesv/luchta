@@ -92,8 +92,19 @@ jobs:
         with:
           tool: cargo-nextest
 
+      # Pinned rather than `apt-get install rclone`: Ubuntu 24.04 ships
+      # rclone 1.60.1, on which the rcd daemon exits with status 1 the moment
+      # it starts — it predates unix-socket support for `--rc-addr`, which is
+      # how Luchta talks to it — and all 17 remote-sync tests fail. 1.74.3 is
+      # the version this code was developed and live-probed against.
       - name: Install rclone
-        run: sudo apt-get update && sudo apt-get install -y rclone
+        env:
+          RCLONE_VERSION: v1.74.3
+        run: |
+          curl -fsSL "https://downloads.rclone.org/${RCLONE_VERSION}/rclone-${RCLONE_VERSION}-linux-amd64.zip" -o /tmp/rclone.zip
+          unzip -q /tmp/rclone.zip -d /tmp
+          sudo install -m 755 "/tmp/rclone-${RCLONE_VERSION}-linux-amd64/rclone" /usr/local/bin/rclone
+          rclone version
 
       # These tests exercise the real remote-sync path (blob/entry push and
       # pull, rcd lifecycle) against rclone's built-in `:local:` filesystem
