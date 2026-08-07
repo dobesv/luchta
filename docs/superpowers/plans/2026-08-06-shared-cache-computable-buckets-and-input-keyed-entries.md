@@ -32,6 +32,23 @@ Three observations drive it:
 - **Windows is a live target** — `ci.yml` builds `windows-latest` and runs clippy with `-D warnings` (production targets, so `--lib` is in scope); `release.yaml` ships three `*-pc-windows-msvc` triples. Remote code is `#[cfg(unix)]` gated. To check the non-unix build locally without a Windows toolchain, copy the crate to a scratch worktree, substitute the cfg predicates (including the `cfg_attr` forms — see Task 1 Step 1 for the exact sed) and run `cargo check -p luchta-cache --lib`. This technique found a real CI-breaking warning on the previous branch in about 90 seconds.
 - Commit with a **lowercase imperative** subject. **No AI attribution footers** — no "Co-Authored-By", no "Generated with". This repo forbids them.
 
+## Amendment: refreshes are batched (decided during execution)
+
+Task 5 originally specified a per-hit `merge_entry_with_outcome` + remote push. Measured across that
+commit, the rclone-gated suite went from 269/269 clean in 3.8s to 3-5 failures every run at 122s — a 32x
+slowdown at load average 0.70, i.e. self-inflicted. The mechanism generalises beyond tests: a build with
+N cache hits enqueues up to N remote pushes on the first run of a day, and N is largest exactly when the
+cache is working best. Saturating the rclone daemon trips the timeout circuit breaker and disables the
+remote for the rest of the build.
+
+Human ruling: batch. Collect refreshed entries during the run and flush once at the end — a single merge
+into today's bucket and a single remote push regardless of hit count. This also removes the per-hit
+bucket reload, since `merge_entry_with_outcome` must load and decompress the day's consolidated shard
+before it can even report `IdempotentNoop`.
+
+The meta mtime touch stays immediate and per-entry: it is a local file operation with no rclone
+involvement and must happen per file anyway.
+
 ## Compatibility rules that bind the whole plan
 
 - **`SHARED_CACHE_SHARD_COUNT` is a wire-compatibility constant, not a tunable.** If one machine writes with 12 shards and another reads 6, the reader silently misses everything in shards 6–11. Decreasing is safe; increasing is not. It must not be env-configurable. Changing it is a coordinated fleet-wide change tied to a schema bump.
