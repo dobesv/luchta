@@ -171,6 +171,32 @@ impl SnapshotStore {
         shard_key: &str,
         entry: SnapshotEntry,
     ) -> MergeEntryOutcome {
+        self.merge_entries_with_outcome(shard_key, vec![entry])
+    }
+
+    /// Merges any number of entries into `shard_key` in a single
+    /// load-modify-write cycle: one shard load, and (only if something
+    /// actually changed) one consolidated write producing at most one
+    /// `new_snapshot_upload` — regardless of how many entries are in
+    /// `entries`.
+    ///
+    /// `merge_entry_with_outcome` is the `entries.len() == 1` case of this,
+    /// not a separate code path.
+    ///
+    /// Used by `SharedCache::flush_refreshes` to collapse a run's worth of
+    /// cache-hit refreshes into a single remote push instead of one push per
+    /// hit: pushing on every hit saturates the rclone daemon on exactly the
+    /// runs where the cache has the most hits, tripping the timeout-disable
+    /// circuit breaker and defeating the feature under its own success.
+    pub fn merge_entries_with_outcome(
+        &self,
+        shard_key: &str,
+        entries: Vec<SnapshotEntry>,
+    ) -> MergeEntryOutcome {
+        if entries.is_empty() {
+            return MergeEntryOutcome::from_result(MergeResult::IdempotentNoop);
+        }
+
         let shard_dir = self.shard_dir_path(shard_key);
         if let Err(err) = fs::create_dir_all(&shard_dir) {
             eprintln!(
@@ -181,30 +207,51 @@ impl SnapshotStore {
         }
 
         let visible_shards = self.list_snapshot_shards(shard_key);
-        let merged_snapshot = self
+        let mut consolidated = self
             .load_merged_snapshot_from_shards(shard_key, visible_shards.clone())
             .unwrap_or_default();
 
-        if let Some(existing) = merged_snapshot.entries.get(&input_key_hex(entry.input_key)) {
-            if existing.outputs_hash == entry.outputs_hash {
-                return MergeEntryOutcome::from_result(MergeResult::IdempotentNoop);
+        let mut changed = false;
+        let mut saw_conflict = false;
+        for entry in entries {
+            let entry_key = input_key_hex(entry.input_key);
+            match consolidated.entries.get(&entry_key) {
+                Some(existing) if existing.outputs_hash == entry.outputs_hash => {
+                    // Already present with the same content: nothing to do
+                    // for this entry.
+                }
+                Some(_existing) => {
+                    // Conflict: same rule as a single-entry merge. Since
+                    // `input_key` folds in a hash of the package's resolved
+                    // input content (`derive_input_key`'s `inputs_hash`), two
+                    // writers landing on the same key have, by construction,
+                    // observed the same source state. A same-key
+                    // `outputs_hash` mismatch here means a non-deterministic
+                    // build (or a task-spec/env collision this key doesn't
+                    // yet distinguish), not two legitimate source states
+                    // racing for one slot. Keeping the first writer is still
+                    // the safe choice for a non-deterministic build.
+                    saw_conflict = true;
+                }
+                None => {
+                    consolidated.entries.insert(entry_key, entry);
+                    changed = true;
+                }
             }
-
-            // Since `input_key` folds in a hash of the package's resolved
-            // input content (`derive_input_key`'s `inputs_hash`), two writers
-            // landing on the same key have, by construction, observed the
-            // same source state. A same-key `outputs_hash` mismatch here
-            // means a non-deterministic build (or a task-spec/env collision
-            // this key doesn't yet distinguish), not two legitimate source
-            // states racing for one slot -- that scenario now gets distinct
-            // keys and never reaches this branch. Keeping the first writer is
-            // still the safe choice for a non-deterministic build.
-            return MergeEntryOutcome::from_result(MergeResult::ConflictKeptExisting);
         }
 
-        let mut consolidated = merged_snapshot;
-        let entry_key = input_key_hex(entry.input_key);
-        consolidated.entries.insert(entry_key, entry);
+        if !changed {
+            // Preserve the single-entry distinction exactly: a lone
+            // conflicting entry must still report `ConflictKeptExisting`
+            // (see `snapshot_store_conflict_keeps_existing_entry`), not
+            // collapse into the more generic "nothing changed" outcome.
+            let result = if saw_conflict {
+                MergeResult::ConflictKeptExisting
+            } else {
+                MergeResult::IdempotentNoop
+            };
+            return MergeEntryOutcome::from_result(result);
+        }
 
         self.write_consolidated_shard(shard_key, &consolidated, &visible_shards)
     }

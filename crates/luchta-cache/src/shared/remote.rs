@@ -2070,17 +2070,17 @@ mod tests {
     }
 
     #[test]
-    fn refresh_entry_on_remote_backed_cache_pushes_the_merge_and_entry_meta() {
+    fn flush_refreshes_on_remote_backed_cache_pushes_the_merge_and_entry_meta() {
         if !should_run_rclone_test() {
             eprintln!("skipping rclone-gated shared-cache refresh push test; rclone not on PATH or LUCHTA_TEST_RCLONE disabled");
             return;
         }
 
-        // `refresh_entry` must reach the remote, not just this machine's
-        // local index: `enqueue_push_store_artifacts` is the only path in
-        // this crate that syncs a snapshot shard outward. A refresh that
-        // only updated the local `SnapshotStore` would leave the day-window
-        // leak open for every OTHER machine pulling from the same remote --
+        // A refresh must reach the remote, not just this machine's local
+        // index: `enqueue_push_store_artifacts` is the only path in this
+        // crate that syncs a snapshot shard outward. A refresh that only
+        // updated the local `SnapshotStore` would leave the day-window leak
+        // open for every OTHER machine pulling from the same remote --
         // exactly the multi-machine deployment this task exists to fix.
         let harness = RemoteHarness::new("console.log('refresh-push');\n");
         let cache = harness.cache();
@@ -2091,7 +2091,7 @@ mod tests {
         // A real hit always has a locally-readable meta object before
         // `refresh_entry` is ever called -- `try_restore_candidates` requires
         // `read_entry_meta` to succeed to produce a candidate at all -- so
-        // seed one here for `refresh_entry` to read `has_outputs` from.
+        // seed one here for `flush_refreshes` to read `has_outputs` from.
         let record_bytes = bincode::serde::encode_to_vec(
             sample_record(true, 200),
             crate::serialization::bincode_config(),
@@ -2125,19 +2125,29 @@ mod tests {
             tool_version: None,
         };
 
-        // Nothing has been merged into today's write bucket yet, so this
-        // refresh is the day's first hit that adds the key: the merge
-        // outcome is `Inserted`, which is exactly the case that must trigger
-        // a real remote push (see `refresh_entry`'s doc comment for why
-        // `IdempotentNoop`/`ConflictKeptExisting` push at most the entry
-        // meta/blob, not a fresh snapshot shard).
+        // `refresh_entry` only records the entry and touches its local
+        // mtime -- nothing reaches the remote (or even the local index)
+        // until `flush_refreshes` runs.
         cache.refresh_entry(&input_key, &entry);
         cache.flush_push_queue();
-
         let write_key = cache.write_bucket_key().unwrap().to_string();
         assert!(
+            remote_snapshot_files(harness.remote_root.path(), &write_key).is_empty(),
+            "refresh_entry alone must not reach the remote"
+        );
+
+        // Nothing has been merged into today's write bucket yet, so this
+        // flush is the day's first hit that adds the key: the merge outcome
+        // is `Inserted`, which is exactly the case that must trigger a real
+        // remote push (see `flush_refreshes`'s doc comment for why
+        // `IdempotentNoop`/`ConflictKeptExisting` push at most the entry
+        // meta/blob, not a fresh snapshot shard).
+        cache.flush_refreshes();
+        cache.flush_push_queue();
+
+        assert!(
             !remote_snapshot_files(harness.remote_root.path(), &write_key).is_empty(),
-            "refresh_entry must push the merged snapshot shard to the remote, \
+            "flush_refreshes must push the merged snapshot shard to the remote, \
              not just merge it into the local index"
         );
         assert!(
@@ -2147,7 +2157,110 @@ mod tests {
                 .join("entries")
                 .join(format!("{}.bin", hex_hash(input_key)))
                 .exists(),
-            "refresh_entry must push the entry meta object to the remote too"
+            "flush_refreshes must push the entry meta object to the remote too"
         );
+    }
+
+    #[test]
+    fn flush_refreshes_collapses_two_hits_into_a_single_push() {
+        if !should_run_rclone_test() {
+            eprintln!("skipping rclone-gated shared-cache refresh-batching test; rclone not on PATH or LUCHTA_TEST_RCLONE disabled");
+            return;
+        }
+
+        // Round 2 of this feature pushed a merge to the remote on every
+        // single hit: a build with N hits enqueued up to N pushes, worst on
+        // exactly the runs where the cache works best, saturating the rclone
+        // daemon and tripping its timeout-disable circuit breaker. Batching
+        // must collapse any number of hits in one run into exactly one
+        // push -- proven here with two hits for two distinct keys.
+        let harness = RemoteHarness::new("console.log('flush-collapse');\n");
+        let cache = harness.cache();
+
+        let hits = [
+            (
+                derive_input_key([31; 32], [32; 32], [33; 32], [34; 32], [35; 32]),
+                [0x71; 32],
+                31u8,
+            ),
+            (
+                derive_input_key([41; 32], [42; 32], [43; 32], [44; 32], [45; 32]),
+                [0x72; 32],
+                41u8,
+            ),
+        ];
+
+        for (input_key, outputs_hash, seed) in hits {
+            let record_bytes = bincode::serde::encode_to_vec(
+                sample_record(true, 200),
+                crate::serialization::bincode_config(),
+            )
+            .unwrap();
+            crate::shared::write_entry_meta(
+                cache.paths(),
+                &input_key,
+                &crate::shared::EntryMeta {
+                    schema_version: crate::shared::ENTRY_META_SCHEMA_VERSION,
+                    outputs_hash,
+                    has_outputs: false,
+                    record: record_bytes,
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                    reports: Vec::new(),
+                },
+            )
+            .unwrap();
+
+            let entry = SnapshotEntry {
+                task_id: format!("pkg-{seed}#refresh"),
+                input_key,
+                outputs_hash,
+                task_spec_hash: [seed; 32],
+                env_hash: [seed.wrapping_add(1); 32],
+                pkg_dep_hash: [seed.wrapping_add(2); 32],
+                duration_ms: 200,
+                output_bytes: 0,
+                cached_at_unix_ms: 1_000_000_000_000,
+                tool_version: None,
+            };
+            cache.refresh_entry(&input_key, &entry);
+        }
+
+        // Neither hit has reached the remote yet: two calls to
+        // `refresh_entry` with no flush in between must produce zero remote
+        // traffic.
+        cache.flush_push_queue();
+        let write_key = cache.write_bucket_key().unwrap().to_string();
+        assert!(
+            remote_snapshot_files(harness.remote_root.path(), &write_key).is_empty(),
+            "two hits with no flush yet must not have reached the remote"
+        );
+
+        cache.flush_refreshes();
+        cache.flush_push_queue();
+
+        let files = remote_snapshot_files(harness.remote_root.path(), &write_key);
+        assert_snapshot_shard_count(&files, 1, 1);
+
+        // And that single shard must carry BOTH entries -- proving the flush
+        // merged them together in one pass rather than only the last one
+        // surviving.
+        let remote_paths = crate::shared::open_shared_paths(harness.remote_root.path()).unwrap();
+        let remote_snapshot = SnapshotStore::new(remote_paths)
+            .load(&write_key)
+            .expect("the single pushed shard must be loadable");
+        assert_eq!(
+            remote_snapshot.entries.len(),
+            2,
+            "the single push must carry both refreshed entries"
+        );
+        for (input_key, _, _) in hits {
+            assert!(
+                remote_snapshot
+                    .entries
+                    .contains_key(&input_key_hex(input_key)),
+                "both hits' entries must be present in the one pushed shard"
+            );
+        }
     }
 }

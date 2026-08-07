@@ -45,13 +45,13 @@ pub use snapshot::{
     combined_dep_outputs_hash, derive_input_key, input_key_hex, MergeEntryOutcome, MergeResult,
     Snapshot, SnapshotEntry, SnapshotStore, SnapshotUpload, SNAPSHOT_SCHEMA_VERSION,
 };
-use std::collections::HashSet;
 #[cfg(unix)]
 use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
 
 #[cfg(unix)]
@@ -217,6 +217,12 @@ pub struct SharedCache {
     index: OnceLock<MergedIndex>,
     /// Size cap for individual blobs.
     size_cap_bytes: u64,
+    /// Entries refreshed by a cache hit this run, keyed by `input_key` so
+    /// repeat hits of the same key collapse to one entry. Recorded here by
+    /// `refresh_entry` and only actually merged/pushed by `flush_refreshes`,
+    /// called once after all tasks complete — see `flush_refreshes`'s doc
+    /// comment for why a per-hit push would be self-defeating.
+    pending_refreshes: Mutex<HashMap<[u8; 32], SnapshotEntry>>,
 }
 
 pub(crate) fn blob_path(paths: &SharedCachePaths, outputs_hash: &[u8; 32]) -> PathBuf {
@@ -327,6 +333,7 @@ impl SharedCache {
             remote,
             index: OnceLock::new(),
             size_cap_bytes,
+            pending_refreshes: Mutex::new(HashMap::new()),
         })
     }
 
@@ -355,6 +362,7 @@ impl SharedCache {
             remote: None,
             index: OnceLock::new(),
             size_cap_bytes,
+            pending_refreshes: Mutex::new(HashMap::new()),
         })
     }
 
@@ -859,68 +867,34 @@ impl SharedCache {
         &self.snapshot_store
     }
 
-    /// Refreshes an entry on a shared-cache hit: re-merges it into today's
-    /// write bucket, pushes that merge to the remote (mirroring `store()`),
-    /// and advances `entries/<input_key>.bin`'s mtime.
+    /// Records an entry on a shared-cache hit for a later batched merge, and
+    /// immediately advances `entries/<input_key>.bin`'s mtime.
     ///
     /// Without this, a stable entry written once falls out of the day window
     /// a few days later (every build then misses it, rebuilds, and rewrites
     /// it — a sawtooth on exactly the packages the cache exists to serve),
     /// and separately, `gc_entries_dir` ages its meta out by mtime alone
-    /// since a hit doesn't otherwise touch the file. Skipping the remote push
-    /// would leave both problems in place for every machine but the one that
-    /// happened to refresh: `enqueue_push_store_artifacts` is the only path
-    /// in this crate that syncs a snapshot shard outward, so a refresh that
-    /// only updates `self.snapshot_store` locally never leaves this machine.
+    /// since a hit doesn't otherwise touch the file.
+    ///
+    /// Only the mtime touch happens here, per hit. The merge into today's
+    /// write bucket (and the remote push it enables) is deferred to
+    /// `flush_refreshes`, called once after all tasks complete: merging and
+    /// pushing per-hit self-defeats the feature -- see `flush_refreshes`'s
+    /// doc comment. The mtime touch itself stays immediate and per-entry:
+    /// it's a local file operation with no rclone involvement, and every
+    /// refreshed entry's meta file has to be touched regardless of how the
+    /// index-merge is batched.
     ///
     /// Best-effort and infallible: the hit has already succeeded by the time
     /// this runs, so a refresh failure must never turn it into a miss or fail
-    /// the build. Every failure path here just logs at `debug:` and returns.
-    /// Never re-stores the blob or the meta object — both are content-
-    /// addressed and already correct, so only a small index entry, an mtime,
-    /// and (at most once per `input_key` per day — see below) a remote push
-    /// of that index entry move.
+    /// the build. The mtime-touch failure path just logs at `debug:` and
+    /// returns. Never re-stores the blob or the meta object — both are
+    /// content-addressed and already correct.
     pub fn refresh_entry(&self, input_key: &[u8; 32], entry: &SnapshotEntry) {
-        if let Some(write_key) = self.write_bucket_key.as_deref() {
-            let merge = self
-                .snapshot_store
-                .merge_entry_with_outcome(write_key, entry.clone());
-            match merge.result {
-                MergeResult::SkippedLockUnavailable => {
-                    eprintln!(
-                        "debug: shared cache refresh could not merge entry for input_key={}",
-                        hex_hash(*input_key)
-                    );
-                }
-                MergeResult::Inserted
-                | MergeResult::IdempotentNoop
-                | MergeResult::ConflictKeptExisting => {
-                    // Same push path `finish_store` feeds after `store()`'s own
-                    // merge. `merge.new_snapshot_upload` is `None` on
-                    // `IdempotentNoop`/`ConflictKeptExisting` (the common case:
-                    // the entry already lived in today's bucket, or a refresh
-                    // raced another writer), so the snapshot-shard push itself
-                    // fires at most once per `input_key` per day, on whichever
-                    // hit is first to actually add it. `push_blob_if_missing`
-                    // and `push_entry_meta_if_missing` (called unconditionally
-                    // inside that push, same as for a fresh `store()`) already
-                    // no-op once the remote copy exists.
-                    #[cfg(unix)]
-                    {
-                        let has_outputs = read_entry_meta(&self.paths, input_key)
-                            .map(|meta| meta.has_outputs)
-                            .unwrap_or(false);
-                        self.enqueue_remote_push(
-                            write_key,
-                            entry.outputs_hash,
-                            *input_key,
-                            has_outputs,
-                            merge,
-                        );
-                    }
-                }
-            }
-        }
+        self.pending_refreshes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(*input_key, entry.clone());
 
         let path = entry_meta_path(&self.paths, input_key);
         match OpenOptions::new().write(true).open(&path) {
@@ -938,6 +912,84 @@ impl SharedCache {
                     "debug: shared cache refresh could not advance meta mtime for input_key={}: {err}",
                     hex_hash(*input_key)
                 );
+            }
+        }
+    }
+
+    /// Flushes every entry `refresh_entry` recorded this run: exactly one
+    /// `merge_entries_with_outcome` call (one shard load, at most one
+    /// consolidated write) and, on unix, exactly one `enqueue_remote_push`
+    /// call, regardless of how many hits fed into it.
+    ///
+    /// Round 2 of this feature pushed a merge to the remote on every single
+    /// hit. That reached the remote correctly, but a build with N cache hits
+    /// enqueues up to N pushes on the first run of a day -- and N is largest
+    /// exactly when the cache is working best. Saturating the rclone daemon
+    /// trips the `timeout_disable` circuit breaker, disabling the remote for
+    /// the rest of the build: the feature defeats itself under its own
+    /// success. Batching collapses that to one push per run, independent of
+    /// hit count, and also removes the per-hit shard reload
+    /// `merge_entry_with_outcome` (now `merge_entries_with_outcome`) pays to
+    /// even report `IdempotentNoop` -- one flush, one load.
+    ///
+    /// Batching is invisible within a run: `get_or_build_index` builds the
+    /// merged index once behind a `OnceLock`, so a mid-run merge was never
+    /// visible to a later lookup in the same process anyway.
+    ///
+    /// Best-effort and infallible, same as `refresh_entry`: called after all
+    /// tasks complete, so nothing downstream depends on it succeeding.
+    pub fn flush_refreshes(&self) {
+        let entries: Vec<SnapshotEntry> = {
+            let mut pending = self
+                .pending_refreshes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if pending.is_empty() {
+                return;
+            }
+            std::mem::take(&mut *pending).into_values().collect()
+        };
+
+        let Some(write_key) = self.write_bucket_key.as_deref() else {
+            return;
+        };
+
+        // Only needed for the `#[cfg(unix)]` push below, which needs some
+        // single entry's `outputs_hash`/`input_key` to size its (idempotent,
+        // best-effort) blob/entry-meta catch-up. Captured before `entries` is
+        // moved into `merge_entries_with_outcome`; which entry is picked
+        // doesn't matter, since the snapshot-shard push itself is driven by
+        // `merge.new_snapshot_upload`, not by this one.
+        #[cfg(unix)]
+        let representative = entries.first().cloned();
+        let entry_count = entries.len();
+
+        let merge = self
+            .snapshot_store
+            .merge_entries_with_outcome(write_key, entries);
+        match merge.result {
+            MergeResult::SkippedLockUnavailable => {
+                eprintln!(
+                    "debug: shared cache refresh flush could not merge {entry_count} pending entries"
+                );
+            }
+            MergeResult::Inserted
+            | MergeResult::IdempotentNoop
+            | MergeResult::ConflictKeptExisting =>
+            {
+                #[cfg(unix)]
+                if let Some(representative) = representative {
+                    let has_outputs = read_entry_meta(&self.paths, &representative.input_key)
+                        .map(|meta| meta.has_outputs)
+                        .unwrap_or(false);
+                    self.enqueue_remote_push(
+                        write_key,
+                        representative.outputs_hash,
+                        representative.input_key,
+                        has_outputs,
+                        merge,
+                    );
+                }
             }
         }
     }
@@ -2393,11 +2445,16 @@ mod tests {
         );
 
         cache.refresh_entry(&input_key, &entry);
+        assert!(
+            cache.snapshot_store().load(&write_bucket).is_none(),
+            "refresh_entry only records the entry; nothing is merged until flush_refreshes runs"
+        );
+        cache.flush_refreshes();
 
         let refreshed = cache
             .snapshot_store()
             .load(&write_bucket)
-            .expect("refresh must write into the current bucket");
+            .expect("flush_refreshes must write the recorded entry into the current bucket");
         assert!(
             refreshed.entries.contains_key(&input_key_hex(input_key)),
             "the refreshed entry must be present in today's bucket, so it survives \
