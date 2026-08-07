@@ -736,101 +736,22 @@ fn cross_worktree_shared_cache_hit() {
     );
 }
 
-/// Test: cross-commit key hierarchy verification.
+/// Test: a dirty-tree build's entry is not reused by a later clean build.
 ///
-/// Verify that candidate_commit_keys returns proper newest-first ordering
-/// with commit-dirty pairs. This tests the git history walking logic
-/// that enables cross-commit cache hits.
+/// Bucket keys carry no notion of git state, so a clean build can now land
+/// in the same bucket as a dirty build's entry just like any other
+/// candidate — nothing about the bucket's name keeps them apart anymore.
+/// Isolation instead comes from the `input_key` itself: `derive_input_key`
+/// folds in `inputs_hash`, a hash of the task's resolved input CONTENT, so
+/// the dirty build's key and the clean build's key differ once the file
+/// content differs. The clean build's shared-cache lookup for ITS key simply
+/// finds no candidate — `decide_shared_restore` (which compares a found
+/// candidate's recorded inputs against the caller's already-resolved
+/// `inputs_hash`, see its doc comment) is never reached, because
+/// `try_restore_candidates` never returns the dirty build's entry for a
+/// different key in the first place.
 #[test]
-fn cross_commit_key_hierarchy() {
-    use std::process::Command;
-
-    let temp = assert_fs::TempDir::new().unwrap();
-
-    // Set up git repo
-    let status = Command::new("git")
-        .args(["init"])
-        .current_dir(temp.path())
-        .status()
-        .expect("git init");
-    assert!(status.success());
-    let status = Command::new("git")
-        .args(["config", "user.email", "test@example.com"])
-        .current_dir(temp.path())
-        .status()
-        .expect("git config");
-    assert!(status.success());
-    let status = Command::new("git")
-        .args(["config", "user.name", "Test User"])
-        .current_dir(temp.path())
-        .status()
-        .expect("git config");
-    assert!(status.success());
-
-    temp.child("file1.txt").write_str("one\n").unwrap();
-    let status = Command::new("git")
-        .args(["add", "."])
-        .current_dir(temp.path())
-        .status()
-        .expect("git add");
-    assert!(status.success());
-    let status = Command::new("git")
-        .args(["commit", "-m", "first"])
-        .current_dir(temp.path())
-        .status()
-        .expect("git commit");
-    assert!(status.success());
-
-    let commit_a = get_head_commit(temp.path());
-
-    temp.child("file2.txt").write_str("two\n").unwrap();
-    let status = Command::new("git")
-        .args(["add", "."])
-        .current_dir(temp.path())
-        .status()
-        .expect("git add");
-    assert!(status.success());
-    let status = Command::new("git")
-        .args(["commit", "-m", "second"])
-        .current_dir(temp.path())
-        .status()
-        .expect("git commit");
-    assert!(status.success());
-
-    let commit_b = get_head_commit(temp.path());
-    assert_ne!(commit_a, commit_b, "commits should differ");
-
-    // Use the internal API to verify candidate_commit_keys ordering
-    let candidates = luchta_cache::shared::git::candidate_commit_keys(temp.path(), 10);
-
-    // Should be: [commit_b, commit_b-dirty, commit_a, commit_a-dirty]
-    assert!(candidates.len() >= 4, "should have at least 4 candidates");
-    assert!(candidates.contains(&commit_b), "should contain commit_b");
-    assert!(
-        candidates.contains(&format!("{}-dirty", commit_b)),
-        "should contain commit_b-dirty"
-    );
-    assert!(candidates.contains(&commit_a), "should contain commit_a");
-    assert!(
-        candidates.contains(&format!("{}-dirty", commit_a)),
-        "should contain commit_a-dirty"
-    );
-
-    // Newest-first ordering
-    let pos_b = candidates.iter().position(|k| k == &commit_b).unwrap();
-    let pos_a = candidates.iter().position(|k| k == &commit_a).unwrap();
-    assert!(
-        pos_b < pos_a,
-        "commit_b should appear before commit_a (newest-first)"
-    );
-}
-
-/// Test: dirty key isolation.
-///
-/// A dirty-tree build writes a `<commit>-dirty.bincode` snapshot, NEVER the clean one.
-/// A clean build does not get a dirty hit.
-#[test]
-fn dirty_key_isolation() {
+fn dirty_tree_entry_is_not_reused_by_clean_build() {
     let shared_cache_dir = tempfile::tempdir().unwrap();
 
     let temp = assert_fs::TempDir::new().unwrap();
@@ -854,15 +775,14 @@ fn dirty_key_isolation() {
         .unwrap();
     init_git(&temp);
 
-    let commit = get_head_commit(temp.path());
-
     // Make dirty (uncommitted change)
     temp.child("packages/app/src.txt")
         .write_str("dirty change\n")
         .unwrap();
     // Do NOT commit — tree is dirty
 
-    // Build in dirty state — counter advances to 1
+    // Build in dirty state — counter advances to 1. The entry is recorded
+    // against the dirty content's input_key.
     Command::cargo_bin("luchta")
         .unwrap()
         .arg("run")
@@ -879,39 +799,46 @@ fn dirty_key_isolation() {
 
     temp.child("packages/app/counter.txt").assert("1\n");
 
-    // Verify dirty snapshot shard dir exists, clean commit dir does NOT
-    let snapshots_dir = shared_cache_dir.path().join("snapshots");
-    let dirty_snapshot_dir = snapshots_dir.join(format!("{}-dirty", commit));
-    let clean_snapshot_dir = snapshots_dir.join(&commit);
+    // Finalize with content DIFFERENT from what was dirty-built, and commit
+    // it. Same task, env, and deps as the dirty build, but different file
+    // content means a different `inputs_hash` and therefore a different
+    // `input_key` — the dirty build's entry lives under a key this build
+    // will never look up.
+    temp.child("packages/app/src.txt")
+        .write_str("final change\n")
+        .unwrap();
+    git_commit_all(temp.path(), "commit the change");
 
-    let dirty_snapshot_shards = snapshot_shard_paths(&dirty_snapshot_dir);
-    assert!(
-        !dirty_snapshot_shards.is_empty(),
-        "dirty snapshot shard(s) should exist"
-    );
-    assert!(
-        !clean_snapshot_dir.exists(),
-        "clean snapshot dir should NOT exist"
-    );
+    // Wipe local cache so the second build has to go through the shared cache.
+    std::fs::remove_dir_all(temp.child(".luchta/cache").path()).unwrap();
 
-    // NEW TEST START — verify written entry structure directly
-    // Load the snapshot and verify entry structure
-    let paths = luchta_cache::shared::open_shared_paths(shared_cache_dir.path()).unwrap();
-    let store = luchta_cache::shared::snapshot::SnapshotStore::new(paths);
-    let snapshot = store.load(&format!("{}-dirty", commit));
-    assert!(snapshot.is_some(), "dirty snapshot should load");
-    let snapshot = snapshot.unwrap();
-    assert!(
-        !snapshot.entries.is_empty(),
-        "dirty snapshot should have entries"
-    );
+    // Second, clean build must NOT reuse the dirty build's entry: its own
+    // input_key (content-keyed) differs from the dirty build's, so the
+    // shared-cache lookup finds no candidate at all — a genuine miss — and
+    // the task runs again.
+    let second = Command::cargo_bin("luchta")
+        .unwrap()
+        .arg("run")
+        .arg("pkgbuild")
+        .arg("--workspace-root")
+        .arg(temp.path())
+        .env("LUCHTA_SHARED_CACHE", "1")
+        .env(
+            "LUCHTA_SHARED_CACHE_DIR",
+            shared_cache_dir.path().to_str().unwrap(),
+        )
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let second_stdout = String::from_utf8(second).unwrap();
 
-    // Verify the entry has correct task_id
-    let entry = snapshot.entries.values().next().unwrap();
-    assert_eq!(
-        entry.task_id, "app#pkgbuild",
-        "entry should have correct task_id"
+    assert!(
+        !second_stdout.contains("📥"),
+        "clean build must not restore the dirty build's entry, stdout was:\n{second_stdout}"
     );
+    temp.child("packages/app/counter.txt").assert("2\n");
 }
 
 /// Test: cross-commit shared cache hit — the headline CI value.
@@ -1091,9 +1018,15 @@ fn cross_commit_shared_cache_hit() {
     temp.child("run-count.txt").assert("2\n");
 }
 
-/// Test: accumulation — running multiple tasks on SAME commit produces ONE snapshot with multiple entries.
+/// Test: entries from separate `luchta run` invocations are both discoverable.
+///
+/// Each write picks its bucket as `<YYYYMMDD>-<shard>` from a nonce, so
+/// `lint` and `test` may land in the same bucket or different ones — nothing
+/// here pins them apart. What matters is that a build's read window covers
+/// every bucket it could have written to, so a later build can restore
+/// either task's entry regardless of which bucket each landed in.
 #[test]
-fn accumulation_single_snapshot_multiple_entries() {
+fn entries_from_separate_runs_are_both_discoverable() {
     let shared_cache_dir = tempfile::tempdir().unwrap();
 
     let temp = assert_fs::TempDir::new().unwrap();
@@ -1121,7 +1054,7 @@ fn accumulation_single_snapshot_multiple_entries() {
         .unwrap();
     init_git(&temp);
 
-    // Run lint
+    // Run lint.
     Command::cargo_bin("luchta")
         .unwrap()
         .arg("run")
@@ -1135,8 +1068,9 @@ fn accumulation_single_snapshot_multiple_entries() {
         )
         .assert()
         .success();
+    temp.child("packages/app/lint-counter.txt").assert("1\n");
 
-    // Run test (same commit)
+    // Run test — a separate invocation.
     Command::cargo_bin("luchta")
         .unwrap()
         .arg("run")
@@ -1150,33 +1084,58 @@ fn accumulation_single_snapshot_multiple_entries() {
         )
         .assert()
         .success();
+    temp.child("packages/app/test-counter.txt").assert("1\n");
 
-    // Verify commit snapshot shard(s) preserve both entries
-    let commit = get_head_commit(temp.path());
-    let commit_snapshot_dir = shared_cache_dir.path().join("snapshots").join(&commit);
-    let shard_paths = snapshot_shard_paths(&commit_snapshot_dir);
+    // Wipe local cache so both re-runs have to go through the shared cache.
+    std::fs::remove_dir_all(temp.child(".luchta/cache").path()).unwrap();
 
+    // Re-run lint: restored from the shared cache, counter unchanged.
+    let lint_rerun = Command::cargo_bin("luchta")
+        .unwrap()
+        .arg("run")
+        .arg("lint")
+        .arg("--workspace-root")
+        .arg(temp.path())
+        .env("LUCHTA_SHARED_CACHE", "1")
+        .env(
+            "LUCHTA_SHARED_CACHE_DIR",
+            shared_cache_dir.path().to_str().unwrap(),
+        )
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let lint_rerun_stdout = String::from_utf8(lint_rerun).unwrap();
     assert!(
-        !shard_paths.is_empty(),
-        "snapshot shard(s) should exist for commit"
+        lint_rerun_stdout.contains("📥 1"),
+        "lint re-run should report a shared hit, stdout was:\n{lint_rerun_stdout}"
     );
+    temp.child("packages/app/lint-counter.txt").assert("1\n");
 
-    // Load merged snapshot and verify entry count
-    let paths = luchta_cache::shared::open_shared_paths(shared_cache_dir.path()).unwrap();
-    let store = luchta_cache::shared::snapshot::SnapshotStore::new(paths);
-    let snapshot = store.load(&commit).expect("snapshot should load");
-
-    assert_eq!(
-        snapshot.entries.len(),
-        2,
-        "snapshot should have 2 entries (lint + test)"
+    // Re-run test: restored from the shared cache, counter unchanged.
+    let test_rerun = Command::cargo_bin("luchta")
+        .unwrap()
+        .arg("run")
+        .arg("test")
+        .arg("--workspace-root")
+        .arg(temp.path())
+        .env("LUCHTA_SHARED_CACHE", "1")
+        .env(
+            "LUCHTA_SHARED_CACHE_DIR",
+            shared_cache_dir.path().to_str().unwrap(),
+        )
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let test_rerun_stdout = String::from_utf8(test_rerun).unwrap();
+    assert!(
+        test_rerun_stdout.contains("📥 1"),
+        "test re-run should report a shared hit, stdout was:\n{test_rerun_stdout}"
     );
-
-    // Verify each task has an entry
-    let has_lint = snapshot.entries.values().any(|e| e.task_id == "app#lint");
-    let has_test = snapshot.entries.values().any(|e| e.task_id == "app#test");
-    assert!(has_lint, "snapshot should contain lint entry");
-    assert!(has_test, "snapshot should contain test entry");
+    temp.child("packages/app/test-counter.txt").assert("1\n");
 }
 
 /// Test: over-size-cap task is NOT cached.
@@ -1251,7 +1210,7 @@ fn over_size_cap_task_not_cached() {
     // The key invariant: no blob was written for over-size output
 }
 
-/// Recursively list snapshot shard files under snapshots/<commit>/*.bincode.
+/// Recursively list snapshot shard files under snapshots/<YYYYMMDD>-<shard>/*.bincode.
 fn snapshot_shard_paths(root: &Path) -> Vec<PathBuf> {
     let mut shards = Vec::new();
     collect_snapshot_shards(root, &mut shards);
@@ -1296,7 +1255,6 @@ fn get_head_commit(repo_path: &Path) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
-#[allow(dead_code)]
 /// Commit all changes in repo.
 fn git_commit_all(repo_path: &Path, message: &str) {
     use std::process::Command;

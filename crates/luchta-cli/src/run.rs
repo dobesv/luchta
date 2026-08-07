@@ -609,6 +609,10 @@ struct SharedCacheSkipInput<'a> {
     task_def: &'a TaskDefinition,
     current: &'a CurrentState<'a>,
     decision: &'a DecisionResult,
+    /// The task's local cache record, if any. Used as the mtime prior when
+    /// resolving inputs up front for the shared-cache key -- see the comment
+    /// in `try_shared_cache_skip`.
+    local_record: Option<&'a TaskRunRecord>,
 }
 
 #[derive(Clone)]
@@ -2361,6 +2365,18 @@ pub(crate) fn run_cycle<'a>(
             cancel_token,
         )
         .await;
+
+        // All tasks for this cycle have finished (successfully, with
+        // failures, or cancelled) -- flush this cycle's shared-cache-hit
+        // refreshes now, in one batched push, rather than one push per hit
+        // as tasks completed. See `SharedCache::flush_refreshes`'s doc
+        // comment for why per-hit pushing self-defeats the feature. Not
+        // hooked via `Drop`: ordering relative to unwinding/cancellation
+        // would be fragile, and this needs to run exactly once per cycle
+        // regardless of outcome, which an explicit call site guarantees.
+        if let Some(shared_cache) = &resources.shared_cache {
+            shared_cache.flush_refreshes();
+        }
 
         finalize_and_report(FinalizeCycle {
             run,

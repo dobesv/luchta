@@ -13,14 +13,17 @@ use crate::shared::{derive_input_key, restore_blob, SnapshotEntry, SnapshotStore
 pub const DEFAULT_GC_RETENTION: Duration = Duration::from_secs(14 * 24 * 60 * 60);
 /// Default throttle window for opportunistic GC runs.
 pub const DEFAULT_GC_THROTTLE: Duration = Duration::from_secs(24 * 60 * 60);
-const LAST_GC_MARKER: &str = ".last-gc";
+/// Marker file for the GC throttle.
+const GC_MARKER_NAME: &str = ".gc-marker";
 const SNAPSHOT_SUFFIX: &str = ".bincode";
 const BLOB_SUFFIX: &str = ".tar.zst";
+const ENTRY_META_SUFFIX: &str = ".bin";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct GcStats {
     pub snapshots_deleted: u64,
     pub blobs_deleted: u64,
+    pub entries_deleted: usize,
     pub bytes_freed: u64,
 }
 
@@ -31,6 +34,7 @@ pub fn run_gc(paths: &SharedCachePaths, retention: Duration) -> GcStats {
 
     gc_snapshot_dir(paths, retention, now, &mut stats);
     gc_blob_dir(paths, retention, now, &mut stats);
+    gc_entries_dir(paths, retention, now, &mut stats);
 
     stats
 }
@@ -40,12 +44,12 @@ pub fn maybe_run_gc(
     retention: Duration,
     throttle: Duration,
 ) -> Option<GcStats> {
-    if !should_run_gc(paths, throttle, SystemTime::now()) {
+    if !should_run_marked(paths, GC_MARKER_NAME, throttle, SystemTime::now()) {
         return None;
     }
 
     let stats = run_gc(paths, retention);
-    let _ = write_gc_marker(paths, SystemTime::now());
+    let _ = write_marker(paths, GC_MARKER_NAME, SystemTime::now());
     Some(stats)
 }
 
@@ -165,26 +169,64 @@ fn gc_blob_dir(
     }
 }
 
-fn should_run_gc(paths: &SharedCachePaths, throttle: Duration, now: SystemTime) -> bool {
-    let marker_path = gc_marker_path(paths);
-    match fs::metadata(marker_path).and_then(|metadata| metadata.modified()) {
+fn gc_entries_dir(
+    paths: &SharedCachePaths,
+    retention: Duration,
+    now: SystemTime,
+    stats: &mut GcStats,
+) {
+    let entries = match fs::read_dir(&paths.entries_dir) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+
+    for entry in entries {
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
+        if !has_file_name_suffix(&path, ENTRY_META_SUFFIX) {
+            continue;
+        }
+        if !is_older_than(&path, retention, now) {
+            continue;
+        }
+
+        // Age-based, like blobs. A reader that loses the race treats the
+        // missing meta as a cache miss and reruns the task.
+        let meta_bytes = file_len(&path);
+        if remove_file_if_exists(&path) {
+            stats.entries_deleted += 1;
+            stats.bytes_freed = stats.bytes_freed.saturating_add(meta_bytes);
+        }
+    }
+}
+
+/// True if `throttle` has elapsed since the marker named `marker_name` was
+/// last stamped (or if it has never been stamped).
+fn should_run_marked(
+    paths: &SharedCachePaths,
+    marker_name: &str,
+    throttle: Duration,
+    now: SystemTime,
+) -> bool {
+    let path = marker_path(paths, marker_name);
+    match fs::metadata(path).and_then(|metadata| metadata.modified()) {
         Ok(modified) => elapsed_at_least(modified, throttle, now),
         Err(error) if error.kind() == io::ErrorKind::NotFound => true,
         Err(_) => true,
     }
 }
 
-fn write_gc_marker(paths: &SharedCachePaths, now: SystemTime) -> io::Result<()> {
+fn write_marker(paths: &SharedCachePaths, marker_name: &str, now: SystemTime) -> io::Result<()> {
     let timestamp = now
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
         .to_string();
-    atomic_write(&gc_marker_path(paths), timestamp.as_bytes()).map_err(io::Error::other)
+    atomic_write(&marker_path(paths, marker_name), timestamp.as_bytes()).map_err(io::Error::other)
 }
 
-fn gc_marker_path(paths: &SharedCachePaths) -> PathBuf {
-    paths.root.join(LAST_GC_MARKER)
+fn marker_path(paths: &SharedCachePaths, marker_name: &str) -> PathBuf {
+    paths.root.join(marker_name)
 }
 
 fn has_file_name_suffix(path: &Path, suffix: &str) -> bool {
@@ -238,11 +280,11 @@ fn remove_file_if_exists(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shared::{open_shared_paths, write_blob};
+    use crate::shared::{open_shared_paths, write_outputs_blob};
     use filetime::FileTime;
     use std::sync::Arc;
     use std::thread;
-    use tempfile::tempdir;
+    use tempfile::{tempdir, TempDir};
 
     fn entry_for(task_id: &str, outputs_hash: [u8; 32]) -> SnapshotEntry {
         let task_spec_hash = [1; 32];
@@ -250,7 +292,7 @@ mod tests {
         let pkg_dep_hash = [3; 32];
         SnapshotEntry {
             task_id: task_id.to_owned(),
-            input_key: derive_input_key(task_spec_hash, env_hash, pkg_dep_hash, [0; 32]),
+            input_key: derive_input_key(task_spec_hash, env_hash, pkg_dep_hash, [0; 32], [0; 32]),
             outputs_hash,
             task_spec_hash,
             env_hash,
@@ -289,7 +331,7 @@ mod tests {
         let output_path = package_dir.join(&output_rel);
         fs::create_dir_all(output_path.parent().unwrap()).unwrap();
         fs::write(&output_path, b"shared blob data").unwrap();
-        let result = write_blob(
+        let result = write_outputs_blob(
             paths,
             &outputs_hash,
             package_dir,
@@ -414,7 +456,7 @@ mod tests {
 
         assert!(first.is_some());
         assert!(second.is_none());
-        assert!(gc_marker_path(&paths).exists());
+        assert!(marker_path(&paths, GC_MARKER_NAME).exists());
     }
 
     #[test]
@@ -469,6 +511,58 @@ mod tests {
 
         assert!(stats.snapshots_deleted <= 1);
         assert!(stats.blobs_deleted <= 1);
+    }
+
+    #[test]
+    fn run_gc_deletes_old_entry_meta() {
+        let temp = TempDir::new().unwrap();
+        let paths = crate::shared::paths::open_shared_paths(temp.path()).unwrap();
+        let input_key = [12_u8; 32];
+
+        let meta = crate::shared::EntryMeta {
+            schema_version: crate::shared::ENTRY_META_SCHEMA_VERSION,
+            outputs_hash: [1; 32],
+            has_outputs: false,
+            record: vec![0],
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            reports: Vec::new(),
+        };
+        crate::shared::write_entry_meta(&paths, &input_key, &meta).unwrap();
+
+        let path = crate::shared::entry_meta_path(&paths, &input_key);
+        set_mtime(
+            &path,
+            SystemTime::now() - Duration::from_secs(60 * 60 * 24 * 30),
+        );
+
+        let stats = run_gc(&paths, Duration::from_secs(60 * 60 * 24 * 7));
+
+        assert_eq!(stats.entries_deleted, 1);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn run_gc_keeps_recent_entry_meta() {
+        let temp = TempDir::new().unwrap();
+        let paths = crate::shared::paths::open_shared_paths(temp.path()).unwrap();
+        let input_key = [13_u8; 32];
+
+        let meta = crate::shared::EntryMeta {
+            schema_version: crate::shared::ENTRY_META_SCHEMA_VERSION,
+            outputs_hash: [1; 32],
+            has_outputs: false,
+            record: vec![0],
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            reports: Vec::new(),
+        };
+        crate::shared::write_entry_meta(&paths, &input_key, &meta).unwrap();
+
+        let stats = run_gc(&paths, Duration::from_secs(60 * 60 * 24 * 7));
+
+        assert_eq!(stats.entries_deleted, 0);
+        assert!(crate::shared::entry_meta_path(&paths, &input_key).exists());
     }
 
     fn set_mtime(path: &Path, modified: SystemTime) {

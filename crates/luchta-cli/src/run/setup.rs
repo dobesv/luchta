@@ -9,7 +9,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use luchta_cache::shared::{maybe_run_gc, SharedCache, DEFAULT_GC_RETENTION, DEFAULT_GC_THROTTLE};
+use luchta_cache::shared::{
+    maybe_run_gc, SharedCache, DEFAULT_GC_RETENTION, DEFAULT_GC_THROTTLE,
+    DEFAULT_SHARED_CACHE_DAY_WINDOW,
+};
 #[cfg(unix)]
 use luchta_cache::shared::{OpenExtras, RemoteConfig};
 use luchta_cache::{Cache, ListingCache};
@@ -126,8 +129,12 @@ const SHARED_CACHE_ENABLED_ENV: &str = "LUCHTA_SHARED_CACHE";
 const SHARED_CACHE_GC_DAYS_ENV: &str = "LUCHTA_SHARED_CACHE_GC_DAYS";
 /// Environment variable overriding shared cache output size cap, in megabytes.
 const SHARED_CACHE_MAX_OUTPUT_MB_ENV: &str = "LUCHTA_SHARED_CACHE_MAX_OUTPUT_MB";
-/// Environment variable overriding shared cache recent-commit history length.
-const SHARED_CACHE_HISTORY_ENV: &str = "LUCHTA_SHARED_CACHE_HISTORY";
+/// Environment variable overriding the shared cache read window, in days.
+const SHARED_CACHE_DAYS_ENV: &str = "LUCHTA_SHARED_CACHE_DAYS";
+/// Deprecated alias for `SHARED_CACHE_DAYS_ENV`, kept for one release. The old
+/// name counted git commits, which this design no longer has — see
+/// `shared_cache_day_window`'s doc comment.
+const SHARED_CACHE_HISTORY_ENV_DEPRECATED: &str = "LUCHTA_SHARED_CACHE_HISTORY";
 /// Environment variable overriding shared cache remote sync timeout, in seconds.
 const SHARED_CACHE_SYNC_TIMEOUT_ENV: &str = "LUCHTA_SHARED_CACHE_SYNC_TIMEOUT";
 /// Environment variable controlling how many consecutive rclone timeouts disable remote.
@@ -164,8 +171,6 @@ pub(crate) const NO_CACHE_ENV: &str = "LUCHTA_NO_CACHE";
 
 /// Default shared cache size cap in megabytes.
 const DEFAULT_SHARED_CACHE_SIZE_CAP_MB: u64 = 250;
-/// Default shared cache history length (number of commits).
-const DEFAULT_SHARED_CACHE_HISTORY_LEN: usize = 20;
 
 fn parse_truthy_env_value(value: Option<&str>) -> bool {
     matches!(value.map(str::trim), Some(raw) if raw.eq_ignore_ascii_case("1") || raw.eq_ignore_ascii_case("true") || raw.eq_ignore_ascii_case("on"))
@@ -292,12 +297,54 @@ fn shared_cache_size_cap_bytes() -> u64 {
     mb.saturating_mul(1024 * 1024)
 }
 
-fn shared_cache_history_len() -> usize {
-    parse_env_u64_or(
-        SHARED_CACHE_HISTORY_ENV,
-        std::env::var(SHARED_CACHE_HISTORY_ENV).ok().as_deref(),
-        DEFAULT_SHARED_CACHE_HISTORY_LEN as u64,
-    ) as usize
+/// Message printed to stderr when the deprecated `LUCHTA_SHARED_CACHE_HISTORY`
+/// env var is set, or `None` if it isn't. Pulled out as a pure function of the
+/// two "is set" flags so the exact wording — and the both-set precedence rule
+/// — can be asserted directly, without going through real env vars or
+/// capturing stderr.
+fn shared_cache_days_deprecation_warning(old_set: bool, new_set: bool) -> Option<String> {
+    if !old_set {
+        return None;
+    }
+    Some(if new_set {
+        format!(
+            "warning: {SHARED_CACHE_HISTORY_ENV_DEPRECATED} is deprecated in favor of \
+             {SHARED_CACHE_DAYS_ENV} and will be removed in a future release; both are set, \
+             {SHARED_CACHE_DAYS_ENV} wins"
+        )
+    } else {
+        format!(
+            "warning: {SHARED_CACHE_HISTORY_ENV_DEPRECATED} is deprecated and will be removed \
+             in a future release; set {SHARED_CACHE_DAYS_ENV} instead"
+        )
+    })
+}
+
+/// Days of shared-cache history to read (`SharedCache`'s `day_window`), not a
+/// count of commits or shards: computed bucket keys replaced the old
+/// commit/shard discovery scheme. Defaults to
+/// `luchta_cache::shared::DEFAULT_SHARED_CACHE_DAY_WINDOW`, not a local
+/// constant, so the CLI default can't drift from the crate's own default.
+///
+/// Reads `LUCHTA_SHARED_CACHE_DAYS`, falling back to the deprecated
+/// `LUCHTA_SHARED_CACHE_HISTORY` for one release. If both are set, the new
+/// name wins, and the deprecation warning says so.
+fn shared_cache_day_window() -> usize {
+    let new_value = std::env::var(SHARED_CACHE_DAYS_ENV).ok();
+    let old_value = std::env::var(SHARED_CACHE_HISTORY_ENV_DEPRECATED).ok();
+
+    if let Some(message) =
+        shared_cache_days_deprecation_warning(old_value.is_some(), new_value.is_some())
+    {
+        eprintln!("{message}");
+    }
+
+    let (var_name, value) = match &new_value {
+        Some(v) => (SHARED_CACHE_DAYS_ENV, Some(v.as_str())),
+        None => (SHARED_CACHE_HISTORY_ENV_DEPRECATED, old_value.as_deref()),
+    };
+
+    non_zero_env_u64_or(var_name, value, DEFAULT_SHARED_CACHE_DAY_WINDOW as u64) as usize
 }
 
 /// Builds the executor (with all task commands registered), the build cache,
@@ -323,7 +370,7 @@ pub(crate) fn build_execution_resources(
         SharedCacheMode::LocalOnly => SharedCache::open(
             inputs.workspace_root,
             shared_cache_size_cap_bytes(),
-            shared_cache_history_len(),
+            shared_cache_day_window(),
         )
         .map(Arc::new),
         SharedCacheMode::Remote { fs_base } => {
@@ -332,7 +379,7 @@ pub(crate) fn build_execution_resources(
                 SharedCache::open_with_remote(
                     inputs.workspace_root,
                     shared_cache_size_cap_bytes(),
-                    shared_cache_history_len(),
+                    shared_cache_day_window(),
                     OpenExtras {
                         cache_dir: None,
                         remote: Some(RemoteConfig {
@@ -352,7 +399,7 @@ pub(crate) fn build_execution_resources(
                 SharedCache::open(
                     inputs.workspace_root,
                     shared_cache_size_cap_bytes(),
-                    shared_cache_history_len(),
+                    shared_cache_day_window(),
                 )
                 .map(Arc::new)
             }
@@ -400,6 +447,7 @@ pub(crate) fn build_execution_resources(
 mod tests {
     use super::*;
     use crate::memory_pressure::MemorySample;
+    use luchta_cache::shared::SHARED_CACHE_SHARD_COUNT;
     use luchta_test_support::require_nextest;
     use std::sync::Mutex;
 
@@ -614,22 +662,98 @@ mod tests {
     }
 
     #[test]
-    fn parse_shared_cache_history_defaults_and_overrides() {
+    fn parse_shared_cache_days_defaults_and_overrides() {
         assert_eq!(
-            parse_env_u64_or(
-                SHARED_CACHE_HISTORY_ENV,
+            non_zero_env_u64_or(
+                SHARED_CACHE_DAYS_ENV,
                 None,
-                DEFAULT_SHARED_CACHE_HISTORY_LEN as u64
+                DEFAULT_SHARED_CACHE_DAY_WINDOW as u64
             ),
-            20
+            3
         );
         assert_eq!(
-            parse_env_u64_or(
-                SHARED_CACHE_HISTORY_ENV,
+            non_zero_env_u64_or(
+                SHARED_CACHE_DAYS_ENV,
                 Some("64"),
-                DEFAULT_SHARED_CACHE_HISTORY_LEN as u64
+                DEFAULT_SHARED_CACHE_DAY_WINDOW as u64
             ),
             64
+        );
+        // "0" would otherwise make `bucket_keys_for` return an empty read
+        // set, silently disabling shared-cache reads — fall back to the default.
+        assert_eq!(
+            non_zero_env_u64_or(
+                SHARED_CACHE_DAYS_ENV,
+                Some("0"),
+                DEFAULT_SHARED_CACHE_DAY_WINDOW as u64
+            ),
+            3
+        );
+    }
+
+    #[test]
+    fn shared_cache_days_deprecation_warning_matrix() {
+        // Neither set: no warning.
+        assert_eq!(shared_cache_days_deprecation_warning(false, false), None);
+        // New-only: no warning; the deprecated name was never touched.
+        assert_eq!(shared_cache_days_deprecation_warning(false, true), None);
+        // Old-only: warns, but doesn't claim a precedence conflict that isn't happening.
+        let old_only = shared_cache_days_deprecation_warning(true, false).unwrap();
+        assert!(old_only.contains(SHARED_CACHE_HISTORY_ENV_DEPRECATED));
+        assert!(old_only.contains(SHARED_CACHE_DAYS_ENV));
+        assert!(old_only.contains("deprecated"));
+        assert!(!old_only.contains("wins"));
+        // Both set: warns AND says which one wins.
+        let both_set = shared_cache_days_deprecation_warning(true, true).unwrap();
+        assert!(both_set.contains("both are set"));
+        assert!(both_set.contains("wins"));
+    }
+
+    #[test]
+    fn shared_cache_day_window_uses_deprecated_env_when_only_it_is_set() {
+        require_nextest();
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _new_guard = EnvVarGuard::remove(SHARED_CACHE_DAYS_ENV);
+        let _old_guard = EnvVarGuard::set(SHARED_CACHE_HISTORY_ENV_DEPRECATED, "9");
+        assert_eq!(shared_cache_day_window(), 9);
+    }
+
+    #[test]
+    fn shared_cache_day_window_prefers_new_env_when_both_are_set() {
+        require_nextest();
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _new_guard = EnvVarGuard::set(SHARED_CACHE_DAYS_ENV, "5");
+        let _old_guard = EnvVarGuard::set(SHARED_CACHE_HISTORY_ENV_DEPRECATED, "9");
+        assert_eq!(shared_cache_day_window(), 5);
+    }
+
+    #[test]
+    fn shared_cache_day_window_treats_zero_as_default() {
+        require_nextest();
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvVarGuard::set(SHARED_CACHE_DAYS_ENV, "0");
+        let _old_guard = EnvVarGuard::remove(SHARED_CACHE_HISTORY_ENV_DEPRECATED);
+        assert_eq!(shared_cache_day_window(), DEFAULT_SHARED_CACHE_DAY_WINDOW);
+    }
+
+    #[test]
+    fn shared_cache_day_window_default_is_three_days_of_six_shards_each() {
+        // Pins both constants together: a future change to either one that
+        // isn't deliberate would silently inflate (or shrink) the number of
+        // buckets fetched per restore. Also guards against the CLI's default
+        // drifting from `luchta-cache`'s own default the way it did before
+        // this test existed (`DEFAULT_SHARED_CACHE_HISTORY_LEN = 20` fed into
+        // what is now `day_window`, an 18-vs-120-key blow-up).
+        require_nextest();
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvVarGuard::remove(SHARED_CACHE_DAYS_ENV);
+        let _old_guard = EnvVarGuard::remove(SHARED_CACHE_HISTORY_ENV_DEPRECATED);
+        assert_eq!(DEFAULT_SHARED_CACHE_DAY_WINDOW, 3);
+        assert_eq!(shared_cache_day_window(), DEFAULT_SHARED_CACHE_DAY_WINDOW);
+        assert_eq!(
+            shared_cache_day_window() * SHARED_CACHE_SHARD_COUNT,
+            18,
+            "default read set must be 18 computed bucket keys"
         );
     }
 

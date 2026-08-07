@@ -72,7 +72,61 @@ jobs:
           tool: cargo-nextest
 
       - name: Test workspace
-        run: cargo nextest run --workspace
+        run: cargo nextest run --workspace --no-fail-fast
+
+  rclone:
+    name: Shared Cache (rclone)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      # Pinned rather than `apt-get install rclone`: Ubuntu 24.04 ships
+      # rclone 1.60.1, on which the rcd daemon exits with status 1 the moment
+      # it starts — it predates unix-socket support for `--rc-addr`, which is
+      # how Luchta talks to it — and all 17 remote-sync tests fail. 1.74.3 is
+      # the version this code was developed and live-probed against.
+      # The version lives in a shell variable, deliberately not a job-level
+      # `env:` entry. rclone maps `RCLONE_<FLAG>` environment variables onto
+      # its own flags, so an `RCLONE_VERSION` env var is read as the boolean
+      # `--version` flag and every rclone invocation dies with
+      # `strconv.ParseBool: parsing "v1.74.3"`. Don't "tidy" this into `env:`.
+      - name: Install rclone
+        run: |
+          version=v1.74.3
+          curl -fsSL "https://downloads.rclone.org/${version}/rclone-${version}-linux-amd64.zip" -o /tmp/rclone.zip
+          unzip -q /tmp/rclone.zip -d /tmp
+          sudo install -m 755 "/tmp/rclone-${version}-linux-amd64/rclone" /usr/local/bin/rclone
+          rclone version
+
+      # These tests exercise the real remote-sync path (blob/entry push and
+      # pull, rcd lifecycle) against rclone's built-in `:local:` filesystem
+      # remote, so no cloud credentials are needed. They're gated on
+      # `LUCHTA_TEST_RCLONE=1` and skipped everywhere else, which is exactly
+      # why CI needs to set it explicitly — nothing else does.
+      - name: Test shared cache remote sync (rclone)
+        run: LUCHTA_TEST_RCLONE=1 cargo nextest run -p luchta-cache --no-fail-fast
+
+      # Known pre-existing leak, not introduced by this change: the gated
+      # suite leaks roughly 6 `rclone rcd` daemons per run even on a clean
+      # pass (measured 0 -> 6 -> 12 -> 18 across three back-to-back local
+      # runs). Harmless here since GitHub-hosted runners are torn down after
+      # the job, but this best-effort cleanup keeps a self-hosted or reused
+      # runner from accumulating them silently.
+      - name: Clean up any leaked rclone daemons
+        if: always()
+        run: pkill -f 'rclone rcd' || true
 
   fmt:
     name: Format

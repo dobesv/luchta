@@ -159,29 +159,49 @@ fn check_patterns_unchanged(prior: &TaskRunRecord, current: &CurrentState<'_>) -
 /// Rules:
 /// 1. Same cacheability checks as normal skip path: prior succeeded, task spec/env/
 ///    package deps/dependency outputs unchanged.
-/// 2. Same effective input pattern resolution semantics as normal skip path.
-/// 3. Inputs must still match current tree state.
-/// 4. Outputs are NOT compared at all.
+/// 2. The candidate's recorded inputs must hash to `inputs_hash` (see below).
+/// 3. Outputs are NOT compared at all.
 ///
 /// This allows cases like:
 /// - Full `decide()` would return `Run` because outputs are absent → legitimate
 ///   shared restore candidate.
 /// - Shared snapshot from another clone/commit can hydrate outputs safely when
 ///   inputs and dependency outputs still match.
+///
+/// ## `inputs_hash` is a key-integrity guard, not a resolve
+///
+/// The caller (`try_shared_cache_skip`) resolves inputs exactly once, up
+/// front, against the task-definition patterns, and folds the result into
+/// `input_key` as `derive_input_key`'s `inputs_hash` component *before* ever
+/// looking up a candidate. Every candidate `try_restore_candidates` returns
+/// was already filtered by that exact key, so under normal operation its
+/// `record.inputs` is guaranteed to hash to the same value -- the write path
+/// computes the key from that same field (see `write_run_record`). Re-resolving
+/// inputs a second time here, against the filesystem, would cost a directory
+/// walk (or, on a fresh CI checkout where no mtime matches any prior, a full
+/// re-hash) on every shared-cache **hit** -- exactly the workload this key
+/// exists to make cheap.
+///
+/// So this compares hashes instead of re-resolving:
+/// `combined_inputs_hash(&record.inputs) == inputs_hash`, a hash of an
+/// in-memory `Vec`, not a filesystem walk. It still catches the thing worth
+/// catching -- a candidate whose recorded inputs don't actually match what
+/// its own key claims -- but it does NOT catch a resolve error, because
+/// there is no resolve here to fail: the caller already resolved
+/// successfully before this function is ever reached (`try_shared_cache_skip`
+/// returns `Decision::Run` on resolve failure without calling this function
+/// at all).
 #[must_use]
-pub fn decide_shared_restore(record: &TaskRunRecord, current: &CurrentState<'_>) -> bool {
+pub fn decide_shared_restore(
+    record: &TaskRunRecord,
+    current: &CurrentState<'_>,
+    inputs_hash: [u8; 32],
+) -> bool {
     if !cacheable_prior(record, current) {
         return false;
     }
 
-    let input_patterns = effective_input_patterns(record, current);
-
-    patterns_unchanged(
-        &record.inputs,
-        &input_patterns,
-        current.resolver,
-        FileEntryKind::Inputs,
-    )
+    crate::resolve::combined_inputs_hash(&record.inputs) == inputs_hash
 }
 
 fn cacheable_prior(prior: &TaskRunRecord, current: &CurrentState<'_>) -> bool {
@@ -236,22 +256,6 @@ fn changed_dep_tasks(prior: &TaskRunRecord, current: &CurrentState<'_>) -> Vec<S
 enum FileEntryKind {
     Inputs,
     Outputs,
-}
-
-fn patterns_unchanged(
-    prior_entries: &[FileEntry],
-    patterns: &[String],
-    resolver: &dyn FileStateResolver,
-    kind: FileEntryKind,
-) -> bool {
-    let resolved_entries = match kind {
-        FileEntryKind::Inputs => resolver.resolve_inputs(patterns, prior_entries),
-        FileEntryKind::Outputs => resolver.resolve_outputs(patterns, prior_entries),
-    };
-    let Ok(resolved_entries) = resolved_entries else {
-        return false;
-    };
-    !files_changed(prior_entries, &resolved_entries)
 }
 
 fn change_reason(
@@ -370,7 +374,10 @@ fn file_identity_changed(prior: &FileEntry, current: &FileEntry) -> bool {
 mod tests {
     use std::{cell::RefCell, collections::BTreeMap, path::Path};
 
-    use crate::{CacheError, FileDelta, FileEntry, RunReason, TaskRunRecord, SCHEMA_VERSION_V5};
+    use crate::{
+        combined_inputs_hash, CacheError, FileDelta, FileEntry, RunReason, TaskRunRecord,
+        SCHEMA_VERSION_V5,
+    };
 
     use super::{
         decide, files_diff, CurrentState, Decision, DecisionResult, FileStateResolver,
@@ -1130,15 +1137,26 @@ mod tests {
     }
 
     // === Tests for decide_shared_restore ===
+    //
+    // `decide_shared_restore` no longer resolves anything itself -- it
+    // compares the caller-supplied `inputs_hash` against
+    // `combined_inputs_hash(&record.inputs)`. The resolver built into
+    // `CurrentState` below is therefore inert for these tests (kept only
+    // because `current_state()` needs one to construct a `CurrentState`);
+    // what matters is the `inputs_hash` argument each test passes.
 
     #[test]
     fn shared_restore_allows_absent_outputs_when_inputs_match() {
         let prior = sample_record();
+        // Empty outputs (not `matching_resolver`) so the sanity check below,
+        // which exercises the full `decide()` path, actually sees outputs as
+        // absent -- `decide_shared_restore` itself no longer touches the
+        // resolver at all, so this only matters for that sanity check.
         let resolver = FixtureResolver::new(prior.inputs.clone(), vec![]);
         let current = current_state(&prior, &resolver);
 
         assert!(
-            super::decide_shared_restore(&prior, &current),
+            super::decide_shared_restore(&prior, &current, combined_inputs_hash(&prior.inputs)),
             "should allow shared restore when outputs are absent but inputs match"
         );
         assert_eq!(
@@ -1151,26 +1169,26 @@ mod tests {
     #[test]
     fn shared_restore_input_mismatch_returns_false() {
         let prior = sample_record();
+        let resolver = matching_resolver(&prior);
+        let current = current_state(&prior, &resolver);
         let mut changed_inputs = prior.inputs.clone();
         changed_inputs[0].hash = [9; 32];
-        let resolver = FixtureResolver::new(changed_inputs, vec![]);
-        let current = current_state(&prior, &resolver);
 
         assert!(
-            !super::decide_shared_restore(&prior, &current),
-            "should reject restore when inputs differ"
+            !super::decide_shared_restore(&prior, &current, combined_inputs_hash(&changed_inputs)),
+            "should reject restore when the caller-resolved inputs_hash doesn't match the record's inputs"
         );
     }
 
     #[test]
     fn shared_restore_task_spec_mismatch_returns_false() {
         let prior = sample_record();
-        let resolver = FixtureResolver::new(prior.inputs.clone(), vec![]);
+        let resolver = matching_resolver(&prior);
         let mut current = current_state(&prior, &resolver);
         current.task_spec_hash = [9; 32];
 
         assert!(
-            !super::decide_shared_restore(&prior, &current),
+            !super::decide_shared_restore(&prior, &current, combined_inputs_hash(&prior.inputs)),
             "should reject restore when task_spec_hash differs"
         );
     }
@@ -1178,12 +1196,12 @@ mod tests {
     #[test]
     fn shared_restore_env_mismatch_returns_false() {
         let prior = sample_record();
-        let resolver = FixtureResolver::new(prior.inputs.clone(), vec![]);
+        let resolver = matching_resolver(&prior);
         let mut current = current_state(&prior, &resolver);
         current.env_hash = [9; 32];
 
         assert!(
-            !super::decide_shared_restore(&prior, &current),
+            !super::decide_shared_restore(&prior, &current, combined_inputs_hash(&prior.inputs)),
             "should reject restore when env_hash differs"
         );
     }
@@ -1191,12 +1209,12 @@ mod tests {
     #[test]
     fn shared_restore_pkg_dep_mismatch_returns_false() {
         let prior = sample_record();
-        let resolver = FixtureResolver::new(prior.inputs.clone(), vec![]);
+        let resolver = matching_resolver(&prior);
         let mut current = current_state(&prior, &resolver);
         current.pkg_dep_hash = [9; 32];
 
         assert!(
-            !super::decide_shared_restore(&prior, &current),
+            !super::decide_shared_restore(&prior, &current, combined_inputs_hash(&prior.inputs)),
             "should reject restore when pkg_dep_hash differs"
         );
     }
@@ -1204,12 +1222,12 @@ mod tests {
     #[test]
     fn shared_restore_dep_outputs_mismatch_returns_false() {
         let prior = sample_record();
-        let resolver = FixtureResolver::new(prior.inputs.clone(), vec![]);
+        let resolver = matching_resolver(&prior);
         let mut current = current_state(&prior, &resolver);
         current.dep_outputs.insert("dep#build".to_owned(), [9; 32]);
 
         assert!(
-            !super::decide_shared_restore(&prior, &current),
+            !super::decide_shared_restore(&prior, &current, combined_inputs_hash(&prior.inputs)),
             "should reject restore when dep_outputs differs"
         );
     }
@@ -1231,7 +1249,7 @@ mod tests {
         let current = current_state(&prior, &resolver);
 
         assert!(
-            super::decide_shared_restore(&prior, &current),
+            super::decide_shared_restore(&prior, &current, combined_inputs_hash(&prior.inputs)),
             "should allow restore when inputs match and outputs present"
         );
     }
@@ -1249,6 +1267,9 @@ mod tests {
     }
 
     /// Helper for testing that decide_shared_restore rejects a condition.
+    /// Passes an `inputs_hash` that matches `prior.inputs`, so the assertion
+    /// exercises whatever gate `prior_mut`/`current_mut` are targeting, not
+    /// the inputs check.
     fn assert_shared_restore_rejects(
         prior: TaskRunRecord,
         prior_mut: impl FnOnce(&mut TaskRunRecord),
@@ -1260,10 +1281,34 @@ mod tests {
         let resolver = matching_resolver(&prior);
         let mut current = current_state(&prior, &resolver);
         current_mut(&mut current);
+        let inputs_hash = combined_inputs_hash(&prior.inputs);
         assert!(
-            !super::decide_shared_restore(&prior, &current),
+            !super::decide_shared_restore(&prior, &current, inputs_hash),
             "{}",
             message
+        );
+    }
+
+    #[test]
+    fn shared_restore_recorded_inputs_hash_mismatch_returns_false() {
+        // Guards the actual invariant `inputs_hash` defends now: a candidate
+        // whose recorded inputs don't hash to what its own key claims must
+        // never be restored, even though every other cacheability check
+        // passes. This is the scenario a corrupted/mismatched entry meta
+        // would produce.
+        let prior = sample_record();
+        let resolver = matching_resolver(&prior);
+        let current = current_state(&prior, &resolver);
+        let wrong_inputs_hash = combined_inputs_hash(&[]);
+
+        assert_ne!(
+            combined_inputs_hash(&prior.inputs),
+            wrong_inputs_hash,
+            "fixture must pick a genuinely different inputs_hash"
+        );
+        assert!(
+            !super::decide_shared_restore(&prior, &current, wrong_inputs_hash),
+            "should reject restore when record.inputs doesn't hash to the caller's inputs_hash"
         );
     }
 

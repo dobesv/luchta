@@ -224,7 +224,11 @@ fn blob_path(paths: &SharedCachePaths, outputs_hash: &[u8; 32]) -> PathBuf {
     ))
 }
 
-pub fn write_blob(
+/// Write an outputs-only blob.
+///
+/// The archive contains nothing but the task's output files. Per-task meta
+/// lives in `entries/<input_key>` — see `shared/entry_meta.rs` and issue #278.
+pub fn write_outputs_blob(
     paths: &SharedCachePaths,
     outputs_hash: &[u8; 32],
     package_dir: &Path,
@@ -335,7 +339,7 @@ mod tests {
             PathBuf::from("dist/nested/chunk.js"),
         ];
 
-        let result = write_blob(
+        let result = write_outputs_blob(
             &paths,
             &outputs_hash,
             &package_dir,
@@ -375,7 +379,7 @@ mod tests {
         let outputs_hash = [8_u8; 32];
         let rel_paths = vec![PathBuf::from("bin/tool.sh")];
 
-        let result = write_blob(
+        let result = write_outputs_blob(
             &paths,
             &outputs_hash,
             &package_dir,
@@ -406,7 +410,8 @@ mod tests {
         let outputs_hash = [9_u8; 32];
         let rel_paths = vec![PathBuf::from("a.txt"), PathBuf::from("b.txt")];
 
-        let result = write_blob(&paths, &outputs_hash, &package_dir, &rel_paths, 9).unwrap();
+        let result =
+            write_outputs_blob(&paths, &outputs_hash, &package_dir, &rel_paths, 9).unwrap();
 
         assert_eq!(result, BlobWriteResult::SkippedTooLarge { bytes: 10 });
         assert_eq!(read_dir_paths(&paths.blobs_dir), Vec::<PathBuf>::new());
@@ -424,7 +429,8 @@ mod tests {
         let outputs_hash = [11_u8; 32];
         let rel_paths = vec![PathBuf::from("out.txt")];
 
-        let first = write_blob(&paths, &outputs_hash, &package_dir, &rel_paths, 1_024).unwrap();
+        let first =
+            write_outputs_blob(&paths, &outputs_hash, &package_dir, &rel_paths, 1_024).unwrap();
         assert_eq!(first, BlobWriteResult::Written);
 
         let blob_path = blob_path(&paths, &outputs_hash);
@@ -433,7 +439,8 @@ mod tests {
 
         std::thread::sleep(Duration::from_millis(20));
 
-        let second = write_blob(&paths, &outputs_hash, &package_dir, &rel_paths, 1_024).unwrap();
+        let second =
+            write_outputs_blob(&paths, &outputs_hash, &package_dir, &rel_paths, 1_024).unwrap();
         assert_eq!(second, BlobWriteResult::AlreadyExists);
         assert_eq!(fs::read(&blob_path).unwrap(), first_bytes);
         assert_eq!(
@@ -451,10 +458,10 @@ mod tests {
         let cache_dir = temp_dir.path().join("shared-cache");
         let paths = open_shared_paths(&cache_dir).unwrap();
 
-        let empty = write_blob(&paths, &[13_u8; 32], &package_dir, &[], 1_024).unwrap();
+        let empty = write_outputs_blob(&paths, &[13_u8; 32], &package_dir, &[], 1_024).unwrap();
         assert_eq!(empty, BlobWriteResult::NoOutputs);
 
-        let missing = write_blob(
+        let missing = write_outputs_blob(
             &paths,
             &[14_u8; 32],
             &package_dir,
@@ -464,6 +471,46 @@ mod tests {
         .unwrap();
         assert_eq!(missing, BlobWriteResult::NoOutputs);
         assert_eq!(read_dir_paths(&paths.blobs_dir), Vec::<PathBuf>::new());
+    }
+
+    #[test]
+    fn write_outputs_blob_creates_no_file_when_there_are_no_outputs() {
+        let temp = tempdir().unwrap();
+        let paths = crate::shared::paths::open_shared_paths(temp.path()).unwrap();
+        let package_dir = temp.path().join("pkg");
+        std::fs::create_dir_all(&package_dir).unwrap();
+
+        let outputs_hash = crate::resolve::combined_outputs_hash(&[]);
+        let result = write_outputs_blob(&paths, &outputs_hash, &package_dir, &[], 1_024).unwrap();
+
+        assert_eq!(result, BlobWriteResult::NoOutputs);
+        assert!(
+            !blob_path(&paths, &outputs_hash).exists(),
+            "no blob file should be created for an empty output set"
+        );
+    }
+
+    #[test]
+    fn write_outputs_blob_omits_meta_dir_from_archive() {
+        let temp = tempdir().unwrap();
+        let paths = crate::shared::paths::open_shared_paths(temp.path()).unwrap();
+        let package_dir = temp.path().join("pkg");
+        std::fs::create_dir_all(package_dir.join("dist")).unwrap();
+        std::fs::write(package_dir.join("dist/main.js"), "console.log(1);").unwrap();
+
+        let outputs_hash = [21_u8; 32];
+        let result = write_outputs_blob(
+            &paths,
+            &outputs_hash,
+            &package_dir,
+            &[PathBuf::from("dist/main.js")],
+            1_000_000,
+        )
+        .unwrap();
+        assert_eq!(result, BlobWriteResult::Written);
+
+        let entries = list_entries(&blob_path(&paths, &outputs_hash)).unwrap();
+        assert_eq!(entries, vec![PathBuf::from("dist/main.js")]);
     }
 
     fn list_entries(blob_path: &Path) -> io::Result<Vec<PathBuf>> {
@@ -525,7 +572,7 @@ echo hi
             PathBuf::from("dist/bin/tool.sh"),
         ];
 
-        let write_result = write_blob(
+        let write_result = write_outputs_blob(
             &paths,
             &outputs_hash,
             &source_package_dir,
@@ -861,15 +908,27 @@ pub fn restore_blob_with_meta(
         .tempdir_in(package_dir)?;
 
     match extract_blob_with_meta_to_staging(compressed, package_dir, staging_dir.path()) {
-        Ok(Some(meta)) => Ok(BlobReadResultWithMeta::Restored(StagedRestore {
+        Ok(meta) => Ok(BlobReadResultWithMeta::Restored(StagedRestore {
             meta,
             staging_dir,
             package_dir: package_dir.to_path_buf(),
         })),
-        Ok(None) => Ok(BlobReadResultWithMeta::Corrupt),
         Err(RestoreError::Corrupt) => Ok(BlobReadResultWithMeta::Corrupt),
         Err(RestoreError::Io(error)) => Err(error),
     }
+}
+
+/// Restore an outputs-only blob into a staging directory.
+///
+/// Blobs written by older clients still carry a `.luchta-meta/` directory.
+/// Its contents are ignored here — `entries/<input_key>` is authoritative —
+/// and `move_non_meta_files` filters it out on commit.
+pub fn restore_outputs_staged(
+    paths: &SharedCachePaths,
+    outputs_hash: &[u8; 32],
+    package_dir: &Path,
+) -> io::Result<BlobReadResultWithMeta<StagedRestore>> {
+    restore_blob_with_meta(paths, outputs_hash, package_dir)
 }
 
 /// A staged restore that holds extracted files in a temp directory.
@@ -885,6 +944,23 @@ pub struct StagedRestore {
 }
 
 impl StagedRestore {
+    /// A staged restore holding no files. Commits to an empty path list.
+    pub fn empty(package_dir: &Path) -> io::Result<Self> {
+        let staging_dir = tempfile::Builder::new()
+            .prefix("blob-restore-empty-")
+            .tempdir_in(package_dir)?;
+        Ok(Self {
+            meta: MetaFiles {
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                record: Vec::new(),
+                reports: Vec::new(),
+            },
+            staging_dir,
+            package_dir: package_dir.to_path_buf(),
+        })
+    }
+
     /// Move all non-meta files from staging into the package directory.
     /// Returns absolute destination paths written into the package directory.
     /// After this call, the staging directory is cleaned up.
@@ -922,7 +998,7 @@ fn extract_blob_with_meta_to_staging(
     compressed: File,
     package_dir: &Path,
     staging_dir: &Path,
-) -> Result<Option<MetaFiles>, RestoreError> {
+) -> Result<MetaFiles, RestoreError> {
     let decoder = zstd::Decoder::new(compressed).map_err(|_| RestoreError::Corrupt)?;
     let mut archive = Archive::new(decoder);
     let entries = archive.entries().map_err(|_| RestoreError::Corrupt)?;
@@ -1006,20 +1082,15 @@ fn extract_blob_with_meta_to_staging(
         }
     }
 
-    // Meta files are optional - we only need at least one present
-    // If no meta files, return Corrupt
-    if meta_stdout.is_none() && meta_stderr.is_none() && meta_record.is_none() {
-        // No meta files found, blob may be from an older version
-        // Return None to indicate corrupt/missing meta
-        return Ok(None);
-    }
-
-    Ok(Some(MetaFiles {
+    // Outputs-only blobs (the current format, see write_outputs_blob) carry no
+    // .luchta-meta at all — that is not corruption, just an entry whose record,
+    // stdout, and stderr live in entries/<input_key> instead.
+    Ok(MetaFiles {
         stdout: meta_stdout.unwrap_or_default(),
         stderr: meta_stderr.unwrap_or_default(),
         record: meta_record.unwrap_or_default(),
         reports: meta_reports,
-    }))
+    })
 }
 
 struct MoveOutputsError {
