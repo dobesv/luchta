@@ -118,6 +118,7 @@ impl SnapshotEntry {
             self.env_hash,
             self.pkg_dep_hash,
             [0; 32],
+            [0; 32],
         )
     }
 }
@@ -202,6 +203,15 @@ impl SnapshotStore {
                 return MergeEntryOutcome::from_result(MergeResult::IdempotentNoop);
             }
 
+            // Since `input_key` folds in a hash of the package's resolved
+            // input content (`derive_input_key`'s `inputs_hash`), two writers
+            // landing on the same key have, by construction, observed the
+            // same source state. A same-key `outputs_hash` mismatch here
+            // means a non-deterministic build (or a task-spec/env collision
+            // this key doesn't yet distinguish), not two legitimate source
+            // states racing for one slot -- that scenario now gets distinct
+            // keys and never reaches this branch. Keeping the first writer is
+            // still the safe choice for a non-deterministic build.
             return MergeEntryOutcome::from_result(MergeResult::ConflictKeptExisting);
         }
 
@@ -500,18 +510,37 @@ pub fn input_key_hex(input_key: [u8; 32]) -> String {
     blake3::Hash::from(input_key).to_hex().to_string()
 }
 
+/// Derives the shared-cache entry key.
+///
+/// `inputs_hash` covers the package's own resolved source content
+/// (`combined_inputs_hash` over the same `FileEntry` list `files_changed`
+/// compares in `decide.rs`). Folding it into the key means two branches that
+/// change a package differently land in distinct slots instead of racing for
+/// one first-writer-wins slot keyed only by the task's *definition* — see
+/// `decide_shared_restore`'s doc comment for why the separate inputs
+/// comparison there is now a safety net rather than the discriminator.
+///
+/// An inputs hash is only meaningful when the pattern set it was computed
+/// over came from the task definition, not from a previously stored record —
+/// otherwise the record would need to be fetched to know which patterns to
+/// hash, which is circular. Every caller must resolve inputs against
+/// `detected_input_patterns: false` (see `TaskRunRecord::detected_input_patterns`
+/// and `assemble_run_record` in `luchta-cli`); enabling worker-detected input
+/// patterns requires reworking this key derivation first.
 #[must_use]
 pub fn derive_input_key(
     task_spec_hash: [u8; 32],
     env_hash: [u8; 32],
     pkg_dep_hash: [u8; 32],
     dep_outputs_hash: [u8; 32],
+    inputs_hash: [u8; 32],
 ) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(&task_spec_hash);
     hasher.update(&env_hash);
     hasher.update(&pkg_dep_hash);
     hasher.update(&dep_outputs_hash);
+    hasher.update(&inputs_hash);
     *hasher.finalize().as_bytes()
 }
 
@@ -570,12 +599,29 @@ mod tests {
 
     #[test]
     fn derive_input_key_changes_when_any_component_changes() {
-        let base = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32]);
+        let base = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32], [5; 32]);
 
-        assert_ne!(base, derive_input_key([9; 32], [2; 32], [3; 32], [4; 32]));
-        assert_ne!(base, derive_input_key([1; 32], [9; 32], [3; 32], [4; 32]));
-        assert_ne!(base, derive_input_key([1; 32], [2; 32], [9; 32], [4; 32]));
-        assert_ne!(base, derive_input_key([1; 32], [2; 32], [3; 32], [9; 32]));
+        assert_ne!(
+            base,
+            derive_input_key([9; 32], [2; 32], [3; 32], [4; 32], [5; 32])
+        );
+        assert_ne!(
+            base,
+            derive_input_key([1; 32], [9; 32], [3; 32], [4; 32], [5; 32])
+        );
+        assert_ne!(
+            base,
+            derive_input_key([1; 32], [2; 32], [9; 32], [4; 32], [5; 32])
+        );
+        assert_ne!(
+            base,
+            derive_input_key([1; 32], [2; 32], [3; 32], [9; 32], [5; 32])
+        );
+        assert_ne!(
+            base,
+            derive_input_key([1; 32], [2; 32], [3; 32], [4; 32], [9; 32]),
+            "inputs_hash must be folded into the key"
+        );
     }
 
     #[test]
@@ -819,6 +865,47 @@ mod tests {
             snapshot.entries.get(&input_key_hex(original.input_key)),
             Some(&original)
         );
+    }
+
+    #[test]
+    fn two_writers_to_the_same_input_key_merge_as_idempotent_not_conflict() {
+        // With resolved input content folded into the key, two
+        // writers that land on the same `input_key` have, by construction,
+        // observed the same source state and therefore the same
+        // deterministic build output. Storing the same key twice must merge
+        // as a benign no-op, never `ConflictKeptExisting` -- that outcome is
+        // now reserved for the (non-deterministic-build) case where the same
+        // key somehow produced two different `outputs_hash`.
+        let temp_dir = tempdir().unwrap();
+        let paths = open_shared_paths(temp_dir.path()).unwrap();
+        let store = SnapshotStore::new(paths);
+
+        let inputs_hash = crate::resolve::combined_inputs_hash(&[crate::record::FileEntry {
+            path: "src/main.ts".to_string(),
+            size: 10,
+            mtime_ns: 0,
+            hash: [0xAA; 32],
+            absent: false,
+        }]);
+        let input_key = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32], inputs_hash);
+
+        let mut first_writer = sample_entry_with_seed(20, [42; 32]);
+        first_writer.input_key = input_key;
+        let mut second_writer = first_writer.clone();
+        second_writer.task_id = "pkg-b#build".to_owned();
+
+        assert_eq!(
+            store.merge_entry("commit-idempotent", first_writer.clone()),
+            MergeResult::Inserted
+        );
+        assert_eq!(
+            store.merge_entry("commit-idempotent", second_writer),
+            MergeResult::IdempotentNoop,
+            "two writers landing on one input_key must merge as idempotent, not a conflict"
+        );
+
+        let snapshot = store.load("commit-idempotent").unwrap();
+        assert_eq!(snapshot.entries.len(), 1);
     }
 
     #[test]
@@ -1165,7 +1252,7 @@ mod tests {
     }
 
     fn sample_snapshot() -> Snapshot {
-        let input_key = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32]);
+        let input_key = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32], [5; 32]);
         let entry = SnapshotEntry {
             task_id: "pkg-a#build".to_owned(),
             input_key,
@@ -1189,9 +1276,16 @@ mod tests {
         let env_hash = [seed.wrapping_add(1); 32];
         let pkg_dep_hash = [seed.wrapping_add(2); 32];
         let dep_outputs_hash = [seed.wrapping_add(3); 32];
+        let inputs_hash = [seed.wrapping_add(4); 32];
         SnapshotEntry {
             task_id: format!("pkg-{seed}#build"),
-            input_key: derive_input_key(task_spec_hash, env_hash, pkg_dep_hash, dep_outputs_hash),
+            input_key: derive_input_key(
+                task_spec_hash,
+                env_hash,
+                pkg_dep_hash,
+                dep_outputs_hash,
+                inputs_hash,
+            ),
             outputs_hash,
             task_spec_hash,
             env_hash,

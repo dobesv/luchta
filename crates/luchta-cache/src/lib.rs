@@ -19,7 +19,7 @@ pub use record::{
     SCHEMA_VERSION_V4, SCHEMA_VERSION_V5,
 };
 pub use resolve::{
-    combined_outputs_hash, resolve_inputs, resolve_inputs_with_options,
+    combined_inputs_hash, combined_outputs_hash, resolve_inputs, resolve_inputs_with_options,
     resolve_inputs_with_semantics, resolve_inputs_with_semantics_and_options, resolve_outputs,
     resolve_outputs_with_options, ListingCache, ResolveOptions, ResolveRequest,
 };

@@ -14,8 +14,8 @@ use luchta_cache::shared::{
     combined_dep_outputs_hash, derive_input_key, RestoredHit, StoreOutcome,
 };
 use luchta_cache::{
-    decide_shared_restore, task_cache_key, CurrentState, FileEntry, ReportInput, RunArtifacts,
-    RunReason, SCHEMA_VERSION_V5,
+    combined_inputs_hash, decide_shared_restore, task_cache_key, CurrentState, FileEntry,
+    ReportInput, RunArtifacts, RunReason, SCHEMA_VERSION_V5,
 };
 use luchta_types::EnvSpec;
 use luchta_worker::BUILTIN_PASSTHROUGH_ENV;
@@ -715,6 +715,16 @@ fn assemble_run_record(
         inputs,
         output_patterns: patterns.output_patterns.clone(),
         outputs,
+        // Load-bearing for the shared cache key: `derive_input_key`'s
+        // `inputs_hash` component only makes sense when the patterns it was
+        // computed over come from the task DEFINITION, not from a record
+        // (which would be circular -- you'd need the record to know which
+        // patterns to hash). `input_patterns` above is always
+        // `cache_ctx.task_def.inputs` (see `build_run_record`), never a
+        // worker-detected set, so `false` here is not a placeholder -- it is
+        // the invariant the shared-cache key derivation depends on. Enabling
+        // worker-detected input patterns requires reworking key derivation
+        // first; see `derive_input_key`'s doc comment.
         detected_input_patterns: false,
         detected_output_patterns: patterns.detected_output_patterns,
         outputs_hash,
@@ -899,11 +909,24 @@ async fn write_run_record(
         if shared_store_enabled {
             if let Some(shared) = shared_cache {
                 let _duration_ms = end_unix_ms.saturating_sub(start_unix_ms);
+                // `record_for_shared.inputs` are the stable, already-resolved
+                // inputs captured before the task ran (see
+                // `build_successful_run_record`'s doc comment) — no re-resolve
+                // needed at write time.
+                //
+                // Precondition (see `derive_input_key`'s doc comment): the
+                // inputs hash is only well-defined against task-definition
+                // patterns, never record-carried ones.
+                debug_assert!(
+                    !record_for_shared.detected_input_patterns,
+                    "combined_inputs_hash requires patterns from the task definition, not a record"
+                );
                 let input_key = derive_input_key(
                     task_spec_hash,
                     env_hash,
                     pkg_dep_hash,
                     combined_dep_outputs_hash(&dep_outputs),
+                    combined_inputs_hash(&record_for_shared.inputs),
                 );
 
                 // Gather package-relative output paths from record.outputs (skip absent entries)
@@ -1014,7 +1037,8 @@ fn build_cache_decision_context(
         nonce: cache_nonce.as_deref(),
         cache_context: &cache_context,
     });
-    let decision = decide(ctx.cache.read(&task_id.to_string()).as_ref(), &current);
+    let local_record = ctx.cache.read(&task_id.to_string());
+    let decision = decide(local_record.as_ref(), &current);
     cache_ctx.decision = cache_decision_from_result(&decision);
     maybe_mark_shared_cache_hit(
         ctx,
@@ -1025,6 +1049,7 @@ fn build_cache_decision_context(
             task_def: &task_def,
             current: &current,
             decision: &decision,
+            local_record: local_record.as_ref(),
         },
         &cache_context.dep_outputs,
     );
@@ -1072,6 +1097,7 @@ fn maybe_mark_shared_cache_hit(
         &cache_ctx.package_path,
         input.current,
         dep_outputs,
+        input.local_record,
     ) {
         if matches!(shared_decision, Decision::SharedHit) {
             cache_ctx.decision.action = Decision::SharedHit;
@@ -1101,6 +1127,7 @@ fn try_shared_cache_skip(
     package_path: &Path,
     current: &CurrentState<'_>,
     dep_outputs: &BTreeMap<String, [u8; 32]>,
+    local_record: Option<&TaskRunRecord>,
 ) -> Option<Decision> {
     let shared_cache = ctx.shared_cache.as_ref()?;
 
@@ -1110,6 +1137,35 @@ fn try_shared_cache_skip(
         return Some(Decision::Run);
     }
 
+    // Resolve inputs up front, before the (potentially network-bound) shared
+    // lookup, so the input_key reflects the CURRENT source state rather than
+    // the state of whatever candidate happens to be fetched. `decide()`
+    // frequently reaches here without ever resolving inputs (no local record,
+    // or a changed dependency short-circuits before `check_patterns_unchanged`
+    // runs). Resolving here, against the LOCAL record's inputs as the mtime
+    // prior, is neutral on a warm dev machine (same file states, same hash
+    // reuse) and strictly cheaper on a fresh CI checkout (every mtime differs
+    // from any prior anyway, so every input gets hashed regardless -- doing
+    // that before the network round trip instead of after, inside
+    // `decide_shared_restore`, skips the fetch entirely on a miss).
+    //
+    // `current.declared_input_patterns` is the task-definition pattern list,
+    // which is the only sound thing to hash here: an inputs hash requires
+    // patterns to be known before any record is fetched, and
+    // `effective_input_patterns` only falls back to record-carried patterns
+    // when `detected_input_patterns` is true, which `assemble_run_record`
+    // hardcodes to `false` today (see the `debug_assert!` in
+    // `write_run_record` and `derive_input_key`'s doc comment).
+    let prior_inputs: &[FileEntry] = local_record.map_or(&[], |record| record.inputs.as_slice());
+    let Ok(resolved_inputs) = current
+        .resolver
+        .resolve_inputs(current.declared_input_patterns, prior_inputs)
+    else {
+        // Resolve failed -> never restore; let the normal Run path proceed.
+        return Some(Decision::Run);
+    };
+    let inputs_hash = combined_inputs_hash(&resolved_inputs);
+
     // Compute input_key from the SAME hashes used for local cache.
     let dep_outputs_hash = combined_dep_outputs_hash(dep_outputs);
     let input_key = derive_input_key(
@@ -1117,6 +1173,7 @@ fn try_shared_cache_skip(
         current.env_hash,
         current.pkg_dep_hash,
         dep_outputs_hash,
+        inputs_hash,
     );
 
     // Try restore from shared cache with validation.

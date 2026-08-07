@@ -168,6 +168,19 @@ fn check_patterns_unchanged(prior: &TaskRunRecord, current: &CurrentState<'_>) -
 ///   shared restore candidate.
 /// - Shared snapshot from another clone/commit can hydrate outputs safely when
 ///   inputs and dependency outputs still match.
+///
+/// ## Inputs check is now a safety net, not the discriminator
+///
+/// The shared cache key (`derive_input_key`) folds in a hash of the same
+/// resolved input entries this function compares (see
+/// `combined_inputs_hash`). An exact key match on the way in therefore
+/// already implies these inputs match, so this call is defence-in-depth, not
+/// the mechanism that tells two source states apart -- that job now belongs
+/// to the key itself. It stays because it is cheap and it still catches a
+/// resolve error: `patterns_unchanged` returns `false` when
+/// `current.resolver` fails to resolve, and that "resolve failed ⇒ do not
+/// restore" behavior is load-bearing regardless of what the key already
+/// tells us.
 #[must_use]
 pub fn decide_shared_restore(record: &TaskRunRecord, current: &CurrentState<'_>) -> bool {
     if !cacheable_prior(record, current) {

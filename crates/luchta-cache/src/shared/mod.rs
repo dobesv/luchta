@@ -955,7 +955,7 @@ mod tests {
         fs::create_dir_all(package_dir.join("dist")).unwrap();
         fs::write(package_dir.join("dist/main.js"), "console.log('hi');").unwrap();
 
-        let input_key = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32]);
+        let input_key = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32], [5; 32]);
         let record = sample_record(true, 200);
 
         let result = cache
@@ -1041,7 +1041,7 @@ mod tests {
         fs::write(&script_path, "#!/bin/bash\necho hi").unwrap();
         fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755)).unwrap();
 
-        let input_key = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32]);
+        let input_key = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32], [5; 32]);
         let record = sample_record(true, 200);
 
         cache
@@ -1093,7 +1093,7 @@ mod tests {
         fs::create_dir_all(package_dir.join("dist")).unwrap();
         fs::write(package_dir.join("dist/main.js"), "content").unwrap();
 
-        let input_key = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32]);
+        let input_key = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32], [5; 32]);
         let record = sample_record(false, 200);
 
         let result = cache
@@ -1132,7 +1132,7 @@ mod tests {
         fs::create_dir_all(package_dir.join("dist")).unwrap();
         fs::write(package_dir.join("dist/main.js"), "content").unwrap();
 
-        let input_key = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32]);
+        let input_key = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32], [5; 32]);
         let record = sample_record(true, 50); // 50ms < 100ms
 
         let result = cache
@@ -1169,7 +1169,7 @@ mod tests {
         // Write content that exceeds cap (and also exceeds meta size)
         fs::write(package_dir.join("dist/main.js"), "x").unwrap();
 
-        let input_key = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32]);
+        let input_key = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32], [5; 32]);
         let record = sample_record(true, 200);
 
         let result = cache
@@ -1224,7 +1224,7 @@ mod tests {
 
         // Create a sibling file that triggers cross-package when classified.
         // We need outputs that resolve to outside package_dir.
-        let input_key = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32]);
+        let input_key = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32], [5; 32]);
         let mut record = sample_record(true, 200);
         record.outputs = vec![FileEntry {
             path: "../pkg-b/output.txt".to_string(),
@@ -1269,7 +1269,7 @@ mod tests {
         let package_dir = temp_repo.path().join("pkg");
         fs::create_dir_all(&package_dir).unwrap();
 
-        let input_key = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32]);
+        let input_key = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32], [5; 32]);
         let record = sample_record(true, 200);
 
         let result = cache.store(
@@ -1315,7 +1315,7 @@ mod tests {
         )
         .unwrap();
 
-        let input_key = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32]);
+        let input_key = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32], [5; 32]);
         let record = sample_record(true, 200);
 
         let result = cache
@@ -1361,7 +1361,7 @@ mod tests {
         fs::create_dir_all(package_dir.join("dist")).unwrap();
         fs::write(package_dir.join("dist/main.js"), "v1").unwrap();
 
-        let input_key = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32]);
+        let input_key = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32], [5; 32]);
         let record = sample_record(true, 200);
 
         let entry = SnapshotEntry {
@@ -1459,8 +1459,8 @@ mod tests {
         create_commit(temp_repo.path());
         let temp_cache = TempDir::new().unwrap();
         let snapshot_dir = temp_cache.path().join("snapshots");
-        let input_key1 = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32]);
-        let input_key2 = derive_input_key([5; 32], [6; 32], [7; 32], [8; 32]);
+        let input_key1 = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32], [5; 32]);
+        let input_key2 = derive_input_key([5; 32], [6; 32], [7; 32], [8; 32], [5; 32]);
 
         // Keys must be valid computed bucket keys (`<YYYYMMDD>-<shard>`), not
         // arbitrary strings: `candidate_keys()` no longer discovers whatever
@@ -1563,7 +1563,7 @@ mod tests {
         let now = discovery::now_unix_ms();
         let old_day_ms = now.saturating_sub((DAY_WINDOW as u64 - 1) * 24 * 60 * 60 * 1000);
         let old_bucket = discovery::bucket_key(old_day_ms, 0);
-        let old_input_key = derive_input_key([88; 32], [1; 32], [1; 32], [1; 32]);
+        let old_input_key = derive_input_key([88; 32], [1; 32], [1; 32], [1; 32], [5; 32]);
         {
             let paths = open_shared_paths(temp_cache.path()).unwrap();
             SnapshotStore::new(paths.clone()).merge_entry(
@@ -1619,7 +1619,7 @@ mod tests {
                 Some(temp_cache.path()),
             )
             .unwrap();
-            let churn_input_key = derive_input_key([i; 32], [2; 32], [2; 32], [2; 32]);
+            let churn_input_key = derive_input_key([i; 32], [2; 32], [2; 32], [2; 32], [2; 32]);
             cache
                 .store(
                     "pkg#churn",
@@ -1680,7 +1680,7 @@ mod tests {
         fs::create_dir_all(package_dir.join("dist")).unwrap();
         fs::write(package_dir.join("dist/main.js"), "content").unwrap();
 
-        let input_key = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32]);
+        let input_key = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32], [5; 32]);
         let record = sample_record(true, 200);
 
         cache
@@ -1746,7 +1746,7 @@ mod tests {
         fs::create_dir_all(package_dir.join("dist")).unwrap();
         fs::write(package_dir.join("dist/main.js"), "content").unwrap();
 
-        let input_key = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32]);
+        let input_key = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32], [5; 32]);
         let record = sample_record(true, 200);
 
         cache
@@ -1807,11 +1807,11 @@ mod tests {
         record_a.outputs = vec![];
         record_a.outputs_hash = empty_hash;
         record_a.task_spec_hash = [11; 32];
-        let key_a = derive_input_key([11; 32], [2; 32], [3; 32], [4; 32]);
+        let key_a = derive_input_key([11; 32], [2; 32], [3; 32], [4; 32], [5; 32]);
 
         let mut record_b = record_a.clone();
         record_b.task_spec_hash = [22; 32];
-        let key_b = derive_input_key([22; 32], [2; 32], [3; 32], [4; 32]);
+        let key_b = derive_input_key([22; 32], [2; 32], [3; 32], [4; 32], [5; 32]);
 
         cache
             .store(
@@ -1889,7 +1889,7 @@ mod tests {
         fs::create_dir_all(package_dir.join("dist")).unwrap();
         fs::write(package_dir.join("dist/main.js"), "console.log('hi');").unwrap();
 
-        let input_key = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32]);
+        let input_key = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32], [5; 32]);
         let record = sample_record(true, 200);
 
         cache
@@ -1951,7 +1951,7 @@ mod tests {
         record.output_patterns = vec![];
         record.outputs = vec![];
         record.outputs_hash = empty_hash;
-        let input_key = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32]);
+        let input_key = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32], [5; 32]);
 
         cache
             .store(
@@ -2019,7 +2019,7 @@ mod tests {
             hash: [0; 32],
             absent: true,
         }];
-        let input_key = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32]);
+        let input_key = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32], [5; 32]);
 
         let result = cache
             .store(
@@ -2070,8 +2070,8 @@ mod tests {
 
         // Two SharedCache instances over one cache dir, as two separate
         // `luchta run` invocations would be. Each picks its own write shard.
-        let key_a = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32]);
-        let key_b = derive_input_key([5; 32], [6; 32], [7; 32], [8; 32]);
+        let key_a = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32], [5; 32]);
+        let key_b = derive_input_key([5; 32], [6; 32], [7; 32], [8; 32], [5; 32]);
 
         for (task, key, spec) in [("pkg#a", key_a, [1u8; 32]), ("pkg#b", key_b, [5u8; 32])] {
             let cache = SharedCache::open_with_cache_dir(
@@ -2157,5 +2157,87 @@ mod tests {
                 discovery::MIN_SHARED_CACHE_DAY_WINDOW
             );
         }
+    }
+
+    #[test]
+    fn two_source_states_of_one_task_each_get_their_own_entry() {
+        // Before inputs were part of the key both states computed the SAME
+        // input_key, the first writer took the slot, and the second could
+        // never be stored (ConflictKeptExisting) — a permanent miss plus a
+        // wasted meta fetch on every build until GC aged the entry out.
+        let temp_repo = TempDir::new().unwrap();
+        setup_git_repo(temp_repo.path());
+        create_commit(temp_repo.path());
+        let temp_cache = TempDir::new().unwrap();
+        let cache = SharedCache::open_with_cache_dir(
+            temp_repo.path(),
+            1_000_000,
+            3,
+            Some(temp_cache.path()),
+        )
+        .unwrap();
+
+        let package_dir = temp_repo.path().join("pkg");
+        fs::create_dir_all(&package_dir).unwrap();
+        let empty_outputs = crate::resolve::combined_outputs_hash(&[]);
+
+        // Same task, same env, same deps — only the input CONTENT differs.
+        let inputs_a = crate::resolve::combined_inputs_hash(&[FileEntry {
+            path: "src/main.ts".to_string(),
+            size: 10,
+            mtime_ns: 0,
+            hash: [0xAA; 32],
+            absent: false,
+        }]);
+        let inputs_b = crate::resolve::combined_inputs_hash(&[FileEntry {
+            path: "src/main.ts".to_string(),
+            size: 10,
+            mtime_ns: 0,
+            hash: [0xBB; 32],
+            absent: false,
+        }]);
+        assert_ne!(
+            inputs_a, inputs_b,
+            "fixture must model two distinct source states"
+        );
+
+        let key_a = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32], inputs_a);
+        let key_b = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32], inputs_b);
+        assert_ne!(
+            key_a, key_b,
+            "distinct inputs must yield distinct cache keys"
+        );
+
+        for (key, marker) in [(key_a, &b"variant-a"[..]), (key_b, &b"variant-b"[..])] {
+            let mut record = sample_record(true, 200);
+            record.output_patterns = vec![];
+            record.outputs = vec![];
+            record.outputs_hash = empty_outputs;
+            let outcome = cache
+                .store(
+                    "pkg#build",
+                    &key,
+                    &empty_outputs,
+                    &package_dir,
+                    &[],
+                    &record,
+                    marker,
+                    b"",
+                    &[],
+                    temp_repo.path(),
+                )
+                .unwrap();
+            assert_eq!(outcome, StoreOutcome::Stored, "both variants must store");
+        }
+
+        // Each key resolves to its own meta — neither evicted the other.
+        assert_eq!(
+            read_entry_meta(cache.paths(), &key_a).unwrap().stdout,
+            b"variant-a"
+        );
+        assert_eq!(
+            read_entry_meta(cache.paths(), &key_b).unwrap().stdout,
+            b"variant-b"
+        );
     }
 }

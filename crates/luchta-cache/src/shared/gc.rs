@@ -292,7 +292,7 @@ mod tests {
         let pkg_dep_hash = [3; 32];
         SnapshotEntry {
             task_id: task_id.to_owned(),
-            input_key: derive_input_key(task_spec_hash, env_hash, pkg_dep_hash, [0; 32]),
+            input_key: derive_input_key(task_spec_hash, env_hash, pkg_dep_hash, [0; 32], [0; 32]),
             outputs_hash,
             task_spec_hash,
             env_hash,

@@ -15,6 +15,7 @@ use walkdir::WalkDir;
 use crate::{CacheError, FileEntry, Result};
 
 const COMBINED_OUTPUTS_HASH_DOMAIN: &[u8] = b"luchta-cache:combined-outputs:v1";
+const COMBINED_INPUTS_HASH_DOMAIN: &[u8] = b"luchta-cache:combined-inputs:v1";
 
 /// Run-scoped memo of directory listings, shared across every task in a single
 /// `luchta run` so each package directory is walked once rather than once per
@@ -581,6 +582,33 @@ pub fn combined_outputs_hash(entries: &[FileEntry]) -> [u8; 32] {
     *hasher.finalize().as_bytes()
 }
 
+/// Combines a task's resolved input entries into a single hash, so the shared
+/// cache key can distinguish two source states that share the same task
+/// definition, env, package deps, and dependency outputs but differ in file
+/// content. Mirrors `combined_outputs_hash` field-for-field (sort by path,
+/// length-prefixed path, absent flag, content hash) but uses its own domain
+/// string — inputs and outputs must never hash to the same value for the same
+/// entry list.
+#[must_use]
+pub fn combined_inputs_hash(entries: &[FileEntry]) -> [u8; 32] {
+    let mut sorted = entries.to_vec();
+    sorted.sort_by(|left, right| left.path.cmp(&right.path));
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(COMBINED_INPUTS_HASH_DOMAIN);
+    hasher.update(&(sorted.len() as u64).to_le_bytes());
+
+    for entry in sorted {
+        let path = entry.path.as_bytes();
+        hasher.update(&(path.len() as u64).to_le_bytes());
+        hasher.update(path);
+        hasher.update(&[u8::from(entry.absent)]);
+        hasher.update(&entry.hash);
+    }
+
+    *hasher.finalize().as_bytes()
+}
+
 fn resolve_with(
     base_dir: &Path,
     patterns: &[String],
@@ -1005,13 +1033,14 @@ mod tests {
     use luchta_types::{classify_pattern, InputSemantics};
 
     use super::{
-        cached_worktree_root, combined_outputs_hash, dedupe_and_sort_entries, file_entry_from_path,
-        prefix_union, prior_entries_by_path, qualified_base_dir_prefix, resolve_file_entries,
-        resolve_inputs, resolve_inputs_with_options, resolve_inputs_with_semantics,
-        resolve_literal_request, resolve_outputs, resolve_outputs_with_options,
-        resolve_wildcard_with_candidates, resolve_with, resolve_with_candidates,
-        strip_suffix_components, walk_output_candidates, CandidateLister, Exclusions, FileReader,
-        FilesystemLister, ListingCache, ResolveOptions, ResolveRequest, ResolvedBase, StdFs,
+        cached_worktree_root, combined_inputs_hash, combined_outputs_hash, dedupe_and_sort_entries,
+        file_entry_from_path, prefix_union, prior_entries_by_path, qualified_base_dir_prefix,
+        resolve_file_entries, resolve_inputs, resolve_inputs_with_options,
+        resolve_inputs_with_semantics, resolve_literal_request, resolve_outputs,
+        resolve_outputs_with_options, resolve_wildcard_with_candidates, resolve_with,
+        resolve_with_candidates, strip_suffix_components, walk_output_candidates, CandidateLister,
+        Exclusions, FileReader, FilesystemLister, ListingCache, ResolveOptions, ResolveRequest,
+        ResolvedBase, StdFs,
     };
     use crate::FileEntry;
     use crate::Result;
@@ -2215,6 +2244,41 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].path, "pkg-a/src/schema.graphql");
         assert!(!entries[0].absent);
+    }
+
+    fn entry(path: &str, hash: [u8; 32]) -> FileEntry {
+        FileEntry {
+            path: path.to_string(),
+            size: 1,
+            mtime_ns: 0,
+            hash,
+            absent: false,
+        }
+    }
+
+    #[test]
+    fn combined_inputs_hash_changes_when_any_input_content_changes() {
+        let base = vec![entry("src/a.ts", [1; 32]), entry("src/b.ts", [2; 32])];
+        let changed = vec![entry("src/a.ts", [1; 32]), entry("src/b.ts", [9; 32])];
+        assert_ne!(combined_inputs_hash(&base), combined_inputs_hash(&changed));
+    }
+
+    #[test]
+    fn combined_inputs_hash_is_order_stable() {
+        let a = vec![entry("src/a.ts", [1; 32]), entry("src/b.ts", [2; 32])];
+        let b = vec![entry("src/b.ts", [2; 32]), entry("src/a.ts", [1; 32])];
+        assert_eq!(combined_inputs_hash(&a), combined_inputs_hash(&b));
+    }
+
+    #[test]
+    fn combined_inputs_hash_differs_from_combined_outputs_hash_for_same_entries() {
+        // Domain separation: identical FileEntry lists must not collide across
+        // the inputs/outputs hash domains.
+        let entries = vec![entry("src/a.ts", [1; 32])];
+        assert_ne!(
+            combined_inputs_hash(&entries),
+            combined_outputs_hash(&entries)
+        );
     }
 
     struct TestRepo {

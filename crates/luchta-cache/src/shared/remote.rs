@@ -832,7 +832,7 @@ mod tests {
     ) -> StoredRemoteCase {
         let (stdout, stderr) = streams;
         let harness = RemoteHarness::new(file_body);
-        let input_key = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32]);
+        let input_key = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32], [5; 32]);
         let cache = harness.cache();
         let outcome = cache
             .store(
@@ -948,7 +948,7 @@ mod tests {
             shard_key,
             SnapshotEntry {
                 task_id: "pkg#a".to_string(),
-                input_key: derive_input_key([11; 32], [12; 32], [13; 32], [14; 32]),
+                input_key: derive_input_key([11; 32], [12; 32], [13; 32], [14; 32], [5; 32]),
                 outputs_hash: [21; 32],
                 task_spec_hash: [31; 32],
                 env_hash: [41; 32],
@@ -965,7 +965,7 @@ mod tests {
             shard_key,
             SnapshotEntry {
                 task_id: "pkg#b".to_string(),
-                input_key: derive_input_key([15; 32], [16; 32], [17; 32], [18; 32]),
+                input_key: derive_input_key([15; 32], [16; 32], [17; 32], [18; 32], [5; 32]),
                 outputs_hash: [22; 32],
                 task_spec_hash: [32; 32],
                 env_hash: [42; 32],
@@ -1099,7 +1099,7 @@ mod tests {
         }
 
         let harness = RemoteHarness::new("queue-body");
-        let input_key = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32]);
+        let input_key = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32], [5; 32]);
         let outputs_hash = [0x31; 32];
         let cache = harness.cache();
         cache
@@ -1254,7 +1254,7 @@ mod tests {
             &shard_key,
             SnapshotEntry {
                 task_id: "pkg#c".to_string(),
-                input_key: derive_input_key([19; 32], [20; 32], [21; 32], [22; 32]),
+                input_key: derive_input_key([19; 32], [20; 32], [21; 32], [22; 32], [5; 32]),
                 outputs_hash: [23; 32],
                 task_spec_hash: [33; 32],
                 env_hash: [43; 32],
@@ -1284,7 +1284,7 @@ mod tests {
             .join(&shard_key)
             .join(format!("subsuming-shard.{SNAPSHOT_FILE_EXTENSION}"));
         fs::create_dir_all(&blocking_path).unwrap();
-        let input_key = derive_input_key([19; 32], [20; 32], [21; 32], [22; 32]);
+        let input_key = derive_input_key([19; 32], [20; 32], [21; 32], [22; 32], [5; 32]);
         harness.remote.push_store_artifacts(PushArtifacts {
             paths: cache.paths(),
             commit_key: &shard_key,
@@ -1394,7 +1394,7 @@ mod tests {
             },
         )
         .unwrap();
-        let input_key = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32]);
+        let input_key = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32], [5; 32]);
         let restore_dir = temp_repo.path().join("restore-degrade");
         fs::create_dir_all(&restore_dir).unwrap();
 
@@ -1552,7 +1552,7 @@ mod tests {
         let before_mtime = fs::metadata(&blob_path).unwrap().modified().unwrap();
 
         let cache = harness.cache();
-        let input_key = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32]);
+        let input_key = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32], [5; 32]);
         let outcome = cache
             .store(
                 "pkg#build",
@@ -1598,7 +1598,7 @@ mod tests {
         record.output_patterns = vec![];
         record.outputs = vec![];
         record.outputs_hash = empty_hash;
-        let input_key = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32]);
+        let input_key = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32], [5; 32]);
 
         let remote = RemoteSync::new(
             Arc::new(RcloneRcd::with_default_timeout().unwrap()),
@@ -1807,7 +1807,7 @@ mod tests {
         )
         .unwrap();
 
-        let input_key = derive_input_key([71; 32], [72; 32], [73; 32], [74; 32]);
+        let input_key = derive_input_key([71; 32], [72; 32], [73; 32], [74; 32], [5; 32]);
         harness.remote.push_store_artifacts(PushArtifacts {
             paths: seed_cache.paths(),
             commit_key: &shard_key,
@@ -1872,7 +1872,7 @@ mod tests {
             .exists());
 
         fs::remove_dir_all(harness.local_cache.path().join("snapshots")).ok();
-        let input_key = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32]);
+        let input_key = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32], [5; 32]);
         let outcome = cache
             .store(
                 "pkg#build",
@@ -1896,12 +1896,18 @@ mod tests {
         assert!(!snapshot_files
             .iter()
             .any(|name| name.starts_with(&merge1_id)));
-        assert_eq!(
+        // merge2's shard must survive the unrelated `cache.store()` above
+        // (its entries a+b are still valid, so it's not subsumed by
+        // anything) alongside the brand-new shard the store just created.
+        // Check set membership, not position: `remote_snapshot_files` sorts
+        // lexicographically by shard_id, an opaque hash, so which shard
+        // happens to sort first is not a meaningful thing to assert on.
+        assert!(
             snapshot_files
                 .iter()
-                .find_map(|name| name.strip_suffix(".bincode"))
-                .unwrap(),
-            merge2_id
+                .filter_map(|name| name.strip_suffix(".bincode"))
+                .any(|id| id == merge2_id),
+            "merge2's shard must still be present, not subsumed: {snapshot_files:?}"
         );
         assert_snapshot_shard_count(&snapshot_files, 2, 2);
     }
@@ -1997,7 +2003,7 @@ mod tests {
         // shares a cache dir with this one, only the remote.
         let seed_cache_dir = tempfile::tempdir().unwrap();
         let seed_paths = crate::shared::open_shared_paths(seed_cache_dir.path()).unwrap();
-        let input_key = derive_input_key([61; 32], [62; 32], [63; 32], [64; 32]);
+        let input_key = derive_input_key([61; 32], [62; 32], [63; 32], [64; 32], [5; 32]);
         let record_bytes = bincode::serde::encode_to_vec(
             sample_record(true, 150),
             crate::serialization::bincode_config(),

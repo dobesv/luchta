@@ -609,6 +609,10 @@ struct SharedCacheSkipInput<'a> {
     task_def: &'a TaskDefinition,
     current: &'a CurrentState<'a>,
     decision: &'a DecisionResult,
+    /// The task's local cache record, if any. Used as the mtime prior when
+    /// resolving inputs up front for the shared-cache key -- see the comment
+    /// in `try_shared_cache_skip`.
+    local_record: Option<&'a TaskRunRecord>,
 }
 
 #[derive(Clone)]
