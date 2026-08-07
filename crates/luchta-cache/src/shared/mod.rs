@@ -18,9 +18,8 @@ pub use blob::{
     StagedRestore,
 };
 pub use discovery::{
-    bucket_key, bucket_keys_for, current_session_shard_key, new_session_shard_key,
-    rank_shard_candidates, write_bucket_key, ShardCandidate, DEFAULT_SHARD_BYTE_BUDGET,
-    DEFAULT_SHARD_MAX_AGE_MS, DEFAULT_SHARED_CACHE_DAY_WINDOW, SHARED_CACHE_SHARD_COUNT,
+    bucket_key, bucket_keys_for, write_bucket_key, DEFAULT_SHARED_CACHE_DAY_WINDOW,
+    SHARED_CACHE_SHARD_COUNT,
 };
 pub use entry_meta::{
     encode_entry_meta, entry_meta_path, read_entry_meta, write_entry_meta, EntryMeta,
@@ -537,49 +536,6 @@ impl SharedCache {
 
         merged
     }
-
-    /// Roll the currently-discoverable shards into one merged shard.
-    ///
-    /// Unreferenced as of the switch to computed bucket keys: with a fixed,
-    /// small read set (`day_window * SHARED_CACHE_SHARD_COUNT` keys) there's
-    /// no unbounded shard sprawl for a rollup to bound. Kept in place rather
-    /// than deleted here so the diff that introduces computed buckets stays
-    /// reviewable separately from the deletion of what they replace (see the
-    /// module doc on `discovery`). A later task removes it.
-    #[allow(dead_code)]
-    fn maybe_write_rollup(&self, keys: &[String], candidates_since_last_rollup: usize) {
-        if keys.len() < 2
-            || !gc::should_run_rollup(
-                &self.paths,
-                gc::DEFAULT_GC_THROTTLE,
-                self.day_window,
-                candidates_since_last_rollup,
-            )
-        {
-            return;
-        }
-        let rollup_key = current_session_shard_key();
-        let Some(upload) = self.snapshot_store.write_rollup_shard(keys, &rollup_key) else {
-            return;
-        };
-        self.maybe_push_rollup_upload(rollup_key, upload);
-    }
-
-    #[cfg(unix)]
-    #[allow(dead_code)]
-    fn maybe_push_rollup_upload(&self, rollup_key: String, upload: SnapshotUpload) {
-        let Some(remote) = &self.remote else {
-            return;
-        };
-        if remote.is_disabled() {
-            return;
-        }
-        remote.enqueue_push_snapshot_upload(rollup_key, upload);
-    }
-
-    #[cfg(not(unix))]
-    #[allow(dead_code)]
-    fn maybe_push_rollup_upload(&self, _rollup_key: String, _upload: SnapshotUpload) {}
 
     #[cfg(unix)]
     fn pull_candidate_commits(&self, remote: Option<&RemoteSync>, candidate_keys: &[String]) {
@@ -1549,10 +1505,10 @@ mod tests {
         );
 
         let paths = open_shared_paths(temp_cache.path()).unwrap();
-        // No rollup pre-stamp needed here: `build_index` no longer runs a
-        // rollup pass at all under computed bucket keys (see
-        // `maybe_write_rollup`'s doc), so there's nothing that would re-read
-        // either fixture a second time on top of the load this test counts.
+        // `build_index` reads each candidate key's shard exactly once and
+        // never re-reads it under computed bucket keys, so nothing here
+        // re-reads either fixture a second time on top of the load this
+        // test counts.
         let (snapshot_store, load_counter) = SnapshotStore::new_with_counter(paths);
         let cache =
             SharedCache::from_parts_for_test(temp_repo.path(), 1_000_000, 10, snapshot_store)
@@ -1583,131 +1539,67 @@ mod tests {
         assert!(cache.index.get().is_some());
     }
 
-    fn shard_dir_count(cache_dir: &Path) -> usize {
-        fs::read_dir(cache_dir.join("snapshots"))
-            .map(|entries| {
-                entries
-                    .flatten()
-                    .filter(|entry| entry.path().is_dir())
-                    .count()
-            })
-            .unwrap_or(0)
-    }
-
     #[test]
-    fn shard_count_pressure_rollup_does_not_retrigger_without_fresh_churn() {
-        // Directly seed enough distinct local shards to exceed the pressure
-        // threshold in one discovery pass, bypassing `store()` so this stays
-        // focused on discovery/rollup behavior rather than the store path.
-        // `history_len` here (100, passed to `open_with_cache_dir` below) is
-        // deliberately non-default so the pressure threshold has to be
-        // derived from it, not the hardcoded value for the default cap of 20.
+    fn old_bucket_within_the_day_window_survives_heavy_same_day_churn() {
+        // The #277 property, restated for computed buckets: a bucket near
+        // the back of the day window must stay reachable no matter how much
+        // local churn piles up on other buckets. Under the old
+        // discovery-plus-rollup scheme this needed a rollup to protect an
+        // old shard from a shard-count cap; computed buckets have no cap to
+        // evict it from in the first place -- the read set is exactly
+        // `bucket_keys_for(now, day_window)`, independent of how many local
+        // shard directories exist.
+        let temp_repo = TempDir::new().unwrap();
+        setup_git_repo(temp_repo.path());
+        create_commit(temp_repo.path());
         let temp_cache = TempDir::new().unwrap();
-        let history_len = 100;
-        let seed_count = gc::rollup_pressure_threshold(history_len) + 1;
-        for i in 0..seed_count {
+
+        const DAY_WINDOW: usize = 3;
+
+        // A bucket for the oldest day still inside the window, on a shard
+        // this test's churn never touches directly -- seeded straight into
+        // the snapshot store, bypassing `store()` (which only ever writes
+        // to *today's* bucket).
+        let now = discovery::now_unix_ms();
+        let old_day_ms = now.saturating_sub((DAY_WINDOW as u64 - 1) * 24 * 60 * 60 * 1000);
+        let old_bucket = discovery::bucket_key(old_day_ms, 0);
+        let old_input_key = derive_input_key([88; 32], [1; 32], [1; 32], [1; 32]);
+        {
             let paths = open_shared_paths(temp_cache.path()).unwrap();
-            let store = SnapshotStore::new(paths);
-            let seed = i as u8;
-            store.merge_entry(
-                &format!("{i:013}-seed"),
+            SnapshotStore::new(paths.clone()).merge_entry(
+                &old_bucket,
                 SnapshotEntry {
-                    task_id: format!("pkg#seed-{i}"),
-                    input_key: derive_input_key([seed; 32], [9; 32], [9; 32], [9; 32]),
+                    task_id: "pkg#old".to_string(),
+                    input_key: old_input_key,
                     outputs_hash: [0; 32],
-                    task_spec_hash: [seed; 32],
-                    env_hash: [9; 32],
-                    pkg_dep_hash: [9; 32],
+                    task_spec_hash: [1; 32],
+                    env_hash: [1; 32],
+                    pkg_dep_hash: [1; 32],
                     duration_ms: 200,
                     output_bytes: 0,
                     cached_at_unix_ms: 1,
                     tool_version: None,
                 },
             );
-        }
-
-        let before_first_run = shard_dir_count(temp_cache.path());
-        assert_eq!(before_first_run, seed_count, "sanity: all seeds landed");
-
-        let temp_repo = TempDir::new().unwrap();
-        setup_git_repo(temp_repo.path());
-        create_commit(temp_repo.path());
-
-        // First "run": discovery should see shard-count pressure and fire a
-        // rollup, adding one new shard directory.
-        {
-            let cache = SharedCache::open_with_cache_dir(
-                temp_repo.path(),
-                1_000_000,
-                history_len,
-                Some(temp_cache.path()),
+            write_entry_meta(
+                &paths,
+                &old_input_key,
+                &EntryMeta {
+                    schema_version: ENTRY_META_SCHEMA_VERSION,
+                    outputs_hash: [0; 32],
+                    has_outputs: false,
+                    record: bincode::serde::encode_to_vec(
+                        sample_record(true, 200),
+                        bincode_config(),
+                    )
+                    .unwrap(),
+                    stdout: b"old-stdout".to_vec(),
+                    stderr: Vec::new(),
+                    reports: Vec::new(),
+                },
             )
             .unwrap();
-            let restore_dir = temp_repo.path().join("restore-first");
-            fs::create_dir_all(&restore_dir).unwrap();
-            let probe_key = derive_input_key([254; 32], [8; 32], [8; 32], [8; 32]);
-            let _ = cache
-                .try_restore_candidates("pkg#probe", &probe_key, &restore_dir)
-                .next();
         }
-
-        let after_first_run = shard_dir_count(temp_cache.path());
-        assert_eq!(
-            after_first_run,
-            before_first_run + 1,
-            "a rollup should have added exactly one new shard directory"
-        );
-
-        // Second "run": no new shards since the rollup. Discovery must not
-        // fire a second one -- without the reset, a naive
-        // discovered-count-since-forever check would retrigger on every
-        // single call once churn crossed the threshold, since rollups never
-        // delete their sources.
-        {
-            let cache = SharedCache::open_with_cache_dir(
-                temp_repo.path(),
-                1_000_000,
-                history_len,
-                Some(temp_cache.path()),
-            )
-            .unwrap();
-            let restore_dir = temp_repo.path().join("restore-second");
-            fs::create_dir_all(&restore_dir).unwrap();
-            let probe_key = derive_input_key([253; 32], [8; 32], [8; 32], [8; 32]);
-            let _ = cache
-                .try_restore_candidates("pkg#probe", &probe_key, &restore_dir)
-                .next();
-        }
-
-        let after_second_run = shard_dir_count(temp_cache.path());
-        assert_eq!(
-            after_second_run, after_first_run,
-            "no new rollup should fire without fresh churn since the last one"
-        );
-    }
-
-    #[test]
-    fn shard_count_pressure_rollup_keeps_an_old_pack_reachable_through_heavy_local_churn() {
-        // The motivating #277 scenario: an older shard ("the pack") plus
-        // enough newer, tiny local shards to exceed the shard-count `limit`
-        // on their own. Without the pressure trigger, the count cap alone
-        // would evict the pack before any rollup got a chance to fold it in.
-        //
-        // Still passes under computed bucket keys, but no longer for the
-        // reason described above: `build_index` no longer calls
-        // `maybe_write_rollup` at all (see its doc), so no rollup ever fires
-        // here. The assertion holds instead because every write in this test
-        // happens "today", and today's shards are always in the computed
-        // read window regardless of how many local shard directories pile
-        // up — the shard-count cap this test was probing doesn't exist
-        // anymore. Left in place because it still exercises a real
-        // production path (`store()` / `try_restore_candidates()`) under
-        // heavy churn; the doc comment above is kept for history, not as a
-        // claim about current behavior.
-        let temp_repo = TempDir::new().unwrap();
-        setup_git_repo(temp_repo.path());
-        create_commit(temp_repo.path());
-        let temp_cache = TempDir::new().unwrap();
 
         let package_dir = temp_repo.path().join("pkg");
         fs::create_dir_all(&package_dir).unwrap();
@@ -1717,44 +1609,13 @@ mod tests {
         record.outputs = vec![];
         record.outputs_hash = empty_hash;
 
-        const HISTORY_LEN: usize = 20;
-
-        let old_input_key = derive_input_key([88; 32], [1; 32], [1; 32], [1; 32]);
-        {
+        // Heavy same-day churn: 30 fresh stores, each landing in one of
+        // today's `SHARED_CACHE_SHARD_COUNT` shards.
+        for i in 0..30u8 {
             let cache = SharedCache::open_with_cache_dir(
                 temp_repo.path(),
                 1_000_000,
-                HISTORY_LEN,
-                Some(temp_cache.path()),
-            )
-            .unwrap();
-            cache
-                .store(
-                    "pkg#old",
-                    &old_input_key,
-                    &empty_hash,
-                    &package_dir,
-                    &[],
-                    &record,
-                    b"",
-                    b"",
-                    &[],
-                    temp_repo.path(),
-                )
-                .unwrap();
-        }
-
-        // 21 more "runs": each writes one fresh shard, then triggers
-        // discovery, simulating local churn past both the pressure
-        // threshold (15) and the shard-count cap (20). Kept to the minimum
-        // that clears both bars rather than a rounder, larger number: each
-        // iteration opens a fresh `SharedCache` and does real disk I/O, and
-        // this test doesn't need more churn than that to prove the property.
-        for i in 0..21u8 {
-            let cache = SharedCache::open_with_cache_dir(
-                temp_repo.path(),
-                1_000_000,
-                HISTORY_LEN,
+                DAY_WINDOW,
                 Some(temp_cache.path()),
             )
             .unwrap();
@@ -1773,29 +1634,25 @@ mod tests {
                     temp_repo.path(),
                 )
                 .unwrap();
-            let restore_dir = temp_repo.path().join(format!("restore-{i}"));
-            fs::create_dir_all(&restore_dir).unwrap();
-            let _ = cache
-                .try_restore_candidates("pkg#churn", &churn_input_key, &restore_dir)
-                .next();
         }
 
         let cache = SharedCache::open_with_cache_dir(
             temp_repo.path(),
             1_000_000,
-            HISTORY_LEN,
+            DAY_WINDOW,
             Some(temp_cache.path()),
         )
         .unwrap();
-        let restore_dir = temp_repo.path().join("restore-final");
+        let restore_dir = temp_repo.path().join("restore-old");
         fs::create_dir_all(&restore_dir).unwrap();
-        assert!(
-            cache
-                .try_restore_candidates("pkg#old", &old_input_key, &restore_dir)
-                .next()
-                .is_some(),
-            "the old pack's entry should survive heavy local churn once shard-count pressure rolls it up"
-        );
+        let candidate = cache
+            .try_restore_candidates("pkg#old", &old_input_key, &restore_dir)
+            .next()
+            .expect(
+                "an old bucket inside the day window must stay reachable \
+                 regardless of how many newer buckets exist",
+            );
+        assert_eq!(candidate.stdout, b"old-stdout");
     }
 
     #[test]

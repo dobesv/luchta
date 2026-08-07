@@ -38,10 +38,6 @@ pub struct Entry {
     pub is_dir: bool,
     #[serde(rename = "Size")]
     pub size: i64,
-    /// RFC3339. Absent or unparseable on some backends — callers fall back to
-    /// key ordering, which is chronological because keys are timestamps.
-    #[serde(rename = "ModTime", default)]
-    pub mod_time: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]

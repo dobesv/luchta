@@ -21,8 +21,8 @@ use std::time::Duration;
 
 use super::snapshot::{SnapshotUpload, SNAPSHOT_FILE_EXTENSION, SNAPSHOT_MERGED_EXTENSION};
 use super::{
-    blob_path, entry_meta_path, hex_hash, rclone, MergeEntryOutcome, RcloneRcd, ShardCandidate,
-    SharedCachePaths, SnapshotStore, BLOBS_DIR_NAME, ENTRIES_DIR_NAME, SNAPSHOTS_DIR_NAME,
+    blob_path, entry_meta_path, hex_hash, rclone, MergeEntryOutcome, RcloneRcd, SharedCachePaths,
+    SnapshotStore, BLOBS_DIR_NAME, ENTRIES_DIR_NAME, SNAPSHOTS_DIR_NAME,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,7 +117,6 @@ struct PushQueue {
 #[derive(Debug)]
 enum PushMsg {
     Push(OwnedPushArtifacts),
-    PushSnapshotUpload(String, SnapshotUpload),
     #[cfg(any(test, doctest))]
     Flush(std::sync::mpsc::Sender<()>),
 }
@@ -229,55 +228,6 @@ impl RemoteSync {
         )
     }
 
-    pub(crate) fn snapshots_root_fs(&self) -> String {
-        format!(
-            "{}/{SNAPSHOTS_DIR_NAME}",
-            self.remote_base_fs.trim_end_matches('/')
-        )
-    }
-
-    /// List shard directories on the remote with their modification times.
-    ///
-    /// Returns an empty list on any error — discovery then falls back to
-    /// whatever local shard directories are already on disk.
-    ///
-    /// Unreferenced as of the switch to computed bucket keys: readers no
-    /// longer list the remote, they compute the exact keys they want and
-    /// fetch them directly. Kept in place rather than deleted here so the
-    /// diff that introduces computed buckets stays reviewable separately
-    /// from the deletion of what they replace. A later task removes it.
-    #[allow(dead_code)]
-    pub(crate) fn list_shard_candidates(&self) -> Vec<ShardCandidate> {
-        if self.is_disabled() {
-            return Vec::new();
-        }
-        let entries =
-            match self
-                .rclone
-                .list(&self.snapshots_root_fs(), "", self.rclone.default_timeout())
-            {
-                Ok(entries) => {
-                    self.record_remote_success();
-                    entries
-                }
-                Err(err) => {
-                    self.record_remote_error(&err);
-                    eprintln!("debug: remote snapshot listing failed: {err}");
-                    return Vec::new();
-                }
-            };
-
-        entries
-            .into_iter()
-            .filter(|entry| entry.is_dir)
-            .map(|entry| ShardCandidate {
-                modified_unix_ms: shard_key_unix_ms(&entry.name).unwrap_or(0),
-                approx_bytes: remote_approx_bytes(entry.size),
-                key: entry.name,
-            })
-            .collect()
-    }
-
     fn blobs_fs(&self) -> String {
         format!(
             "{}/{BLOBS_DIR_NAME}",
@@ -291,26 +241,6 @@ impl RemoteSync {
             self.remote_base_fs.trim_end_matches('/')
         )
     }
-}
-
-/// Proxy for a remote shard's byte size.
-///
-/// A non-positive (or otherwise unrepresentable) size falls back to 1 so an
-/// unknown-size candidate still counts toward the byte budget instead of
-/// being treated as free.
-fn remote_approx_bytes(size: i64) -> u64 {
-    u64::try_from(size).unwrap_or(1).max(1)
-}
-
-/// Recover the timestamp from a `<unix_ms>-<nonce>` shard key.
-///
-/// `luchta-cache` has no RFC3339 parser dependency (rclone's `ModTime` field
-/// would otherwise be the primary source), so remote shard ranking relies
-/// entirely on the timestamp embedded in the key itself. Task 7 zero-padded
-/// that timestamp to 13 digits precisely so lexical and chronological order
-/// agree here.
-fn shard_key_unix_ms(key: &str) -> Option<u64> {
-    key.split_once('-')?.0.parse().ok()
 }
 
 /// Splits a remote snapshot-dir listing into shard file names and the set of
@@ -345,9 +275,6 @@ impl RemoteSync {
             for msg in rx {
                 match msg {
                     PushMsg::Push(push) => worker_remote.push_store_artifacts_owned(push),
-                    PushMsg::PushSnapshotUpload(commit_key, upload) => {
-                        let _ = worker_remote.push_snapshot_upload(&commit_key, &upload);
-                    }
                     #[cfg(any(test, doctest))]
                     PushMsg::Flush(ack) => {
                         let _ = ack.send(());
@@ -380,31 +307,6 @@ impl RemoteSync {
             return;
         };
         if tx.send(PushMsg::Push(push)).is_err() {
-            eprintln!("debug: remote push queue closed before enqueue completed");
-        }
-    }
-
-    /// Enqueue a rollup shard upload on the same push queue `store()` uses.
-    ///
-    /// `push_snapshot_upload` already does the transfer (it's the same call
-    /// `push_store_artifacts` makes after a snapshot merge); this just gets a
-    /// rollup's upload onto that queue instead of blocking the caller on it.
-    pub(crate) fn enqueue_push_snapshot_upload(&self, commit_key: String, upload: SnapshotUpload) {
-        let Some(tx) = self
-            .push_queue
-            .tx
-            .lock()
-            .expect("push queue tx mutex poisoned")
-            .as_ref()
-            .cloned()
-        else {
-            let _ = self.push_snapshot_upload(&commit_key, &upload);
-            return;
-        };
-        if tx
-            .send(PushMsg::PushSnapshotUpload(commit_key, upload))
-            .is_err()
-        {
             eprintln!("debug: remote push queue closed before enqueue completed");
         }
     }
@@ -757,9 +659,8 @@ mod tests {
     use crate::shared::snapshot::snapshot_bincode_config;
     use crate::shared::tests::{create_commit, sample_record, setup_git_repo};
     use crate::shared::{
-        current_session_shard_key, derive_input_key, input_key_hex, new_session_shard_key,
-        MergeResult, OpenExtras, SharedCache, Snapshot, SnapshotEntry, StoreOutcome,
-        SNAPSHOT_SCHEMA_VERSION,
+        derive_input_key, input_key_hex, MergeResult, OpenExtras, SharedCache, Snapshot,
+        SnapshotEntry, StoreOutcome, SNAPSHOT_SCHEMA_VERSION,
     };
     use std::collections::BTreeMap;
     use std::fs;
@@ -1248,7 +1149,6 @@ mod tests {
                         release_rx.recv().unwrap();
                         processed_tx.send(()).unwrap();
                     }
-                    PushMsg::PushSnapshotUpload(..) => {}
                     PushMsg::Flush(ack) => {
                         let _ = ack.send(());
                     }
@@ -1854,9 +1754,9 @@ mod tests {
 
         let harness = RemoteHarness::new("console.log('compact-mid-push');\n");
         // No `cache.store()` runs in this test, so there's no write key to
-        // match against — just a fresh, unique shard key to seed and assert
+        // match against — just an arbitrary shard key to seed and assert
         // against consistently.
-        let shard_key = current_session_shard_key();
+        let shard_key = "0000000000001-mid-push".to_string();
         let (seed_cache, _merge1_id, surviving_shard_id) = seed_remote_snapshot_entries(
             harness.temp_repo.path(),
             &shard_key,
@@ -2065,73 +1965,101 @@ mod tests {
     }
 
     #[test]
-    fn list_shard_candidates_returns_remote_shard_dirs() {
-        if !should_run_rclone_test() {
-            eprintln!("skipping rclone-gated remote shard listing test; rclone not on PATH or LUCHTA_TEST_RCLONE disabled");
-            return;
-        }
-
-        let remote_root = tempfile::tempdir().unwrap();
-        let snapshots = remote_root.path().join("snapshots");
-        std::fs::create_dir_all(snapshots.join("0000000000001-aaaa")).unwrap();
-        std::fs::create_dir_all(snapshots.join("0000000000002-bbbb")).unwrap();
-        // A stray file at the shard-dir level must be ignored.
-        std::fs::write(snapshots.join("stray.txt"), b"x").unwrap();
-
-        let remote = RemoteSync::new(
-            Arc::new(RcloneRcd::with_default_timeout().unwrap()),
-            format!(":local:{}", remote_root.path().display()),
-            8,
-        );
-
-        let mut keys: Vec<String> = remote
-            .list_shard_candidates()
-            .into_iter()
-            .map(|candidate| candidate.key)
-            .collect();
-        keys.sort();
-
-        assert_eq!(keys, vec!["0000000000001-aaaa", "0000000000002-bbbb"]);
-    }
-
-    #[test]
     fn candidate_keys_include_remote_only_shards() {
         if !should_run_rclone_test() {
             eprintln!("skipping rclone-gated remote-only shard discovery test; rclone not on PATH or LUCHTA_TEST_RCLONE disabled");
             return;
         }
 
-        // `candidate_keys()` age-filters by the timestamp embedded in the shard
-        // key (see `DEFAULT_SHARD_MAX_AGE_MS`), so the fixture needs a
-        // realistic recent timestamp rather than an arbitrary key — an
-        // ancient-looking key like "0000000000001-aaaa" would be correctly
-        // dropped as stale before it ever reached the assertion.
-        let shard_key = new_session_shard_key(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as u64,
-            0xaaaa,
-        );
-        let remote_root = tempfile::tempdir().unwrap();
-        let snapshots = remote_root.path().join("snapshots");
-        std::fs::create_dir_all(snapshots.join(&shard_key)).unwrap();
+        // The #277 guarantee, restated for computed buckets: a bucket that
+        // exists only on the remote must still be reachable. There's no
+        // listing step left to prove that through -- `candidate_keys()` is
+        // pure arithmetic over `now`/`day_window` and never touches the
+        // remote -- so the proof has to be that `pull_candidate_commits`
+        // actually copies a remote-only bucket down and a fresh local cache
+        // restores from it. The seeded key is yesterday's date on a shard
+        // this test never writes to directly, so nothing here accidentally
+        // makes it reachable except the computed read window.
+        let yesterday_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            - 24 * 60 * 60 * 1000;
+        let remote_only_key = crate::shared::bucket_key(yesterday_ms, 5);
 
         let repo = tempfile::tempdir().unwrap();
-        crate::shared::tests::setup_git_repo(repo.path());
-        crate::shared::tests::create_commit(repo.path());
-        let local_cache = tempfile::tempdir().unwrap();
+        setup_git_repo(repo.path());
+        create_commit(repo.path());
+        let remote_root = tempfile::tempdir().unwrap();
 
-        let remote = RemoteSync::new(
+        // Seed the entry on its own local cache dir, standing in for a
+        // different machine: the fresh cache asserted against below never
+        // shares a cache dir with this one, only the remote.
+        let seed_cache_dir = tempfile::tempdir().unwrap();
+        let seed_paths = crate::shared::open_shared_paths(seed_cache_dir.path()).unwrap();
+        let input_key = derive_input_key([61; 32], [62; 32], [63; 32], [64; 32]);
+        let record_bytes = bincode::serde::encode_to_vec(
+            sample_record(true, 150),
+            crate::serialization::bincode_config(),
+        )
+        .unwrap();
+        crate::shared::write_entry_meta(
+            &seed_paths,
+            &input_key,
+            &crate::shared::EntryMeta {
+                schema_version: crate::shared::ENTRY_META_SCHEMA_VERSION,
+                outputs_hash: [0; 32],
+                has_outputs: false,
+                record: record_bytes,
+                stdout: b"remote-only-stdout".to_vec(),
+                stderr: Vec::new(),
+                reports: Vec::new(),
+            },
+        )
+        .unwrap();
+        let merge = SnapshotStore::new(seed_paths.clone()).merge_entry_with_outcome(
+            &remote_only_key,
+            SnapshotEntry {
+                task_id: "pkg#remote-only".to_string(),
+                input_key,
+                outputs_hash: [0; 32],
+                task_spec_hash: [61; 32],
+                env_hash: [62; 32],
+                pkg_dep_hash: [63; 32],
+                duration_ms: 150,
+                output_bytes: 0,
+                cached_at_unix_ms: 1,
+                tool_version: None,
+            },
+        );
+
+        let remote_seed = RemoteSync::new(
             Arc::new(RcloneRcd::with_default_timeout().unwrap()),
             format!(":local:{}", remote_root.path().display()),
             8,
         );
-        let cache = open_cache_with_remote(repo.path(), local_cache.path(), &remote);
+        remote_seed.push_store_artifacts(PushArtifacts {
+            paths: &seed_paths,
+            commit_key: &remote_only_key,
+            outputs_hash: &[0; 32],
+            input_key: &input_key,
+            has_outputs: false,
+            merge,
+        });
 
-        assert!(
-            cache.candidate_keys().iter().any(|key| key == &shard_key),
-            "a shard that exists only on the remote must still be a candidate"
-        );
+        // Fresh local cache: it never wrote to `remote_only_key`, and that
+        // key isn't its own write bucket either. The only way it can see
+        // this entry is by pulling every computed candidate key from the
+        // remote.
+        let fresh_cache_dir = tempfile::tempdir().unwrap();
+        let cache = open_cache_with_remote(repo.path(), fresh_cache_dir.path(), &remote_seed);
+        let restore_dir = repo.path().join("restore-remote-only");
+        fs::create_dir_all(&restore_dir).unwrap();
+
+        let candidate = cache
+            .try_restore_candidates("pkg#remote-only", &input_key, &restore_dir)
+            .next()
+            .expect("a shard that exists only on the remote must still be reachable");
+        assert_eq!(candidate.stdout, b"remote-only-stdout");
     }
 }

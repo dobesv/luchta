@@ -15,12 +15,6 @@ pub const DEFAULT_GC_RETENTION: Duration = Duration::from_secs(14 * 24 * 60 * 60
 pub const DEFAULT_GC_THROTTLE: Duration = Duration::from_secs(24 * 60 * 60);
 /// Marker file for the GC throttle.
 const GC_MARKER_NAME: &str = ".gc-marker";
-/// Marker file for the shard rollup throttle.
-///
-/// A separate marker from `GC_MARKER_NAME` so a GC run and a rollup run don't
-/// throttle each other: `mod.rs::build_index` runs its rollup on its own
-/// schedule, independent of the CLI's `maybe_run_gc` call.
-pub const ROLLUP_MARKER_NAME: &str = ".rollup-marker";
 const SNAPSHOT_SUFFIX: &str = ".bincode";
 const BLOB_SUFFIX: &str = ".tar.zst";
 const ENTRY_META_SUFFIX: &str = ".bin";
@@ -57,75 +51,6 @@ pub fn maybe_run_gc(
     let stats = run_gc(paths, retention);
     let _ = write_marker(paths, GC_MARKER_NAME, SystemTime::now());
     Some(stats)
-}
-
-/// Shard-count pressure threshold for a given shard-count cap (`history_len`,
-/// `DEFAULT_SHARED_CACHE_HISTORY_LEN` in the CLI by default, but
-/// user-configurable with no floor via `LUCHTA_SHARED_CACHE_HISTORY`): if
-/// this many discovered candidates have appeared since the last rollup, fire
-/// one immediately instead of waiting for the 24h throttle.
-///
-/// Must sit strictly below `history_len` so a burst of local churn triggers a
-/// rollup while there's still headroom in the count cap: with headroom
-/// still available, discovery hasn't had to evict anything yet, so the
-/// rollup still sees (and so keeps) whatever older shard the churn would
-/// otherwise have pushed out. Without that headroom, pressure would only be
-/// detected after the cap had already done the evicting it exists to
-/// prevent. A hardcoded constant can't guarantee that margin once
-/// `history_len` is configurable, so this is derived from the cap instead:
-/// three quarters of it, floored at 1 so the threshold is never 0 (which
-/// would fire a rollup on every single call). At the default cap of 20 this
-/// yields 15, matching the historical fixed value.
-#[must_use]
-pub fn rollup_pressure_threshold(history_len: usize) -> usize {
-    ((history_len * 3) / 4).max(1)
-}
-
-/// True if `throttle` has elapsed since the last shard rollup, or if
-/// `candidates_since_last_rollup` exceeds
-/// [`rollup_pressure_threshold(history_len)`](rollup_pressure_threshold).
-/// Stamps the rollup marker on a `true` result.
-///
-/// Throttled independently of `maybe_run_gc`: rollups run inside
-/// `build_index` (see `mod.rs::maybe_write_rollup`), not from the CLI's GC
-/// hook, and re-serialize the whole discovered index, so they need their own
-/// cadence rather than piggybacking on the GC throttle.
-///
-/// Stamping the marker on a pressure-triggered fire (not just a
-/// throttle-triggered one) is what keeps this from re-firing on every single
-/// call once churn crosses the threshold: rollups never delete their source
-/// shards, so a naive `discovered_count > threshold` check would stay true
-/// forever after the first crossing. Because the marker's timestamp resets
-/// on every fire, and `candidates_since_last_rollup` is computed relative to
-/// that timestamp (see `rollup_marker_modified_unix_ms`), pressure drops back
-/// toward zero immediately after a rollup and only climbs again as fresh
-/// shards accumulate.
-#[must_use]
-pub fn should_run_rollup(
-    paths: &SharedCachePaths,
-    throttle: Duration,
-    history_len: usize,
-    candidates_since_last_rollup: usize,
-) -> bool {
-    let due_by_time = should_run_marked(paths, ROLLUP_MARKER_NAME, throttle, SystemTime::now());
-    let due_by_pressure = candidates_since_last_rollup > rollup_pressure_threshold(history_len);
-    if !due_by_time && !due_by_pressure {
-        return false;
-    }
-    let _ = write_marker(paths, ROLLUP_MARKER_NAME, SystemTime::now());
-    true
-}
-
-/// The rollup marker's on-disk modification time, in unix milliseconds, or
-/// `None` if a rollup has never run (in which case every discovered
-/// candidate counts as "since the last rollup").
-#[must_use]
-pub fn rollup_marker_modified_unix_ms(paths: &SharedCachePaths) -> Option<u64> {
-    fs::metadata(marker_path(paths, ROLLUP_MARKER_NAME))
-        .and_then(|metadata| metadata.modified())
-        .ok()
-        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
-        .map(|elapsed| elapsed.as_millis() as u64)
 }
 
 fn gc_snapshot_dir(
@@ -276,9 +201,7 @@ fn gc_entries_dir(
 }
 
 /// True if `throttle` has elapsed since the marker named `marker_name` was
-/// last stamped (or if it has never been stamped). Shared by the GC throttle
-/// and the rollup throttle, each with its own marker file, so neither run
-/// throttles the other.
+/// last stamped (or if it has never been stamped).
 fn should_run_marked(
     paths: &SharedCachePaths,
     marker_name: &str,
@@ -534,121 +457,6 @@ mod tests {
         assert!(first.is_some());
         assert!(second.is_none());
         assert!(marker_path(&paths, GC_MARKER_NAME).exists());
-    }
-
-    #[test]
-    fn should_run_rollup_throttles_back_to_back_calls() {
-        let temp = TempDir::new().unwrap();
-        let paths = crate::shared::paths::open_shared_paths(temp.path()).unwrap();
-
-        assert!(should_run_rollup(&paths, Duration::from_secs(3600), 20, 0));
-        assert!(!should_run_rollup(&paths, Duration::from_secs(3600), 20, 0));
-    }
-
-    #[test]
-    fn rollup_throttle_is_independent_of_the_gc_throttle() {
-        let temp = TempDir::new().unwrap();
-        let paths = crate::shared::paths::open_shared_paths(temp.path()).unwrap();
-
-        assert!(should_run_rollup(&paths, Duration::from_secs(3600), 20, 0));
-        // GC has its own marker, so it is still eligible.
-        assert!(maybe_run_gc(&paths, Duration::from_secs(60), Duration::from_secs(3600)).is_some());
-    }
-
-    #[test]
-    fn should_run_rollup_fires_on_shard_count_pressure_within_the_throttle_window() {
-        let temp = TempDir::new().unwrap();
-        let paths = crate::shared::paths::open_shared_paths(temp.path()).unwrap();
-
-        assert!(should_run_rollup(&paths, Duration::from_secs(3600), 20, 0));
-        // Still well inside the throttle window, but pressure alone must
-        // still trigger a second rollup.
-        assert!(should_run_rollup(
-            &paths,
-            Duration::from_secs(3600),
-            20,
-            rollup_pressure_threshold(20) + 1
-        ));
-    }
-
-    #[test]
-    fn should_run_rollup_fires_on_shard_count_pressure_with_a_small_configured_cap() {
-        // The finding this covers: a hardcoded pressure threshold is only
-        // correct against the *default* cap of 20. `history_len` is
-        // user-configurable via `LUCHTA_SHARED_CACHE_HISTORY` with no floor,
-        // so a small cap (e.g. 8) needs its own, proportionally smaller
-        // threshold -- otherwise pressure could never fire before the cap
-        // itself started evicting shards.
-        let temp = TempDir::new().unwrap();
-        let paths = crate::shared::paths::open_shared_paths(temp.path()).unwrap();
-        let small_history_len = 8;
-        let threshold = rollup_pressure_threshold(small_history_len);
-        // Sanity: the threshold must leave headroom below the cap, not just
-        // be some arbitrary small number.
-        assert!(threshold < small_history_len);
-
-        assert!(should_run_rollup(
-            &paths,
-            Duration::from_secs(3600),
-            small_history_len,
-            0
-        ));
-        // Pressure fires well before `small_history_len` candidates have
-        // accumulated -- proving the threshold scaled down with the cap
-        // instead of staying pinned at a value derived from the default 20.
-        assert!(should_run_rollup(
-            &paths,
-            Duration::from_secs(3600),
-            small_history_len,
-            threshold + 1
-        ));
-    }
-
-    #[test]
-    fn should_run_rollup_pressure_resets_after_a_rollup_fires() {
-        let temp = TempDir::new().unwrap();
-        let paths = crate::shared::paths::open_shared_paths(temp.path()).unwrap();
-
-        assert!(should_run_rollup(
-            &paths,
-            Duration::from_secs(3600),
-            20,
-            rollup_pressure_threshold(20) + 1
-        ));
-        // Immediately after, with no fresh churn, neither the throttle nor
-        // pressure should retrigger. Without this reset, a naive
-        // count-since-forever check would fire on every single call once
-        // churn crossed the threshold, since rollups never delete their
-        // sources.
-        assert!(!should_run_rollup(&paths, Duration::from_secs(3600), 20, 0));
-    }
-
-    #[test]
-    fn rollup_marker_modified_unix_ms_is_none_before_the_first_rollup() {
-        let temp = TempDir::new().unwrap();
-        let paths = crate::shared::paths::open_shared_paths(temp.path()).unwrap();
-
-        assert!(rollup_marker_modified_unix_ms(&paths).is_none());
-        assert!(should_run_rollup(&paths, Duration::from_secs(3600), 20, 0));
-        assert!(rollup_marker_modified_unix_ms(&paths).is_some());
-    }
-
-    #[test]
-    fn rollup_pressure_threshold_matches_historical_default() {
-        // history_len = 20 (DEFAULT_SHARED_CACHE_HISTORY_LEN) must yield 15,
-        // preserving the behavior of the old hardcoded constant exactly.
-        assert_eq!(rollup_pressure_threshold(20), 15);
-    }
-
-    #[test]
-    fn rollup_pressure_threshold_never_reaches_zero() {
-        // Degenerate small caps: the threshold must never be 0, since that
-        // would fire a rollup on literally every call.
-        assert_eq!(rollup_pressure_threshold(0), 1);
-        assert_eq!(rollup_pressure_threshold(1), 1);
-        assert_eq!(rollup_pressure_threshold(2), 1);
-        assert_eq!(rollup_pressure_threshold(4), 3);
-        assert_eq!(rollup_pressure_threshold(8), 6);
     }
 
     #[test]
