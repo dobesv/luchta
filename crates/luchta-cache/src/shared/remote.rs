@@ -100,18 +100,65 @@ fn is_missing_local_source_copy_error(err: &rclone::RcloneError) -> bool {
         && body.contains("no such file")
 }
 
-#[derive(Debug, Clone)]
+/// One owner, many borrows: only the `RemoteSync` returned by [`RemoteSync::new`]
+/// owns the push queue and the rclone daemon. Every clone — the restore
+/// iteration's, the push worker's — is a non-owning handle. That is what lets
+/// `Drop` tear down unconditionally instead of trying to work out whether it
+/// is the last one standing.
+#[derive(Debug)]
 pub struct RemoteSync {
     pub(crate) rclone: Arc<RcloneRcd>,
     pub(crate) remote_base_fs: String,
     state: Arc<RemoteState>,
     push_queue: Arc<PushQueue>,
+    /// True only for the instance `new` returned. Clones share `rclone` and
+    /// `state` but must never tear either down: `RcloneRcd::shutdown` quits
+    /// the daemon behind the shared `Arc`, so a clone running it would kill
+    /// the daemon out from under the owner while it is still in use.
+    owns_shared_state: bool,
+}
+
+impl Clone for RemoteSync {
+    fn clone(&self) -> Self {
+        Self {
+            rclone: Arc::clone(&self.rclone),
+            remote_base_fs: self.remote_base_fs.clone(),
+            state: Arc::clone(&self.state),
+            push_queue: Arc::clone(&self.push_queue),
+            // Never inherited. A derived `Clone` would hand every transient
+            // handle the right to shut down the shared daemon, and the
+            // restore path clones per candidate pull.
+            owns_shared_state: false,
+        }
+    }
 }
 
 #[derive(Debug)]
 struct PushQueue {
     tx: Mutex<Option<SyncSender<PushMsg>>>,
     worker: Mutex<Option<JoinHandle<()>>>,
+}
+
+/// Closes the push queue and quits the rclone daemon when the last
+/// `RemoteSync` sharing this queue goes away.
+///
+/// `SharedCache::drop` already does this explicitly on the production path,
+/// and doing it twice is harmless — `flush_push_queue` takes the sender and
+/// worker handle, so the second call finds `None`. This exists for the paths
+/// that don't: a `RemoteSync` built directly and simply dropped used to leave
+/// its daemon running until the machine was rebooted, which is how the test
+/// suite accumulated hundreds of them (#283).
+///
+/// `RemoteSync` is not `Clone`, so an owning instance is the only one — no
+/// last-owner arbitration, and nothing to race.
+impl Drop for RemoteSync {
+    fn drop(&mut self) {
+        if !self.owns_shared_state {
+            return;
+        }
+        self.flush_push_queue();
+        self.shutdown();
+    }
 }
 
 #[derive(Debug)]
@@ -165,6 +212,7 @@ impl RemoteSync {
                 tx: Mutex::new(None),
                 worker: Mutex::new(None),
             }),
+            owns_shared_state: true,
         };
         remote.start_push_queue();
         remote
@@ -280,7 +328,24 @@ impl RemoteSync {
             .map(|value| value.max(1))
             .unwrap_or(DEFAULT_PUSH_QUEUE_CAPACITY);
         let (tx, rx) = mpsc::sync_channel(capacity);
-        let worker_remote = self.clone();
+        // The worker gets its own inert `PushQueue` rather than sharing this
+        // one. Sharing it means the worker holds the sender too, so the
+        // channel stays open even after the owner is gone, the thread blocks
+        // on `rx` forever, and the `Arc<RcloneRcd>` it carries never drops --
+        // which orphaned an rclone daemon per un-shut-down `RemoteSync`
+        // (#283). `Drop` closing the queue is the primary fix; this keeps the
+        // worker from being able to hold it open in the first place. The
+        // worker only ever needs the push methods, never the queue.
+        let worker_remote = Self {
+            rclone: Arc::clone(&self.rclone),
+            remote_base_fs: self.remote_base_fs.clone(),
+            state: Arc::clone(&self.state),
+            push_queue: Arc::new(PushQueue {
+                tx: Mutex::new(None),
+                worker: Mutex::new(None),
+            }),
+            owns_shared_state: false,
+        };
         let worker = std::thread::spawn(move || {
             for msg in rx {
                 match msg {
@@ -1170,6 +1235,77 @@ mod tests {
 
         cache.flush_push_queue();
         assert!(remote_blob.exists());
+    }
+
+    #[test]
+    fn dropping_a_remote_sync_releases_its_rclone_handle() {
+        // The push-queue worker used to hold a full `RemoteSync` clone, which
+        // shared the `Arc<PushQueue>` holding the sender. Dropping every real
+        // `RemoteSync` therefore never closed the channel: the worker blocked
+        // on `rx` forever, kept its `Arc<RcloneRcd>` alive, and the rclone
+        // daemon outlived the process that spawned it. The gated suite leaked
+        // ~7 daemons per run that way (#283).
+        //
+        // Strong count is the direct observable: if it's back to 1, the
+        // worker thread has exited and let go of the handle. No rclone binary
+        // is involved -- `RcloneRcd::new` only builds a runtime, and the
+        // daemon spawns lazily on first use -- so this runs ungated.
+        let rclone = Arc::new(RcloneRcd::new(Duration::from_secs(5)).unwrap());
+        assert_eq!(Arc::strong_count(&rclone), 1);
+
+        let remote = RemoteSync::new(Arc::clone(&rclone), ":local:/tmp/nonexistent", 8);
+        assert!(
+            Arc::strong_count(&rclone) > 1,
+            "the worker should be holding a handle while the queue is live"
+        );
+
+        drop(remote);
+
+        assert_eq!(
+            Arc::strong_count(&rclone),
+            1,
+            "dropping the owning RemoteSync must close the queue and join the worker, \
+             or its rclone daemon is orphaned for the life of the machine"
+        );
+    }
+
+    #[test]
+    fn dropping_a_clone_leaves_the_owner_working() {
+        // Clones are non-owning handles -- the restore path makes one per
+        // candidate pull, and the push worker holds one. If a clone tore down
+        // shared state on drop it would quit the rclone daemon and close the
+        // push queue while the owner was still using them, which is strictly
+        // worse than the leak this all started as.
+        let rclone = Arc::new(RcloneRcd::new(Duration::from_secs(5)).unwrap());
+        let remote = RemoteSync::new(Arc::clone(&rclone), ":local:/tmp/nonexistent", 8);
+
+        let handle = remote.clone();
+        assert!(
+            !handle.owns_shared_state,
+            "a clone must never claim ownership"
+        );
+        drop(handle);
+
+        assert!(
+            remote
+                .push_queue
+                .tx
+                .lock()
+                .expect("push queue tx mutex poisoned")
+                .is_some(),
+            "a dropped clone must leave the owner's push queue open"
+        );
+        assert!(
+            Arc::strong_count(&rclone) > 1,
+            "a dropped clone must leave the owner's rclone handle alive"
+        );
+
+        drop(remote);
+        assert_eq!(
+            Arc::strong_count(&rclone),
+            1,
+            "the owner still tears everything down"
+        );
     }
 
     #[test]
