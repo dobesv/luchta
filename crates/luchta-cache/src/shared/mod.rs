@@ -48,6 +48,7 @@ pub use snapshot::{
 #[cfg(unix)]
 use std::collections::VecDeque;
 use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::fs::OpenOptions;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -318,6 +319,38 @@ pub(crate) fn blob_path(paths: &SharedCachePaths, outputs_hash: &[u8; 32]) -> Pa
 
 pub(crate) fn hex_hash(hash: [u8; 32]) -> String {
     blake3::Hash::from(hash).to_hex().to_string()
+}
+
+/// Creates `dir`, first clearing a non-directory sitting where it belongs.
+///
+/// The snapshot key scheme has changed twice — `<commit>`, then
+/// `<unix_ms>-<nonce>`, now `<YYYYMMDD>-<shard>` — and older layouts wrote a
+/// plain file where a shard directory now goes. That file makes its bucket
+/// permanently unusable: every pull fails to prepare the directory and every
+/// merge fails to create it. Both report at `debug:`, so the only symptom a
+/// user sees is a shared cache that never hits, which is what #276 was.
+///
+/// Removing it is safe. Everything under the cache dir is disposable and
+/// content-addressed; the worst case is one bucket's worth of entries being
+/// rebuilt. Only a non-directory blocking the path is treated this way —
+/// permission errors and read-only filesystems still surface.
+pub(crate) fn ensure_cache_dir(dir: &Path) -> io::Result<()> {
+    let Err(err) = fs::create_dir_all(dir) else {
+        return Ok(());
+    };
+
+    let blocked_by_file = fs::symlink_metadata(dir).is_ok_and(|meta| !meta.is_dir());
+    if !blocked_by_file {
+        return Err(err);
+    }
+
+    fs::remove_file(dir)?;
+    eprintln!(
+        "warning: removed a stale file at {} where the shared cache needs a directory; \
+         it is left over from an older cache layout and its entries will be rebuilt",
+        dir.display()
+    );
+    fs::create_dir_all(dir)
 }
 
 impl Drop for SharedCache {
@@ -2953,6 +2986,37 @@ mod tests {
         // under eager merges exactly as the local one does. Do not re-add a
         // post-flush shard-file-count assertion on either side; it will pass
         // under both behaviours and imply a proof it can't provide.
+    }
+
+    #[test]
+    fn ensure_cache_dir_leaves_an_existing_directory_and_its_contents_alone() {
+        // The healing path deletes whatever is in the way, so the guard that
+        // it only ever fires for a non-directory matters: firing on a real
+        // shard directory would delete a whole bucket's entries every run.
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path().join("20260808-01");
+        fs::create_dir_all(&dir).unwrap();
+        let shard = dir.join("existing.bincode");
+        fs::write(&shard, b"real shard").unwrap();
+
+        ensure_cache_dir(&dir).expect("an existing directory is not an error");
+
+        assert!(dir.is_dir());
+        assert_eq!(
+            fs::read(&shard).unwrap(),
+            b"real shard",
+            "an existing shard directory must survive untouched"
+        );
+    }
+
+    #[test]
+    fn ensure_cache_dir_creates_missing_parents() {
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path().join("snapshots").join("20260808-02");
+
+        ensure_cache_dir(&dir).expect("missing parents should be created");
+
+        assert!(dir.is_dir());
     }
 
     #[test]

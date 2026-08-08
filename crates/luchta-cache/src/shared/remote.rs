@@ -473,7 +473,7 @@ impl RemoteSync {
         }
         let remote_fs = self.snapshots_fs(commit_key);
         let local_dir = snapshot_store.paths().snapshots_dir.join(commit_key);
-        if let Err(err) = fs::create_dir_all(&local_dir) {
+        if let Err(err) = crate::shared::ensure_cache_dir(&local_dir) {
             eprintln!("debug: local snapshot dir prep failed for bucket={commit_key}: {err}");
             return;
         }

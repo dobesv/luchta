@@ -221,7 +221,7 @@ impl SnapshotStore {
         }
 
         let shard_dir = self.shard_dir_path(shard_key);
-        if let Err(err) = fs::create_dir_all(&shard_dir) {
+        if let Err(err) = crate::shared::ensure_cache_dir(&shard_dir) {
             eprintln!(
                 "warning: failed to create snapshot shard dir {}: {err}; skipping shared snapshot write",
                 shard_dir.display()
@@ -1477,6 +1477,42 @@ mod tests {
             .join(format!("{shard_id}.{SNAPSHOT_FILE_EXTENSION}"));
         atomic_write(&path, &compress_snapshot_bytes(&encoded).unwrap()).unwrap();
         (shard_id, path)
+    }
+
+    #[test]
+    fn merge_heals_a_stale_file_where_the_shard_dir_belongs() {
+        // What a cache written by an older luchta looks like after the key
+        // scheme changed: a plain file at `snapshots/<key>`, where the shard
+        // directory now goes. Before, `create_dir_all` failed on it, the
+        // merge bailed with a `debug:` line, and that bucket never worked
+        // again -- a shared cache that silently never hits (#276).
+        let temp_dir = tempdir().unwrap();
+        let paths = open_shared_paths(temp_dir.path()).unwrap();
+        let store = SnapshotStore::new(paths);
+        let shard_key = "20260808-03";
+
+        let blocking = store.shard_dir_path(shard_key);
+        fs::create_dir_all(blocking.parent().unwrap()).unwrap();
+        fs::write(&blocking, b"snapshot bytes from an older layout").unwrap();
+        assert!(blocking.is_file(), "the stale file must be in place");
+
+        let entry = sample_entry_with_seed(1, [5; 32]);
+        assert_eq!(
+            store.merge_entry(shard_key, entry.clone()),
+            MergeResult::Inserted,
+            "the merge must clear the stale file rather than fail forever"
+        );
+
+        assert!(
+            blocking.is_dir(),
+            "the shard path should now be a directory"
+        );
+        let loaded = store.load(shard_key).expect("the bucket must be readable");
+        assert_eq!(
+            loaded.entries.get(&input_key_hex(entry.input_key)),
+            Some(&entry),
+            "the entry written after healing must be readable back"
+        );
     }
 
     #[test]
