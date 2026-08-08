@@ -36,12 +36,9 @@ use crate::run::setup::no_cache_env;
 
 #[tokio::main]
 async fn main() {
-    // Restore the default SIGPIPE disposition. Rust ignores SIGPIPE by default,
-    // which turns writes to a closed pipe into `EPIPE` errors that make
-    // `println!`/`eprintln!` panic (e.g. `luchta run ... | head`). Resetting it
-    // to `SIG_DFL` makes the process terminate quietly on a broken pipe, which
-    // is the expected behavior for a CLI that streams task output.
-    reset_sigpipe();
+    // Leave SIGPIPE ignored and handle broken pipes where they happen. See
+    // `install_broken_pipe_guard`.
+    install_broken_pipe_guard();
 
     let result = run(Cli::parse()).await;
     let exit_code = match result {
@@ -59,19 +56,93 @@ fn is_tasks_failed(err: &Report) -> bool {
     err.downcast_ref::<TasksFailed>().is_some()
 }
 
-/// Reset SIGPIPE to its default disposition so broken-pipe writes terminate the
-/// process quietly instead of panicking. No-op on non-Unix platforms.
-#[cfg(unix)]
-fn reset_sigpipe() {
-    // SAFETY: installing the default handler for SIGPIPE is async-signal-safe
-    // and is called once at startup before any output is produced.
-    unsafe {
-        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
-    }
+/// Exit quietly when a print to stdout/stderr fails because the reader is
+/// gone, so `luchta run ... | head` doesn't spew a panic.
+///
+/// This used to be done by resetting SIGPIPE to `SIG_DFL`, which is the usual
+/// CLI trick but is wrong for a process that also writes to pipes it doesn't
+/// own. `SIG_DFL` kills on a broken pipe of *any* fd, and luchta writes task
+/// requests to worker stdin (`worker/io_tasks.rs`). During failure teardown a
+/// worker can exit before the write lands, and luchta died of signal 13
+/// mid-teardown — after printing the failure block, before the summary (#282).
+/// `write_worker_request` already handles a failed write by crashing that
+/// worker's jobs; the signal just never let it see the error.
+///
+/// So SIGPIPE stays ignored (Rust's default, which turns those writes into
+/// ordinary `EPIPE` errors) and the one case that actually wants to end the
+/// process — nobody left reading our own output — is handled here instead.
+fn install_broken_pipe_guard() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if is_broken_pipe_panic(info) {
+            // Success: the reader closed the pipe on purpose, as `head` does.
+            std::process::exit(0);
+        }
+        default_hook(info);
+    }));
 }
 
-#[cfg(not(unix))]
-fn reset_sigpipe() {}
+/// Whether a panic is the standard library failing to write to stdout/stderr
+/// because the pipe is closed.
+///
+/// Both halves are required. The prefix is the exact wording the `print!`
+/// family uses when its write fails, and matching it alone would silently
+/// turn a genuine write failure (a full disk, say) into exit 0.
+fn is_broken_pipe_panic(info: &std::panic::PanicHookInfo<'_>) -> bool {
+    let payload = info.payload();
+    let message = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or_default();
+    is_broken_pipe_message(message)
+}
+
+fn is_broken_pipe_message(message: &str) -> bool {
+    message.starts_with("failed printing to")
+        // `Display` for the error is `strerror`, which can be localised, so
+        // accept the raw errno spelling too. EPIPE is 32 on Linux and macOS.
+        && (message.contains("Broken pipe") || message.contains("os error 32"))
+}
+
+#[cfg(test)]
+mod broken_pipe_tests {
+    use super::is_broken_pipe_message;
+
+    #[test]
+    fn recognizes_a_closed_output_pipe() {
+        // The exact wording the `print!` family panics with.
+        assert!(is_broken_pipe_message(
+            "failed printing to stdout: Broken pipe (os error 32)"
+        ));
+        assert!(is_broken_pipe_message(
+            "failed printing to stderr: Broken pipe (os error 32)"
+        ));
+        // Same thing under a non-English locale, where `strerror` is
+        // translated but the errno spelling is not.
+        assert!(is_broken_pipe_message(
+            "failed printing to stdout: Tubo roto (os error 32)"
+        ));
+    }
+
+    #[test]
+    fn leaves_every_other_panic_alone() {
+        // A write that failed for some other reason must reach the real hook
+        // and abort loudly. Exiting 0 here would turn a full disk into a
+        // build that looks like it succeeded.
+        assert!(!is_broken_pipe_message(
+            "failed printing to stdout: No space left on device (os error 28)"
+        ));
+        // Broken pipe from somewhere that isn't our own output: a worker
+        // pipe. That must not take the process down at all -- it's the whole
+        // point of #282.
+        assert!(!is_broken_pipe_message(
+            "called `Result::unwrap()` on an `Err` value: Os { code: 32, kind: BrokenPipe, message: \"Broken pipe\" }"
+        ));
+        assert!(!is_broken_pipe_message("index out of bounds"));
+        assert!(!is_broken_pipe_message(""));
+    }
+}
 
 async fn run(cli: Cli) -> Result<()> {
     let workspace_root = run::resolve_workspace_root(cli.workspace_root)?;
