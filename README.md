@@ -1074,6 +1074,7 @@ Invalid numeric values will trigger a warning and fall back to their defaults.
 - `LUCHTA_SHARED_CACHE_RCLONE_CHECKERS` — rclone rcd `--checkers` setting. Default: `8`.
 - `LUCHTA_SHARED_CACHE_RCLONE_JOB_EXPIRE_DURATION` — rclone rcd `--rc-job-expire-duration`; must exceed execution timeout so finished jobs are not reaped before polling completes. Default: `10m`.
 - `LUCHTA_SHARED_CACHE_PUSH_QUEUE_CAPACITY` — Bounded background push queue depth; when full, producers block instead of dropping remote cache writes. Default: `256`.
+- `LUCHTA_SHARED_CACHE_MIN_DURATION_MS` — Tasks faster than this are not stored; the round trip costs more than re-running them. Raise it to keep cheap tasks out of the cache. Default: `100`.
 
 #### Remote Synchronization (S3/rclone)
 Luchta can synchronize the shared cache with a remote object store (like S3, GCS, or Azure) using [rclone](https://rclone.org/).

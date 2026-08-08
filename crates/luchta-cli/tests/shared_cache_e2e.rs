@@ -267,7 +267,12 @@ fn slow_task_stores_in_shared_cache() {
     );
 }
 
-/// Test: a <100ms task does NOT store in shared cache.
+/// Test: a task below the duration threshold does NOT store in shared cache.
+///
+/// The threshold is raised via `LUCHTA_SHARED_CACHE_MIN_DURATION_MS` rather
+/// than relying on the task beating the 100ms default. Racing the clock made
+/// this fail under CPU oversubscription — the task crossed 100ms, was cached
+/// legitimately, and the failure read as a cache regression (#290).
 #[test]
 fn fast_task_skips_shared_cache_store() {
     let shared_cache_dir = tempfile::tempdir().unwrap();
@@ -275,7 +280,6 @@ fn fast_task_skips_shared_cache_store() {
     let temp = assert_fs::TempDir::new().unwrap();
 
     write_root_workspace(&temp);
-    // Task deliberately fast (<100ms)
     write_counter_task_config(
         &temp,
         r#""app#pkgbuild":{"cache":{},"worker":"shell","inputs":["src.txt"],"outputs":["counter.txt"],"command":"count=$(cat counter.txt 2>/dev/null || echo 0); count=$((count+1)); echo $count > counter.txt"}"#,
@@ -305,6 +309,9 @@ fn fast_task_skips_shared_cache_store() {
             "LUCHTA_SHARED_CACHE_DIR",
             shared_cache_dir.path().to_str().unwrap(),
         )
+        // An hour. No task in this test can cross it however loaded the
+        // machine is, so "below the threshold" is a fact rather than a race.
+        .env("LUCHTA_SHARED_CACHE_MIN_DURATION_MS", "3600000")
         .assert()
         .success();
 
