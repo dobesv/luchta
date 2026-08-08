@@ -184,6 +184,20 @@ pub(crate) struct OwnedEntryArtifacts {
     pub(crate) has_outputs: bool,
 }
 
+/// Borrowed inputs for [`RemoteSync::push_entry_artifacts`].
+///
+/// A param struct rather than positional arguments because `outputs_hash` and
+/// `input_key` are both `&[u8; 32]`: adjacent, same-typed, and silently
+/// swappable. Getting them the wrong way round compiles, pushes the blob
+/// under the entry-meta name, and only shows up later as a cross-machine
+/// restore that misses or stages the wrong outputs.
+pub(crate) struct EntryArtifacts<'a> {
+    pub(crate) paths: &'a SharedCachePaths,
+    pub(crate) outputs_hash: &'a [u8; 32],
+    pub(crate) input_key: &'a [u8; 32],
+    pub(crate) has_outputs: bool,
+}
+
 /// Owned inputs for [`RemoteSync::push_index_merge`], queued so the push can
 /// happen off the caller's thread.
 ///
@@ -441,12 +455,12 @@ impl RemoteSync {
     }
 
     fn push_entry_artifacts_owned(&self, push: OwnedEntryArtifacts) {
-        self.push_entry_artifacts(
-            &push.paths,
-            &push.outputs_hash,
-            &push.input_key,
-            push.has_outputs,
-        );
+        self.push_entry_artifacts(EntryArtifacts {
+            paths: &push.paths,
+            outputs_hash: &push.outputs_hash,
+            input_key: &push.input_key,
+            has_outputs: push.has_outputs,
+        });
     }
 
     fn push_index_merge_owned(&self, push: OwnedIndexPush) {
@@ -560,21 +574,15 @@ impl RemoteSync {
     /// blob and the entry meta are useful to a restore on another machine
     /// whether or not this run's index push has happened yet, so this half
     /// is dispatchable on its own.
-    pub(crate) fn push_entry_artifacts(
-        &self,
-        paths: &SharedCachePaths,
-        outputs_hash: &[u8; 32],
-        input_key: &[u8; 32],
-        has_outputs: bool,
-    ) {
+    pub(crate) fn push_entry_artifacts(&self, artifacts: EntryArtifacts<'_>) {
         if self.is_disabled() {
             return;
         }
 
-        if has_outputs {
-            self.push_blob_if_missing(paths, outputs_hash);
+        if artifacts.has_outputs {
+            self.push_blob_if_missing(artifacts.paths, artifacts.outputs_hash);
         }
-        self.push_entry_meta_if_missing(paths, input_key);
+        self.push_entry_meta_if_missing(artifacts.paths, artifacts.input_key);
     }
 
     /// Pushes the merged index shard (when the merge produced one) and then
@@ -1028,7 +1036,12 @@ mod tests {
             .snapshot_store
             .merge_entry_with_outcome(shard_key, entry);
         let shard_id = merge.new_snapshot_upload.as_ref().unwrap().shard_id.clone();
-        remote_seed.push_entry_artifacts(seed_cache.paths(), &outputs_hash, &input_key, true);
+        remote_seed.push_entry_artifacts(EntryArtifacts {
+            paths: seed_cache.paths(),
+            outputs_hash: &outputs_hash,
+            input_key: &input_key,
+            has_outputs: true,
+        });
         remote_seed.push_index_merge(shard_key, &merge);
         shard_id
     }
@@ -1460,9 +1473,12 @@ mod tests {
             .join(format!("subsuming-shard.{SNAPSHOT_FILE_EXTENSION}"));
         fs::create_dir_all(&blocking_path).unwrap();
         let input_key = derive_input_key([19; 32], [20; 32], [21; 32], [22; 32], [5; 32]);
-        harness
-            .remote
-            .push_entry_artifacts(cache.paths(), &[23; 32], &input_key, true);
+        harness.remote.push_entry_artifacts(EntryArtifacts {
+            paths: cache.paths(),
+            outputs_hash: &[23; 32],
+            input_key: &input_key,
+            has_outputs: true,
+        });
         harness.remote.push_index_merge(&shard_key, &merge3);
         // The failed upload must not have disabled the remote permanently in a
         // way that hides a delete — but it must have skipped the subsumed-shard
@@ -1984,9 +2000,12 @@ mod tests {
         .unwrap();
 
         let input_key = derive_input_key([71; 32], [72; 32], [73; 32], [74; 32], [5; 32]);
-        harness
-            .remote
-            .push_entry_artifacts(seed_cache.paths(), &[0x66; 32], &input_key, true);
+        harness.remote.push_entry_artifacts(EntryArtifacts {
+            paths: seed_cache.paths(),
+            outputs_hash: &[0x66; 32],
+            input_key: &input_key,
+            has_outputs: true,
+        });
         harness.remote.push_index_merge(&shard_key, &merge3);
         assert!(harness.remote.is_disabled_for_test());
         fs::remove_dir(&poisoned_file).unwrap();
@@ -2219,7 +2238,12 @@ mod tests {
             format!(":local:{}", remote_root.path().display()),
             8,
         );
-        remote_seed.push_entry_artifacts(&seed_paths, &[0; 32], &input_key, false);
+        remote_seed.push_entry_artifacts(EntryArtifacts {
+            paths: &seed_paths,
+            outputs_hash: &[0; 32],
+            input_key: &input_key,
+            has_outputs: false,
+        });
         remote_seed.push_index_merge(&remote_only_key, &merge);
 
         // Fresh local cache: it never wrote to `remote_only_key`, and that
@@ -2602,7 +2626,7 @@ mod tests {
         // remote traffic on exactly the path batching exists to make cheaper.
         //
         // Observed from the remote rather than from
-        // `pending_catchup_representative`: deleting the remote entry-meta
+        // `PendingState::catchup_representative`: deleting the remote entry-meta
         // object first makes the catch-up push, if it happens, restore the
         // file. Asserting the private field instead stays green under the
         // pre-batching `entries.first().cloned()` representative, because
