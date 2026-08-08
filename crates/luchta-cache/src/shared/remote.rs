@@ -691,16 +691,6 @@ impl RemoteSync {
         }
         self.record_remote_success();
 
-        let merged_name = format!("{}.{SNAPSHOT_MERGED_EXTENSION}", upload.shard_id);
-        if let Err(err) = self.copy_bytes_up(&upload.merged_bytes, &remote_fs, &merged_name) {
-            self.record_remote_error(&err);
-            eprintln!(
-                "warn: shared cache remote snapshot upload failed for bucket={commit_key} file={merged_name}: {err}"
-            );
-            return false;
-        }
-        self.record_remote_success();
-
         true
     }
 
@@ -985,7 +975,10 @@ mod tests {
         assert!(remote_blob_path(remote_root, outputs_hash).exists());
     }
 
-    fn assert_snapshot_shard_count(files: &[String], bincode_count: usize, merged_count: usize) {
+    /// Asserts the bucket holds exactly `bincode_count` shard files and no
+    /// `.merged` sidecars. Nothing writes sidecars any more (#284), so a
+    /// stray one means something reintroduced the write.
+    fn assert_snapshot_shard_count(files: &[String], bincode_count: usize) {
         assert_eq!(
             files
                 .iter()
@@ -998,14 +991,17 @@ mod tests {
                 .iter()
                 .filter(|name| name.ends_with(".merged"))
                 .count(),
-            merged_count
+            0,
+            "no .merged sidecar should be written any more"
         );
     }
 
     fn assert_remote_store_layout(remote_root: &Path, shard_key: &str, outputs_hash: &[u8; 32]) {
         let files = remote_snapshot_files(remote_root, shard_key);
-        assert_eq!(files.len(), 2);
-        assert_snapshot_shard_count(&files, 1, 1);
+        // One object per shard now that the unread `.merged` sidecar is no
+        // longer uploaded (#284).
+        assert_eq!(files.len(), 1);
+        assert_snapshot_shard_count(&files, 1);
         assert_remote_has_blob(remote_root, outputs_hash);
     }
 
@@ -1436,7 +1432,9 @@ mod tests {
             harness.remote_root.path(),
         );
         let remote_before = remote_snapshot_files(harness.remote_root.path(), &shard_key);
-        assert_eq!(remote_before.len(), 2);
+        // One object: the consolidated shard. The second used to be its
+        // `.merged` sidecar, no longer uploaded (#284).
+        assert_eq!(remote_before.len(), 1);
         seed_guard_blob(&harness.local_cache, [23; 32], b"blob-23");
         let mut merge3 = cache.snapshot_store.merge_entry_with_outcome(
             &shard_key,
@@ -1709,18 +1707,16 @@ mod tests {
             }
         }
         assert_eq!(bincode_files.len(), 1);
-        assert_eq!(merged_files.len(), 1);
+        assert!(
+            merged_files.is_empty(),
+            "the unread .merged sidecar is no longer uploaded (#284)"
+        );
 
         let local_snapshot_dir = seed.cache.paths().snapshots_dir.join(seed.shard_key());
         let local_shard_name = bincode_files.pop().unwrap();
-        let local_merged_name = merged_files.pop().unwrap();
         assert_eq!(
             fs::read(snapshot_dir.join(&local_shard_name)).unwrap(),
             fs::read(local_snapshot_dir.join(&local_shard_name)).unwrap()
-        );
-        assert_eq!(
-            fs::read(snapshot_dir.join(&local_merged_name)).unwrap(),
-            fs::read(local_snapshot_dir.join(&local_merged_name)).unwrap()
         );
     }
 
@@ -1955,18 +1951,22 @@ mod tests {
             harness.remote_root.path(),
         );
         let remote_before = remote_snapshot_files(harness.remote_root.path(), &shard_key);
-        assert_eq!(remote_before.len(), 2);
+        // One object: the consolidated shard. The second used to be its
+        // `.merged` sidecar, no longer uploaded (#284).
+        assert_eq!(remote_before.len(), 1);
         seed_guard_blob(&harness.local_cache, [0x66; 32], b"blob-66");
 
         let upload_shard_id = "subsuming-shard-mid-push".to_string();
         let upload_shard_bytes = b"synthetic-shard".to_vec();
+        // A sidecar as an older luchta would have written it. Nothing
+        // writes these any more, but subsume still deletes them so existing
+        // remotes get cleaned up rather than accumulating orphans (#284).
         let upload_merged_bytes = b"synthetic-merged".to_vec();
         let merge3 = MergeEntryOutcome {
             result: MergeResult::Inserted,
             new_snapshot_upload: Some(SnapshotUpload {
                 shard_id: upload_shard_id.clone(),
                 shard_bytes: upload_shard_bytes.clone(),
-                merged_bytes: upload_merged_bytes.clone(),
             }),
             subsumed_shard_ids: vec![
                 "disabling-shard-mid-push".to_string(),
@@ -2012,16 +2012,21 @@ mod tests {
         drop(seed_cache);
 
         let snapshot_files = remote_snapshot_files(harness.remote_root.path(), &shard_key);
-        assert_eq!(snapshot_files.len(), 5);
+        // One fewer than before: the consolidated shard no longer brings a
+        // `.merged` sidecar with it (#284). The legacy sidecars this test
+        // seeds by hand are still here, which is the point -- the
+        // named-file assertions below check they survive a halted push.
+        assert_eq!(snapshot_files.len(), 4);
         assert!(snapshot_files
             .iter()
             .any(|name| name == &format!("{disabling_shard_id}.{SNAPSHOT_MERGED_EXTENSION}")));
         assert!(snapshot_files
             .iter()
             .any(|name| name == &format!("{surviving_shard_id}.{SNAPSHOT_FILE_EXTENSION}")));
-        assert!(snapshot_files
-            .iter()
-            .any(|name| name == &format!("{surviving_shard_id}.{SNAPSHOT_MERGED_EXTENSION}")));
+        // No sidecar assertion for the surviving shard: it was produced by a
+        // real merge, and merges no longer write one (#284). The two
+        // hand-seeded legacy sidecars still assert the halted-delete
+        // behaviour, which is what this test is about.
         assert!(!snapshot_files
             .iter()
             .any(|name| name == &format!("{disabling_shard_id}.{SNAPSHOT_FILE_EXTENSION}")));
@@ -2053,7 +2058,9 @@ mod tests {
             harness.remote_root.path(),
         );
         let seeded_files = remote_snapshot_files(harness.remote_root.path(), &shard_key);
-        assert_eq!(seeded_files.len(), 2);
+        // One object: the consolidated shard. The second used to be its
+        // `.merged` sidecar, no longer uploaded (#284).
+        assert_eq!(seeded_files.len(), 1);
         assert!(harness
             .remote_root
             .path()
@@ -2086,7 +2093,9 @@ mod tests {
         drop(seed_cache);
 
         let snapshot_files = remote_snapshot_files(harness.remote_root.path(), &shard_key);
-        assert_eq!(snapshot_files.len(), 4);
+        // Two fewer than before: neither the seeded shard nor the one this
+        // store writes uploads a `.merged` sidecar any more (#284).
+        assert_eq!(snapshot_files.len(), 2);
         assert!(!snapshot_files
             .iter()
             .any(|name| name.starts_with(&merge1_id)));
@@ -2103,7 +2112,7 @@ mod tests {
                 .any(|id| id == merge2_id),
             "merge2's shard must still be present, not subsumed: {snapshot_files:?}"
         );
-        assert_snapshot_shard_count(&snapshot_files, 2, 2);
+        assert_snapshot_shard_count(&snapshot_files, 2);
     }
 
     #[test]
@@ -2369,7 +2378,7 @@ mod tests {
         // push -- shown here with two hits for two distinct keys.
         //
         // The discriminating assertion is the pre-flush emptiness check
-        // below, not the post-flush `assert_snapshot_shard_count(&files, 1, 1)`:
+        // below, not the post-flush `assert_snapshot_shard_count(&files, 1)`:
         // `push_index_merge` deletes each subsumed shard from the remote, so
         // two eager per-hit pushes also settle at one shard. Same reasoning as
         // `store_pushes_artifacts_immediately_but_defers_the_index_push_to_flush`
@@ -2440,7 +2449,7 @@ mod tests {
         cache.flush_push_queue();
 
         let files = remote_snapshot_files(harness.remote_root.path(), &write_key);
-        assert_snapshot_shard_count(&files, 1, 1);
+        assert_snapshot_shard_count(&files, 1);
 
         // And that single shard must carry BOTH entries -- proving the flush
         // merged them together in one pass rather than only the last one
@@ -2538,7 +2547,7 @@ mod tests {
         cache.flush_push_queue();
 
         let files = remote_snapshot_files(harness.remote_root.path(), &write_key);
-        assert_snapshot_shard_count(&files, 1, 1);
+        assert_snapshot_shard_count(&files, 1);
     }
 
     #[test]
