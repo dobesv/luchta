@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -55,6 +55,22 @@ pub struct MergeEntryOutcome {
     pub result: MergeResult,
     pub new_snapshot_upload: Option<SnapshotUpload>,
     pub subsumed_shard_ids: Vec<String>,
+}
+
+/// What a bucket's shard files merged into, plus the ids of the shards that
+/// actually contributed.
+///
+/// The id list is what makes deleting subsumed shards safe. A shard that
+/// failed to decode — corrupt, or written by a client running a newer
+/// `SNAPSHOT_SCHEMA_VERSION` — is skipped by the merge, so it holds entries
+/// the consolidated shard does not. Subsuming it anyway destroys cache
+/// entries this client merely couldn't read, and since the same id list
+/// drives `push_index_merge`'s remote deletes, an older client would wipe a
+/// newer client's shard off the object store too.
+#[derive(Debug)]
+struct MergedShards {
+    snapshot: Option<Snapshot>,
+    merged_shard_ids: HashSet<String>,
 }
 
 #[derive(Debug)]
@@ -160,6 +176,7 @@ impl SnapshotStore {
         }
 
         self.load_merged_snapshot_from_shards(shard_key, shards)
+            .snapshot
     }
 
     /// Single-entry convenience wrapper over `merge_entries_with_outcome`,
@@ -213,9 +230,11 @@ impl SnapshotStore {
         }
 
         let visible_shards = self.list_snapshot_shards(shard_key);
-        let mut consolidated = self
-            .load_merged_snapshot_from_shards(shard_key, visible_shards.clone())
-            .unwrap_or_default();
+        let MergedShards {
+            snapshot,
+            merged_shard_ids,
+        } = self.load_merged_snapshot_from_shards(shard_key, visible_shards.clone());
+        let mut consolidated = snapshot.unwrap_or_default();
 
         let mut changed = false;
         let mut saw_conflict = false;
@@ -259,7 +278,7 @@ impl SnapshotStore {
             return MergeEntryOutcome::from_result(result);
         }
 
-        self.write_consolidated_shard(shard_key, &consolidated, &visible_shards)
+        self.write_consolidated_shard(shard_key, &consolidated, &visible_shards, &merged_shard_ids)
     }
 
     /// Writes the consolidated shard + `.merged` sidecar and deletes the shards
@@ -269,6 +288,7 @@ impl SnapshotStore {
         shard_key: &str,
         consolidated: &Snapshot,
         visible_shards: &[SnapshotShard],
+        merged_shard_ids: &HashSet<String>,
     ) -> MergeEntryOutcome {
         let shard_dir = self.shard_dir_path(shard_key);
         let encoded = bincode::serde::encode_to_vec(consolidated, snapshot_bincode_config())
@@ -308,7 +328,7 @@ impl SnapshotStore {
             return MergeEntryOutcome::from_result(MergeResult::SkippedLockUnavailable);
         }
 
-        self.finalize_sidecar_and_subsumed(shard_key, write, visible_shards)
+        self.finalize_sidecar_and_subsumed(shard_key, write, visible_shards, merged_shard_ids)
     }
 
     fn finalize_sidecar_and_subsumed(
@@ -316,14 +336,22 @@ impl SnapshotStore {
         shard_key: &str,
         write: ConsolidatedShardWrite,
         visible_shards: &[SnapshotShard],
+        merged_shard_ids: &HashSet<String>,
     ) -> MergeEntryOutcome {
         let ConsolidatedShardWrite {
             shard_id,
             shard_on_disk,
             merged_sidecar_path,
         } = write;
+        // Subsume only the shards that actually merged. One this client
+        // couldn't decode still holds entries the consolidated shard is
+        // missing, so deleting it would drop cache entries -- and for a
+        // future-schema shard, they'd be a newer client's entries, deleted
+        // both locally and (via `push_index_merge`) on the shared remote.
+        // Leaving it costs a warning per load until GC ages it out.
         let subsumed_shard_ids = visible_shards
             .iter()
+            .filter(|shard| merged_shard_ids.contains(&shard.shard_id))
             .filter_map(SnapshotShard::deletable_shard_id)
             .collect::<Vec<_>>();
         let inserted_without_cleanup = |shard_id, shard_bytes| MergeEntryOutcome {
@@ -396,9 +424,10 @@ impl SnapshotStore {
         &self,
         shard_key: &str,
         shards: Vec<SnapshotShard>,
-    ) -> Option<Snapshot> {
+    ) -> MergedShards {
         let mut merged = Snapshot::new();
         let mut saw_any = false;
+        let mut merged_shard_ids = HashSet::new();
 
         for shard in shards {
             let bytes = match fs::read(shard.path()) {
@@ -428,10 +457,14 @@ impl SnapshotStore {
             };
 
             saw_any = true;
+            merged_shard_ids.insert(shard.shard_id.clone());
             merge_shard_entries(&mut merged, snapshot);
         }
 
-        saw_any.then_some(merged)
+        MergedShards {
+            snapshot: saw_any.then_some(merged),
+            merged_shard_ids,
+        }
     }
 
     fn list_snapshot_shards(&self, shard_key: &str) -> Vec<SnapshotShard> {
@@ -1112,9 +1145,11 @@ mod tests {
         );
 
         let visible_shards = store.list_snapshot_shards(shard_key);
-        let mut consolidated = store
-            .load_merged_snapshot_from_shards(shard_key, visible_shards.clone())
-            .unwrap();
+        let MergedShards {
+            snapshot,
+            merged_shard_ids: _,
+        } = store.load_merged_snapshot_from_shards(shard_key, visible_shards.clone());
+        let mut consolidated = snapshot.unwrap();
         consolidated
             .entries
             .insert(input_key_hex(new_entry.input_key), new_entry.clone());
@@ -1406,6 +1441,7 @@ mod tests {
 
         let merged = store
             .load_merged_snapshot_from_shards(shard_key, shards)
+            .snapshot
             .expect("surviving shard should still load");
         assert_eq!(merged.entries.len(), 1);
         assert_eq!(
@@ -1422,6 +1458,81 @@ mod tests {
         let bytes = bincode::serde::encode_to_vec(&snapshot, snapshot_bincode_config()).unwrap();
         let on_disk = compress_snapshot_bytes(&bytes).unwrap();
         fs::write(path, on_disk).unwrap();
+    }
+
+    /// Writes a shard this client cannot decode, and returns its id and path.
+    /// `schema_version` above `SNAPSHOT_SCHEMA_VERSION` is what a client
+    /// running a newer luchta writes into a shared bucket.
+    fn write_future_schema_shard(
+        store: &SnapshotStore,
+        shard_key: &str,
+        entry: SnapshotEntry,
+    ) -> (String, PathBuf) {
+        let mut snapshot = snapshot_with_entries([entry]);
+        snapshot.schema_version = SNAPSHOT_SCHEMA_VERSION + 1;
+        let encoded = bincode::serde::encode_to_vec(&snapshot, snapshot_bincode_config()).unwrap();
+        let shard_id = blake3::hash(&encoded).to_hex().to_string();
+        let path = store
+            .shard_dir_path(shard_key)
+            .join(format!("{shard_id}.{SNAPSHOT_FILE_EXTENSION}"));
+        atomic_write(&path, &compress_snapshot_bytes(&encoded).unwrap()).unwrap();
+        (shard_id, path)
+    }
+
+    #[test]
+    fn merge_does_not_subsume_a_shard_it_could_not_decode() {
+        // A shard written by a client running a newer schema version is
+        // skipped by the merge, so the consolidated shard does not contain
+        // its entries. Deleting it would destroy cache entries this client
+        // merely couldn't read -- and because `subsumed_shard_ids` also
+        // drives `push_index_merge`'s remote deletes, an older client would
+        // wipe a newer client's shard off the shared object store.
+        let temp_dir = tempdir().unwrap();
+        let paths = open_shared_paths(temp_dir.path()).unwrap();
+        let store = SnapshotStore::new(paths);
+        let shard_key = "20260807-00";
+
+        // Seed a readable shard so the merge has something to subsume, which
+        // keeps this test honest: if it deleted nothing at all, the
+        // assertions below would pass for the wrong reason.
+        let readable = sample_entry_with_seed(1, [5; 32]);
+        assert_eq!(
+            store.merge_entry(shard_key, readable.clone()),
+            MergeResult::Inserted
+        );
+        let readable_shard_id = collect_bincode_files(&store.shard_dir_path(shard_key))
+            .first()
+            .and_then(|path| path.file_stem())
+            .and_then(|stem| stem.to_str())
+            .map(str::to_owned)
+            .expect("the readable shard should be on disk");
+
+        let future_entry = sample_entry_with_seed(2, [6; 32]);
+        let (future_shard_id, future_path) =
+            write_future_schema_shard(&store, shard_key, future_entry);
+
+        let outcome = store.merge_entry_with_outcome(shard_key, sample_entry_with_seed(3, [7; 32]));
+        assert_eq!(outcome.result, MergeResult::Inserted);
+
+        assert!(
+            !outcome.subsumed_shard_ids.contains(&future_shard_id),
+            "an undecodable shard must not be reported as subsumed, or the remote copy gets deleted too"
+        );
+        assert!(
+            future_path.exists(),
+            "an undecodable shard must survive a merge by a client that cannot read it"
+        );
+        assert!(
+            outcome.subsumed_shard_ids.contains(&readable_shard_id),
+            "shards that did merge must still be subsumed, or consolidation stops reclaiming anything"
+        );
+        assert!(
+            !store
+                .shard_dir_path(shard_key)
+                .join(format!("{readable_shard_id}.{SNAPSHOT_FILE_EXTENSION}"))
+                .exists(),
+            "the subsumed readable shard should be gone from disk"
+        );
     }
 
     fn collect_bincode_files(dir: &Path) -> Vec<PathBuf> {
