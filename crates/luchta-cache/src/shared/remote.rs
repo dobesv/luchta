@@ -2602,7 +2602,7 @@ mod tests {
         // remote traffic on exactly the path batching exists to make cheaper.
         //
         // Observed from the remote rather than from
-        // `pending_catchup_representative`: deleting the remote entry-meta
+        // `PendingState::catchup_representative`: deleting the remote entry-meta
         // object first makes the catch-up push, if it happens, restore the
         // file. Asserting the private field instead stays green under the
         // pre-batching `entries.first().cloned()` representative, because

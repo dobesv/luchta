@@ -249,7 +249,7 @@ pub struct SharedCache {
     ///   so this entry needs no remote catch-up at flush time.
     /// - `refresh_entry`, right after a cache hit. This entry's artifacts may
     ///   have been pushed by some earlier run, possibly on another machine,
-    ///   so it may need a catch-up push — see `pending_catchup_representative`.
+    ///   so it may need a catch-up push — see `PendingState::catchup_representative`.
     ///
     /// A given `input_key` can only ever be stored (following a miss) or
     /// refreshed (following a hit) in one run, never both, so a repeat
@@ -276,11 +276,25 @@ pub struct SharedCache {
     /// refreshes before this change, and a killed build losing its last few
     /// stores' worth of index entries is far cheaper than the per-store
     /// remote traffic this batching removes.
-    pending_entries: Mutex<HashMap<[u8; 32], SnapshotEntry>>,
+    pending: Mutex<PendingState>,
+}
+
+/// The run's pending index state, behind one lock.
+///
+/// These two were separate `Mutex`es. The coupling between them —  a
+/// representative only ever exists alongside the entries it was recorded
+/// with — was maintained by convention, and a path that cleared one without
+/// the other would leave a stale representative for a later flush to push a
+/// catch-up for. One lock makes the pair inseparable, and lets
+/// `refresh_entry` record both in a single acquisition.
+#[derive(Debug, Default)]
+struct PendingState {
+    /// Keyed by `input_key` so repeat writes of the same key collapse.
+    entries: HashMap<[u8; 32], SnapshotEntry>,
     /// The first refreshed entry recorded this run, if any — used by
     /// `flush_pending_entries` for a best-effort blob/entry-meta catch-up
-    /// push. `None` for a run that only stores: see `pending_entries`'s doc
-    /// comment for why stores need no catch-up.
+    /// push. `None` for a run that only stores: see `SharedCache::pending`'s
+    /// doc comment for why stores need no catch-up.
     ///
     /// One entry, not N. This is a token push for a single representative,
     /// not general coverage of the run's refreshed artifacts: if a run
@@ -293,7 +307,7 @@ pub struct SharedCache {
     /// snapshot-shard push itself is driven by the merge outcome, not by
     /// this entry.
     #[cfg(unix)]
-    pending_catchup_representative: Mutex<Option<SnapshotEntry>>,
+    catchup_representative: Option<SnapshotEntry>,
 }
 
 pub(crate) fn blob_path(paths: &SharedCachePaths, outputs_hash: &[u8; 32]) -> PathBuf {
@@ -331,13 +345,13 @@ impl Drop for SharedCache {
         // there, and no shard points at any of them, so the next run misses
         // on all of it. One line makes that diagnosable.
         let pending = self
-            .pending_entries
+            .pending
             .get_mut()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if !pending.is_empty() {
+        if !pending.entries.is_empty() {
             eprintln!(
                 "debug: shared cache dropped with {} unflushed pending index entries",
-                pending.len()
+                pending.entries.len()
             );
         }
     }
@@ -424,9 +438,7 @@ impl SharedCache {
             remote,
             index: OnceLock::new(),
             size_cap_bytes,
-            pending_entries: Mutex::new(HashMap::new()),
-            #[cfg(unix)]
-            pending_catchup_representative: Mutex::new(None),
+            pending: Mutex::new(PendingState::default()),
         })
     }
 
@@ -455,9 +467,7 @@ impl SharedCache {
             remote: None,
             index: OnceLock::new(),
             size_cap_bytes,
-            pending_entries: Mutex::new(HashMap::new()),
-            #[cfg(unix)]
-            pending_catchup_representative: Mutex::new(None),
+            pending: Mutex::new(PendingState::default()),
         })
     }
 
@@ -882,7 +892,7 @@ impl SharedCache {
     /// Only the artifact half (blob + entry meta) is immediate here; the
     /// index half is deferred to `flush_pending_entries`, called once after
     /// all tasks complete, the same way `refresh_entry` already defers it for
-    /// cache hits — see `pending_entries`'s doc comment for why one map and
+    /// cache hits — see `PendingState::entries`'s doc comment for why one map and
     /// one flush serve both, and `flush_pending_entries`'s doc comment for
     /// why batching the merge is the point. Pushing the artifacts immediately
     /// (rather than also deferring them) matters because a restore on
@@ -1003,24 +1013,42 @@ impl SharedCache {
     /// same one-entry shard anyway.
     #[cfg(test)]
     fn pending_entry_count(&self) -> usize {
-        self.pending_entries
+        self.pending
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entries
             .len()
     }
 
-    /// Shared insert behind `pending_entries`, used by both `finish_store`
+    /// Shared insert behind `PendingState::entries`, used by both `finish_store`
     /// (after a miss) and `refresh_entry` (after a hit). See
-    /// `pending_entries`'s doc comment for why one map serves both.
+    /// `SharedCache::pending`'s doc comment for why one map serves both.
     ///
     /// Keys on `entry.input_key`, the same field `merge_entries_with_outcome`
     /// re-keys on at flush time, so the map's dedup key and the shard's key
     /// cannot drift apart.
     fn record_pending_entry(&self, entry: SnapshotEntry) {
-        self.pending_entries
+        self.pending
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entries
             .insert(entry.input_key, entry);
+    }
+
+    /// `record_pending_entry` for the cache-hit path, which additionally
+    /// nominates the first refreshed entry as the catch-up representative.
+    /// One acquisition rather than two, so the entry and the representative
+    /// it belongs to can never be recorded across a gap.
+    fn record_pending_refresh(&self, entry: SnapshotEntry) {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        #[cfg(unix)]
+        if pending.catchup_representative.is_none() {
+            pending.catchup_representative = Some(entry.clone());
+        }
+        pending.entries.insert(entry.input_key, entry);
     }
 
     /// Records an entry on a shared-cache hit for a later batched merge, and
@@ -1045,7 +1073,7 @@ impl SharedCache {
     /// queued yet -- unlike a store, a refreshed entry's artifacts may have
     /// been pushed by an earlier run, possibly on another machine, so they
     /// may be missing from this remote. See
-    /// `pending_catchup_representative`'s doc comment.
+    /// `PendingState::catchup_representative`'s doc comment.
     ///
     /// Best-effort and infallible: the hit has already succeeded by the time
     /// this runs, so a refresh failure must never turn it into a miss or fail
@@ -1053,18 +1081,7 @@ impl SharedCache {
     /// returns. Never re-stores the blob or the meta object — both are
     /// content-addressed and already correct.
     pub fn refresh_entry(&self, input_key: &[u8; 32], entry: &SnapshotEntry) {
-        self.record_pending_entry(entry.clone());
-
-        #[cfg(unix)]
-        {
-            let mut representative = self
-                .pending_catchup_representative
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if representative.is_none() {
-                *representative = Some(entry.clone());
-            }
-        }
+        self.record_pending_refresh(entry.clone());
 
         let path = entry_meta_path(&self.paths, input_key);
         match OpenOptions::new().write(true).open(&path) {
@@ -1110,8 +1127,8 @@ impl SharedCache {
     /// one flush, one load.
     ///
     /// The catch-up push is representative-driven and only fires when a
-    /// refresh queued one (see `pending_catchup_representative`'s doc
-    /// comment): a flush containing only stores has nothing to catch up --
+    /// refresh nominated one (see `PendingState::catchup_representative`'s
+    /// doc comment): a flush containing only stores has nothing to catch up --
     /// `finish_store` already pushed each store's own artifacts immediately
     /// -- so it does exactly one `enqueue_index_push` and no
     /// `enqueue_entry_artifacts` call at all. When it does fire it covers one
@@ -1144,13 +1161,22 @@ impl SharedCache {
 
         let entries: Vec<SnapshotEntry> = {
             let mut pending = self
-                .pending_entries
+                .pending
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if pending.is_empty() {
+            if pending.entries.is_empty() {
+                // A representative is only ever recorded alongside an entry,
+                // so there should be nothing here. Clear it anyway rather
+                // than trust that: a representative outliving its entries
+                // would have a later flush push a catch-up for an entry this
+                // run never merged.
+                #[cfg(unix)]
+                {
+                    pending.catchup_representative = None;
+                }
                 return;
             }
-            std::mem::take(&mut *pending).into_values().collect()
+            std::mem::take(&mut pending.entries).into_values().collect()
         };
 
         let entry_count = entries.len();
@@ -1178,16 +1204,17 @@ impl SharedCache {
                     // either way, but the catch-up push is independent of
                     // them and there's no reason to lose both.
                     //
-                    // Only refreshes queue a representative (see
-                    // `pending_catchup_representative`'s doc comment): a
-                    // store-only flush must not manufacture a catch-up push
-                    // for an arbitrary entry, since `finish_store` already
-                    // pushed that entry's own artifacts immediately -- that's
-                    // exactly the remote traffic this task exists to remove.
+                    // Only refreshes nominate a representative (see
+                    // `PendingState::catchup_representative`): a store-only
+                    // flush must not manufacture a catch-up push for an
+                    // arbitrary entry, since `finish_store` already pushed
+                    // that entry's own artifacts immediately -- that's
+                    // exactly the remote traffic this batching removes.
                     let representative = self
-                        .pending_catchup_representative
+                        .pending
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .catchup_representative
                         .take();
                     if let Some(representative) = representative {
                         let has_outputs = read_entry_meta(&self.paths, &representative.input_key)
@@ -2799,7 +2826,7 @@ mod tests {
 
     #[test]
     fn repeat_hits_of_the_same_key_collapse_to_one_entry_before_flush() {
-        // `pending_entries` is keyed by `input_key` precisely so repeat
+        // `PendingState::entries` is keyed by `input_key` precisely so repeat
         // hits of the same key collapse to a single entry before a flush.
         // `flush_pending_entries_collapses_two_hits_into_a_single_push` (in
         // `remote.rs`) proves N DISTINCT keys collapse into one push, but
