@@ -61,6 +61,31 @@ use crate::record::TaskRunRecord;
 use crate::serialization::bincode_config;
 
 /// Reserved prefix for metadata files inside blobs.
+/// Tasks faster than this aren't worth a shared-cache round trip: the store,
+/// and the restore it would enable, cost more than just running the task.
+pub const DEFAULT_MIN_STORE_DURATION_MS: u64 = 100;
+
+/// Minimum task duration that qualifies for a shared-cache store, overridable
+/// with `LUCHTA_SHARED_CACHE_MIN_DURATION_MS`.
+///
+/// The override exists because the default makes "this task is too fast to
+/// cache" untestable by wall clock: a test that needs a task to finish inside
+/// 100ms is really asserting the machine isn't busy, and fails under CPU
+/// oversubscription while looking exactly like a cache regression (#290).
+/// Setting the threshold instead of racing it makes those tests deterministic.
+///
+/// Read once — the value can't change within a run, and `store()` consults it
+/// per task.
+fn min_store_duration_ms() -> u64 {
+    static MIN_DURATION_MS: OnceLock<u64> = OnceLock::new();
+    *MIN_DURATION_MS.get_or_init(|| {
+        std::env::var("LUCHTA_SHARED_CACHE_MIN_DURATION_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_MIN_STORE_DURATION_MS)
+    })
+}
+
 pub const META_DIR_NAME: &str = ".luchta-meta";
 pub const META_STDOUT_FILE_NAME: &str = "stdout.log";
 pub const META_STDERR_FILE_NAME: &str = "stderr.log";
@@ -766,7 +791,7 @@ impl SharedCache {
 
         // Check duration threshold.
         let duration_ms = record.end_unix_ms.saturating_sub(record.start_unix_ms);
-        if duration_ms < 100 {
+        if duration_ms < min_store_duration_ms() {
             return Ok(StoreOutcome::SkippedTooFast { duration_ms });
         }
 
