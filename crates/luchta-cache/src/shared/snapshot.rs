@@ -47,7 +47,6 @@ pub enum MergeResult {
 pub struct SnapshotUpload {
     pub shard_id: String,
     pub shard_bytes: Vec<u8>,
-    pub merged_bytes: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,7 +76,6 @@ struct MergedShards {
 struct ConsolidatedShardWrite {
     shard_id: String,
     shard_on_disk: Vec<u8>,
-    merged_sidecar_path: PathBuf,
 }
 
 impl MergeEntryOutcome {
@@ -296,7 +294,6 @@ impl SnapshotStore {
         let shard_id = blake3::hash(&encoded).to_hex().to_string();
         let shard_path = shard_dir.join(format!("{shard_id}.{SNAPSHOT_FILE_EXTENSION}"));
         let write = ConsolidatedShardWrite {
-            merged_sidecar_path: shard_dir.join(format!("{shard_id}.{SNAPSHOT_MERGED_EXTENSION}")),
             shard_id,
             shard_on_disk: Vec::new(),
         };
@@ -341,7 +338,6 @@ impl SnapshotStore {
         let ConsolidatedShardWrite {
             shard_id,
             shard_on_disk,
-            merged_sidecar_path,
         } = write;
         // Subsume only the shards that actually merged. One this client
         // couldn't decode still holds entries the consolidated shard is
@@ -354,35 +350,10 @@ impl SnapshotStore {
             .filter(|shard| merged_shard_ids.contains(&shard.shard_id))
             .filter_map(SnapshotShard::deletable_shard_id)
             .collect::<Vec<_>>();
-        let inserted_without_cleanup = |shard_id, shard_bytes| MergeEntryOutcome {
-            result: MergeResult::Inserted,
-            new_snapshot_upload: Some(SnapshotUpload {
-                shard_id,
-                shard_bytes,
-                merged_bytes: Vec::new(),
-            }),
-            subsumed_shard_ids: Vec::new(),
-        };
-
-        let merged_bytes = encode_merged_sidecar(&subsumed_shard_ids).into_bytes();
-        let merged_on_disk = match compress_snapshot_bytes(&merged_bytes) {
-            Ok(merged_on_disk) => merged_on_disk,
-            Err(err) => {
-                eprintln!(
-                    "warning: failed to compress snapshot merged sidecar {}: {err}; skipping compaction cleanup",
-                    merged_sidecar_path.display()
-                );
-                return inserted_without_cleanup(shard_id, shard_on_disk);
-            }
-        };
-        if let Err(err) = atomic_write(&merged_sidecar_path, &merged_on_disk) {
-            eprintln!(
-                "warning: failed to write snapshot merged sidecar {}: {err}; skipping compaction cleanup",
-                merged_sidecar_path.display()
-            );
-            return inserted_without_cleanup(shard_id, shard_on_disk);
-        }
-
+        // The consolidated shard is already on disk at this point, so the
+        // shards it subsumes are redundant and safe to drop. This used to be
+        // gated on first writing a `.merged` sidecar listing them -- a
+        // journal for a recovery pass that was never written (#284).
         for subsumed_shard_id in &subsumed_shard_ids {
             self.delete_shard_files_by_id(shard_key, subsumed_shard_id);
         }
@@ -392,7 +363,6 @@ impl SnapshotStore {
             new_snapshot_upload: Some(SnapshotUpload {
                 shard_id,
                 shard_bytes: shard_on_disk,
-                merged_bytes: merged_on_disk,
             }),
             subsumed_shard_ids,
         }
@@ -548,14 +518,6 @@ fn merge_shard_entries(merged: &mut Snapshot, shard: Snapshot) {
             Some(existing) if existing.outputs_hash == entry.outputs_hash => {}
             Some(_) => {}
         }
-    }
-}
-
-fn encode_merged_sidecar(shard_ids: &[String]) -> String {
-    if shard_ids.is_empty() {
-        String::new()
-    } else {
-        format!("{}\n", shard_ids.join("\n"))
     }
 }
 
@@ -818,8 +780,10 @@ mod tests {
                 .and_then(|stem| stem.to_str())
                 .unwrap(),
         );
-        let merged_bytes = fs::read(merged_path).unwrap();
-        assert!(merged_bytes.starts_with(&ZSTD_FRAME_MAGIC));
+        assert!(
+            !merged_path.exists(),
+            "the .merged sidecar had no reader and is no longer written (#284)"
+        );
 
         assert_eq!(store.lookup("commit-a", &entry.input_key), Some(entry));
         assert_eq!(store.lookup("commit-a", &[99; 32]), None);
@@ -874,17 +838,14 @@ mod tests {
                     .join(format!("{shard_id}.{SNAPSHOT_FILE_EXTENSION}")),
             )
             .unwrap();
-            let merged_bytes = fs::read(store_a.merged_sidecar_path(shard_key, &shard_id)).unwrap();
             last_upload = Some(SnapshotUpload {
                 shard_id,
                 shard_bytes,
-                merged_bytes,
             });
         }
 
         let upload = last_upload.unwrap();
         assert!(upload.shard_bytes.starts_with(&ZSTD_FRAME_MAGIC));
-        assert!(upload.merged_bytes.starts_with(&ZSTD_FRAME_MAGIC));
 
         let temp_dir_b = tempdir().unwrap();
         let paths_b = open_shared_paths(temp_dir_b.path()).unwrap();
@@ -894,11 +855,6 @@ mod tests {
             .join(format!("{}.{SNAPSHOT_FILE_EXTENSION}", upload.shard_id));
         fs::create_dir_all(shard_path.parent().unwrap()).unwrap();
         fs::write(&shard_path, &upload.shard_bytes).unwrap();
-        fs::write(
-            store_b.merged_sidecar_path(shard_key, &upload.shard_id),
-            &upload.merged_bytes,
-        )
-        .unwrap();
 
         let snapshot = store_b.load(shard_key).unwrap();
         assert_eq!(snapshot.entries.len(), entries.len());
@@ -1066,7 +1022,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_store_compacts_seeded_shards_and_records_subsumed_ids() {
+    fn snapshot_store_compacts_seeded_shards_and_reports_subsumed_ids() {
         let temp_dir = tempdir().unwrap();
         let paths = open_shared_paths(temp_dir.path()).unwrap();
         let store = SnapshotStore::new(paths.clone());
@@ -1094,23 +1050,24 @@ mod tests {
         assert_eq!(shard_ids_before.len(), 3);
 
         let new_entry = sample_entry_with_seed(15, [4; 32]);
-        assert_eq!(
-            store.merge_entry(shard_key, new_entry.clone()),
-            MergeResult::Inserted
-        );
+        let outcome = store.merge_entry_with_outcome(shard_key, new_entry.clone());
+        assert_eq!(outcome.result, MergeResult::Inserted);
 
         let shard_ids_after = collect_shard_ids(&store.shard_dir_path(shard_key));
         assert_eq!(shard_ids_after.len(), 1);
-        let merged_sidecar =
-            fs::read(store.merged_sidecar_path(shard_key, &shard_ids_after[0])).unwrap();
-        let merged_sidecar =
-            String::from_utf8(decompress_snapshot_bytes(&merged_sidecar).unwrap()).unwrap();
-        assert_eq!(
-            merged_sidecar.lines().collect::<Vec<_>>(),
-            shard_ids_before
-                .iter()
-                .map(String::as_str)
-                .collect::<Vec<_>>()
+        // The subsumed ids used to be written to a `.merged` sidecar nobody
+        // read (#284). They still exist where they are actually used: the
+        // merge outcome, which drives the remote deletes.
+        let mut subsumed = outcome.subsumed_shard_ids.clone();
+        subsumed.sort();
+        let mut expected = shard_ids_before.clone();
+        expected.sort();
+        assert_eq!(subsumed, expected);
+        assert!(
+            !store
+                .merged_sidecar_path(shard_key, &shard_ids_after[0])
+                .exists(),
+            "no sidecar should be written for the consolidated shard"
         );
 
         let snapshot = store.load(shard_key).unwrap();
@@ -1159,7 +1116,6 @@ mod tests {
         let consolidated_path = store
             .shard_dir_path(shard_key)
             .join(format!("{consolidated_id}.{SNAPSHOT_FILE_EXTENSION}"));
-        let consolidated_sidecar = store.merged_sidecar_path(shard_key, &consolidated_id);
 
         let consolidated_on_disk = compress_snapshot_bytes(&consolidated_bytes).unwrap();
         atomic_write(&consolidated_path, &consolidated_on_disk).unwrap();
@@ -1179,9 +1135,6 @@ mod tests {
             .iter()
             .filter_map(SnapshotShard::deletable_shard_id)
             .collect::<Vec<_>>();
-        let consolidated_sidecar_bytes =
-            compress_snapshot_bytes(encode_merged_sidecar(&subsumed_shard_ids).as_bytes()).unwrap();
-        atomic_write(&consolidated_sidecar, &consolidated_sidecar_bytes).unwrap();
         for shard_id in subsumed_shard_ids {
             store.delete_shard_files_by_id(shard_key, &shard_id);
         }
