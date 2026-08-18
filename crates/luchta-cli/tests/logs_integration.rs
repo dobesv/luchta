@@ -298,6 +298,48 @@ fn logs_filters_top_level() {
     );
 }
 
+/// Regression for #300: requesting logs for a task that exists only at the top
+/// level without `-T` must guide the user to `-T` instead of the misleading
+/// "not found in task graph".
+#[test]
+fn logs_top_level_task_without_flag_suggests_top_level() {
+    let temp = assert_fs::TempDir::new().unwrap();
+    common::write_root_workspace(&temp);
+    temp.child("yarn.lock").write_str("").unwrap();
+    common::write_counter_task_config(
+        &temp,
+        r##""#audit":{"cache":{},"worker":"shell","inputs":["audit-in.txt"],"outputs":["audit-out.txt"],"command":"echo ok > audit-out.txt"}"##,
+    );
+    temp.child("audit-in.txt").write_str("in\n").unwrap();
+    common::init_git(&temp);
+
+    // Populate the cache for the top-level task.
+    common::run_luchta_top_level(&temp, "audit").success();
+
+    // Bare `logs audit` (no -T) must fail with an actionable scope hint.
+    let mut cmd = Command::cargo_bin("luchta").unwrap();
+    cmd.env("NO_COLOR", "1");
+    cmd.arg("logs").arg("audit");
+    cmd.arg("--workspace-root").arg(temp.path());
+    let output = cmd.assert().failure();
+    let stderr = String::from_utf8_lossy(&output.get_output().stderr).into_owned();
+    assert!(
+        stderr.contains("is a top-level task") && stderr.contains("-T"),
+        "expected top-level scope hint, got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("not found in task graph"),
+        "must not print the misleading not-found message, got: {stderr}"
+    );
+
+    // With `-T`, the same request succeeds and shows the task log.
+    let stdout = run_logs(&temp, &["-T", "audit"]);
+    assert!(
+        stdout.contains("#audit"),
+        "expected top-level audit task in output: {stdout}"
+    );
+}
+
 #[test]
 fn logs_filters_failed() {
     let temp = assert_fs::TempDir::new().unwrap();
