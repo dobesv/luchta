@@ -1113,7 +1113,13 @@ pub(crate) fn collect_requested_subgraph(
     pruned_with_selection.extend_from_slice(pruned);
     pruned_with_selection.extend(selection_prunes);
 
-    validate_literal_task_requests(&requested_ids, selection, &pruned_with_selection, &criteria)?;
+    validate_literal_task_requests(
+        &requested_ids,
+        selection,
+        &pruned_with_selection,
+        &criteria,
+        &available_nodes,
+    )?;
 
     if requested_ids.is_empty() && single_literal_task_request(selection.requested_tasks).is_none()
     {
@@ -1201,6 +1207,7 @@ fn validate_literal_task_requests(
     selection: &TaskSelection<'_>,
     pruned: &[PrunedTask],
     criteria: &SelectionCriteria<'_>,
+    available_nodes: &[&TaskNode],
 ) -> Result<()> {
     for requested in selection
         .requested_tasks
@@ -1212,7 +1219,7 @@ fn validate_literal_task_requests(
             .iter()
             .any(|task_id| task_id.task.as_str() == requested);
         if !matched {
-            report_unmatched_request(requested, pruned, criteria)?;
+            report_unmatched_request(requested, pruned, criteria, available_nodes)?;
         }
     }
     Ok(())
@@ -1233,10 +1240,16 @@ fn single_literal_task_request(requested_tasks: &[String]) -> Option<&str> {
 /// The pruned-away check honours the active package/scope filter: a pruned task
 /// in a package excluded by `-p` (or at the wrong root scope) must not suppress
 /// the "not found" error for the selected packages.
+///
+/// Package tasks and top-level (`#task`) tasks are separate namespaces. If the
+/// request found nothing only because it targeted the wrong scope, the error is
+/// replaced with an actionable hint (see [`wrong_scope_hint`]) instead of the
+/// misleading bare "not found in task graph".
 fn report_unmatched_request(
     requested: &str,
     pruned: &[PrunedTask],
     criteria: &SelectionCriteria<'_>,
+    available_nodes: &[&TaskNode],
 ) -> Result<()> {
     let pruned_away = pruned.iter().any(|entry| {
         entry.task_id.task.as_str() == requested && package_matches(&entry.task_id, criteria)
@@ -1250,7 +1263,50 @@ fn report_unmatched_request(
         );
         return Ok(());
     }
+
+    if let Some(hint) = wrong_scope_hint(requested, criteria, available_nodes) {
+        bail!("{}", hint);
+    }
+
     bail!("task '{}' not found in task graph", requested);
+}
+
+/// Detects a literal task request that matched nothing only because it targeted
+/// the wrong scope. Package tasks (`task`) and top-level tasks (`#task`) are
+/// separate namespaces, so a bare request never sees top-level tasks and `-T`
+/// only sees top-level tasks.
+///
+/// - Without `-T`, when the name exists only as a top-level task: suggest `-T`.
+/// - With bare `-T`, when the name exists only as a package task: suggest
+///   dropping `-T` (or adding `-p`).
+///
+/// Returns `None` (falling back to the plain "not found" error) for any other
+/// case, including package-filter mismatches, which have their own messaging.
+fn wrong_scope_hint(
+    requested: &str,
+    criteria: &SelectionCriteria<'_>,
+    available_nodes: &[&TaskNode],
+) -> Option<String> {
+    let exists_at_root = available_nodes
+        .iter()
+        .any(|node| node.id.is_root() && node.id.task.as_str() == requested);
+    let exists_as_package_task = available_nodes
+        .iter()
+        .any(|node| !node.id.is_root() && node.id.task.as_str() == requested);
+
+    if !criteria.top_level && exists_at_root {
+        return Some(format!(
+            "task '{requested}' is a top-level task; pass -T/--top-level to select it"
+        ));
+    }
+
+    if criteria.top_level && criteria.match_all_non_root_packages && exists_as_package_task {
+        return Some(format!(
+            "task '{requested}' is a package task, not a top-level task; drop -T (or pass -p <package>) to select it"
+        ));
+    }
+
+    None
 }
 
 /// Expands the seed task ids to include all of their transitive dependencies.
@@ -1923,7 +1979,7 @@ mod tests {
             top_level: true,
             since_affected: None,
         };
-        let result = report_unmatched_request("build", &pruned, &top_level_criteria);
+        let result = report_unmatched_request("build", &pruned, &top_level_criteria, &[]);
         assert!(
             result.is_err(),
             "top-level request must not match a pruned package task"
@@ -1938,7 +1994,7 @@ mod tests {
             top_level: false,
             since_affected: None,
         };
-        report_unmatched_request("build", &pruned, &default_criteria)
+        report_unmatched_request("build", &pruned, &default_criteria, &[])
             .expect("default request should treat the pruned package task as a match");
     }
 
@@ -1961,7 +2017,7 @@ mod tests {
             top_level: false,
             since_affected: None,
         };
-        let result = report_unmatched_request("build", &pruned, &criteria);
+        let result = report_unmatched_request("build", &pruned, &criteria, &[]);
         assert!(
             result.is_err(),
             "a pruned task outside the package filter must not suppress the not-found error"
@@ -1972,8 +2028,93 @@ mod tests {
             task_id: TaskId::new("@repo/app", "build"),
             outcome: luchta_engine::PruneOutcome::Pruned { reason: None },
         }];
-        report_unmatched_request("build", &pruned_in_scope, &criteria)
+        report_unmatched_request("build", &pruned_in_scope, &criteria, &[])
             .expect("a pruned task within the package filter should be treated as a match");
+    }
+
+    #[test]
+    fn report_unmatched_request_hints_top_level_for_root_only_task() {
+        // `audit-licenses` exists only as a top-level (`#`) task, but the
+        // request is a bare `audit-licenses` (no -T). The error must guide the
+        // user to -T instead of the misleading "not found in task graph".
+        let nodes = [TaskNode {
+            id: TaskId::new(luchta_types::ROOT_PACKAGE_NAME, "audit-licenses"),
+            weight: 1,
+        }];
+        let node_refs: Vec<&TaskNode> = nodes.iter().collect();
+        let empty_globs = build_globset(&[]).expect("build empty globs");
+        let criteria = SelectionCriteria {
+            task_globs: &empty_globs,
+            package_globs: &empty_globs,
+            match_all_non_root_packages: true,
+            top_level: false,
+            since_affected: None,
+        };
+
+        let error = report_unmatched_request("audit-licenses", &[], &criteria, &node_refs)
+            .expect_err("bare request for a root-only task must error");
+        let message = error.to_string();
+        assert!(
+            message.contains("is a top-level task") && message.contains("-T"),
+            "expected top-level hint, got: {message}"
+        );
+        assert!(
+            !message.contains("not found in task graph"),
+            "must not fall back to the misleading message, got: {message}"
+        );
+    }
+
+    #[test]
+    fn report_unmatched_request_hints_package_scope_for_top_level_request() {
+        // `build` exists only as a package task, but the request is `-T build`.
+        // The error must guide the user to drop -T (or pass -p).
+        let nodes = [TaskNode {
+            id: TaskId::new("@repo/app", "build"),
+            weight: 1,
+        }];
+        let node_refs: Vec<&TaskNode> = nodes.iter().collect();
+        let empty_globs = build_globset(&[]).expect("build empty globs");
+        let criteria = SelectionCriteria {
+            task_globs: &empty_globs,
+            package_globs: &empty_globs,
+            match_all_non_root_packages: true,
+            top_level: true,
+            since_affected: None,
+        };
+
+        let error = report_unmatched_request("build", &[], &criteria, &node_refs)
+            .expect_err("top-level request for a package-only task must error");
+        let message = error.to_string();
+        assert!(
+            message.contains("is a package task") && message.contains("drop -T"),
+            "expected package-scope hint, got: {message}"
+        );
+    }
+
+    #[test]
+    fn report_unmatched_request_keeps_not_found_for_unknown_task() {
+        // A genuinely unknown task keeps the plain "not found" error at both
+        // scopes — the hint must not fire when the name exists nowhere.
+        let nodes = [TaskNode {
+            id: TaskId::new("@repo/app", "build"),
+            weight: 1,
+        }];
+        let node_refs: Vec<&TaskNode> = nodes.iter().collect();
+        let empty_globs = build_globset(&[]).expect("build empty globs");
+        let criteria = SelectionCriteria {
+            task_globs: &empty_globs,
+            package_globs: &empty_globs,
+            match_all_non_root_packages: true,
+            top_level: false,
+            since_affected: None,
+        };
+
+        let error = report_unmatched_request("does-not-exist", &[], &criteria, &node_refs)
+            .expect_err("unknown task must error");
+        assert!(
+            error.to_string().contains("not found in task graph"),
+            "expected plain not-found error, got: {error}"
+        );
     }
 
     // =========================================================================
