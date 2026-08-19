@@ -22,6 +22,7 @@ oxc = [
     "dep:oxc_syntax",
     "dep:serde",
     "dep:serde_json",
+    "dep:url",
 ]
 
 [dependencies]
@@ -38,6 +39,7 @@ oxc_syntax = { git = "https://github.com/oxc-project/oxc", rev = "415fe1e7bb423c
 rustc-hash = "2.1.1"
 serde = { workspace = true, optional = true, features = ["derive"] }
 serde_json = { workspace = true, optional = true }
+url = { workspace = true, optional = true }
 
 # mimalloc as the global allocator, with target gating modeled on oxlint's
 # (apps/oxlint/Cargo.toml). oxc is allocation-heavy outside its arena; the

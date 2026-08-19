@@ -10,6 +10,7 @@ use oxc_linter::{
     ConfigStore, FixKind, LintOptions, LintRunner, LintServiceOptions, Linter,
     OxlintSuppressionFileAction, SuppressionManager, TsGoLintState,
 };
+use url::Url;
 
 use crate::opts::OxlintOpts;
 use crate::suppressions::{remove_empty_suppressions_file, FinalizeResult, SUPPRESSIONS_FILENAME};
@@ -148,14 +149,24 @@ pub fn wrap_error(error: &Error, cwd: &Path, repo_root: &Path) -> WrappedDiagnos
         info.message.clone()
     };
 
+    let path = diagnostic_path(&info.filename, cwd);
+
     WrappedDiagnostic {
         severity,
         rule_id: info.rule_id.clone(),
         message: diagnostic_message,
         start_line: info.start.line.max(1),
         start_column: info.start.column.max(1),
-        relative_uri: luchta_worker::paths::repo_relative(&cwd.join(&info.filename), repo_root),
+        relative_uri: luchta_worker::paths::repo_relative(&path, repo_root),
     }
+}
+
+fn diagnostic_path(filename: &str, cwd: &Path) -> PathBuf {
+    Url::parse(filename)
+        .ok()
+        .filter(|uri| uri.scheme() == "file")
+        .and_then(|uri| uri.to_file_path().ok())
+        .unwrap_or_else(|| cwd.join(filename))
 }
 
 fn compare_findings(left: &WrappedDiagnostic, right: &WrappedDiagnostic) -> Ordering {
@@ -176,13 +187,43 @@ pub fn has_error(findings: &[WrappedDiagnostic]) -> bool {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::path::Path;
 
     use assert_fs::TempDir;
 
     use crate::config::{collect_target_files, discover_config};
     use crate::opts::OxlintOpts;
 
-    use super::lint_files_blocking;
+    use super::{diagnostic_path, lint_files_blocking};
+
+    #[test]
+    fn diagnostic_path_resolves_relative_filename_from_cwd() {
+        assert_eq!(
+            diagnostic_path("src/index.js", Path::new("/repo/packages/app")),
+            Path::new("/repo/packages/app/src/index.js")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn diagnostic_path_converts_unix_file_uri() {
+        assert_eq!(
+            diagnostic_path("file:///repo/src/file%20name.ts", Path::new("/ignored")),
+            Path::new("/repo/src/file name.ts")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn diagnostic_path_converts_windows_file_uri() {
+        assert_eq!(
+            diagnostic_path(
+                "file:///C:/repo/src/file%20name.ts",
+                Path::new(r"D:\ignored")
+            ),
+            Path::new(r"C:\repo\src\file name.ts")
+        );
+    }
 
     #[test]
     fn relative_uri_is_repo_root_relative_for_sub_package_scan() {
