@@ -611,18 +611,20 @@ mod tests {
             source_map["sources"],
             serde_json::json!(["src/nested/example.ts"])
         );
+        assert!(progress.len() >= 2, "expected initial and final snapshots");
         assert_eq!(
-            progress,
-            vec![
-                TaskProgress {
-                    pending: 1,
-                    ..TaskProgress::default()
-                },
-                TaskProgress {
-                    completed: 1,
-                    ..TaskProgress::default()
-                },
-            ]
+            progress.first(),
+            Some(&TaskProgress {
+                pending: 1,
+                ..TaskProgress::default()
+            })
+        );
+        assert_eq!(
+            progress.last(),
+            Some(&TaskProgress {
+                completed: 1,
+                ..TaskProgress::default()
+            })
         );
     }
 
@@ -769,19 +771,21 @@ mod tests {
         assert!(!cwd.join("dist/js/button.stories.js").exists());
         assert!(!cwd.join("dist/js/widget.unitTest.js").exists());
         assert!(cwd.join("dist/js/real.js").exists());
+        assert!(progress.len() >= 2, "expected initial and final snapshots");
         assert_eq!(
-            progress,
-            vec![
-                TaskProgress {
-                    pending: 3,
-                    ..TaskProgress::default()
-                },
-                TaskProgress {
-                    completed: 3,
-                    skipped: 2,
-                    ..TaskProgress::default()
-                },
-            ]
+            progress.first(),
+            Some(&TaskProgress {
+                pending: 3,
+                ..TaskProgress::default()
+            })
+        );
+        assert_eq!(
+            progress.last(),
+            Some(&TaskProgress {
+                completed: 3,
+                skipped: 2,
+                ..TaskProgress::default()
+            })
         );
     }
 

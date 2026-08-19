@@ -49,6 +49,16 @@ impl ScanWork {
             progress: Some(progress),
         }
     }
+
+    fn skip_all(&self) {
+        let Some(progress) = &self.progress else {
+            return;
+        };
+        let phases = if self.fix { 2 } else { 1 };
+        for _ in 0..self.files.len().saturating_mul(phases) {
+            progress.start_item().skip();
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -469,6 +479,7 @@ pub(crate) async fn scan_files_async(
     tokio::task::spawn_blocking(move || {
         let rules = load_rules(&config.rule_files)?;
         if rules.is_empty() {
+            work.skip_all();
             return Ok(ScanResult::default());
         }
         let context = ScanContext {
@@ -489,13 +500,14 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use ast_grep_config::Severity;
+    use luchta_worker::{ItemProgress, TaskProgress};
     use tempfile::TempDir;
 
     use super::{
-        ensure_within_root, finding_sort_key, scan_files, scan_files_with_collection,
-        write_atomically, ScanContext,
+        ensure_within_root, finding_sort_key, scan_files, scan_files_async,
+        scan_files_with_collection, write_atomically, ScanContext, ScanWork,
     };
-    use crate::config::discover_config;
+    use crate::config::{discover_config, DiscoveredConfig};
 
     fn write_basic_rule_fixture(temp: &TempDir, rule_body: &str, source: &str) -> PathBuf {
         fs::create_dir_all(temp.path().join("rules")).expect("rules");
@@ -512,6 +524,39 @@ mod tests {
             .expect("discover")
             .expect("config present");
         scan_files(temp.path(), temp.path(), &config, vec![source], fix).expect("scan")
+    }
+
+    #[tokio::test]
+    async fn empty_rule_set_skips_all_tracked_fix_and_scan_work() {
+        let temp = TempDir::new().expect("tempdir");
+        let files = vec![temp.path().join("one.ts"), temp.path().join("two.ts")];
+        let config = DiscoveredConfig {
+            config_path: temp.path().join("sgconfig.yml"),
+            config_dir: temp.path().to_path_buf(),
+            rule_files: Vec::new(),
+            language_globs: Vec::new(),
+            warnings: Vec::new(),
+        };
+        let progress = ItemProgress::new(4);
+
+        let result = scan_files_async(
+            temp.path(),
+            temp.path(),
+            &config,
+            ScanWork::tracked(files, true, progress.clone()),
+        )
+        .await
+        .expect("empty rules succeed");
+
+        assert!(result.findings.is_empty());
+        assert_eq!(
+            progress.snapshot(),
+            TaskProgress {
+                completed: 4,
+                skipped: 4,
+                ..TaskProgress::default()
+            }
+        );
     }
 
     #[test]

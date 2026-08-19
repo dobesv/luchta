@@ -1,7 +1,4 @@
-use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    Arc,
-};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde::{Deserialize, Serialize};
 
@@ -53,43 +50,30 @@ impl ParallelProgress {
 /// that item completed, including error paths and unwinding.
 #[derive(Debug, Clone)]
 pub struct ItemProgress {
-    state: Arc<ItemProgressState>,
-}
-
-#[derive(Debug)]
-struct ItemProgressState {
-    revision: AtomicU64,
-    completed: AtomicU64,
-    skipped: AtomicU64,
-    running: AtomicU64,
-    pending: AtomicU64,
+    state: Arc<Mutex<TaskProgress>>,
 }
 
 impl ItemProgress {
     #[must_use]
     pub fn new(total: usize) -> Self {
         Self {
-            state: Arc::new(ItemProgressState {
-                revision: AtomicU64::new(0),
-                completed: AtomicU64::new(0),
-                skipped: AtomicU64::new(0),
-                running: AtomicU64::new(0),
-                pending: AtomicU64::new(u64::try_from(total).unwrap_or(u64::MAX)),
-            }),
+            state: Arc::new(Mutex::new(TaskProgress {
+                pending: u64::try_from(total).unwrap_or(u64::MAX),
+                ..TaskProgress::default()
+            })),
         }
     }
 
     /// Move one pending item into the running state.
     #[must_use]
     pub fn start_item(&self) -> ItemProgressGuard {
-        let revision = self.state.begin_update();
-        let pending = self.state.pending.load(Ordering::Relaxed);
-        let had_pending = pending > 0;
+        let mut state = self.lock_state();
+        let had_pending = state.pending > 0;
         if had_pending {
-            self.state.pending.store(pending - 1, Ordering::Relaxed);
-            self.state.running.fetch_add(1, Ordering::Relaxed);
+            state.pending -= 1;
+            state.running += 1;
         }
-        self.state.end_update(revision);
+        drop(state);
         ItemProgressGuard {
             progress: self.clone(),
             active: had_pending,
@@ -99,51 +83,13 @@ impl ItemProgress {
 
     #[must_use]
     pub fn snapshot(&self) -> TaskProgress {
-        loop {
-            let revision = self.state.revision.load(Ordering::Acquire);
-            if revision % 2 == 1 {
-                std::hint::spin_loop();
-                continue;
-            }
-            let snapshot = TaskProgress {
-                completed: self.state.completed.load(Ordering::Relaxed),
-                skipped: self.state.skipped.load(Ordering::Relaxed),
-                running: self.state.running.load(Ordering::Relaxed),
-                pending: self.state.pending.load(Ordering::Relaxed),
-            };
-            if self.state.revision.load(Ordering::Acquire) == revision {
-                return snapshot;
-            }
-        }
-    }
-}
-
-impl ItemProgressState {
-    fn begin_update(&self) -> u64 {
-        loop {
-            let revision = self.revision.load(Ordering::Acquire);
-            if revision % 2 == 1 {
-                std::hint::spin_loop();
-                continue;
-            }
-            if self
-                .revision
-                .compare_exchange_weak(
-                    revision,
-                    revision.wrapping_add(1),
-                    Ordering::Acquire,
-                    Ordering::Relaxed,
-                )
-                .is_ok()
-            {
-                return revision;
-            }
-        }
+        *self.lock_state()
     }
 
-    fn end_update(&self, revision: u64) {
-        self.revision
-            .store(revision.wrapping_add(2), Ordering::Release);
+    fn lock_state(&self) -> MutexGuard<'_, TaskProgress> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -168,16 +114,12 @@ impl Drop for ItemProgressGuard {
         if !self.active {
             return;
         }
-        let revision = self.progress.state.begin_update();
+        let mut state = self.progress.lock_state();
         if self.skipped {
-            self.progress.state.skipped.fetch_add(1, Ordering::Relaxed);
+            state.skipped += 1;
         }
-        self.progress
-            .state
-            .completed
-            .fetch_add(1, Ordering::Relaxed);
-        self.progress.state.running.fetch_sub(1, Ordering::Relaxed);
-        self.progress.state.end_update(revision);
+        state.completed += 1;
+        state.running -= 1;
     }
 }
 

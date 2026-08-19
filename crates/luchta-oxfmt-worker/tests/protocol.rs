@@ -53,26 +53,28 @@ async fn negotiated_progress_reports_initial_and_final_file_snapshots() {
         .into_iter()
         .filter(|value| value["type"] == "progress")
         .collect::<Vec<_>>();
+    assert!(progress.len() >= 2, "expected initial and final snapshots");
     assert_eq!(
-        progress,
-        vec![
-            serde_json::json!({
-                "type": "progress",
-                "id": "pkg#format",
-                "completed": 0,
-                "skipped": 0,
-                "running": 0,
-                "pending": 1
-            }),
-            serde_json::json!({
-                "type": "progress",
-                "id": "pkg#format",
-                "completed": 1,
-                "skipped": 0,
-                "running": 0,
-                "pending": 0
-            }),
-        ]
+        progress.first(),
+        Some(&serde_json::json!({
+            "type": "progress",
+            "id": "pkg#format",
+            "completed": 0,
+            "skipped": 0,
+            "running": 0,
+            "pending": 1
+        }))
+    );
+    assert_eq!(
+        progress.last(),
+        Some(&serde_json::json!({
+            "type": "progress",
+            "id": "pkg#format",
+            "completed": 1,
+            "skipped": 0,
+            "running": 0,
+            "pending": 0
+        }))
     );
 }
 

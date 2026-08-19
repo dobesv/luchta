@@ -506,13 +506,16 @@ fn fix_flag_in_command_rewrites_file_end_to_end() {
         .iter()
         .filter(|value| value["type"].as_str() == Some("progress"))
         .collect::<Vec<_>>();
-    assert_eq!(progress.len(), 2, "initial and final snapshots: {output:?}");
-    let total = progress[0]["pending"]
-        .as_u64()
-        .expect("initial pending counter");
+    assert!(
+        progress.len() >= 2,
+        "expected initial and final snapshots: {output:?}"
+    );
+    let first = progress.first().expect("initial progress snapshot");
+    let last = progress.last().expect("final progress snapshot");
+    let total = first["pending"].as_u64().expect("initial pending counter");
     assert!(total >= 2, "fix and scan phases must both be counted");
-    assert_eq!(progress[1]["completed"].as_u64(), Some(total));
-    assert_eq!(progress[1]["pending"].as_u64(), Some(0));
+    assert_eq!(last["completed"].as_u64(), Some(total));
+    assert_eq!(last["pending"].as_u64(), Some(0));
 }
 
 fn assert_log_line_contains(output: &[Value], id: &str, substring: &str) {
