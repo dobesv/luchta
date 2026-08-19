@@ -3,18 +3,19 @@ use std::{
     collections::HashSet,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Mutex,
+        Arc, Mutex,
     },
     time::Instant,
 };
 
+use luchta_engine::{ExecutionLogSink, TaskProgress};
 use luchta_types::TaskId;
 use owo_colors::{OwoColorize, Stream};
 
 use crate::{
     cli::OutputMode,
     memory_pressure::{PressureReason, PressureSnapshot},
-    progress_task_list::render_task_id_list,
+    progress_task_list::{render_task_id_list, render_task_id_list_with_progress},
 };
 
 /// Outcome of a task as recorded by the progress reporter.
@@ -44,6 +45,7 @@ pub struct ProgressReporter {
     pub wave_skipped: Vec<AtomicUsize>,
     pub wave_failed: Vec<AtomicUsize>,
     pub running: Mutex<HashMap<TaskId, Instant>>,
+    progress_sinks: Mutex<HashMap<TaskId, ExecutionLogSink>>,
     pub failed_tasks: Mutex<HashSet<TaskId>>,
     done: AtomicUsize,
     skipped: AtomicUsize,
@@ -73,6 +75,7 @@ impl ProgressReporter {
             wave_failed: (0..total_waves).map(|_| AtomicUsize::new(0)).collect(),
             wave_total,
             running: Mutex::new(HashMap::new()),
+            progress_sinks: Mutex::new(HashMap::new()),
             failed_tasks: Mutex::new(HashSet::new()),
             start: Instant::now(),
             done: AtomicUsize::new(0),
@@ -92,6 +95,26 @@ impl ProgressReporter {
             .lock()
             .expect("progress reporter running mutex poisoned");
         running.insert(id.clone(), Instant::now());
+    }
+
+    pub fn task_started_with_progress(&self, id: &TaskId, sink: ExecutionLogSink) {
+        self.task_started(id);
+        if !self.wave_of.contains_key(id) {
+            return;
+        }
+        self.progress_sinks
+            .lock()
+            .expect("progress reporter sink mutex poisoned")
+            .insert(id.clone(), sink);
+    }
+
+    pub(crate) fn start_callback(
+        self: &Arc<Self>,
+        id: TaskId,
+        sink: ExecutionLogSink,
+    ) -> impl FnOnce() + Send + 'static {
+        let reporter = Arc::clone(self);
+        move || reporter.task_started_with_progress(&id, sink)
     }
 
     pub fn task_ran(&self, id: &TaskId) {
@@ -117,6 +140,7 @@ impl ProgressReporter {
             .expect("progress reporter running mutex poisoned");
         running.remove(id);
         drop(running);
+        self.remove_progress_sink(id);
 
         let mut failed_tasks = self
             .failed_tasks
@@ -155,6 +179,7 @@ impl ProgressReporter {
             .lock()
             .expect("progress reporter running mutex poisoned");
         let counts = self.progress_counts(&running);
+        let task_progress = self.worker_progress();
 
         let mut segments = vec![format!("✔ {}", counts.done_or_skipped)
             .if_supports_color(stream, |t| t.green())
@@ -163,6 +188,7 @@ impl ProgressReporter {
             &mut segments,
             stream,
             &running,
+            &task_progress,
             self.failed_segment(stream),
             ProgressSegmentCounts {
                 skipped: counts.skipped,
@@ -241,6 +267,7 @@ impl ProgressReporter {
             .expect("progress reporter running mutex poisoned");
         running.remove(id);
         drop(running);
+        self.remove_progress_sink(id);
 
         let Some(&wave_index) = self.wave_of.get(id) else {
             return;
@@ -282,6 +309,26 @@ impl ProgressReporter {
             .if_supports_color(stream, |t| t.red())
             .to_string(),
         )
+    }
+
+    fn remove_progress_sink(&self, id: &TaskId) {
+        if let Some(sink) = self
+            .progress_sinks
+            .lock()
+            .expect("progress reporter sink mutex poisoned")
+            .remove(id)
+        {
+            sink.clear_progress();
+        }
+    }
+
+    fn worker_progress(&self) -> HashMap<TaskId, TaskProgress> {
+        self.progress_sinks
+            .lock()
+            .expect("progress reporter sink mutex poisoned")
+            .iter()
+            .filter_map(|(id, sink)| sink.progress().map(|progress| (id.clone(), progress)))
+            .collect()
     }
 
     fn progress_counts(&self, running: &HashMap<TaskId, Instant>) -> ProgressCounts {
@@ -344,6 +391,7 @@ fn extend_progress_segments(
     segments: &mut Vec<String>,
     stream: Stream,
     running: &HashMap<TaskId, Instant>,
+    task_progress: &HashMap<TaskId, TaskProgress>,
     failed_segment: Option<String>,
     counts: ProgressSegmentCounts,
     rss_formatted: &str,
@@ -367,7 +415,7 @@ fn extend_progress_segments(
         format!(
             "🏃 {} ({})",
             counts.running_count,
-            render_task_id_list(running.keys().collect())
+            render_task_id_list_with_progress(running.keys().collect(), task_progress)
         )
         .if_supports_color(stream, |value| value.bright_black())
         .to_string()

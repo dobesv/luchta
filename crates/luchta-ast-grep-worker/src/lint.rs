@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use ast_grep_config::{from_yaml_string, GlobalRules, RuleCollection, RuleConfig, Severity};
 use ast_grep_core::{tree_sitter::StrDoc, NodeMatch};
 use ast_grep_language::{LanguageExt, SupportLang};
+use luchta_worker::ItemProgress;
 
 use crate::config::{resolve_language, DiscoveredConfig, LanguageGlobEntry};
 
@@ -23,6 +24,41 @@ pub struct ScanResult {
     pub findings: Vec<Finding>,
     pub fixed_files: Vec<String>,
     pub warnings: Vec<String>,
+}
+
+pub(crate) struct ScanWork {
+    files: Vec<PathBuf>,
+    fix: bool,
+    progress: Option<ItemProgress>,
+}
+
+impl ScanWork {
+    #[cfg(test)]
+    fn untracked(files: Vec<PathBuf>, fix: bool) -> Self {
+        Self {
+            files,
+            fix,
+            progress: None,
+        }
+    }
+
+    pub(crate) fn tracked(files: Vec<PathBuf>, fix: bool, progress: ItemProgress) -> Self {
+        Self {
+            files,
+            fix,
+            progress: Some(progress),
+        }
+    }
+
+    fn skip_all(&self) {
+        let Some(progress) = &self.progress else {
+            return;
+        };
+        let phases = if self.fix { 2 } else { 1 };
+        for _ in 0..self.files.len().saturating_mul(phases) {
+            progress.start_item().skip();
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -87,23 +123,28 @@ pub fn scan_files(
         config_dir: &config.config_dir,
         language_globs: &config.language_globs,
     };
-    scan_files_with_rules(context, rules, files, fix)
+    scan_files_with_rules(context, rules, ScanWork::untracked(files, fix))
 }
 
 fn scan_files_with_rules(
     context: ScanContext<'_>,
     rules: Vec<RuleConfig<SupportLang>>,
-    files: Vec<PathBuf>,
-    fix: bool,
+    work: ScanWork,
 ) -> Result<ScanResult, String> {
+    let ScanWork {
+        files,
+        fix,
+        progress,
+    } = work;
+    let progress = progress.as_ref();
     let collection = RuleCollection::try_new(rules)
         .map_err(|error| format!("failed to build ast-grep rule collection: {error}"))?;
     let (fixed_files, warnings) = if fix {
-        apply_fixes(context, &collection, &files)?
+        apply_fixes(context, &collection, &files, progress)?
     } else {
         (Vec::new(), Vec::new())
     };
-    let findings = scan_files_with_collection(context, &collection, files)?;
+    let findings = scan_files_with_collection_progress(context, &collection, files, progress)?;
     Ok(ScanResult {
         findings,
         fixed_files,
@@ -111,10 +152,20 @@ fn scan_files_with_rules(
     })
 }
 
+#[cfg(test)]
 fn scan_files_with_collection(
     context: ScanContext<'_>,
     collection: &RuleCollection<SupportLang>,
     files: Vec<PathBuf>,
+) -> Result<Vec<Finding>, String> {
+    scan_files_with_collection_progress(context, collection, files, None)
+}
+
+fn scan_files_with_collection_progress(
+    context: ScanContext<'_>,
+    collection: &RuleCollection<SupportLang>,
+    files: Vec<PathBuf>,
+    progress: Option<&ItemProgress>,
 ) -> Result<Vec<Finding>, String> {
     let threads = std::thread::available_parallelism()
         .map(|parallelism| parallelism.get())
@@ -128,6 +179,7 @@ fn scan_files_with_collection(
             jobs.push(scope.spawn(move || {
                 let mut chunk_findings = Vec::new();
                 for file in chunk {
+                    let _item = progress.map(ItemProgress::start_item);
                     let mut per_file = scan_file(context, collection, file.clone())?;
                     chunk_findings.append(&mut per_file);
                 }
@@ -152,10 +204,12 @@ fn apply_fixes(
     context: ScanContext<'_>,
     collection: &RuleCollection<SupportLang>,
     files: &[PathBuf],
+    progress: Option<&ItemProgress>,
 ) -> Result<(Vec<String>, Vec<String>), String> {
     let mut fixed = Vec::new();
     let mut warnings = Vec::new();
     for file in files {
+        let _item = progress.map(ItemProgress::start_item);
         let apply = apply_fixes_to_file(context, collection, file)?;
         if apply.fixed {
             fixed.push(context.relative_uri(file));
@@ -413,12 +467,11 @@ where
     }
 }
 
-pub async fn scan_files_async(
+pub(crate) async fn scan_files_async(
     cwd: &Path,
     repo_root: &Path,
     config: &DiscoveredConfig,
-    files: Vec<PathBuf>,
-    fix: bool,
+    work: ScanWork,
 ) -> Result<ScanResult, String> {
     let cwd = cwd.to_path_buf();
     let repo_root = repo_root.to_path_buf();
@@ -426,6 +479,7 @@ pub async fn scan_files_async(
     tokio::task::spawn_blocking(move || {
         let rules = load_rules(&config.rule_files)?;
         if rules.is_empty() {
+            work.skip_all();
             return Ok(ScanResult::default());
         }
         let context = ScanContext {
@@ -434,7 +488,7 @@ pub async fn scan_files_async(
             config_dir: &config.config_dir,
             language_globs: &config.language_globs,
         };
-        scan_files_with_rules(context, rules, files, fix)
+        scan_files_with_rules(context, rules, work)
     })
     .await
     .map_err(|error| format!("ast-grep worker join error: {error}"))?
@@ -446,13 +500,14 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use ast_grep_config::Severity;
+    use luchta_worker::{ItemProgress, TaskProgress};
     use tempfile::TempDir;
 
     use super::{
-        ensure_within_root, finding_sort_key, scan_files, scan_files_with_collection,
-        write_atomically, ScanContext,
+        ensure_within_root, finding_sort_key, scan_files, scan_files_async,
+        scan_files_with_collection, write_atomically, ScanContext, ScanWork,
     };
-    use crate::config::discover_config;
+    use crate::config::{discover_config, DiscoveredConfig};
 
     fn write_basic_rule_fixture(temp: &TempDir, rule_body: &str, source: &str) -> PathBuf {
         fs::create_dir_all(temp.path().join("rules")).expect("rules");
@@ -469,6 +524,39 @@ mod tests {
             .expect("discover")
             .expect("config present");
         scan_files(temp.path(), temp.path(), &config, vec![source], fix).expect("scan")
+    }
+
+    #[tokio::test]
+    async fn empty_rule_set_skips_all_tracked_fix_and_scan_work() {
+        let temp = TempDir::new().expect("tempdir");
+        let files = vec![temp.path().join("one.ts"), temp.path().join("two.ts")];
+        let config = DiscoveredConfig {
+            config_path: temp.path().join("sgconfig.yml"),
+            config_dir: temp.path().to_path_buf(),
+            rule_files: Vec::new(),
+            language_globs: Vec::new(),
+            warnings: Vec::new(),
+        };
+        let progress = ItemProgress::new(4);
+
+        let result = scan_files_async(
+            temp.path(),
+            temp.path(),
+            &config,
+            ScanWork::tracked(files, true, progress.clone()),
+        )
+        .await
+        .expect("empty rules succeed");
+
+        assert!(result.findings.is_empty());
+        assert_eq!(
+            progress.snapshot(),
+            TaskProgress {
+                completed: 4,
+                skipped: 4,
+                ..TaskProgress::default()
+            }
+        );
     }
 
     #[test]

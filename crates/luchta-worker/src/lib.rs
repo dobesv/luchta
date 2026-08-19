@@ -1,5 +1,6 @@
 pub mod parallel;
 pub mod paths;
+mod progress;
 pub mod proxy;
 mod runtime;
 pub mod sarif;
@@ -12,6 +13,7 @@ use luchta_types::{DependsOn, TaskDefinition};
 use serde::{Deserialize, Serialize};
 
 pub use parallel::process_items_in_parallel;
+pub use progress::{ItemProgress, ItemProgressGuard, ParallelProgress, TaskProgress};
 pub use proxy::{
     split_current_process_argv, split_delegate_argv, DelegateArgvSplit, DelegateHandle, ProxyError,
     RawDelegate, SharedWriter,
@@ -101,6 +103,9 @@ pub struct WorkerRequest {
     pub workspace: Option<String>,
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// Whether the engine can consume transient progress snapshots.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub progress: bool,
 }
 
 impl WorkerRequest {
@@ -113,6 +118,7 @@ impl WorkerRequest {
             outputs: None,
             workspace: None,
             env: HashMap::new(),
+            progress: false,
         }
     }
 
@@ -140,6 +146,11 @@ impl WorkerRequest {
         self.env = env;
         self
     }
+
+    pub fn with_progress(mut self, progress: bool) -> Self {
+        self.progress = progress;
+        self
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -157,6 +168,12 @@ pub enum WorkerResponse {
         filename: String,
         mime_type: String,
         content: String,
+    },
+    #[serde(rename_all = "camelCase")]
+    Progress {
+        id: String,
+        #[serde(flatten)]
+        progress: TaskProgress,
     },
     #[serde(rename_all = "camelCase")]
     Done {
@@ -225,6 +242,13 @@ impl WorkerResponse {
         }
     }
 
+    pub fn progress(id: impl Into<String>, progress: TaskProgress) -> Self {
+        Self::Progress {
+            id: id.into(),
+            progress,
+        }
+    }
+
     pub fn done(id: impl Into<String>, exit_code: i32) -> Self {
         Self::Done {
             id: id.into(),
@@ -256,6 +280,7 @@ impl WorkerResponse {
         match self {
             Self::Log { id, .. }
             | Self::Report { id, .. }
+            | Self::Progress { id, .. }
             | Self::Done { id, .. }
             | Self::Resolved { id, .. } => id,
         }
@@ -266,6 +291,7 @@ impl WorkerResponse {
         match self {
             Self::Log { .. } => "log",
             Self::Report { .. } => "report",
+            Self::Progress { .. } => "progress",
             Self::Done { .. } => "done",
             Self::Resolved { .. } => "resolved",
         }
@@ -536,8 +562,8 @@ mod tests {
     use crate::is_valid_report_filename;
 
     use super::{
-        LogStream, ResolveMode, ResolveResult, ResolveTask, TaskModification, WorkerMessage,
-        WorkerRequest, WorkerResponse,
+        LogStream, ResolveMode, ResolveResult, ResolveTask, TaskModification, TaskProgress,
+        WorkerMessage, WorkerRequest, WorkerResponse,
     };
 
     #[test]
@@ -633,6 +659,28 @@ mod tests {
     }
 
     #[test]
+    fn worker_request_progress_capability_defaults_false_and_serializes_only_when_enabled() {
+        let default_request: WorkerRequest = serde_json::from_value(json!({
+            "id": "pkg#task",
+            "command": "build",
+            "cwd": null
+        }))
+        .expect("request deserializes");
+        assert!(!default_request.progress);
+        assert!(!serde_json::to_value(&default_request)
+            .expect("request serializes")
+            .as_object()
+            .expect("request object")
+            .contains_key("progress"));
+
+        let enabled = WorkerRequest::new("pkg#task", "build").with_progress(true);
+        assert_eq!(
+            serde_json::to_value(enabled).expect("request serializes")["progress"],
+            Value::Bool(true)
+        );
+    }
+
+    #[test]
     fn worker_response_variants_roundtrip_and_match_json_shape() {
         let cases = [
             (
@@ -687,6 +735,57 @@ mod tests {
         .expect("response deserializes");
 
         assert_eq!(decoded, WorkerResponse::done("pkg#task", 9));
+    }
+
+    #[test]
+    fn worker_progress_response_round_trips_and_defaults_omitted_counters() {
+        let response = WorkerResponse::progress(
+            "pkg#task",
+            TaskProgress {
+                completed: 5,
+                skipped: 1,
+                running: 2,
+                pending: 8,
+            },
+        );
+        assert_eq!(
+            serde_json::to_value(&response).expect("response serializes"),
+            json!({
+                "type": "progress",
+                "id": "pkg#task",
+                "completed": 5,
+                "skipped": 1,
+                "running": 2,
+                "pending": 8
+            })
+        );
+
+        let decoded: WorkerResponse = serde_json::from_value(json!({
+            "type": "progress",
+            "id": "pkg#task",
+            "completed": 3
+        }))
+        .expect("progress deserializes");
+        assert_eq!(
+            decoded,
+            WorkerResponse::progress(
+                "pkg#task",
+                TaskProgress {
+                    completed: 3,
+                    ..TaskProgress::default()
+                }
+            )
+        );
+
+        let cleared: WorkerResponse = serde_json::from_value(json!({
+            "type": "progress",
+            "id": "pkg#task"
+        }))
+        .expect("zero progress deserializes");
+        assert_eq!(
+            cleared,
+            WorkerResponse::progress("pkg#task", TaskProgress::default())
+        );
     }
 
     #[test]

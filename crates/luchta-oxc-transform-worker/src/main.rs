@@ -24,17 +24,23 @@ use std::path::{Path, PathBuf};
 
 #[cfg(feature = "oxc")]
 use luchta_worker::{
-    process_items_in_parallel, run_worker_main, InProcessOutcome, JobContext, ResolveResult,
-    ResolveTask, TaskModification, Worker, WorkerRequest,
+    run_worker_main, InProcessOutcome, JobContext, ParallelProgress, ResolveResult, ResolveTask,
+    TaskModification, Worker, WorkerRequest,
 };
-#[cfg(feature = "oxc")]
-use tokio::task;
 
 #[cfg(feature = "oxc")]
 struct FileOutcome {
     produced: Vec<String>,
     errors: Vec<String>,
     failed: bool,
+}
+
+#[cfg(feature = "oxc")]
+fn transform_progress() -> ParallelProgress {
+    ParallelProgress::new(
+        "oxc transform",
+        "oxc transform worker parallel transform thread panicked",
+    )
 }
 #[cfg(feature = "oxc")]
 use crate::transform::{
@@ -162,26 +168,79 @@ impl Worker for OxcTransformWorker {
 
             let mut produced = BTreeSet::new();
             let mut exit_code = 0;
-            let outcomes = match task::spawn_blocking({
-                let cwd = cwd.clone();
-                let src_root = src_root.clone();
-                let out_root = out_root.clone();
-                let target_env = target_env.clone();
-                let entries = entries.clone();
-                move || {
-                    process_items_in_parallel(
-                        &entries,
-                        "oxc transform worker parallel transform thread panicked",
-                        |source_path| {
-                            let mut produced = Vec::new();
-                            let mut errors = Vec::new();
-                            let mut failed = false;
+            let outcomes = match ctx
+                .process_items_with_progress(entries, transform_progress(), {
+                    let cwd = cwd.clone();
+                    let src_root = src_root.clone();
+                    let out_root = out_root.clone();
+                    let target_env = target_env.clone();
+                    move |source_path, item| {
+                        let mut produced = Vec::new();
+                        let mut errors = Vec::new();
+                        let mut failed = false;
 
-                            let relative = match source_path.strip_prefix(&src_root) {
-                                Ok(relative) => relative,
+                        let relative = match source_path.strip_prefix(&src_root) {
+                            Ok(relative) => relative,
+                            Err(error) => {
+                                errors.push(format!(
+                                    "failed to strip src root from {}: {error}",
+                                    source_path.display()
+                                ));
+                                failed = true;
+                                return FileOutcome {
+                                    produced,
+                                    errors,
+                                    failed,
+                                };
+                            }
+                        };
+
+                        if should_skip(relative) {
+                            item.skip();
+                            return FileOutcome {
+                                produced,
+                                errors,
+                                failed,
+                            };
+                        }
+
+                        let output_path = if is_transformable(source_path) {
+                            match output_path_for(&src_root, &out_root, source_path) {
+                                Ok(output_path) => output_path,
+                                Err(error) => {
+                                    errors.push(error);
+                                    failed = true;
+                                    return FileOutcome {
+                                        produced,
+                                        errors,
+                                        failed,
+                                    };
+                                }
+                            }
+                        } else {
+                            out_root.join(relative)
+                        };
+                        if let Some(parent) = output_path.parent() {
+                            if let Err(error) = fs::create_dir_all(parent) {
+                                errors.push(format!(
+                                    "failed to create {}: {error}",
+                                    parent.display()
+                                ));
+                                failed = true;
+                                return FileOutcome {
+                                    produced,
+                                    errors,
+                                    failed,
+                                };
+                            }
+                        }
+
+                        if is_transformable(source_path) {
+                            let source = match fs::read_to_string(source_path) {
+                                Ok(source) => source,
                                 Err(error) => {
                                     errors.push(format!(
-                                        "failed to strip src root from {}: {error}",
+                                        "failed to read {}: {error}",
                                         source_path.display()
                                     ));
                                     failed = true;
@@ -192,37 +251,31 @@ impl Worker for OxcTransformWorker {
                                     };
                                 }
                             };
-
-                            if should_skip(relative) {
-                                return FileOutcome {
-                                    produced,
-                                    errors,
-                                    failed,
-                                };
-                            }
-
-                            let output_path = if is_transformable(source_path) {
-                                match output_path_for(&src_root, &out_root, source_path) {
-                                    Ok(output_path) => output_path,
-                                    Err(error) => {
-                                        errors.push(error);
-                                        failed = true;
-                                        return FileOutcome {
-                                            produced,
-                                            errors,
-                                            failed,
-                                        };
-                                    }
+                            let source_map_path = source_map_output_path(&output_path);
+                            let source_map_source_path =
+                                relative_source_map_source_path(&cwd, source_path);
+                            let source_mapping_url = match source_mapping_url(&source_map_path) {
+                                Ok(source_mapping_url) => source_mapping_url,
+                                Err(error) => {
+                                    errors.push(error);
+                                    failed = true;
+                                    return FileOutcome {
+                                        produced,
+                                        errors,
+                                        failed,
+                                    };
                                 }
-                            } else {
-                                out_root.join(relative)
                             };
-                            if let Some(parent) = output_path.parent() {
-                                if let Err(error) = fs::create_dir_all(parent) {
-                                    errors.push(format!(
-                                        "failed to create {}: {error}",
-                                        parent.display()
-                                    ));
+                            let result = match transform_source(
+                                source_path,
+                                &source,
+                                &target_env,
+                                &source_map_source_path,
+                                &source_mapping_url,
+                            ) {
+                                Ok(result) => result,
+                                Err(errors_from_transform) => {
+                                    errors.extend(errors_from_transform);
                                     failed = true;
                                     return FileOutcome {
                                         produced,
@@ -230,99 +283,12 @@ impl Worker for OxcTransformWorker {
                                         failed,
                                     };
                                 }
-                            }
-
-                            if is_transformable(source_path) {
-                                let source = match fs::read_to_string(source_path) {
-                                    Ok(source) => source,
-                                    Err(error) => {
-                                        errors.push(format!(
-                                            "failed to read {}: {error}",
-                                            source_path.display()
-                                        ));
-                                        failed = true;
-                                        return FileOutcome {
-                                            produced,
-                                            errors,
-                                            failed,
-                                        };
-                                    }
-                                };
-                                let source_map_path = source_map_output_path(&output_path);
-                                let source_map_source_path =
-                                    relative_source_map_source_path(&cwd, source_path);
-                                let source_mapping_url = match source_mapping_url(&source_map_path)
-                                {
-                                    Ok(source_mapping_url) => source_mapping_url,
-                                    Err(error) => {
-                                        errors.push(error);
-                                        failed = true;
-                                        return FileOutcome {
-                                            produced,
-                                            errors,
-                                            failed,
-                                        };
-                                    }
-                                };
-                                let result = match transform_source(
-                                    source_path,
-                                    &source,
-                                    &target_env,
-                                    &source_map_source_path,
-                                    &source_mapping_url,
-                                ) {
-                                    Ok(result) => result,
-                                    Err(errors_from_transform) => {
-                                        errors.extend(errors_from_transform);
-                                        failed = true;
-                                        return FileOutcome {
-                                            produced,
-                                            errors,
-                                            failed,
-                                        };
-                                    }
-                                };
-                                // `transform_source` already appends the `//# sourceMappingURL=...`
-                                // line to `result.code` (via `source_mapping_url`), so write it as-is.
-                                if let Err(error) = fs::write(&output_path, &result.code) {
-                                    errors.push(format!(
-                                        "failed to write {}: {error}",
-                                        output_path.display()
-                                    ));
-                                    failed = true;
-                                    return FileOutcome {
-                                        produced,
-                                        errors,
-                                        failed,
-                                    };
-                                }
-                                produced.push(normalize_path(
-                                    output_path.strip_prefix(&cwd).unwrap_or(&output_path),
-                                ));
-                                if let Some(source_map_json) = result.source_map_json {
-                                    if let Err(error) = fs::write(&source_map_path, source_map_json)
-                                    {
-                                        errors.push(format!(
-                                            "failed to write {}: {error}",
-                                            source_map_path.display()
-                                        ));
-                                        failed = true;
-                                        return FileOutcome {
-                                            produced,
-                                            errors,
-                                            failed,
-                                        };
-                                    }
-                                    produced.push(normalize_path(
-                                        source_map_path
-                                            .strip_prefix(&cwd)
-                                            .unwrap_or(&source_map_path),
-                                    ));
-                                }
-                            } else if let Err(error) = fs::copy(source_path, &output_path) {
+                            };
+                            // `transform_source` already appends the `//# sourceMappingURL=...`
+                            // line to `result.code` (via `source_mapping_url`), so write it as-is.
+                            if let Err(error) = fs::write(&output_path, &result.code) {
                                 errors.push(format!(
-                                    "failed to copy {} to {}: {error}",
-                                    source_path.display(),
+                                    "failed to write {}: {error}",
                                     output_path.display()
                                 ));
                                 failed = true;
@@ -331,35 +297,59 @@ impl Worker for OxcTransformWorker {
                                     errors,
                                     failed,
                                 };
-                            } else {
+                            }
+                            produced.push(normalize_path(
+                                output_path.strip_prefix(&cwd).unwrap_or(&output_path),
+                            ));
+                            if let Some(source_map_json) = result.source_map_json {
+                                if let Err(error) = fs::write(&source_map_path, source_map_json) {
+                                    errors.push(format!(
+                                        "failed to write {}: {error}",
+                                        source_map_path.display()
+                                    ));
+                                    failed = true;
+                                    return FileOutcome {
+                                        produced,
+                                        errors,
+                                        failed,
+                                    };
+                                }
                                 produced.push(normalize_path(
-                                    output_path.strip_prefix(&cwd).unwrap_or(&output_path),
+                                    source_map_path
+                                        .strip_prefix(&cwd)
+                                        .unwrap_or(&source_map_path),
                                 ));
                             }
-
-                            FileOutcome {
+                        } else if let Err(error) = fs::copy(source_path, &output_path) {
+                            errors.push(format!(
+                                "failed to copy {} to {}: {error}",
+                                source_path.display(),
+                                output_path.display()
+                            ));
+                            failed = true;
+                            return FileOutcome {
                                 produced,
                                 errors,
                                 failed,
-                            }
-                        },
-                    )
-                }
-            })
-            .await
+                            };
+                        } else {
+                            produced.push(normalize_path(
+                                output_path.strip_prefix(&cwd).unwrap_or(&output_path),
+                            ));
+                        }
+
+                        FileOutcome {
+                            produced,
+                            errors,
+                            failed,
+                        }
+                    }
+                })
+                .await
             {
-                Ok(Ok(result)) => result,
-                Ok(Err(error)) => {
-                    let _ = ctx.emit_stderr(error).await;
-                    return InProcessOutcome::Done {
-                        exit_code: 1,
-                        outputs: None,
-                    };
-                }
+                Ok(outcomes) => outcomes,
                 Err(error) => {
-                    let _ = ctx
-                        .emit_stderr(format!("oxc transform parallel task failed: {error}"))
-                        .await;
+                    let _ = ctx.emit_stderr(error).await;
                     return InProcessOutcome::Done {
                         exit_code: 1,
                         outputs: None,
@@ -510,8 +500,12 @@ fn normalize_path(path: &Path) -> String {
 #[cfg(all(test, feature = "oxc"))]
 mod tests {
     use assert_fs::TempDir;
-    use luchta_worker::{InProcessOutcome, JobContext, SharedWriter, Worker, WorkerRequest};
+    use luchta_worker::{
+        InProcessOutcome, JobContext, SharedWriter, TaskProgress, Worker, WorkerRequest,
+        WorkerResponse,
+    };
     use std::fs;
+    use tokio::io::{AsyncBufReadExt, BufReader};
 
     use super::OxcTransformWorker;
 
@@ -528,7 +522,7 @@ mod tests {
 
         let req = WorkerRequest::new("pkg#build:node", "build:node")
             .with_cwd(cwd.to_string_lossy().to_string());
-        let outcome = run_worker(&req).await;
+        let (outcome, progress) = run_worker(&req).await;
 
         let InProcessOutcome::Done { exit_code, outputs } = outcome else {
             panic!("expected done outcome");
@@ -558,6 +552,21 @@ mod tests {
             source_map["sources"],
             serde_json::json!(["src/nested/example.ts"])
         );
+        assert!(progress.len() >= 2, "expected initial and final snapshots");
+        assert_eq!(
+            progress.first(),
+            Some(&TaskProgress {
+                pending: 1,
+                ..TaskProgress::default()
+            })
+        );
+        assert_eq!(
+            progress.last(),
+            Some(&TaskProgress {
+                completed: 1,
+                ..TaskProgress::default()
+            })
+        );
     }
 
     #[tokio::test]
@@ -574,7 +583,7 @@ mod tests {
 
         let req =
             WorkerRequest::new("pkg#build", "build").with_cwd(cwd.to_string_lossy().to_string());
-        let outcome = run_worker(&req).await;
+        let (outcome, _) = run_worker(&req).await;
 
         let InProcessOutcome::Done { exit_code, outputs } = outcome else {
             panic!("expected done outcome");
@@ -642,7 +651,7 @@ mod tests {
 
         let req =
             WorkerRequest::new("pkg#build", "build").with_cwd(cwd.to_string_lossy().to_string());
-        let outcome = run_worker(&req).await;
+        let (outcome, progress) = run_worker(&req).await;
 
         let InProcessOutcome::Done { exit_code, outputs } = outcome else {
             panic!("expected done outcome");
@@ -655,15 +664,44 @@ mod tests {
         assert!(!cwd.join("dist/js/button.stories.js").exists());
         assert!(!cwd.join("dist/js/widget.unitTest.js").exists());
         assert!(cwd.join("dist/js/real.js").exists());
+        assert!(progress.len() >= 2, "expected initial and final snapshots");
+        assert_eq!(
+            progress.first(),
+            Some(&TaskProgress {
+                pending: 3,
+                ..TaskProgress::default()
+            })
+        );
+        assert_eq!(
+            progress.last(),
+            Some(&TaskProgress {
+                completed: 3,
+                skipped: 2,
+                ..TaskProgress::default()
+            })
+        );
     }
 
-    async fn run_worker(req: &WorkerRequest) -> InProcessOutcome {
+    async fn run_worker(req: &WorkerRequest) -> (InProcessOutcome, Vec<TaskProgress>) {
         let worker = OxcTransformWorker;
-        let sink = tokio::io::sink();
+        let (stream, reader) = tokio::io::duplex(16 * 1024);
         let writer: SharedWriter = std::sync::Arc::new(tokio::sync::Mutex::new(
-            Box::new(sink) as Box<dyn tokio::io::AsyncWrite + Unpin + Send>
+            Box::new(stream) as Box<dyn tokio::io::AsyncWrite + Unpin + Send>
         ));
-        let ctx = JobContext::new(req.id.clone(), writer);
-        worker.run_in_process(req, &ctx).await
+        let ctx = JobContext::with_progress(req.id.clone(), std::sync::Arc::clone(&writer), true);
+        let outcome = worker.run_in_process(req, &ctx).await;
+        drop(ctx);
+        drop(writer);
+        let mut lines = BufReader::new(reader).lines();
+        let mut progress = Vec::new();
+        while let Some(line) = lines.next_line().await.expect("read response") {
+            if let WorkerResponse::Progress {
+                progress: snapshot, ..
+            } = serde_json::from_str(&line).expect("response JSON")
+            {
+                progress.push(snapshot);
+            }
+        }
+        (outcome, progress)
     }
 }

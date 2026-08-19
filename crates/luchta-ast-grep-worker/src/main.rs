@@ -14,16 +14,16 @@ mod config;
 mod lint;
 mod sarif;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use ast_grep_config::Severity;
 use luchta_worker::{
-    run_worker_main, tokenize::tokenize_command, version_requested, InProcessOutcome, JobContext,
-    ResolveResult, ResolveTask, TaskModification, Worker, WorkerRequest,
+    run_worker_main, tokenize::tokenize_command, version_requested, InProcessOutcome, ItemProgress,
+    JobContext, ResolveResult, ResolveTask, TaskModification, Worker, WorkerRequest,
 };
 
 use crate::config::{collect_source_files, discover_config, DiscoveredConfig};
-use crate::lint::scan_files_async;
+use crate::lint::{scan_files_async, ScanResult, ScanWork};
 use crate::sarif::build_sarif;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -117,19 +117,16 @@ impl Worker for AstGrepWorker {
             }
 
             let repo_root = std::env::current_dir().unwrap_or_else(|_| run.cwd.clone());
-            let scan_result =
-                match scan_files_async(&run.cwd, &repo_root, &run.config, run.files, run.opts.fix)
-                    .await
-                {
-                    Ok(findings) => findings,
-                    Err(error) => {
-                        let _ = ctx.emit_stderr(error).await;
-                        return InProcessOutcome::Done {
-                            exit_code: 1,
-                            outputs: None,
-                        };
-                    }
-                };
+            let scan_result = match scan_with_progress(ctx, run, repo_root).await {
+                Ok(scan_result) => scan_result,
+                Err(error) => {
+                    let _ = ctx.emit_stderr(error).await;
+                    return InProcessOutcome::Done {
+                        exit_code: 1,
+                        outputs: None,
+                    };
+                }
+            };
 
             if let Err(outcome) = emit_warnings(ctx, &scan_result.warnings).await {
                 return outcome;
@@ -158,6 +155,28 @@ struct PreparedRun {
     opts: AstGrepOpts,
     config: DiscoveredConfig,
     files: Vec<std::path::PathBuf>,
+}
+
+async fn scan_with_progress(
+    ctx: &JobContext,
+    run: PreparedRun,
+    repo_root: PathBuf,
+) -> Result<ScanResult, String> {
+    let work_units = if run.opts.fix {
+        run.files.len().saturating_mul(2)
+    } else {
+        run.files.len()
+    };
+    let progress = ItemProgress::new(work_units);
+    let scan_task = scan_files_async(
+        &run.cwd,
+        &repo_root,
+        &run.config,
+        ScanWork::tracked(run.files, run.opts.fix, progress.clone()),
+    );
+    ctx.run_with_progress(&progress, scan_task)
+        .await
+        .map_err(|error| format!("failed to emit ast-grep progress: {error}"))?
 }
 
 fn prepare_run(cwd: &Path, req: &WorkerRequest) -> Result<PreparedRun, PrepareFailure> {

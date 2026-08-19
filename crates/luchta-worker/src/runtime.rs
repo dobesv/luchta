@@ -3,6 +3,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
+use std::time::Duration;
 
 use thiserror::Error;
 use tokio::io::{stdin, stdout, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
@@ -10,10 +11,12 @@ use tokio::process::Command;
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 
+use crate::process_items_in_parallel;
 use crate::{
     is_valid_report_filename, LogStream, ResolveResult, ResolveTask, WorkerMessage, WorkerRequest,
     WorkerResponse,
 };
+use crate::{ItemProgress, ParallelProgress, TaskProgress};
 
 pub trait Worker: Send + Sync + 'static {
     fn resolve_task(&self, req: &ResolveTask) -> ResolveResult;
@@ -47,12 +50,28 @@ type SharedWriter = Arc<Mutex<Box<dyn AsyncWrite + Unpin + Send>>>;
 pub struct JobContext {
     id: String,
     writer: SharedWriter,
+    progress_enabled: bool,
 }
 
 impl JobContext {
     /// Construct a job context for a worker request.
     pub fn new(id: String, writer: SharedWriter) -> Self {
-        Self { id, writer }
+        Self::with_progress(id, writer, false)
+    }
+
+    /// Construct a context with an explicit progress capability, primarily for
+    /// in-process worker composition and tests. Protocol runtimes derive this
+    /// value from [`WorkerRequest::progress`](crate::WorkerRequest::progress).
+    pub fn with_progress(id: String, writer: SharedWriter, progress_enabled: bool) -> Self {
+        Self {
+            id,
+            writer,
+            progress_enabled,
+        }
+    }
+
+    fn negotiated(id: String, writer: SharedWriter, progress_enabled: bool) -> Self {
+        Self::with_progress(id, writer, progress_enabled)
     }
 
     pub async fn emit_stdout(&self, line: impl Into<String>) -> Result<(), WorkerError> {
@@ -114,6 +133,92 @@ impl JobContext {
             &WorkerResponse::report(self.id.clone(), filename, mime_type.into(), content.into()),
         )
         .await
+    }
+
+    /// Emit an absolute progress snapshot when the engine negotiated support.
+    pub async fn emit_progress(&self, progress: TaskProgress) -> Result<(), WorkerError> {
+        if !self.progress_enabled {
+            return Ok(());
+        }
+        write_response(
+            &self.writer,
+            &WorkerResponse::progress(self.id.clone(), progress),
+        )
+        .await
+    }
+
+    /// Observe shared item counters while `work` runs.
+    ///
+    /// An initial snapshot and a final snapshot are always emitted when
+    /// negotiated. Changed intermediate snapshots are emitted at most once per
+    /// 250 milliseconds.
+    pub async fn run_with_progress<F, T>(
+        &self,
+        progress: &ItemProgress,
+        work: F,
+    ) -> Result<T, WorkerError>
+    where
+        F: std::future::Future<Output = T>,
+    {
+        if !self.progress_enabled {
+            return Ok(work.await);
+        }
+
+        let mut last = progress.snapshot();
+        self.emit_progress(last).await?;
+        tokio::pin!(work);
+        let start = tokio::time::Instant::now() + Duration::from_millis(250);
+        let mut updates = tokio::time::interval_at(start, Duration::from_millis(250));
+        updates.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        let output = loop {
+            tokio::select! {
+                output = &mut work => break output,
+                _ = updates.tick() => {
+                    let snapshot = progress.snapshot();
+                    if snapshot != last {
+                        self.emit_progress(snapshot).await?;
+                        last = snapshot;
+                    }
+                }
+            }
+        };
+
+        self.emit_progress(progress.snapshot()).await?;
+        Ok(output)
+    }
+
+    /// Process owned items on blocking threads while reporting coherent item
+    /// progress. The blocking task is not spawned until after the initial
+    /// pending snapshot has been emitted.
+    pub async fn process_items_with_progress<I, T, F>(
+        &self,
+        items: Vec<I>,
+        context: ParallelProgress,
+        process: F,
+    ) -> Result<Vec<T>, String>
+    where
+        I: Send + Sync + 'static,
+        T: Send + 'static,
+        F: Fn(&I, crate::ItemProgressGuard) -> T + Send + Sync + 'static,
+    {
+        let progress = ItemProgress::new(items.len());
+        let processing_progress = progress.clone();
+        let processing = async move {
+            tokio::task::spawn_blocking(move || {
+                process_items_in_parallel(&items, context.panic_message, |item| {
+                    let progress_item = processing_progress.start_item();
+                    process(item, progress_item)
+                })
+            })
+            .await
+        };
+
+        let joined = self
+            .run_with_progress(&progress, processing)
+            .await
+            .map_err(|error| format!("failed to emit {} progress: {error}", context.worker_name))?;
+        joined.map_err(|error| format!("{} parallel task failed: {error}", context.worker_name))?
     }
 }
 
@@ -226,7 +331,7 @@ async fn handle_request<W: Worker>(
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), WorkerError> {
     let id = request.id.clone();
-    let context = JobContext::new(id.clone(), Arc::clone(&writer));
+    let context = JobContext::negotiated(id.clone(), Arc::clone(&writer), request.progress);
     let done_response = match worker.run_in_process(&request, &context).await {
         InProcessOutcome::Done { exit_code, outputs } => {
             WorkerResponse::done_with_outputs(id.clone(), exit_code, outputs)
@@ -496,6 +601,110 @@ mod tests {
             vec![
                 WorkerResponse::log("job-1", LogStream::Stdout, "first"),
                 WorkerResponse::log("job-1", LogStream::Stdout, "second"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn progress_is_silent_without_negotiation() {
+        let (writer, reader) = writer_pair();
+        let ctx = JobContext::new("job-1".to_owned(), Arc::clone(&writer));
+        ctx.emit_progress(TaskProgress {
+            pending: 4,
+            ..TaskProgress::default()
+        })
+        .await
+        .expect("disabled progress is a no-op");
+        drop(ctx);
+        drop(writer);
+
+        assert!(read_responses(reader).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn tracked_progress_emits_initial_and_final_absolute_snapshots() {
+        let (writer, reader) = writer_pair();
+        let ctx = JobContext::with_progress("job-1".to_owned(), Arc::clone(&writer), true);
+        let progress = ItemProgress::new(2);
+
+        ctx.run_with_progress(&progress, async {
+            drop(progress.start_item());
+            progress.start_item().skip();
+        })
+        .await
+        .expect("tracked work succeeds");
+        drop(ctx);
+        drop(writer);
+
+        assert_eq!(
+            read_responses(reader).await,
+            vec![
+                WorkerResponse::progress(
+                    "job-1",
+                    TaskProgress {
+                        pending: 2,
+                        ..TaskProgress::default()
+                    }
+                ),
+                WorkerResponse::progress(
+                    "job-1",
+                    TaskProgress {
+                        completed: 2,
+                        skipped: 1,
+                        ..TaskProgress::default()
+                    }
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn tracked_progress_emits_running_snapshot_at_rate_limited_boundary() {
+        let (writer, reader) = writer_pair();
+        let ctx = JobContext::with_progress("job-1".to_owned(), Arc::clone(&writer), true);
+        let progress = ItemProgress::new(1);
+        let release = Arc::new(tokio::sync::Notify::new());
+        let controller = {
+            let release = Arc::clone(&release);
+            async move {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                release.notify_one();
+            }
+        };
+        let work = async {
+            let _item = progress.start_item();
+            release.notified().await;
+        };
+
+        let (result, ()) = tokio::join!(ctx.run_with_progress(&progress, work), controller);
+        result.expect("tracked work succeeds");
+        drop(ctx);
+        drop(writer);
+
+        assert_eq!(
+            read_responses(reader).await,
+            vec![
+                WorkerResponse::progress(
+                    "job-1",
+                    TaskProgress {
+                        pending: 1,
+                        ..TaskProgress::default()
+                    }
+                ),
+                WorkerResponse::progress(
+                    "job-1",
+                    TaskProgress {
+                        running: 1,
+                        ..TaskProgress::default()
+                    }
+                ),
+                WorkerResponse::progress(
+                    "job-1",
+                    TaskProgress {
+                        completed: 1,
+                        ..TaskProgress::default()
+                    }
+                ),
             ]
         );
     }

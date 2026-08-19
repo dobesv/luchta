@@ -26,11 +26,9 @@ use std::path::{Path, PathBuf};
 
 #[cfg(feature = "swc")]
 use luchta_worker::{
-    process_items_in_parallel, run_worker_main, InProcessOutcome, JobContext, ResolveResult,
-    ResolveTask, TaskModification, Worker, WorkerRequest,
+    run_worker_main, InProcessOutcome, JobContext, ParallelProgress, ResolveResult, ResolveTask,
+    TaskModification, Worker, WorkerRequest,
 };
-#[cfg(feature = "swc")]
-use tokio::task;
 
 #[cfg(feature = "swc")]
 use crate::args::SwcArgs;
@@ -179,17 +177,19 @@ impl Worker for SwcTransformWorker {
 
             let mut produced = BTreeSet::new();
             let mut exit_code = 0;
-            let outcomes = match task::spawn_blocking({
-                let cwd = cwd.clone();
-                let src_root = src_root.clone();
-                let out_root = out_root.clone();
-                let args = args.clone();
-                let entries = entries.clone();
-                move || {
-                    process_items_in_parallel(
-                        &entries,
+            let outcomes = match ctx
+                .process_items_with_progress(
+                    entries,
+                    ParallelProgress::new(
+                        "swc transform",
                         "swc transform worker parallel transform thread panicked",
-                        |source_path| {
+                    ),
+                    {
+                        let cwd = cwd.clone();
+                        let src_root = src_root.clone();
+                        let out_root = out_root.clone();
+                        let args = args.clone();
+                        move |source_path, item| {
                             let mut produced = Vec::new();
                             let mut errors = Vec::new();
                             let mut failed = false;
@@ -211,6 +211,7 @@ impl Worker for SwcTransformWorker {
                             };
 
                             if should_skip(relative) {
+                                item.skip();
                                 return FileOutcome {
                                     produced,
                                     errors,
@@ -357,24 +358,14 @@ impl Worker for SwcTransformWorker {
                                 errors,
                                 failed,
                             }
-                        },
-                    )
-                }
-            })
-            .await
+                        }
+                    },
+                )
+                .await
             {
-                Ok(Ok(result)) => result,
-                Ok(Err(error)) => {
-                    let _ = ctx.emit_stderr(error).await;
-                    return InProcessOutcome::Done {
-                        exit_code: 1,
-                        outputs: None,
-                    };
-                }
+                Ok(outcomes) => outcomes,
                 Err(error) => {
-                    let _ = ctx
-                        .emit_stderr(format!("swc transform parallel task failed: {error}"))
-                        .await;
+                    let _ = ctx.emit_stderr(error).await;
                     return InProcessOutcome::Done {
                         exit_code: 1,
                         outputs: None,
@@ -531,10 +522,11 @@ mod tests {
     use assert_fs::TempDir;
     use luchta_worker::{
         InProcessOutcome, JobContext, ResolveDecision, ResolveMode, ResolveTask, SharedWriter,
-        Worker, WorkerRequest,
+        TaskProgress, Worker, WorkerRequest, WorkerResponse,
     };
     use std::fs;
     use std::path::Path;
+    use tokio::io::{AsyncBufReadExt, BufReader};
 
     use super::SwcTransformWorker;
 
@@ -589,7 +581,7 @@ mod tests {
 
         let req = WorkerRequest::new("pkg#build:node", "build:node")
             .with_cwd(cwd.to_string_lossy().to_string());
-        let outcome = run_worker(&req).await;
+        let (outcome, progress) = run_worker(&req).await;
 
         let InProcessOutcome::Done { exit_code, outputs } = outcome else {
             panic!("expected done outcome");
@@ -619,6 +611,21 @@ mod tests {
             source_map["sources"],
             serde_json::json!(["src/nested/example.ts"])
         );
+        assert!(progress.len() >= 2, "expected initial and final snapshots");
+        assert_eq!(
+            progress.first(),
+            Some(&TaskProgress {
+                pending: 1,
+                ..TaskProgress::default()
+            })
+        );
+        assert_eq!(
+            progress.last(),
+            Some(&TaskProgress {
+                completed: 1,
+                ..TaskProgress::default()
+            })
+        );
     }
 
     #[tokio::test]
@@ -634,7 +641,7 @@ mod tests {
 
         let req = WorkerRequest::new("pkg#build", "--out-dir dist/node")
             .with_cwd(cwd.to_string_lossy().to_string());
-        let outcome = run_worker(&req).await;
+        let (outcome, _) = run_worker(&req).await;
 
         let InProcessOutcome::Done { exit_code, outputs } = outcome else {
             panic!("expected done outcome");
@@ -666,7 +673,7 @@ mod tests {
 
         let req =
             WorkerRequest::new("pkg#build", "build").with_cwd(cwd.to_string_lossy().to_string());
-        let outcome = run_worker(&req).await;
+        let (outcome, _) = run_worker(&req).await;
 
         let InProcessOutcome::Done { exit_code, outputs } = outcome else {
             panic!("expected done outcome");
@@ -722,7 +729,7 @@ mod tests {
 
         let req =
             WorkerRequest::new("pkg#build", "build").with_cwd(cwd.to_string_lossy().to_string());
-        let outcome = run_worker(&req).await;
+        let (outcome, _) = run_worker(&req).await;
 
         let InProcessOutcome::Done { exit_code, outputs } = outcome else {
             panic!("expected done outcome");
@@ -751,7 +758,7 @@ mod tests {
 
         let req =
             WorkerRequest::new("pkg#build", "build").with_cwd(cwd.to_string_lossy().to_string());
-        let outcome = run_worker(&req).await;
+        let (outcome, progress) = run_worker(&req).await;
 
         let InProcessOutcome::Done { exit_code, outputs } = outcome else {
             panic!("expected done outcome");
@@ -764,6 +771,22 @@ mod tests {
         assert!(!cwd.join("dist/js/button.stories.js").exists());
         assert!(!cwd.join("dist/js/widget.unitTest.js").exists());
         assert!(cwd.join("dist/js/real.js").exists());
+        assert!(progress.len() >= 2, "expected initial and final snapshots");
+        assert_eq!(
+            progress.first(),
+            Some(&TaskProgress {
+                pending: 3,
+                ..TaskProgress::default()
+            })
+        );
+        assert_eq!(
+            progress.last(),
+            Some(&TaskProgress {
+                completed: 3,
+                skipped: 2,
+                ..TaskProgress::default()
+            })
+        );
     }
 
     fn resolve_task(cwd: &Path, command: &str) -> ResolveTask {
@@ -779,13 +802,27 @@ mod tests {
         }
     }
 
-    async fn run_worker(req: &WorkerRequest) -> InProcessOutcome {
+    async fn run_worker(req: &WorkerRequest) -> (InProcessOutcome, Vec<TaskProgress>) {
         let worker = SwcTransformWorker;
-        let sink = tokio::io::sink();
+        let (stream, reader) = tokio::io::duplex(16 * 1024);
         let writer: SharedWriter = std::sync::Arc::new(tokio::sync::Mutex::new(
-            Box::new(sink) as Box<dyn tokio::io::AsyncWrite + Unpin + Send>
+            Box::new(stream) as Box<dyn tokio::io::AsyncWrite + Unpin + Send>
         ));
-        let ctx = JobContext::new(req.id.clone(), writer);
-        worker.run_in_process(req, &ctx).await
+        let ctx = JobContext::with_progress(req.id.clone(), std::sync::Arc::clone(&writer), true);
+        let outcome = worker.run_in_process(req, &ctx).await;
+        drop(ctx);
+        drop(writer);
+
+        let mut lines = BufReader::new(reader).lines();
+        let mut progress = Vec::new();
+        while let Some(line) = lines.next_line().await.expect("read response") {
+            if let WorkerResponse::Progress {
+                progress: snapshot, ..
+            } = serde_json::from_str(&line).expect("response JSON")
+            {
+                progress.push(snapshot);
+            }
+        }
+        (outcome, progress)
     }
 }

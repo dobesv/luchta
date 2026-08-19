@@ -210,6 +210,11 @@ impl WorkerManager {
                         });
                     }
                 }
+                Some(WorkerResponse::Progress { progress, .. }) => {
+                    if let Some(sink) = sink {
+                        sink.set_progress(progress);
+                    }
+                }
                 Some(response) => {
                     let kind = response.kind();
                     match select(response) {
@@ -228,6 +233,9 @@ impl WorkerManager {
         };
 
         self.remove_job(&handle, &job_id).await;
+        if let Some(sink) = sink {
+            sink.clear_progress();
+        }
         outcome
     }
 
@@ -264,9 +272,10 @@ impl WorkerManager {
     pub async fn run_job(
         &self,
         worker_name: &str,
-        request: WorkerRequest,
+        mut request: WorkerRequest,
         sink: Option<&ExecutionLogSink>,
     ) -> Result<WorkerDonePayload, WorkerError> {
+        request.progress = sink.is_some();
         let retry_request = request.clone();
 
         // Terminal response is `Done`; logs are streamed, other responses ignored.

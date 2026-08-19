@@ -2,6 +2,8 @@ use super::super::*;
 use super::helpers::*;
 use std::collections::HashMap;
 
+use luchta_engine::{ExecutionLogSink, TaskProgress};
+
 #[test]
 fn render_progress_omits_zero_skipped_and_shows_pending_when_work_remains() {
     let wave_of = HashMap::from([(task_id("pkg-a", "build"), 0)]);
@@ -114,6 +116,63 @@ fn render_progress_running_segment_uses_grouped_list() {
         SegmentLabel::new("🌊", "0 / 1"),
     );
     assert!(!out.contains("running:"));
+}
+
+#[test]
+fn render_progress_uses_latest_worker_snapshot_and_cleans_up_on_completion() {
+    let task = task_id("pkg", "build");
+    let reporter =
+        ProgressReporter::new(OutputMode::Default, HashMap::from([(task.clone(), 0)]), 1);
+    let sink = ExecutionLogSink::new();
+    reporter.task_started_with_progress(&task, sink.clone());
+    sink.set_progress(TaskProgress {
+        completed: 1,
+        pending: 9,
+        ..TaskProgress::default()
+    });
+    sink.set_progress(TaskProgress {
+        completed: 6,
+        skipped: 2,
+        running: 1,
+        pending: 3,
+    });
+
+    let running = reporter.render_progress(
+        "10 MB",
+        &[],
+        &pressure_snapshot(None, 0, 0),
+        owo_colors::Stream::Stdout,
+    );
+    assert!(
+        running.contains("pkg#build(✔ 6 ⏩ 2 ⌛ 3 🏃 1)"),
+        "output was: {running}"
+    );
+    assert!(!running.contains("✔ 1 ⌛ 9"), "output was: {running}");
+
+    sink.set_progress(TaskProgress::default());
+    let cleared = reporter.render_progress(
+        "10 MB",
+        &[],
+        &pressure_snapshot(None, 0, 0),
+        owo_colors::Stream::Stdout,
+    );
+    assert!(cleared.contains("pkg#build"), "output was: {cleared}");
+    assert!(!cleared.contains("pkg#build("), "output was: {cleared}");
+
+    sink.set_progress(TaskProgress {
+        running: 1,
+        ..TaskProgress::default()
+    });
+
+    reporter.task_ran(&task);
+    assert_eq!(sink.progress(), None);
+    let finished = reporter.render_progress(
+        "10 MB",
+        &[],
+        &pressure_snapshot(None, 0, 0),
+        owo_colors::Stream::Stdout,
+    );
+    assert!(!finished.contains("pkg#build"), "output was: {finished}");
 }
 
 #[test]

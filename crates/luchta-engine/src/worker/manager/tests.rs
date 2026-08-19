@@ -17,7 +17,7 @@ use tokio::{process::Command, sync::Barrier, time::Instant};
 
 use super::{WorkerError, WorkerManager};
 use crate::{task_graph::TaskResolver, WorkerRequest};
-use luchta_worker::WorkerDonePayload;
+use luchta_worker::{TaskProgress, WorkerDonePayload};
 
 #[derive(Clone, Copy)]
 struct TestWorkerRef<'a> {
@@ -218,6 +218,121 @@ done
     }
 
     manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn run_negotiates_progress_only_when_a_sink_is_attached() {
+    let temp = TempDir::new().expect("tempdir");
+    let requests = temp.path().join("requests.jsonl");
+    let worker_path = write_worker_script(
+        temp.path(),
+        "progress-capability-worker.sh",
+        &format!(
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "{requests}"
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  printf '{{"type":"done","id":"%s","exitCode":0}}\n' "$id"
+done
+"#,
+            requests = requests.display(),
+        ),
+    );
+    let manager = manager_with_worker(TestWorkerRef::new("fake"), &worker_path);
+
+    manager
+        .run_job("fake", WorkerRequest::new("without", "build"), None)
+        .await
+        .expect("job without sink succeeds");
+    let sink = crate::ExecutionLogSink::new();
+    manager
+        .run_job("fake", WorkerRequest::new("with", "build"), Some(&sink))
+        .await
+        .expect("job with sink succeeds");
+
+    let lines = fs::read_to_string(requests).expect("requests recorded");
+    let requests = lines
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("request JSON"))
+        .collect::<Vec<_>>();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].get("progress"), None);
+    assert_eq!(requests[1]["progress"], true);
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn progress_updates_are_intermediate_latest_wins_and_completion_clears() {
+    let temp = TempDir::new().expect("tempdir");
+    let gate = temp.path().join("gate");
+    let worker_path = write_worker_script(
+        temp.path(),
+        "progress-worker.sh",
+        &format!(
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  printf '{{"type":"progress","id":"%s","completed":1,"pending":9}}\n' "$id"
+  printf '{{"type":"progress","id":"%s","completed":6,"skipped":2,"running":1,"pending":3}}\n' "$id"
+  while [ ! -f "{gate}" ]; do sleep 0.01; done
+  printf '{{"type":"done","id":"%s","exitCode":0}}\n' "$id"
+done
+"#,
+            gate = gate.display(),
+        ),
+    );
+    let manager = Arc::new(manager_with_worker(
+        TestWorkerRef::new("fake"),
+        &worker_path,
+    ));
+    let sink = crate::ExecutionLogSink::new();
+    let job = {
+        let manager = Arc::clone(&manager);
+        let sink = sink.clone();
+        tokio::spawn(async move {
+            manager
+                .run_job("fake", WorkerRequest::new("pkg#task", "build"), Some(&sink))
+                .await
+        })
+    };
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if sink
+                .progress()
+                .is_some_and(|progress| progress.completed == 6)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("latest progress arrives before terminal response");
+    assert_eq!(
+        sink.progress(),
+        Some(TaskProgress {
+            completed: 6,
+            skipped: 2,
+            running: 1,
+            pending: 3,
+        })
+    );
+
+    fs::write(gate, "go").expect("release worker");
+    assert_eq!(
+        job.await
+            .expect("job task joins")
+            .expect("job succeeds")
+            .exit_code,
+        0
+    );
+    assert_eq!(sink.progress(), None);
+
+    Arc::try_unwrap(manager)
+        .expect("manager only ref")
+        .shutdown()
+        .await;
 }
 
 #[tokio::test]

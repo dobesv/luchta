@@ -273,7 +273,13 @@ fn long_run_default_mode_emits_periodic_progress() {
 
     let out = run_build(
         &temp,
-        &shell_worker_body(r#"{"type":"done","id":"%s","exitCode":0}"#, "sleep 1\n"),
+        &shell_worker_body(
+            r#"{"type":"done","id":"%s","exitCode":0}"#,
+            r#"printf '{"type":"progress","id":"%s","completed":1,"pending":9}\n' "$id"
+      printf '{"type":"progress","id":"%s","completed":5,"skipped":1,"running":1,"pending":2}\n' "$id"
+      sleep 1
+"#,
+        ),
         r#""build":{"worker":"fake"}"#,
         false,
         "default run",
@@ -283,6 +289,11 @@ fn long_run_default_mode_emits_periodic_progress() {
     assert!(
         out.stderr().contains("🏃") && out.stderr().contains("✔"),
         "default run should emit periodic progress status line markers on stderr, got: {}",
+        out.stderr()
+    );
+    assert!(
+        out.stderr().contains("a#build(✔ 5 ⏩ 1 ⌛ 2 🏃 1)"),
+        "periodic status should render the latest worker snapshot, got: {}",
         out.stderr()
     );
     out.assert_done_line(DoneLine {

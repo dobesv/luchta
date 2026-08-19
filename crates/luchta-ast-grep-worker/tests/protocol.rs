@@ -488,6 +488,7 @@ fn fix_flag_in_command_rewrites_file_end_to_end() {
         run_line(
             WorkerRequest::new("job-fix", "lint --fix")
                 .with_cwd(fixture.path().display().to_string())
+                .with_progress(true)
         )
     );
     let (output, _stderr) = run_worker_in(fixture.path(), &input);
@@ -501,6 +502,20 @@ fn fix_flag_in_command_rewrites_file_end_to_end() {
     // violation is gone so the run succeeds (exit 0).
     assert_log_line_contains(&output, "job-fix", "fixed: src/index.ts");
     assert_done_with_exit(&output, "job-fix", 0);
+    let progress = output
+        .iter()
+        .filter(|value| value["type"].as_str() == Some("progress"))
+        .collect::<Vec<_>>();
+    assert!(
+        progress.len() >= 2,
+        "expected initial and final snapshots: {output:?}"
+    );
+    let first = progress.first().expect("initial progress snapshot");
+    let last = progress.last().expect("final progress snapshot");
+    let total = first["pending"].as_u64().expect("initial pending counter");
+    assert!(total >= 2, "fix and scan phases must both be counted");
+    assert_eq!(last["completed"].as_u64(), Some(total));
+    assert_eq!(last["pending"].as_u64(), Some(0));
 }
 
 fn assert_log_line_contains(output: &[Value], id: &str, substring: &str) {
