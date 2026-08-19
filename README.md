@@ -489,6 +489,17 @@ Additional targeting rules:
 - **Mandatory Tasks**: At least one task argument is required; `luchta run -p pkg` is an error.
 - **Error Reporting**: If no matches are found, Luchta provides a clear error distinguishing between "no packages matched the pattern" and "no tasks matched within the selected packages".
 
+#### Progress output
+
+With the default output mode, an interactive terminal with terminal control
+support (`TERM` is not `dumb`) gets one live status line that refreshes ten times
+per second. Task output, warnings, and diagnostics clear that line before they
+are printed, and progress resumes below them. Long running-task lists adapt to
+the available terminal width, keeping complete task names that fit and
+summarizing the remainder. When stderr is redirected or piped, or `TERM=dumb`,
+Luchta retains append-only status records every five seconds so logs remain
+readable and deterministic. `--output summary` suppresses progress in either
+environment and prints only the final summary.
 
 #### Failed Task Output
 

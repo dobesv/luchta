@@ -8,8 +8,8 @@ use clap::{Parser, Subcommand};
 /// and intentionally absent here.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum OutputMode {
-    /// Periodic wave-bucketed progress (every 5s, only when the run exceeds 5s)
-    /// plus a final summary line.
+    /// Live in-place progress on a capable interactive terminal (`TERM` is not
+    /// `dumb`), or append-only progress every 5s otherwise, plus a final summary.
     #[default]
     Default,
     /// Only the final summary line; no periodic progress.

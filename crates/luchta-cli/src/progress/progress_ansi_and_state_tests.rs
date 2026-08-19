@@ -1,9 +1,108 @@
 use super::super::*;
 use super::helpers::*;
+use luchta_test_support::require_nextest;
 use std::collections::{HashMap, HashSet};
+
+fn render_sample_summary(color: bool) -> String {
+    let task = task_id("pkg", "build");
+    let reporter =
+        ProgressReporter::new(OutputMode::Summary, HashMap::from([(task.clone(), 0)]), 1);
+    reporter.task_ran(&task);
+    owo_colors::with_override(color, || {
+        reporter.render_summary("10 MB", false, owo_colors::Stream::Stdout)
+    })
+}
+
+#[test]
+fn interactive_status_replaces_and_clears_one_terminal_line() {
+    let mut state = InteractiveStatusState::default();
+    let mut output = Vec::new();
+
+    state
+        .render(&mut output, "first", 79)
+        .expect("render first");
+    state
+        .render(&mut output, "second", 79)
+        .expect("render second");
+    state.clear(&mut output).expect("clear status");
+    state.clear(&mut output).expect("second clear is a no-op");
+
+    assert_eq!(
+        String::from_utf8(output).expect("status output is UTF-8"),
+        concat!("\r\x1b[2Kfirst", "\r\x1b[2Ksecond", "\r\x1b[2K",)
+    );
+}
+
+#[test]
+fn interactive_status_hard_limit_preserves_ansi_and_unicode_width() {
+    let line = "\x1b[31mabcdef 🐏 10 GB\x1b[0m";
+    let truncated = truncate_ansi(line, 10);
+
+    assert_eq!(visible_width(&truncated), 10);
+    assert!(truncated.starts_with("\x1b[31mabcdef "));
+    assert!(truncated.ends_with("…\x1b[0m"));
+}
+
+#[test]
+fn live_progress_compacts_running_tasks_and_preserves_fixed_status() {
+    require_nextest();
+    let tasks = [
+        task_id("alpha", "build"),
+        task_id("beta", "build"),
+        task_id("gamma-with-a-long-package-name", "build"),
+    ];
+    let reporter = ProgressReporter::new(
+        OutputMode::Default,
+        tasks.iter().cloned().map(|task| (task, 0)).collect(),
+        1,
+    );
+    for task in &tasks {
+        reporter.task_started(task);
+    }
+
+    let (line, wide_line) = owo_colors::with_override(true, || {
+        let pressure = pressure_snapshot(None, 0, 0);
+        let line = reporter.render_progress_for_width(ProgressRenderContext {
+            rss_formatted: "10 MB",
+            warnings: &[],
+            pressure: &pressure,
+            stream: owo_colors::Stream::Stderr,
+            max_width: Some(70),
+        });
+        let wide_line = reporter.render_progress_for_width(ProgressRenderContext {
+            rss_formatted: "10 MB",
+            warnings: &[],
+            pressure: &pressure,
+            stream: owo_colors::Stream::Stderr,
+            max_width: Some(500),
+        });
+        (line, wide_line)
+    });
+
+    assert!(visible_width(&line) <= 70, "line was too wide: {line:?}");
+    assert!(line.contains("🏃 3"), "running count was lost: {line}");
+    assert!(line.contains('…'), "hidden-task marker was absent: {line}");
+    assert!(!line.contains("more"), "marker repeated task count: {line}");
+    assert!(line.contains("⌚ "), "elapsed time was lost: {line}");
+    assert!(line.contains("🐏 10 MB"), "memory usage was lost: {line}");
+    assert!(line.contains("🌊 0 / 1"), "wave progress was lost: {line}");
+    assert!(line.contains('\u{1b}'), "ANSI styling was lost: {line:?}");
+
+    assert!(
+        !wide_line.contains('…'),
+        "wide status remained compacted: {wide_line}"
+    );
+    for task in &tasks {
+        assert!(
+            wide_line.contains(task.package.as_str()),
+            "wide status omitted {task}: {wide_line}"
+        );
+    }
+}
 
 #[test]
 fn render_progress_emits_no_ansi_when_color_unsupported() {
+    require_nextest();
     // Captured (non-tty) output must degrade to plain text identical to the
     // pre-color behavior: no ANSI escape sequences.
     let task = task_id("pkg", "build");
@@ -29,14 +128,8 @@ fn render_progress_emits_no_ansi_when_color_unsupported() {
 
 #[test]
 fn render_summary_emits_no_ansi_when_color_unsupported() {
-    let task = task_id("pkg", "build");
-    let reporter =
-        ProgressReporter::new(OutputMode::Summary, HashMap::from([(task.clone(), 0)]), 1);
-    reporter.task_ran(&task);
-
-    let summary = owo_colors::with_override(false, || {
-        reporter.render_summary("10 MB", false, owo_colors::Stream::Stdout)
-    });
+    require_nextest();
+    let summary = render_sample_summary(false);
 
     assert!(
         !summary.contains('\u{1b}'),
@@ -46,6 +139,7 @@ fn render_summary_emits_no_ansi_when_color_unsupported() {
 
 #[test]
 fn render_progress_colors_running_tasks_bright_black() {
+    require_nextest();
     // Currently running tasks in the status line are rendered in bright black
     // (light grey), not yellow — see issue #153. Guards against an accidental
     // revert since ANSI-stripping tests would not catch a color regression.
@@ -78,6 +172,7 @@ fn render_progress_colors_running_tasks_bright_black() {
 
 #[test]
 fn render_progress_emits_ansi_when_color_forced() {
+    require_nextest();
     // When color is force-enabled, the status line carries ANSI escapes,
     // while the underlying text (counts/emoji) is preserved. Exercise the
     // shared-cache (cyan) and pressure-warning (red) coloring paths too, not
@@ -123,14 +218,8 @@ fn render_progress_emits_ansi_when_color_forced() {
 
 #[test]
 fn render_summary_emits_ansi_when_color_forced() {
-    let task = task_id("pkg", "build");
-    let reporter =
-        ProgressReporter::new(OutputMode::Summary, HashMap::from([(task.clone(), 0)]), 1);
-    reporter.task_ran(&task);
-
-    let summary = owo_colors::with_override(true, || {
-        reporter.render_summary("10 MB", false, owo_colors::Stream::Stdout)
-    });
+    require_nextest();
+    let summary = render_sample_summary(true);
 
     assert!(
         summary.contains('\u{1b}'),

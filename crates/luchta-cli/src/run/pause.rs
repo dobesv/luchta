@@ -28,7 +28,7 @@ pub(super) enum PauseTick {
     /// Progress interval ticked — caller should render progress.
     ProgressDue,
     /// Shutdown signal arrived — caller should return interrupted.
-    Shutdown,
+    Shutdown(ShutdownSignal),
 }
 
 /// The real implementation (ProdPressureEnv) preserves the exact behavior
@@ -41,7 +41,7 @@ pub(super) trait PressureEnv {
     /// Await next tick event: re-check timer, progress interval, or shutdown.
     ///
     /// In production, this is `tokio::select!` over three futures.
-    async fn next_tick(&mut self) -> PauseTick;
+    async fn next_tick(&mut self) -> Result<PauseTick>;
 
     /// Render progress line using current pressure state.
     fn render_progress(&self);
@@ -56,7 +56,7 @@ pub(super) enum PressureClearance {
     /// Pressure cleared — caller should dispatch held task now.
     Dispatch,
     /// Shutdown signal fired during pause — caller should return interrupted.
-    Shutdown,
+    Shutdown(ShutdownSignal),
 }
 
 /// Drives pause loop using injected PressureEnv.
@@ -69,22 +69,26 @@ pub(super) enum PressureClearance {
 /// **Intentional pause-forever behavior**: If pressure never clears, this
 /// function will not return. User must interrupt with Ctrl-C/SIGTERM.
 /// This is BY DESIGN — we do NOT add timeout or auto-resume escape hatch.
-pub(super) async fn await_pressure_clearance<E: PressureEnv>(env: &mut E) -> PressureClearance {
+pub(super) async fn await_pressure_clearance<E: PressureEnv>(
+    env: &mut E,
+) -> Result<PressureClearance> {
     if !env.check().paused {
-        return PressureClearance::Dispatch;
+        return Ok(PressureClearance::Dispatch);
     }
 
     // **Intentional pause-forever behavior**: If pressure never clears,
     // this loop runs forever. No timeout escape hatch.
     loop {
-        match env.next_tick().await {
+        match env.next_tick().await? {
             PauseTick::ReCheck => {
                 if !env.check().paused {
-                    return PressureClearance::Dispatch;
+                    return Ok(PressureClearance::Dispatch);
                 }
             }
             PauseTick::ProgressDue => env.render_progress(),
-            PauseTick::Shutdown => return PressureClearance::Shutdown,
+            PauseTick::Shutdown(shutdown) => {
+                return Ok(PressureClearance::Shutdown(shutdown));
+            }
         }
     }
 }
@@ -113,18 +117,18 @@ impl<'a> PressureEnv for ProdPressureEnv<'a> {
         pressure
     }
 
-    async fn next_tick(&mut self) -> PauseTick {
-        tokio::select! {
+    async fn next_tick(&mut self) -> Result<PauseTick> {
+        Ok(tokio::select! {
             _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {
                 PauseTick::ReCheck
             }
             _ = self.progress_interval.tick() => {
                 PauseTick::ProgressDue
             }
-            _ = self.shutdown_signal.as_mut() => {
-                PauseTick::Shutdown
+            shutdown = self.shutdown_signal.as_mut() => {
+                PauseTick::Shutdown(shutdown?)
             }
-        }
+        })
     }
 
     fn render_progress(&self) {
@@ -146,15 +150,15 @@ fn render_status_line(
 
     let pressure = pressure_state.snapshot();
     let rss = crate::rss::format_rss(pressure.sample.map(|sample| sample.tree_rss));
-    eprintln!(
-        "{}",
-        reporter.render_progress(
-            &rss,
-            &pressure.reasons,
-            &pressure,
-            owo_colors::Stream::Stderr
-        )
-    );
+    let output = reporter.output();
+    let line = reporter.render_progress_for_width(crate::progress::ProgressRenderContext {
+        rss_formatted: &rss,
+        warnings: &pressure.reasons,
+        pressure: &pressure,
+        stream: owo_colors::Stream::Stderr,
+        max_width: output.terminal_width(),
+    });
+    output.progress_line(&line);
 }
 
 fn should_render(paused: bool, running_count: usize, mode: OutputMode) -> bool {
@@ -174,7 +178,9 @@ pub(super) async fn dispatch_loop(
     // and the inner pause loop (via ProdPressureEnv) poll this same future, so
     // a signal delivered while transitioning into the pause loop is never lost.
     let mut signal: ShutdownFuture = shutdown_signal();
-    let mut progress_interval = tokio::time::interval(super::progress_interval_duration());
+    let mut progress_interval = tokio::time::interval(super::progress_interval_duration(
+        ctx.reporter.uses_live_status(),
+    ));
     progress_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     progress_interval.tick().await;
 
@@ -182,21 +188,7 @@ pub(super) async fn dispatch_loop(
         tokio::select! {
             signal_result = signal.as_mut() => {
                 let shutdown = signal_result?;
-                ctx.interrupted.store(true, std::sync::atomic::Ordering::SeqCst);
-                let pressure = pressure_state.snapshot();
-                let rss = pressure
-                    .sample
-                    .map(|sample| sample.tree_rss)
-                    .or_else(crate::rss::process_tree_rss_bytes);
-                let msg = format!(
-                    "Interrupted by {}: {} tasks running after {}s; RSS: {}",
-                    shutdown.name(),
-                    ctx.reporter.running_count(),
-                    ctx.reporter.start.elapsed().as_secs(),
-                    crate::rss::format_rss(rss),
-                );
-                eprintln!("{}", msg.as_str().if_supports_color(owo_colors::Stream::Stderr, |t| t.red()));
-                break Err(miette::miette!("interrupted"));
+                break report_interrupted(ctx, pressure_state, Some(shutdown));
             }
             message = receiver.recv() => {
                 let Some((task_node, done_tx)) = message else {
@@ -213,7 +205,7 @@ pub(super) async fn dispatch_loop(
                     Arc::clone(&decision_semaphore),
                     decision_result_tx.clone(),
                 ) {
-                    if handle_decision_result(
+                    if let std::ops::ControlFlow::Break(shutdown) = handle_decision_result(
                         result,
                         ctx,
                         monitor,
@@ -222,9 +214,8 @@ pub(super) async fn dispatch_loop(
                         &mut signal,
                     )
                     .await?
-                    .is_break()
                     {
-                        return interrupted_during_pause(ctx, pressure_state);
+                        return report_interrupted(ctx, pressure_state, Some(shutdown));
                     }
                 }
             }
@@ -233,7 +224,7 @@ pub(super) async fn dispatch_loop(
                     break Ok(());
                 };
 
-                if handle_decision_result(
+                if let std::ops::ControlFlow::Break(shutdown) = handle_decision_result(
                     result,
                     ctx,
                     monitor,
@@ -242,9 +233,8 @@ pub(super) async fn dispatch_loop(
                     &mut signal,
                 )
                 .await?
-                .is_break()
                 {
-                    return interrupted_during_pause(ctx, pressure_state);
+                    return report_interrupted(ctx, pressure_state, Some(shutdown));
                 }
             }
             _ = progress_interval.tick() => render_status_line(ctx.reporter, pressure_state, false),
@@ -266,7 +256,7 @@ async fn handle_decision_result(
     pressure_state: &Arc<PressureState>,
     progress_interval: &mut tokio::time::Interval,
     signal: &mut ShutdownFuture,
-) -> Result<std::ops::ControlFlow<()>> {
+) -> Result<std::ops::ControlFlow<ShutdownSignal>> {
     let Some(ready) = dispatch_decision_result(result, ctx)? else {
         return Ok(std::ops::ControlFlow::Continue(()));
     };
@@ -278,12 +268,12 @@ async fn handle_decision_result(
         progress_reporter: ctx.reporter,
         shutdown_signal: signal,
     };
-    match await_pressure_clearance(&mut env).await {
+    match await_pressure_clearance(&mut env).await? {
         PressureClearance::Dispatch => {
             dispatch_ready_task(ready, ctx);
             Ok(std::ops::ControlFlow::Continue(()))
         }
-        PressureClearance::Shutdown => Ok(std::ops::ControlFlow::Break(())),
+        PressureClearance::Shutdown(shutdown) => Ok(std::ops::ControlFlow::Break(shutdown)),
     }
 }
 
@@ -313,9 +303,10 @@ where
         .into_diagnostic()
 }
 
-fn interrupted_during_pause(
+fn report_interrupted(
     ctx: &DispatchContext<'_>,
     pressure_state: &PressureState,
+    shutdown: Option<ShutdownSignal>,
 ) -> Result<()> {
     ctx.interrupted
         .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -324,16 +315,20 @@ fn interrupted_during_pause(
         .sample
         .map(|sample| sample.tree_rss)
         .or_else(crate::rss::process_tree_rss_bytes);
-    let msg = format!(
-        "Interrupted: {} tasks running after {}s; RSS: {}",
+    let source = shutdown
+        .map(|signal| format!(" by {}", signal.name()))
+        .unwrap_or_default();
+    let message = format!(
+        "Interrupted{source}: {} tasks running after {}s; RSS: {}",
         ctx.reporter.running_count(),
         ctx.reporter.start.elapsed().as_secs(),
         crate::rss::format_rss(rss),
     );
-    eprintln!(
-        "{}",
-        msg.as_str()
+    ctx.reporter.output().stderr_line(
+        &message
+            .as_str()
             .if_supports_color(owo_colors::Stream::Stderr, |t| t.red())
+            .to_string(),
     );
     Err(miette::miette!("interrupted"))
 }
@@ -385,10 +380,11 @@ mod tests {
                 .expect("FakePressureEnv: check() called but no results remaining")
         }
 
-        async fn next_tick(&mut self) -> PauseTick {
-            self.tick_events
+        async fn next_tick(&mut self) -> Result<PauseTick> {
+            Ok(self
+                .tick_events
                 .pop_front()
-                .expect("FakePressureEnv: next_tick() called but no events remaining")
+                .expect("FakePressureEnv: next_tick() called but no events remaining"))
         }
 
         fn render_progress(&self) {
@@ -440,7 +436,9 @@ mod tests {
         tick_events: Vec<PauseTick>,
     ) -> PauseOutcome {
         let mut env = FakePressureEnv::new(check_results, tick_events);
-        let clearance = await_pressure_clearance(&mut env).await;
+        let clearance = await_pressure_clearance(&mut env)
+            .await
+            .expect("pause clearance should succeed");
         PauseOutcome {
             clearance,
             checks: env.check_count(),
@@ -473,9 +471,16 @@ mod tests {
 
     #[tokio::test]
     async fn pause_loop_returns_shutdown_when_interrupted() {
-        let out = drive(vec![paused_pressure()], vec![PauseTick::Shutdown]).await;
+        let out = drive(
+            vec![paused_pressure()],
+            vec![PauseTick::Shutdown(ShutdownSignal::CtrlC)],
+        )
+        .await;
 
-        assert_eq!(out.clearance, PressureClearance::Shutdown);
+        assert_eq!(
+            out.clearance,
+            PressureClearance::Shutdown(ShutdownSignal::CtrlC)
+        );
         assert_eq!(out.checks, 1);
     }
 
@@ -528,6 +533,22 @@ mod tests {
         assert!(should_render(true, 2, OutputMode::Default));
         assert!(!should_render(false, 0, OutputMode::Default));
         assert!(should_render(false, 2, OutputMode::Default));
+    }
+
+    #[test]
+    fn live_and_redirected_progress_use_distinct_default_cadences() {
+        assert_eq!(
+            super::super::progress_interval_duration_from_value(true, None),
+            std::time::Duration::from_millis(100)
+        );
+        assert_eq!(
+            super::super::progress_interval_duration_from_value(false, None),
+            std::time::Duration::from_secs(5)
+        );
+        assert_eq!(
+            super::super::progress_interval_duration_from_value(true, Some("250")),
+            std::time::Duration::from_millis(250)
+        );
     }
 
     #[tokio::test]

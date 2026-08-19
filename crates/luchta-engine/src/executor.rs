@@ -135,6 +135,19 @@ pub struct ExecutionLogSink {
     lines: Arc<Mutex<Vec<CapturedLogLine>>>,
     reports: Arc<Mutex<Vec<CollectedReport>>>,
     progress: Arc<Mutex<Option<TaskProgress>>>,
+    #[cfg(unix)]
+    diagnostic_writer: Arc<Mutex<Option<DiagnosticWriter>>>,
+}
+
+#[cfg(unix)]
+#[derive(Clone)]
+struct DiagnosticWriter(Arc<dyn Fn(&str) + Send + Sync>);
+
+#[cfg(unix)]
+impl std::fmt::Debug for DiagnosticWriter {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("DiagnosticWriter(..)")
+    }
 }
 
 impl ExecutionLogSink {
@@ -157,6 +170,33 @@ impl ExecutionLogSink {
         let mut reports = self.reports.lock().expect("execution log sink poisoned");
         reports.retain(|existing| existing.filename != report.filename);
         reports.push(report);
+    }
+
+    #[cfg(unix)]
+    pub fn set_diagnostic_writer(&self, writer: impl Fn(&str) + Send + Sync + 'static) {
+        *self
+            .diagnostic_writer
+            .lock()
+            .expect("execution log sink poisoned") = Some(DiagnosticWriter(Arc::new(writer)));
+    }
+
+    #[cfg(not(unix))]
+    pub fn set_diagnostic_writer(&self, _writer: impl Fn(&str) + Send + Sync + 'static) {}
+
+    /// Writes an immediately visible engine diagnostic through the caller's
+    /// synchronized console, returning `false` when no writer was installed.
+    #[cfg(unix)]
+    pub(crate) fn write_diagnostic(&self, message: &str) -> bool {
+        let writer = self
+            .diagnostic_writer
+            .lock()
+            .expect("execution log sink poisoned")
+            .clone();
+        let Some(writer) = writer else {
+            return false;
+        };
+        (writer.0)(message);
+        true
     }
 
     #[must_use]
@@ -547,6 +587,28 @@ mod tests {
             .arg("exit 0")
             .status()
             .expect("create success exit status")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execution_sink_forwards_visible_diagnostics_to_installed_writer() {
+        let sink = ExecutionLogSink::new();
+        assert!(!sink.write_diagnostic("before installation"));
+
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let callback_received = Arc::clone(&received);
+        sink.set_diagnostic_writer(move |message| {
+            callback_received
+                .lock()
+                .expect("diagnostic callback mutex poisoned")
+                .push(message.to_owned());
+        });
+
+        assert!(sink.write_diagnostic("worker warning"));
+        assert_eq!(
+            *received.lock().expect("diagnostic callback mutex poisoned"),
+            vec!["worker warning"]
+        );
     }
 
     #[test]

@@ -195,9 +195,12 @@ impl WorkerManager {
                     ..
                 }) => {
                     if !luchta_worker::is_valid_report_filename(&filename) {
-                        eprintln!(
-                            "warning: dropping worker report with invalid filename for worker '{}' job '{}': {}",
-                            worker_name, job_id, filename
+                        write_diagnostic(
+                            sink,
+                            &format!(
+                                "warning: dropping worker report with invalid filename for worker '{}' job '{}': {}",
+                                worker_name, job_id, filename
+                            ),
                         );
                         continue;
                     }
@@ -261,7 +264,10 @@ impl WorkerManager {
             Err(WorkerError::Crashed { worker, id, .. })
                 if !self.is_shutdown.load(Ordering::SeqCst) =>
             {
-                eprintln!("warning: worker '{worker}' crashed during job '{id}', retrying once");
+                write_diagnostic(
+                    sink,
+                    &format!("warning: worker '{worker}' crashed during job '{id}', retrying once"),
+                );
                 self.round_trip(worker_name, retry_message, |_, _, _| {}, sink, select)
                     .await
             }
@@ -495,6 +501,14 @@ impl WorkerManager {
             }
         }
     }
+}
+
+#[cfg(unix)]
+fn write_diagnostic(sink: Option<&ExecutionLogSink>, message: &str) {
+    if sink.is_some_and(|sink| sink.write_diagnostic(message)) {
+        return;
+    }
+    eprintln!("{message}");
 }
 
 #[cfg(unix)]
