@@ -25,7 +25,7 @@ use luchta_workspace::PackageGraph;
 
 use std::sync::OnceLock;
 
-use super::output::{hydrate_local_cache, replay_logs};
+use super::output::hydrate_local_cache;
 use crate::watch::registry::{register_task_watch_state, register_task_watch_state_from_packages};
 
 /// Shared empty env map used as a stable fallback when a task has no entry in
@@ -1238,9 +1238,9 @@ fn try_shared_cache_skip(
                         &hit,
                         &ctx.reporter.output(),
                     );
-                    // (c) Replay the restored task's captured stdout/stderr so a
-                    // shared-cache hit produces the same visible output as on main.
-                    replay_logs(&hit, &ctx.reporter);
+                    // (c) Keep the restored stdout/stderr captured in the hydrated
+                    // local cache. Successful fresh runs and local cache hits are
+                    // silent, so a shared hit must not replay them to the console.
                     // (d) Refresh the entry so it survives the day window: a
                     // hit re-merges it into today's write bucket (already in
                     // the read set by construction) and advances the meta's
@@ -2358,43 +2358,6 @@ mod tests {
         };
 
         assert_eq!(record.run_reason, None);
-    }
-
-    #[test]
-    fn replay_logs_accepts_restored_hit_output() {
-        let reporter = Arc::new(ProgressReporter::new(
-            OutputMode::Default,
-            HashMap::new(),
-            0,
-        ));
-        let task_id = TaskId::new("pkg", "build");
-        let record = match build_run_record(
-            &sample_cache_write_context(task_id),
-            BuildRunRecordArgs {
-                outcome: None,
-                succeeded: true,
-                end_unix_ms: 20,
-                run_reason: Some(RunReason::NoPriorRecord),
-            },
-        ) {
-            BuildRecordResult::Ok(record) => *record,
-            BuildRecordResult::ExpansionError(msg) => panic!("unexpected expansion error: {msg}"),
-            BuildRecordResult::StabilityMismatch(msg) => {
-                panic!("unexpected stability mismatch: {msg}")
-            }
-        };
-        let hit = RestoredHit {
-            record,
-            outputs_hash: [9; 32],
-            stdout: b"restored stdout\n".to_vec(),
-            stderr: b"restored stderr\n".to_vec(),
-            reports: Vec::new(),
-        };
-
-        // Restored stdout/stderr replay for a shared-cache hit must not panic and
-        // is wired back into the shared-cache-hit path (regression guard: this
-        // call was dropped during the owned-decision-context refactor).
-        replay_logs(&hit, &reporter);
     }
 
     #[test]
