@@ -37,10 +37,31 @@ impl Drop for BuildLock {
 }
 
 pub async fn acquire(cache_dir: &Path) -> miette::Result<Option<BuildLock>> {
-    acquire_with_cancel(cache_dir, tokio::signal::ctrl_c()).await
+    acquire_with_cancel_and_output(cache_dir, tokio::signal::ctrl_c(), true).await
 }
 
+/// Acquire the build lock without printing the normal contention notice.
+///
+/// Polling commands use this so repeated lock races do not produce one message
+/// per poll. Cancellation behavior is identical to [`acquire`]: `Ok(None)` is
+/// returned only when cancellation wins before the lock is acquired.
+pub async fn acquire_quiet(cache_dir: &Path) -> miette::Result<Option<BuildLock>> {
+    acquire_with_cancel_and_output(cache_dir, tokio::signal::ctrl_c(), false).await
+}
+
+#[cfg(test)]
 async fn acquire_with_cancel<F>(cache_dir: &Path, cancel: F) -> miette::Result<Option<BuildLock>>
+where
+    F: Future<Output = io::Result<()>>,
+{
+    acquire_with_cancel_and_output(cache_dir, cancel, true).await
+}
+
+async fn acquire_with_cancel_and_output<F>(
+    cache_dir: &Path,
+    cancel: F,
+    announce_contention: bool,
+) -> miette::Result<Option<BuildLock>>
 where
     F: Future<Output = io::Result<()>>,
 {
@@ -58,10 +79,14 @@ where
         .into_diagnostic()
         .wrap_err_with(|| format!("failed to open build lock file {}", lock_path.display()))?;
 
-    try_acquire_with_cancel(file, cancel).await
+    try_acquire_with_cancel(file, cancel, announce_contention).await
 }
 
-async fn try_acquire_with_cancel<F>(file: File, cancel: F) -> miette::Result<Option<BuildLock>>
+async fn try_acquire_with_cancel<F>(
+    file: File,
+    cancel: F,
+    announce_contention: bool,
+) -> miette::Result<Option<BuildLock>>
 where
     F: Future<Output = io::Result<()>>,
 {
@@ -72,7 +97,9 @@ where
         Err(returned_box) => boxed = returned_box,
     }
 
-    eprintln!("Waiting for concurrent build ...");
+    if announce_contention {
+        eprintln!("Waiting for concurrent build ...");
+    }
     tokio::pin!(cancel);
 
     loop {

@@ -75,7 +75,8 @@ fn shell_single_quote_path(path: &Path) -> String {
 }
 
 fn worker_bin() -> PathBuf {
-    std::env::var_os("CARGO_BIN_EXE_luchta-file-exists-filter")
+    std::env::var_os("NEXTEST_BIN_EXE_luchta_file_exists_filter")
+        .or_else(|| std::env::var_os("CARGO_BIN_EXE_luchta-file-exists-filter"))
         .map(PathBuf::from)
         .expect("cargo sets binary path for integration tests")
 }

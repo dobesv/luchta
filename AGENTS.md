@@ -65,6 +65,14 @@ line; when run under `cargo test` they panic with guidance instead of failing
 spuriously. When adding a test that mutates process-global state, call
 `require_nextest()` first and add `luchta-test-support` as a `[dev-dependency]`.
 
+Nextest runs every test through the repository's hermetic environment wrapper
+in `.config/nextest.toml`. Host environment variables are removed unless they
+are runtime essentials, Cargo/nextest metadata, dynamic-loader or coverage
+settings, or the explicit `LUCHTA_TEST_RCLONE` opt-in. When a test suite needs
+a new ambient customization, add its exact variable to both wrapper scripts'
+allowlists and cover that behavior with a test; do not allow all `LUCHTA_*`
+variables through.
+
 ## Conventions
 - **No `target/`:** Never commit `target/` directories.
 - **Error Types:** Library errors should be clear and descriptive using `thiserror`.
