@@ -99,6 +99,7 @@ oxc_formatter_core = { git = "https://github.com/oxc-project/oxc.git", rev = "41
 oxc_formatter_css = { git = "https://github.com/oxc-project/oxc.git", rev = "415fe1e7bb423cf05019c5e2c9a5705eebbc5447", default-features = false }
 json-strip-comments = "3.1.1"
 serde-sarif = "0.8.0"
+url = "2.5.8"
 
 # swc pinned exact — SWC breaks public API on minor bumps. See plan note a394e139 (probe).
 swc_core = { version = "=74.0.2", features = ["base_module", "common", "ecma_ast", "ecma_parser", "ecma_helpers_inline"] }
