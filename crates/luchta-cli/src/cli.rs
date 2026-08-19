@@ -149,6 +149,20 @@ pub enum Commands {
         #[arg(long)]
         show_changed_files: bool,
     },
+    /// Wait for another process to bring tasks and their dependencies up to date.
+    Await {
+        /// Task names to wait for; supports glob wildcards.
+        tasks: Vec<String>,
+
+        /// Match package NAMEs (not paths); supports glob wildcards. Repeat to target multiple packages.
+        #[arg(short = 'p', long = "package")]
+        packages: Vec<String>,
+
+        /// Match the given task names as top-level (workspace-root) tasks
+        /// instead of package tasks.
+        #[arg(short = 'T', long = "top-level")]
+        top_level: bool,
+    },
     /// View cached logs and metadata for previously executed tasks.
     Logs {
         /// Task names to match; supports glob wildcards.

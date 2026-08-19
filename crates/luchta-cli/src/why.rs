@@ -15,19 +15,16 @@ use luchta_cache::{
     FileStateResolver, ListingCache, DECIDE_FILES_DIFF_LIMIT,
 };
 use luchta_engine::ResolveMode;
-use luchta_types::{EnvSpec, PackageName, TaskDefinition, TaskId};
-use luchta_workspace::PackageNode;
+use luchta_types::{EnvSpec, PackageName, TaskId};
+use luchta_workspace::PackageGraph;
 use miette::Result;
 
-use crate::cache_ctx::{
-    build_current_state, gather_pkg_dep_pairs_filtered, load_lockfile_state, PackageDirResolver,
-};
-use crate::cache_nonce::resolve_cache_nonce;
-use crate::env_merge::merge_env;
+use crate::cache_ctx::{load_lockfile_state, PackageDirResolver};
 use crate::format::package_and_task_display;
+use crate::live_cache_state::{build_live_task_state, LiveCacheContext};
 use crate::run::{
-    build_globset, collect_matched_package_names, collect_requested_subgraph, prepare_workspace,
-    CollectSubgraphRequest, PreparedWorkspace, TaskSelection,
+    analyze_tasks, build_globset, collect_matched_package_names, collect_requested_subgraph,
+    prepare_workspace, CollectSubgraphRequest, PreparedWorkspace, TaskAnalysis, TaskSelection,
 };
 use luchta_engine::{PrunedTask, TaskGraph};
 
@@ -42,10 +39,13 @@ pub(crate) struct WhyOptions<'a> {
 /// Context struct for print_why_for_task, grouping related parameters.
 struct WhyContext<'a> {
     prepared: &'a PreparedWorkspace,
+    package_graph: Arc<PackageGraph>,
     cache: &'a Cache,
     prune_reasons: &'a HashMap<TaskId, String>,
+    invalid: &'a HashMap<TaskId, String>,
     task_envs: &'a HashMap<TaskId, BTreeMap<String, EnvSpec>>,
     lockfile_state: &'a crate::cache_ctx::LockfileState,
+    listing_cache: std::sync::Arc<ListingCache>,
     workspace_root: &'a Path,
     show_inputs: bool,
     show_outputs: bool,
@@ -70,9 +70,6 @@ pub async fn execute_why(workspace_root: &Path, options: &WhyOptions<'_>) -> Res
         .map(|p| (p.task_id.clone(), p.outcome.describe()))
         .collect();
 
-    // Identify all task IDs we'd consider for the "now" decision
-    let all_task_ids: HashSet<TaskId> = prepared.task_graph.nodes().map(|n| n.id.clone()).collect();
-
     // Determine which task IDs match the selection
     let selected_ids = select_task_ids(
         &prepared.task_graph,
@@ -92,15 +89,18 @@ pub async fn execute_why(workspace_root: &Path, options: &WhyOptions<'_>) -> Res
     let mut sorted_ids: Vec<TaskId> = selected_ids.into_iter().collect();
     sorted_ids.sort_by_key(|id| id.to_string());
 
-    // Build env map: task_id -> merged env (global + worker + task-specific)
-    let task_envs = build_task_envs(&prepared, &all_task_ids);
+    let TaskAnalysis { invalid, task_envs } = analyze_tasks(&prepared, workspace_root);
+    let package_graph = Arc::new(prepared.package_graph.clone());
 
     let ctx = WhyContext {
         prepared: &prepared,
+        package_graph,
         cache: &cache,
         prune_reasons: &prune_reasons,
+        invalid: &invalid,
         task_envs: &task_envs,
         lockfile_state: &lockfile_state,
+        listing_cache: std::sync::Arc::new(ListingCache::default()),
         workspace_root,
         show_inputs: options.show_inputs,
         show_outputs: options.show_outputs,
@@ -290,7 +290,7 @@ fn print_why_for_task(task_id: &TaskId, ctx: &WhyContext<'_>) {
 
     // (2) Check for invalid task (no worker / unknown worker) - must check BEFORE decide()
     // because a task with command but no worker should show as invalid, not as cache hit/miss.
-    if let Some(reason) = get_invalid_task_reason(task_id, ctx.prepared) {
+    if let Some(reason) = ctx.invalid.get(task_id) {
         println!("  would run: {}", reason);
         return;
     }
@@ -300,48 +300,7 @@ fn print_why_for_task(task_id: &TaskId, ctx: &WhyContext<'_>) {
     print_last_ran(&prior);
 
     // (4) "now" (live would-it-run)
-    if let Some(task_def) = ctx.prepared.task_graph.task_definition(task_id) {
-        print_live_decision(task_id, ctx, &prior, task_def.clone());
-    } else {
-        println!("  would run: no task definition found");
-    }
-}
-
-/// Returns the reason if a task is invalid (no worker or unknown worker).
-/// Mirrors the validation logic in dispatch.rs build_command_map.
-fn get_invalid_task_reason(task_id: &TaskId, prepared: &PreparedWorkspace) -> Option<String> {
-    let task_def = prepared.task_graph.task_definition(task_id)?;
-    let worker = task_def.worker.as_deref();
-
-    match worker {
-        Some(worker_name) => {
-            if !prepared.workers.contains_key(worker_name) {
-                Some(format!(
-                    "task '{}' references unknown worker '{}'",
-                    task_id, worker_name
-                ))
-            } else {
-                None
-            }
-        }
-        None => {
-            // Task has no worker - check if it has a command
-            if task_def
-                .command
-                .as_deref()
-                .map(|c| !c.trim().is_empty())
-                .unwrap_or(false)
-            {
-                Some(format!(
-                    "task '{}' defines a command but no worker; specify a worker to execute it",
-                    task_id
-                ))
-            } else {
-                // No worker, no command - not invalid (e.g., synthetic/connector tasks)
-                None
-            }
-        }
-    }
+    print_live_decision(task_id, ctx, &prior);
 }
 
 fn print_last_ran(prior: &Option<luchta_cache::TaskRunRecord>) {
@@ -361,53 +320,34 @@ fn print_live_decision(
     task_id: &TaskId,
     ctx: &WhyContext<'_>,
     prior: &Option<luchta_cache::TaskRunRecord>,
-    task_def: TaskDefinition,
 ) {
-    let nonce = resolve_task_nonce(&task_def, ctx.prepared);
-
-    let Some((package_path, package_name)) =
-        get_package_context(task_id, &ctx.prepared.packages, ctx.workspace_root)
-    else {
-        println!("  would run: no package context");
-        return;
+    let live_context = LiveCacheContext {
+        prepared: ctx.prepared,
+        package_graph: &ctx.package_graph,
+        cache: ctx.cache,
+        task_envs: ctx.task_envs,
+        lockfile_state: ctx.lockfile_state,
+        workspace_root: ctx.workspace_root,
+        listing_cache: std::sync::Arc::clone(&ctx.listing_cache),
     };
-
-    let resolver = PackageDirResolver::new(
-        package_path.clone(),
-        ctx.workspace_root.to_path_buf(),
-        package_name.clone(),
-        ctx.prepared.package_graph.clone(),
-        Arc::new(ListingCache::default()),
-    );
-
-    let dep_outputs = build_dep_outputs_from_cache(task_id, ctx.prepared, ctx.cache);
-
-    let package = PackageNode::new(package_name.clone(), package_path.clone());
-    let pkg_dep_pairs = gather_pkg_dep_pairs_filtered(
-        &package,
-        Some(&ctx.prepared.package_graph),
-        ctx.workspace_root,
-        ctx.lockfile_state,
-        &task_def.dependencies,
-    )
-    .unwrap_or_default();
-
-    let empty_env = BTreeMap::new();
-    let merged_env = ctx.task_envs.get(task_id).unwrap_or(&empty_env);
-    let current = build_current_state(
-        &task_def,
-        merged_env,
-        dep_outputs,
-        &pkg_dep_pairs,
-        &resolver,
-        nonce.as_deref(),
-    );
+    let state = match build_live_task_state(task_id, &live_context) {
+        Ok(Some(state)) => state,
+        Ok(None) => {
+            println!("  would run: no task definition or package context");
+            return;
+        }
+        Err(error) => {
+            println!("  would run: failed to construct cache state: {error}");
+            return;
+        }
+    };
+    let current = state.current_state();
 
     let decision = decide(prior.as_ref(), &current);
     print_decision(&decision);
 
     if ctx.show_inputs || ctx.show_outputs {
-        print_file_diffs(ctx, prior, &current, &resolver);
+        print_file_diffs(ctx, prior, &current, state.resolver());
     }
 }
 
@@ -449,85 +389,6 @@ fn print_file_diffs(
             );
         }
     }
-}
-
-/// Build dep_outputs map from cached dependency records.
-///
-/// For each dependency task of the target task, reads the cached record and extracts
-/// its outputs_hash. Dependencies without cached records are omitted (they would
-/// re-run anyway). Mirrors dependency_output_hashes in dispatch.rs but sources from
-/// cache records instead of live output_hashes.
-fn build_dep_outputs_from_cache(
-    task_id: &TaskId,
-    prepared: &PreparedWorkspace,
-    cache: &Cache,
-) -> BTreeMap<String, [u8; 32]> {
-    let deps = prepared.task_graph.dependencies_of(task_id);
-
-    deps.into_iter()
-        .filter_map(|dep| {
-            let dep_id_str = dep.id.to_string();
-            let record = cache.read(&dep_id_str)?;
-            Some((dep_id_str, record.outputs_hash))
-        })
-        .collect()
-}
-
-fn resolve_task_nonce(task_def: &TaskDefinition, prepared: &PreparedWorkspace) -> Option<String> {
-    let env_nonce = std::env::var("LUCHTA_CACHE_NONCE").ok();
-    let global_nonce = prepared.global_cache_nonce.as_deref();
-    // Worker nonce: sparse lookup — missing worker or dangling ref yields None
-    let worker_nonce = task_def
-        .worker
-        .as_deref()
-        .and_then(|w| prepared.workers.get(w))
-        .and_then(|wd| wd.cache.as_ref())
-        .and_then(|c| c.cache_nonce.as_deref());
-    // Task nonce
-    let task_nonce = task_def
-        .cache
-        .as_ref()
-        .and_then(|c| c.cache_nonce.as_deref());
-
-    resolve_cache_nonce(env_nonce.as_deref(), global_nonce, worker_nonce, task_nonce)
-}
-
-fn get_package_context(
-    task_id: &TaskId,
-    packages: &[PackageNode],
-    workspace_root: &Path,
-) -> Option<(std::path::PathBuf, PackageName)> {
-    if task_id.is_root() {
-        // Root task: use workspace root as package path (matches dispatch.rs behavior)
-        return Some((workspace_root.to_path_buf(), task_id.package.clone()));
-    }
-
-    // Find package by name
-    packages
-        .iter()
-        .find(|p| p.name == task_id.package)
-        .map(|p| (p.path.clone(), p.name.clone()))
-}
-
-fn build_task_envs(
-    prepared: &PreparedWorkspace,
-    all_task_ids: &HashSet<TaskId>,
-) -> HashMap<TaskId, BTreeMap<String, EnvSpec>> {
-    let mut task_envs = HashMap::new();
-
-    for task_id in all_task_ids {
-        if let Some(task_def) = prepared.task_graph.task_definition(task_id) {
-            // Get worker env if task has a worker
-            let worker_env = task_def
-                .worker
-                .as_deref()
-                .and_then(|w| prepared.workers.get(w).map(|wd| &wd.env));
-            let merged = merge_env(&prepared.env, worker_env, &task_def.env);
-            task_envs.insert(task_id.clone(), merged);
-        }
-    }
-
-    task_envs
 }
 
 /// Arguments for file diff output.

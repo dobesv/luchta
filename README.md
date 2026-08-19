@@ -172,6 +172,13 @@ git diff --no-color --binary e578159b7ae473127056a65748d7b3a4daa9a93f..9ed9a7d05
 
 `cargo nextest run --workspace` is canonical test command for this workspace. Some tests call `require_nextest()` because they touch process-global state like cwd or real environment variables and rely on nextest's per-test process isolation. Plain `cargo test` will make those tests panic with guidance instead of failing nondeterministically.
 
+Nextest also wraps each test in a hermetic environment. Ambient Luchta settings
+such as `LUCHTA_SHARED_CACHE` are removed so a developer's shell or CI runner
+cannot silently change test behavior. The wrapper preserves only process
+essentials, Cargo/nextest metadata and binary paths, dynamic-loader and coverage
+settings, and the intentional `LUCHTA_TEST_RCLONE` opt-in used by the remote
+cache suite.
+
 Before committing, run full pipeline (see `AGENTS.md` for details):
 
 ```bash
@@ -488,6 +495,36 @@ Additional targeting rules:
 - **AND Logic**: Filters across dimensions are combined, including `--since` (e.g. `-p pkg --since main build` matches goals where package name matches `pkg`, task name matches `build`, and package is in affected set).
 - **Mandatory Tasks**: At least one task argument is required; `luchta run -p pkg` is an error.
 - **Error Reporting**: If no matches are found, Luchta provides a clear error distinguishing between "no packages matched the pattern" and "no tasks matched within the selected packages".
+
+### Awaiting Task Readiness
+
+Use `luchta await build` as a passive barrier when another `luchta run` or
+`luchta watch` process is responsible for building. It snapshots task selection
+and configuration at startup, then checks the selected targets and their full
+dependency subgraph once per second. Package globs, `-T` / `--top-level`,
+`--workspace-root`, and implicit package selection work the same way as for
+`run`:
+
+```bash
+luchta await build
+luchta await -p '@repo/*' build test
+luchta await -T build
+```
+
+`await` never executes a task and never restores outputs from the shared cache.
+It succeeds only after local run records and filesystem outputs show that the
+whole selected subgraph is current. It waits for an active build cycle to
+release the repository build lock before inspecting state, then releases the
+lock between polls so a watch process can build. Ctrl-C cancels either the lock
+wait or the one-second delay cleanly and exits with status 0.
+
+`await` exits non-zero instead of waiting if a selected task is invalid or its
+cache state cannot be inspected.
+
+Unlike `run`, `await` cannot make progress by itself. Unlike `watch`, it does not
+monitor files or start rebuilds. Unlike `run --dry-run`, it checks actual local
+readiness instead of printing an execution plan. There is no timeout: if no
+matching builder is running, or builds keep failing, it waits indefinitely.
 
 #### Progress output
 

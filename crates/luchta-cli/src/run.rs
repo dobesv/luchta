@@ -105,6 +105,30 @@ pub struct PreparedWorkspace {
     pub global_cache_nonce: Option<String>,
 }
 
+/// Read-only task planning facts shared with commands that inspect the graph
+/// without executing it.
+pub(crate) struct TaskAnalysis {
+    pub(crate) invalid: HashMap<TaskId, String>,
+    pub(crate) task_envs: HashMap<TaskId, BTreeMap<String, EnvSpec>>,
+}
+
+pub(crate) fn analyze_tasks(prepared: &PreparedWorkspace, workspace_root: &Path) -> TaskAnalysis {
+    let CommandMap {
+        commands: _,
+        invalid,
+        task_envs,
+    } = build_command_map(
+        &prepared.task_graph,
+        &prepared.packages,
+        workspace_root,
+        &prepared.env,
+        &prepared.workers,
+        Some(&prepared.package_graph),
+    );
+
+    TaskAnalysis { invalid, task_envs }
+}
+
 enum SinceSelection {
     /// No affected packages — caller should no-op with exit 0.
     NoOp,

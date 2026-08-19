@@ -1,3 +1,4 @@
+mod await_cmd;
 mod build_lock;
 mod cache_ctx;
 mod cache_nonce;
@@ -7,6 +8,7 @@ mod env_conflict;
 mod env_merge;
 mod format;
 mod list;
+mod live_cache_state;
 mod logs;
 mod memory_pressure;
 mod outcome;
@@ -150,6 +152,11 @@ async fn run(cli: Cli) -> Result<()> {
     match cli.command {
         command @ Commands::Run { .. } => run_command(&workspace_root, command).await,
         command @ Commands::Watch { .. } => watch_command(&workspace_root, command).await,
+        Commands::Await {
+            tasks,
+            packages,
+            top_level,
+        } => dispatch_await(&workspace_root, tasks, packages, top_level).await,
         Commands::Logs {
             tasks,
             packages,
@@ -198,15 +205,7 @@ async fn run(cli: Cli) -> Result<()> {
             )
             .await
         }
-        Commands::List {
-            tasks,
-            packages,
-            top_level,
-            json,
-        } => {
-            let packages = apply_implicit_package(packages, top_level, &workspace_root)?;
-            list::execute_list(&workspace_root, tasks, packages, top_level, json).await
-        }
+        command @ Commands::List { .. } => dispatch_list(&workspace_root, command).await,
         Commands::Check => dispatch_check(&workspace_root).await,
     }
 }
@@ -230,8 +229,43 @@ async fn dispatch_logs(workspace_root: &Path, options: LogsOptions<'_>) -> Resul
     logs::execute_logs(workspace_root, &options).await
 }
 
+async fn dispatch_await(
+    workspace_root: &Path,
+    tasks: Vec<String>,
+    packages: Vec<String>,
+    top_level: bool,
+) -> Result<()> {
+    let packages = apply_implicit_package(packages, top_level, workspace_root)?;
+    if tasks.is_empty() {
+        return Err(miette::miette!("no tasks specified for await command"));
+    }
+    await_cmd::execute_await(
+        workspace_root,
+        &await_cmd::AwaitOptions {
+            tasks: &tasks,
+            packages: &packages,
+            top_level,
+        },
+    )
+    .await
+}
+
 async fn dispatch_why(workspace_root: &Path, options: why::WhyOptions<'_>) -> Result<()> {
     why::execute_why(workspace_root, &options).await
+}
+
+async fn dispatch_list(workspace_root: &Path, command: Commands) -> Result<()> {
+    let Commands::List {
+        tasks,
+        packages,
+        top_level,
+        json,
+    } = command
+    else {
+        unreachable!("dispatch_list only accepts the list command");
+    };
+    let packages = apply_implicit_package(packages, top_level, workspace_root)?;
+    list::execute_list(workspace_root, tasks, packages, top_level, json).await
 }
 
 async fn dispatch_check(workspace_root: &Path) -> Result<()> {
@@ -355,6 +389,7 @@ fn command_run_args(command: Commands) -> RunArgs {
             since,
         },
         Commands::Watch { .. }
+        | Commands::Await { .. }
         | Commands::Logs { .. }
         | Commands::Why { .. }
         | Commands::List { .. }
@@ -569,6 +604,60 @@ fn resolve_max_weight_override(
 mod tests {
     use super::*;
     use crate::cli::OutputMode;
+
+    #[test]
+    fn await_command_parses_task_and_selection_flags() {
+        let cli = Cli::try_parse_from([
+            "luchta",
+            "await",
+            "build",
+            "test*",
+            "-p",
+            "app-*",
+            "-p",
+            "lib",
+            "-T",
+            "--workspace-root",
+            "/workspace",
+        ])
+        .expect("await arguments should parse");
+
+        assert_eq!(
+            cli.workspace_root,
+            Some(std::path::PathBuf::from("/workspace"))
+        );
+        let Commands::Await {
+            tasks,
+            packages,
+            top_level,
+        } = cli.command
+        else {
+            panic!("expected await command");
+        };
+        assert_eq!(tasks, ["build", "test*"]);
+        assert_eq!(packages, ["app-*", "lib"]);
+        assert!(top_level);
+    }
+
+    #[tokio::test]
+    async fn await_command_errors_when_no_tasks_specified() {
+        let cli = Cli {
+            workspace_root: None,
+            command: Commands::Await {
+                tasks: Vec::new(),
+                packages: Vec::new(),
+                top_level: false,
+            },
+        };
+
+        let error = run(cli).await.expect_err("await without tasks must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("no tasks specified for await command"),
+            "unexpected error: {error}"
+        );
+    }
 
     #[tokio::test]
     async fn run_command_errors_when_no_tasks_specified() {

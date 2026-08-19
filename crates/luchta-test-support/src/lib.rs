@@ -14,3 +14,24 @@ pub fn require_nextest() {
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nextest_runs_tests_with_the_hermetic_environment_wrapper() {
+        require_nextest();
+
+        assert_eq!(
+            std::env::var("LUCHTA_TEST_HERMETIC_WRAPPER").as_deref(),
+            Ok("1"),
+            "the repository nextest wrapper did not run"
+        );
+        assert_eq!(
+            std::env::var_os("LUCHTA_HERMETIC_TEST_CANARY"),
+            None,
+            "the nextest wrapper leaked a non-allowlisted variable"
+        );
+    }
+}

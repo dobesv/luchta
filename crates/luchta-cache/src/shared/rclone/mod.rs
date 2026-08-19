@@ -523,17 +523,18 @@ mod tests {
     use std::thread;
     use tempfile::TempDir;
 
+    fn rclone_is_available() -> bool {
+        std::process::Command::new("rclone")
+            .arg("version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
     fn should_run_rclone_test() -> bool {
-        match std::env::var("LUCHTA_TEST_RCLONE") {
-            Ok(value) => value != "0" && !value.eq_ignore_ascii_case("false"),
-            Err(_) => std::process::Command::new("rclone")
-                .arg("version")
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .map(|status| status.success())
-                .unwrap_or(false),
-        }
+        std::env::var("LUCHTA_TEST_RCLONE").as_deref() == Ok("1") && rclone_is_available()
     }
 
     #[test]
@@ -602,7 +603,7 @@ mod tests {
 
         assert!(result.is_ok(), "noop panicked inside runtime context");
         let call_result = result.unwrap();
-        if !should_run_rclone_test() {
+        if !rclone_is_available() {
             assert!(call_result.is_err(), "missing rclone should return Err");
         }
     }
