@@ -1004,7 +1004,7 @@ mod tests {
     use tokio::io::{self, AsyncReadExt, DuplexStream};
     use tokio::sync::mpsc;
 
-    use crate::{ResolveResult, ResolveTask, WorkerRequest};
+    use crate::{ResolveResult, ResolveTask, TaskProgress, WorkerRequest};
 
     use super::*;
 
@@ -1178,6 +1178,58 @@ done
             stderr_values.is_empty(),
             "clean exit should not log delegate failure: {stderr_values:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn progress_is_forwarded_without_completing_delegate_send() {
+        let (stdout_writer, stdout_reader) = writer_pair();
+        let (stderr_writer, stderr_reader) = writer_pair();
+        let handle = DelegateHandle::with_writers(
+            vec![
+                "sh".to_owned(),
+                "-c".to_owned(),
+                r#"while IFS= read -r line; do
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  printf '{"type":"progress","id":"%s","completed":2,"pending":3}\n' "$id"
+  printf '{"type":"done","id":"%s","exitCode":0}\n' "$id"
+done
+"#
+                .to_owned(),
+            ],
+            stdout_writer,
+            stderr_writer,
+            None,
+        );
+
+        let response = handle
+            .send(WorkerMessage::Run(WorkerRequest::new(
+                "job-progress",
+                "build",
+            )))
+            .await
+            .expect("terminal response arrives");
+        assert_eq!(response, WorkerResponse::done("job-progress", 0));
+        handle.shutdown().await.expect("shutdown succeeds");
+        drop(handle);
+
+        let forwarded = read_json_lines(stdout_reader).await;
+        assert_eq!(
+            forwarded,
+            vec![
+                serde_json::to_value(WorkerResponse::progress(
+                    "job-progress",
+                    TaskProgress {
+                        completed: 2,
+                        pending: 3,
+                        ..TaskProgress::default()
+                    }
+                ))
+                .expect("progress serializes"),
+                serde_json::to_value(WorkerResponse::done("job-progress", 0))
+                    .expect("done serializes"),
+            ]
+        );
+        assert!(read_text_lines(stderr_reader).await.is_empty());
     }
 
     #[tokio::test]

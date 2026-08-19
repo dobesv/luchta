@@ -15,7 +15,7 @@ pub use executor::{
 pub use input_expansion::{expand_input_patterns, InputExpansionError};
 pub use luchta_worker::{
     CapturedLogLine, LogStream, ResolveDecision, ResolveMode, ResolveResult, ResolveTask,
-    TaskModification, WorkerMessage, WorkerRequest, WorkerResponse,
+    TaskModification, TaskProgress, WorkerMessage, WorkerRequest, WorkerResponse,
 };
 pub use task_graph::{
     is_root_task, root_package_name, root_task_id, DeadDependencyReason, DependencyValidationError,

@@ -37,6 +37,46 @@ async fn write_mode_rewrites_unformatted_fixture() {
 }
 
 #[tokio::test]
+async fn negotiated_progress_reports_initial_and_final_file_snapshots() {
+    let (temp, _file) = ts_package("index.ts", "export const value={foo:'bar'}\n").await;
+    let request = serde_json::json!({
+        "type": "run",
+        "id": "pkg#format",
+        "command": "format",
+        "cwd": temp.path().to_string_lossy(),
+        "env": {},
+        "progress": true
+    });
+
+    let progress = send_request(temp.path(), request)
+        .await
+        .into_iter()
+        .filter(|value| value["type"] == "progress")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        progress,
+        vec![
+            serde_json::json!({
+                "type": "progress",
+                "id": "pkg#format",
+                "completed": 0,
+                "skipped": 0,
+                "running": 0,
+                "pending": 1
+            }),
+            serde_json::json!({
+                "type": "progress",
+                "id": "pkg#format",
+                "completed": 1,
+                "skipped": 0,
+                "running": 0,
+                "pending": 0
+            }),
+        ]
+    );
+}
+
+#[tokio::test]
 async fn sort_imports_from_oxfmtrc_reorders_imports_end_to_end() {
     // Regression for issue #242: the worker must honor `.oxfmtrc` `sortImports`.
     // Spawns the real worker binary, which discovers the config from disk and

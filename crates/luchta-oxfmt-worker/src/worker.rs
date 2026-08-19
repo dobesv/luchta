@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 use ignore::{gitignore::Gitignore, WalkBuilder};
 #[cfg(feature = "oxc")]
 use luchta_worker::{
-    process_items_in_parallel, InProcessOutcome, JobContext, ResolveResult, ResolveTask,
-    TaskModification, Worker, WorkerRequest,
+    InProcessOutcome, JobContext, ParallelProgress, ResolveResult, ResolveTask, TaskModification,
+    Worker, WorkerRequest,
 };
 #[cfg(feature = "oxc")]
 use tokio::task;
@@ -176,32 +176,17 @@ impl Worker for OxfmtWorker {
 
             let mut exit_code = 0;
             let mut would_reformat = false;
-            let outcomes = match task::spawn_blocking({
-                let repo_root = repo_root.clone();
-                let loaded_config = loaded_config.clone();
-                let files = files.clone();
-                move || {
-                    process_items_in_parallel(
-                        &files,
-                        "oxfmt worker parallel format thread panicked",
-                        |path| format_file(path, &repo_root, &loaded_config, opts),
-                    )
-                }
-            })
-            .await
+            let outcomes = match ctx
+                .process_items_with_progress(
+                    files,
+                    ParallelProgress::new("oxfmt", "oxfmt worker parallel format thread panicked"),
+                    move |path, _item| format_file(path, &repo_root, &loaded_config, opts),
+                )
+                .await
             {
-                Ok(Ok(outcomes)) => outcomes,
-                Ok(Err(error)) => {
-                    let _ = ctx.emit_stderr(error).await;
-                    return InProcessOutcome::Done {
-                        exit_code: 1,
-                        outputs: None,
-                    };
-                }
+                Ok(outcomes) => outcomes,
                 Err(error) => {
-                    let _ = ctx
-                        .emit_stderr(format!("oxfmt parallel task failed: {error}"))
-                        .await;
+                    let _ = ctx.emit_stderr(error).await;
                     return InProcessOutcome::Done {
                         exit_code: 1,
                         outputs: None,

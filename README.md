@@ -775,6 +775,34 @@ Injected worker dependencies are:
 
 **Worker Overrides:** A worker's `Modify` decision (during the `resolve` protocol phase) may include `dependsOn` or `dependencies` (raw pattern strings) which **fully replaces** the task's static definition for that run. This mirrors how workers can override other task fields like `command` or `weight`. Omitting a field in the `Modify` decision leaves the static filter unchanged.
 
+#### Worker progress
+
+The engine negotiates transient worker-level progress by adding `"progress": true`
+to a `run` request when a progress-aware execution sink is attached. Workers must
+remain silent when the field is absent or false, which keeps newer bundled workers
+compatible with older engines.
+
+While a negotiated job is running, a worker may emit absolute snapshots:
+
+```json
+{"type":"progress","id":"pkg#task","completed":5,"skipped":1,"running":2,"pending":8}
+```
+
+- Every message replaces the previous snapshot; counters are never deltas.
+- Counters are non-negative. Omitted counters deserialize as zero.
+- `completed` counts all terminal items, including `skipped`; `skipped` is a
+  displayed subset for intentionally bypassed inputs.
+- An all-zero snapshot clears the task annotation.
+- Progress is live display telemetry only. It is not cached, added to reports or
+  task results, or used to determine the exit status.
+- Progress responses are intermediate. Protocol proxies and watchers forward
+  them without completing or removing the in-flight `run` request.
+
+Periodic status lines retain their existing deterministic grouping while adding
+snapshots to the individual members, for example:
+`{auth(✔ 5 ⏩ 1 ⌛ 2 🏃 1),main(⌛ 2 🏃 1)}#test` or
+`auth#{lint(✔ 50 ⌛ 100 🏃 16),test(⌛ 2)}`. Zero counters are omitted.
+
 #### Worker reports
 
 Workers can attach report files (e.g., test results or linting findings) to a task using the `report` message in the JSONL protocol:

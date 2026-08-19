@@ -16,7 +16,9 @@ use tokio::{
     sync::Semaphore,
 };
 
-use crate::{task_graph::TaskNode, LogStream, WorkerError, WorkerManager, WorkerRequest};
+use crate::{
+    task_graph::TaskNode, LogStream, TaskProgress, WorkerError, WorkerManager, WorkerRequest,
+};
 
 #[derive(Debug, Clone)]
 pub struct ExecutionRequest {
@@ -132,6 +134,7 @@ pub struct CollectedReport {
 pub struct ExecutionLogSink {
     lines: Arc<Mutex<Vec<CapturedLogLine>>>,
     reports: Arc<Mutex<Vec<CollectedReport>>>,
+    progress: Arc<Mutex<Option<TaskProgress>>>,
 }
 
 impl ExecutionLogSink {
@@ -170,6 +173,20 @@ impl ExecutionLogSink {
             .lock()
             .expect("execution log sink poisoned")
             .clone()
+    }
+
+    pub fn set_progress(&self, progress: TaskProgress) {
+        *self.progress.lock().expect("execution log sink poisoned") =
+            (!progress.is_empty()).then_some(progress);
+    }
+
+    pub fn clear_progress(&self) {
+        *self.progress.lock().expect("execution log sink poisoned") = None;
+    }
+
+    #[must_use]
+    pub fn progress(&self) -> Option<TaskProgress> {
+        *self.progress.lock().expect("execution log sink poisoned")
     }
 }
 
@@ -298,6 +315,7 @@ impl WeightedExecutor {
                             outputs: request.outputs.clone(),
                             workspace: request.workspace.clone(),
                             env: request.env.clone(),
+                            progress: false,
                         },
                         request.log_sink.as_ref(),
                     )
@@ -529,6 +547,35 @@ mod tests {
             .arg("exit 0")
             .status()
             .expect("create success exit status")
+    }
+
+    #[test]
+    fn execution_sink_progress_is_absolute_last_write_wins_and_zero_clears() {
+        let sink = ExecutionLogSink::new();
+        sink.set_progress(TaskProgress {
+            completed: 2,
+            pending: 8,
+            ..TaskProgress::default()
+        });
+        sink.set_progress(TaskProgress {
+            completed: 7,
+            skipped: 1,
+            running: 2,
+            pending: 1,
+        });
+
+        assert_eq!(
+            sink.progress(),
+            Some(TaskProgress {
+                completed: 7,
+                skipped: 1,
+                running: 2,
+                pending: 1,
+            })
+        );
+
+        sink.set_progress(TaskProgress::default());
+        assert_eq!(sink.progress(), None);
     }
 
     #[derive(Clone)]

@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use ast_grep_config::{from_yaml_string, GlobalRules, RuleCollection, RuleConfig, Severity};
 use ast_grep_core::{tree_sitter::StrDoc, NodeMatch};
 use ast_grep_language::{LanguageExt, SupportLang};
+use luchta_worker::ItemProgress;
 
 use crate::config::{resolve_language, DiscoveredConfig, LanguageGlobEntry};
 
@@ -23,6 +24,31 @@ pub struct ScanResult {
     pub findings: Vec<Finding>,
     pub fixed_files: Vec<String>,
     pub warnings: Vec<String>,
+}
+
+pub(crate) struct ScanWork {
+    files: Vec<PathBuf>,
+    fix: bool,
+    progress: Option<ItemProgress>,
+}
+
+impl ScanWork {
+    #[cfg(test)]
+    fn untracked(files: Vec<PathBuf>, fix: bool) -> Self {
+        Self {
+            files,
+            fix,
+            progress: None,
+        }
+    }
+
+    pub(crate) fn tracked(files: Vec<PathBuf>, fix: bool, progress: ItemProgress) -> Self {
+        Self {
+            files,
+            fix,
+            progress: Some(progress),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -87,23 +113,28 @@ pub fn scan_files(
         config_dir: &config.config_dir,
         language_globs: &config.language_globs,
     };
-    scan_files_with_rules(context, rules, files, fix)
+    scan_files_with_rules(context, rules, ScanWork::untracked(files, fix))
 }
 
 fn scan_files_with_rules(
     context: ScanContext<'_>,
     rules: Vec<RuleConfig<SupportLang>>,
-    files: Vec<PathBuf>,
-    fix: bool,
+    work: ScanWork,
 ) -> Result<ScanResult, String> {
+    let ScanWork {
+        files,
+        fix,
+        progress,
+    } = work;
+    let progress = progress.as_ref();
     let collection = RuleCollection::try_new(rules)
         .map_err(|error| format!("failed to build ast-grep rule collection: {error}"))?;
     let (fixed_files, warnings) = if fix {
-        apply_fixes(context, &collection, &files)?
+        apply_fixes(context, &collection, &files, progress)?
     } else {
         (Vec::new(), Vec::new())
     };
-    let findings = scan_files_with_collection(context, &collection, files)?;
+    let findings = scan_files_with_collection_progress(context, &collection, files, progress)?;
     Ok(ScanResult {
         findings,
         fixed_files,
@@ -111,10 +142,20 @@ fn scan_files_with_rules(
     })
 }
 
+#[cfg(test)]
 fn scan_files_with_collection(
     context: ScanContext<'_>,
     collection: &RuleCollection<SupportLang>,
     files: Vec<PathBuf>,
+) -> Result<Vec<Finding>, String> {
+    scan_files_with_collection_progress(context, collection, files, None)
+}
+
+fn scan_files_with_collection_progress(
+    context: ScanContext<'_>,
+    collection: &RuleCollection<SupportLang>,
+    files: Vec<PathBuf>,
+    progress: Option<&ItemProgress>,
 ) -> Result<Vec<Finding>, String> {
     let threads = std::thread::available_parallelism()
         .map(|parallelism| parallelism.get())
@@ -128,6 +169,7 @@ fn scan_files_with_collection(
             jobs.push(scope.spawn(move || {
                 let mut chunk_findings = Vec::new();
                 for file in chunk {
+                    let _item = progress.map(ItemProgress::start_item);
                     let mut per_file = scan_file(context, collection, file.clone())?;
                     chunk_findings.append(&mut per_file);
                 }
@@ -152,10 +194,12 @@ fn apply_fixes(
     context: ScanContext<'_>,
     collection: &RuleCollection<SupportLang>,
     files: &[PathBuf],
+    progress: Option<&ItemProgress>,
 ) -> Result<(Vec<String>, Vec<String>), String> {
     let mut fixed = Vec::new();
     let mut warnings = Vec::new();
     for file in files {
+        let _item = progress.map(ItemProgress::start_item);
         let apply = apply_fixes_to_file(context, collection, file)?;
         if apply.fixed {
             fixed.push(context.relative_uri(file));
@@ -413,12 +457,11 @@ where
     }
 }
 
-pub async fn scan_files_async(
+pub(crate) async fn scan_files_async(
     cwd: &Path,
     repo_root: &Path,
     config: &DiscoveredConfig,
-    files: Vec<PathBuf>,
-    fix: bool,
+    work: ScanWork,
 ) -> Result<ScanResult, String> {
     let cwd = cwd.to_path_buf();
     let repo_root = repo_root.to_path_buf();
@@ -434,7 +477,7 @@ pub async fn scan_files_async(
             config_dir: &config.config_dir,
             language_globs: &config.language_globs,
         };
-        scan_files_with_rules(context, rules, files, fix)
+        scan_files_with_rules(context, rules, work)
     })
     .await
     .map_err(|error| format!("ast-grep worker join error: {error}"))?

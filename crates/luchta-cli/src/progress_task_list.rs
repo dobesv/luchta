@@ -1,20 +1,42 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+use luchta_engine::TaskProgress;
 use luchta_types::TaskId;
 
-pub(crate) fn render_task_id_list(mut all: Vec<&TaskId>) -> String {
+pub(crate) fn render_task_id_list(all: Vec<&TaskId>) -> String {
+    render_task_id_list_with_progress(all, &HashMap::new())
+}
+
+pub(crate) fn render_task_id_list_with_progress(
+    mut all: Vec<&TaskId>,
+    progress: &HashMap<TaskId, TaskProgress>,
+) -> String {
     if all.is_empty() {
         return String::new();
     }
 
     all.sort_by_key(|task_id| task_id.to_string());
-    render_running_task_groups(&all)
+    render_running_task_groups_with_progress(&all, progress)
 }
 
+#[cfg(test)]
 pub(crate) fn render_running_task_groups(shown: &[&TaskId]) -> String {
+    render_running_task_groups_with_progress(shown, &HashMap::new())
+}
+
+pub(crate) fn render_running_task_groups_with_progress(
+    shown: &[&TaskId],
+    progress: &HashMap<TaskId, TaskProgress>,
+) -> String {
     let shared_scope = shared_scope_for_tasks(shown);
-    let (mut rendered, consumed) = group_by_shared_task_name(shown, shared_scope);
-    rendered.extend(group_remaining_by_package(shown, &consumed, shared_scope));
+    let (mut rendered, consumed) =
+        group_by_shared_task_name_with_progress(shown, shared_scope, progress);
+    rendered.extend(group_remaining_by_package_with_progress(
+        shown,
+        &consumed,
+        shared_scope,
+        progress,
+    ));
     rendered.join(", ")
 }
 
@@ -27,9 +49,10 @@ fn shared_scope_for_tasks<'a>(shown: &[&'a TaskId]) -> Option<&'a str> {
     common_scope(&packages)
 }
 
-pub(crate) fn group_by_shared_task_name(
+fn group_by_shared_task_name_with_progress(
     shown: &[&TaskId],
     shared_scope: Option<&str>,
+    progress: &HashMap<TaskId, TaskProgress>,
 ) -> (Vec<String>, Vec<bool>) {
     let mut tasks_by_name: BTreeMap<&str, Vec<(usize, &TaskId)>> = BTreeMap::new();
     for (index, task) in shown.iter().copied().enumerate() {
@@ -49,13 +72,55 @@ pub(crate) fn group_by_shared_task_name(
 
         rendered.push(format!(
             "{}#{}",
-            format_package_set(&packages, shared_scope),
+            format_annotated_package_set(&packages, &tasks, shared_scope, progress),
             task_name
         ));
         mark_consumed(&mut consumed, &tasks);
     }
 
     (rendered, consumed)
+}
+
+fn format_annotated_package_set(
+    packages: &BTreeSet<&str>,
+    tasks: &[(usize, &TaskId)],
+    shared_scope: Option<&str>,
+    progress: &HashMap<TaskId, TaskProgress>,
+) -> String {
+    let display_packages = packages_for_display(packages, shared_scope);
+    let prefix = display_packages
+        .len()
+        .gt(&1)
+        .then(|| longest_shared_boundary_prefix(&display_packages))
+        .flatten();
+    let task_by_package = tasks
+        .iter()
+        .filter(|(_, task)| !task.package.is_root())
+        .map(|(_, task)| (task.package.as_str(), *task))
+        .collect::<BTreeMap<_, _>>();
+
+    let members = packages
+        .iter()
+        .copied()
+        .zip(display_packages)
+        .map(|(package, display)| {
+            let display = prefix
+                .and_then(|prefix| display.strip_prefix(prefix))
+                .unwrap_or(display);
+            let annotation = task_by_package
+                .get(package)
+                .and_then(|task| progress.get(*task))
+                .and_then(|snapshot| render_progress_annotation(*snapshot))
+                .unwrap_or_default();
+            format!("{display}{annotation}")
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+
+    match prefix {
+        Some(prefix) => format!("{prefix}{{{members}}}"),
+        None => format!("{{{members}}}"),
+    }
 }
 
 pub(crate) fn shared_task_name_packages<'a>(tasks: &'a [(usize, &'a TaskId)]) -> BTreeSet<&'a str> {
@@ -184,10 +249,11 @@ pub(crate) fn mark_consumed(consumed: &mut [bool], tasks: &[(usize, &TaskId)]) {
     }
 }
 
-pub(crate) fn group_remaining_by_package(
+fn group_remaining_by_package_with_progress(
     shown: &[&TaskId],
     consumed: &[bool],
     shared_scope: Option<&str>,
+    progress: &HashMap<TaskId, TaskProgress>,
 ) -> Vec<String> {
     let mut tasks_by_package: BTreeMap<&str, Vec<&TaskId>> = BTreeMap::new();
     for (index, task) in shown.iter().copied().enumerate() {
@@ -202,19 +268,29 @@ pub(crate) fn group_remaining_by_package(
 
     tasks_by_package
         .into_values()
-        .map(|tasks| render_package_group(tasks, shared_scope))
+        .map(|tasks| render_package_group_with_progress(tasks, shared_scope, progress))
         .collect()
 }
 
-pub(crate) fn render_package_group(mut tasks: Vec<&TaskId>, shared_scope: Option<&str>) -> String {
+fn render_package_group_with_progress(
+    mut tasks: Vec<&TaskId>,
+    shared_scope: Option<&str>,
+    progress: &HashMap<TaskId, TaskProgress>,
+) -> String {
     tasks.sort_by_key(|task| task.task.to_string());
     if tasks.len() == 1 {
-        return render_single_task(tasks[0], shared_scope);
+        return render_single_task(tasks[0], shared_scope, progress);
     }
 
     let names = tasks
         .iter()
-        .map(|task| task.task.to_string())
+        .map(|task| {
+            let annotation = progress
+                .get(*task)
+                .and_then(|snapshot| render_progress_annotation(*snapshot))
+                .unwrap_or_default();
+            format!("{}{annotation}", task.task)
+        })
         .collect::<Vec<_>>()
         .join(",");
 
@@ -229,13 +305,38 @@ pub(crate) fn render_package_group(mut tasks: Vec<&TaskId>, shared_scope: Option
     }
 }
 
-fn render_single_task(task: &TaskId, shared_scope: Option<&str>) -> String {
+fn render_single_task(
+    task: &TaskId,
+    shared_scope: Option<&str>,
+    progress: &HashMap<TaskId, TaskProgress>,
+) -> String {
+    let annotation = progress
+        .get(task)
+        .and_then(|snapshot| render_progress_annotation(*snapshot))
+        .unwrap_or_default();
     if task.package.is_root() {
-        return task.to_string();
+        return format!("{}{annotation}", task);
     }
 
     let package = display_package_name(task.package.as_str(), shared_scope);
-    format!("{package}#{}", task.task)
+    format!("{package}#{}{annotation}", task.task)
+}
+
+fn render_progress_annotation(progress: TaskProgress) -> Option<String> {
+    let mut counters = Vec::new();
+    if progress.completed > 0 {
+        counters.push(format!("✔ {}", progress.completed));
+    }
+    if progress.skipped > 0 {
+        counters.push(format!("⏩ {}", progress.skipped));
+    }
+    if progress.pending > 0 {
+        counters.push(format!("⌛ {}", progress.pending));
+    }
+    if progress.running > 0 {
+        counters.push(format!("🏃 {}", progress.running));
+    }
+    (!counters.is_empty()).then(|| format!("({})", counters.join(" ")))
 }
 
 fn display_package_name<'a>(package: &'a str, shared_scope: Option<&str>) -> &'a str {
@@ -246,11 +347,14 @@ fn display_package_name<'a>(package: &'a str, shared_scope: Option<&str>) -> &'a
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeSet, HashMap};
 
+    use luchta_engine::TaskProgress;
     use luchta_types::TaskId;
 
-    use super::{format_package_set, render_running_task_groups};
+    use super::{
+        format_package_set, render_running_task_groups, render_running_task_groups_with_progress,
+    };
 
     #[test]
     fn render_running_task_groups_examples() {
@@ -286,6 +390,117 @@ mod tests {
             "a#lint, b#test, c#tsc",
         );
         assert_rendered_groups(&[task_ref("pkg", "task")], "pkg#task");
+    }
+
+    #[test]
+    fn worker_progress_annotates_standalone_and_suppresses_zero_counters() {
+        let task = task_id("pkg", "build");
+        let shown = vec![&task];
+        let progress = HashMap::from([(
+            task.clone(),
+            TaskProgress {
+                completed: 5,
+                skipped: 1,
+                running: 2,
+                pending: 8,
+            },
+        )]);
+
+        assert_eq!(
+            render_running_task_groups_with_progress(&shown, &progress),
+            "pkg#build(✔ 5 ⏩ 1 ⌛ 8 🏃 2)"
+        );
+
+        let progress = HashMap::from([(
+            task.clone(),
+            TaskProgress {
+                running: 2,
+                ..TaskProgress::default()
+            },
+        )]);
+        assert_eq!(
+            render_running_task_groups_with_progress(&shown, &progress),
+            "pkg#build(🏃 2)"
+        );
+        assert_eq!(
+            render_running_task_groups_with_progress(
+                &shown,
+                &HashMap::from([(task.clone(), TaskProgress::default())])
+            ),
+            "pkg#build"
+        );
+    }
+
+    #[test]
+    fn worker_progress_preserves_both_grouping_directions_and_mixed_members() {
+        let auth_test = task_id("auth", "test");
+        let main_test = task_id("main", "test");
+        let shared = vec![&main_test, &auth_test];
+        let shared_progress = HashMap::from([(
+            auth_test.clone(),
+            TaskProgress {
+                completed: 5,
+                skipped: 1,
+                running: 1,
+                pending: 2,
+            },
+        )]);
+        assert_eq!(
+            render_running_task_groups_with_progress(&shared, &shared_progress),
+            "{auth(✔ 5 ⏩ 1 ⌛ 2 🏃 1),main}#test"
+        );
+
+        let lint = task_id("auth", "lint");
+        let package = vec![&auth_test, &lint];
+        let package_progress = HashMap::from([
+            (
+                lint.clone(),
+                TaskProgress {
+                    completed: 50,
+                    running: 16,
+                    pending: 100,
+                    ..TaskProgress::default()
+                },
+            ),
+            (
+                auth_test.clone(),
+                TaskProgress {
+                    pending: 2,
+                    ..TaskProgress::default()
+                },
+            ),
+        ]);
+        assert_eq!(
+            render_running_task_groups_with_progress(&package, &package_progress),
+            "auth#{lint(✔ 50 ⌛ 100 🏃 16),test(⌛ 2)}"
+        );
+    }
+
+    #[test]
+    fn annotated_group_order_is_deterministic() {
+        let a = task_id("a", "build");
+        let z = task_id("z", "build");
+        let shown = vec![&z, &a];
+        let progress = HashMap::from([
+            (
+                z.clone(),
+                TaskProgress {
+                    pending: 1,
+                    ..TaskProgress::default()
+                },
+            ),
+            (
+                a.clone(),
+                TaskProgress {
+                    completed: 1,
+                    ..TaskProgress::default()
+                },
+            ),
+        ]);
+        assert_eq!(
+            render_running_task_groups_with_progress(&shown, &progress),
+            "{a(✔ 1),z(⌛ 1)}#build"
+        );
     }
 
     #[test]

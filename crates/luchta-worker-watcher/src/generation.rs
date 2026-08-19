@@ -119,7 +119,9 @@ fn test_stderr_writer() -> SharedWriter {
 mod tests {
     use std::time::Duration;
 
-    use luchta_worker::{LogStream, ResolveMode, ResolveResult, ResolveTask, WorkerRequest};
+    use luchta_worker::{
+        LogStream, ResolveMode, ResolveResult, ResolveTask, TaskProgress, WorkerRequest,
+    };
 
     use super::*;
 
@@ -165,6 +167,24 @@ mod tests {
         generation.send(&run_message("a")).expect("send succeeds");
 
         assert!(!generation.on_response(&WorkerResponse::log("a", LogStream::Stdout, "line")));
+        assert_eq!(generation.in_flight_len(), 1);
+
+        generation.shutdown().await.expect("shutdown succeeds");
+    }
+
+    #[tokio::test]
+    async fn progress_response_keeps_in_flight_id() {
+        let mut generation = cat_generation(20).await;
+        generation.send(&run_message("a")).expect("send succeeds");
+
+        assert!(!generation.on_response(&WorkerResponse::progress(
+            "a",
+            TaskProgress {
+                completed: 1,
+                pending: 2,
+                ..TaskProgress::default()
+            }
+        )));
         assert_eq!(generation.in_flight_len(), 1);
 
         generation.shutdown().await.expect("shutdown succeeds");

@@ -1262,7 +1262,6 @@ fn spawn_task_runner(ready: ReadyTask, ctx: &DispatchContext<'_>) {
     let task_start_unix_ms = now_unix_ms();
     let task_ctx = build_task_run_context(&task_id, cache_enabled, ctx.no_cache, ctx);
     let reporter = Arc::clone(ctx.reporter);
-    let started_task_id = task_id.clone();
     let repo_root = ctx.workspace_root.to_path_buf();
 
     let executor = Arc::clone(&task_ctx.executor);
@@ -1273,12 +1272,9 @@ fn spawn_task_runner(ready: ReadyTask, ctx: &DispatchContext<'_>) {
     let continue_on_failure = ctx.continue_on_failure;
     let no_cache = ctx.no_cache;
     let log_sink = prepare_task_log_sink(&mut request);
+    let on_start = reporter.start_callback(task_id.clone(), log_sink.clone());
 
     tokio::spawn(async move {
-        let on_start = {
-            let reporter = Arc::clone(&reporter);
-            move || reporter.task_started(&started_task_id)
-        };
         let SpawnedTaskOutcome {
             outcome_res,
             succeeded,
