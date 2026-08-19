@@ -30,6 +30,7 @@ pub(crate) struct PreExecutionSnapshotRequest<'a> {
     pub repo_root: &'a Path,
     pub task_id: &'a TaskId,
     pub inputs_from_worker: bool,
+    pub output: &'a ProgressOutput,
 }
 
 /// Resolve a pre-execution input snapshot for stability checking.
@@ -46,6 +47,7 @@ pub(crate) fn resolve_pre_execution_inputs(
         repo_root,
         task_id,
         inputs_from_worker,
+        output,
     } = request;
 
     // Identify the task by its user-facing `task_id` (root tasks render as
@@ -61,9 +63,9 @@ pub(crate) fn resolve_pre_execution_inputs(
             // is not silently mistaken for "task has no inputs": if the post-run
             // resolution then succeeds, the diff would otherwise look like inputs
             // appeared mid-run and spuriously skip the cache write.
-            eprintln!(
+            output.stderr_line(&format!(
                 "warning: failed to expand input patterns for pre-execution snapshot of task '{task_id}' ({origin}): {error} — skipping concurrent-change detection for this run"
-            );
+            ));
             return Vec::new();
         }
     };
@@ -71,9 +73,9 @@ pub(crate) fn resolve_pre_execution_inputs(
     match resolve_inputs_with_semantics(&requests) {
         Ok(entries) => entries,
         Err(error) => {
-            eprintln!(
+            output.stderr_line(&format!(
                 "warning: failed to resolve inputs for pre-execution snapshot of task '{task_id}' ({origin}): {error} — skipping concurrent-change detection for this run"
-            );
+            ));
             Vec::new()
         }
     }
@@ -174,10 +176,10 @@ pub(crate) fn resolve_cache_inputs(
     match resolve_inputs_with_semantics(&requests) {
         Ok(inputs) => CacheInputResult::Ok(inputs),
         Err(error) => {
-            eprintln!(
+            cache_ctx.output.stderr_line(&format!(
                 "warning: failed to resolve cache inputs for task '{}': {error} — recording run with empty inputs",
                 cache_ctx.task_id
-            );
+            ));
             CacheInputResult::IoError
         }
     }
@@ -191,10 +193,10 @@ pub(crate) fn resolve_cache_outputs(
     match resolve_outputs(&cache_ctx.package_path, output_patterns) {
         Ok(outputs) => Some(outputs),
         Err(error) => {
-            eprintln!(
+            cache_ctx.output.stderr_line(&format!(
                 "warning: failed to resolve cache outputs for task '{}': {error} — recording run with empty outputs",
                 cache_ctx.task_id
-            );
+            ));
             None
         }
     }
@@ -249,6 +251,7 @@ mod tests {
             },
             task_watch_registry: empty_task_watch_registry(),
             pre_snapshot: Some(Vec::new()),
+            output: ProgressOutput::new(false),
         }
     }
 

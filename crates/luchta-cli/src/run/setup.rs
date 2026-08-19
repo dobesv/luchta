@@ -69,20 +69,18 @@ pub(super) fn report_run_outcome(
     pressure_state: &crate::memory_pressure::PressureState,
     was_cancelled: bool,
 ) -> Result<()> {
+    reporter.output().clear_progress();
     run_result?;
 
     let rss = select_summary_rss(
         pressure_state.snapshot().sample,
         crate::rss::process_tree_rss_bytes,
     );
-    println!(
-        "{}",
-        reporter.render_summary(
-            &crate::rss::format_rss(rss),
-            was_cancelled,
-            owo_colors::Stream::Stdout
-        )
-    );
+    reporter.output().stdout_line(&reporter.render_summary(
+        &crate::rss::format_rss(rss),
+        was_cancelled,
+        owo_colors::Stream::Stdout,
+    ));
 
     if any_failed.load(Ordering::SeqCst) {
         return Err(miette::Report::new(TasksFailed));

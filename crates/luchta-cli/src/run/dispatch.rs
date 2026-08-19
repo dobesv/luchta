@@ -25,6 +25,7 @@ use luchta_workspace::PackageGraph;
 
 use std::sync::OnceLock;
 
+use super::output::{hydrate_local_cache, replay_logs};
 use crate::watch::registry::{register_task_watch_state, register_task_watch_state_from_packages};
 
 /// Shared empty env map used as a stable fallback when a task has no entry in
@@ -261,11 +262,11 @@ fn fail_invalid_task(
         ctx.owns_worker_manager,
         ctx.worker_manager,
     );
-    eprintln!(
+    ctx.reporter.output().stderr_line(&format!(
         "{} {}",
         "✖".if_supports_color(Stream::Stderr, |text| text.red()),
         message.if_supports_color(Stream::Stderr, |text| text.red())
-    );
+    ));
     // Invalid/config-error — counted in totals via wave map, but completion is
     // recorded as failed because it is neither done nor cache-skipped.
     ctx.reporter.task_failed(task_id);
@@ -423,6 +424,7 @@ fn build_task_run_context(
         cache_write,
         output_hash_record,
         shared_cache: ctx.shared_cache.clone(),
+        output: ctx.reporter.output(),
     }
 }
 
@@ -445,8 +447,12 @@ struct SpawnedTaskRun<F> {
     task_start_unix_ms: u64,
 }
 
-fn prepare_task_log_sink(request: &mut ExecutionRequest) -> ExecutionLogSink {
+fn prepare_task_log_sink(
+    request: &mut ExecutionRequest,
+    output: ProgressOutput,
+) -> ExecutionLogSink {
     let log_sink = ExecutionLogSink::new();
+    log_sink.set_diagnostic_writer(move |message| output.stderr_line(message));
     request.log_sink = Some(log_sink.clone());
     log_sink
 }
@@ -475,6 +481,7 @@ where
         cache_write,
         output_hash_record,
         shared_cache,
+        output,
     } = task_ctx;
     let outcome_res = executor.run_with_on_start(&request, on_start).await;
     let end_unix_ms = now_unix_ms();
@@ -499,25 +506,43 @@ where
         shared_cache: cache_enabled.then_some(shared_cache).flatten(),
         shared_store_enabled: cache_enabled && !no_cache,
         repo_root,
+        output: &output,
     })
     .await;
 
-    if let Some(expansion_error) = expansion_error {
-        if !interrupted.load(Ordering::SeqCst) {
-            eprintln!(
-                "{} {}",
-                "✖".if_supports_color(Stream::Stderr, |text| text.red()),
-                expansion_error.if_supports_color(Stream::Stderr, |text| text.red())
-            );
-        }
-        return SpawnedTaskOutcome {
-            outcome_res,
-            succeeded: false,
-            start_unix_ms,
-            end_unix_ms,
-        };
-    }
+    finish_spawned_task_run(
+        outcome_res,
+        succeeded,
+        start_unix_ms,
+        end_unix_ms,
+        expansion_error,
+        interrupted.load(Ordering::SeqCst),
+        &output,
+    )
+}
 
+fn finish_spawned_task_run(
+    outcome_res: Result<TaskRunOutcome, luchta_engine::ExecutorError>,
+    succeeded: bool,
+    start_unix_ms: u64,
+    end_unix_ms: u64,
+    expansion_error: Option<String>,
+    interrupted: bool,
+    output: &ProgressOutput,
+) -> SpawnedTaskOutcome {
+    let succeeded = match expansion_error {
+        Some(error) => {
+            if !interrupted {
+                output.stderr_line(&format!(
+                    "{} {}",
+                    "✖".if_supports_color(Stream::Stderr, |text| text.red()),
+                    error.if_supports_color(Stream::Stderr, |text| text.red())
+                ));
+            }
+            false
+        }
+        None => succeeded,
+    };
     SpawnedTaskOutcome {
         outcome_res,
         succeeded,
@@ -529,16 +554,17 @@ where
 fn record_resolved_output_hash(
     output_hashes: &Arc<Mutex<HashMap<TaskId, [u8; 32]>>>,
     output_hash_record: &OutputHashRecordContext,
+    output: &ProgressOutput,
 ) {
     match resolve_outputs(&output_hash_record.package_path, &output_hash_record.output_patterns) {
         Ok(outputs) => {
             let outputs_hash = combined_outputs_hash(&outputs);
             record_output_hash(output_hashes, &output_hash_record.task_id, outputs_hash);
         }
-        Err(error) => eprintln!(
+        Err(error) => output.stderr_line(&format!(
             "warning: skipping dependency output hash record for task '{}': failed to resolve cache outputs: {error}",
             output_hash_record.task_id
-        ),
+        )),
     }
 }
 
@@ -605,6 +631,7 @@ fn build_cache_write_context(task_id: &TaskId, ctx: &DecisionContext) -> CacheIn
         decision: cache_run_decision(),
         task_watch_registry: Arc::clone(&ctx.task_watch_registry),
         pre_snapshot: None,
+        output: ctx.reporter.output(),
     }))
 }
 
@@ -657,9 +684,9 @@ fn cache_pkg_dep_pairs(
     ) {
         Ok(pkg_dep_pairs) => Some(pkg_dep_pairs),
         Err(error) => {
-            eprintln!(
+            ctx.reporter.output().stderr_line(&format!(
                 "warning: skipping cache write for task '{task_id}': failed to gather package dependencies: {error}"
-            );
+            ));
             None
         }
     }
@@ -852,10 +879,10 @@ async fn write_run_record(
         BuildRecordResult::ExpansionError(msg) => return WriteRecordResult::ExpansionError(msg),
         BuildRecordResult::StabilityMismatch(reason) => {
             // Emit warning but don't fail the task - just skip cache write
-            eprintln!(
+            cache_ctx.output.stderr_line(&format!(
                 "{}",
                 reason.if_supports_color(Stream::Stderr, |text| text.yellow())
-            );
+            ));
             return WriteRecordResult::StabilityMismatch(reason);
         }
     };
@@ -886,6 +913,7 @@ async fn write_run_record(
     let record_for_local = (*record).clone();
     let record_for_shared = record_for_local.clone();
     let task_id_for_error = cache_ctx.task_id.clone();
+    let output = cache_ctx.output.clone();
 
     match tokio::task::spawn_blocking(move || {
         // Local cache write (unchanged)
@@ -898,10 +926,10 @@ async fn write_run_record(
                 reports: &reports,
             },
         ) {
-            eprintln!(
+            output.stderr_line(&format!(
                 "warning: failed to write cache record for task '{}': {error}",
                 task_id_for_error
-            );
+            ));
         }
 
         // Shared cache store (after local write, only if enabled)
@@ -964,10 +992,10 @@ async fn write_run_record(
                             ));
                         }
 
-                        eprintln!(
+                        output.stderr_line(&format!(
                             "warning: shared cache store failed for task '{}': {}; continuing with local cache",
                             task_id_str, e
-                        );
+                        ));
                     }
                 }
             }
@@ -979,10 +1007,10 @@ async fn write_run_record(
     {
         Ok(Some(expansion_error)) => return WriteRecordResult::ExpansionError(expansion_error),
         Ok(None) => {}
-        Err(error) => eprintln!(
+        Err(error) => cache_ctx.output.stderr_line(&format!(
             "warning: cache write task panicked for task '{}': {error}",
             cache_ctx.task_id
-        ),
+        )),
     }
     WriteRecordResult::Ok
 }
@@ -1204,7 +1232,12 @@ fn try_shared_cache_skip(
                     // Shared cache HIT (validated):
                     // (a) Outputs now restored to package dir.
                     // (b) Hydrate local cache for next build.
-                    hydrate_local_cache(ctx.cache.clone(), task_id.clone(), &hit);
+                    hydrate_local_cache(
+                        ctx.cache.clone(),
+                        task_id.clone(),
+                        &hit,
+                        &ctx.reporter.output(),
+                    );
                     // (c) Replay the restored task's captured stdout/stderr so a
                     // shared-cache hit produces the same visible output as on main.
                     replay_logs(&hit, &ctx.reporter);
@@ -1221,7 +1254,9 @@ fn try_shared_cache_skip(
                 }
                 Err(e) => {
                     // Commit failed - log and continue to next candidate
-                    eprintln!("warning: shared cache restore commit failed: {e}");
+                    ctx.reporter
+                        .output()
+                        .stderr_line(&format!("warning: shared cache restore commit failed: {e}"));
                     continue;
                 }
             }
@@ -1229,7 +1264,9 @@ fn try_shared_cache_skip(
             // Candidate is STALE - inputs do not match current tree.
             // Discard staging and try next candidate.
             if let Err(e) = candidate.discard() {
-                eprintln!("warning: shared cache discard failed: {e}");
+                ctx.reporter
+                    .output()
+                    .stderr_line(&format!("warning: shared cache discard failed: {e}"));
             }
             continue;
         }
@@ -1271,7 +1308,7 @@ fn spawn_task_runner(ready: ReadyTask, ctx: &DispatchContext<'_>) {
     let owns_worker_manager = ctx.owns_worker_manager;
     let continue_on_failure = ctx.continue_on_failure;
     let no_cache = ctx.no_cache;
-    let log_sink = prepare_task_log_sink(&mut request);
+    let log_sink = prepare_task_log_sink(&mut request, reporter.output());
     let on_start = reporter.start_callback(task_id.clone(), log_sink.clone());
 
     tokio::spawn(async move {
@@ -1368,7 +1405,7 @@ fn finalize_task_run(finalization: TaskRunFinalization<'_>) {
             },
             log_sink,
         );
-        eprint!("{}", failure_logs);
+        reporter.output().stderr_block(&failure_logs);
     }
 
     record_task_outcome(reporter, task_id, failure_kind);
@@ -1454,6 +1491,7 @@ struct CachePersistInputs<'a> {
     shared_store_enabled: bool,
     /// Repo root for scope classification during shared cache write.
     repo_root: PathBuf,
+    output: &'a ProgressOutput,
 }
 
 /// Records the run record (cached tasks) or just the resolved output hash
@@ -1480,6 +1518,7 @@ async fn persist_cache_state(inputs: CachePersistInputs<'_>) -> Option<String> {
         shared_cache,
         shared_store_enabled,
         repo_root,
+        output,
     } = inputs;
 
     if let Some(cache_ctx) = cache_write {
@@ -1499,7 +1538,7 @@ async fn persist_cache_state(inputs: CachePersistInputs<'_>) -> Option<String> {
         .await;
     }
 
-    record_successful_output_hash(output_hashes, output_hash_record, succeeded);
+    record_successful_output_hash(output_hashes, output_hash_record, succeeded, output);
     None
 }
 
@@ -1559,13 +1598,14 @@ fn record_successful_output_hash(
     output_hashes: &Arc<Mutex<HashMap<TaskId, [u8; 32]>>>,
     output_hash_record: Option<&OutputHashRecordContext>,
     succeeded: bool,
+    output: &ProgressOutput,
 ) {
     if !succeeded {
         return;
     }
 
     if let Some(record) = output_hash_record {
-        record_resolved_output_hash(output_hashes, record);
+        record_resolved_output_hash(output_hashes, record, output);
     }
 }
 
@@ -1837,69 +1877,6 @@ fn outputs_lexically_in_package(output_patterns: &[String]) -> bool {
     true
 }
 
-/// Hydrate local cache from a shared-cache hit.
-///
-/// Writes the restored record and logs so the next build in the same
-/// worktree gets a normal local skip with correct downstream invalidation.
-fn hydrate_local_cache(cache: Arc<Cache>, task_id: TaskId, hit: &RestoredHit) {
-    let cache_key = task_id.to_string();
-    let mut record = hit.record.clone();
-    record.schema_version = SCHEMA_VERSION_V5;
-    record.run_reason = Some(RunReason::SharedCacheHit);
-    let reports: Vec<ReportInput> = hit
-        .record
-        .reports
-        .iter()
-        .filter_map(|report| {
-            hit.reports
-                .iter()
-                .find(|stored| stored.filename == report.filename)
-                .map(|stored| ReportInput {
-                    filename: report.filename.clone(),
-                    mime_type: report.mime_type.clone(),
-                    content: stored.content.clone(),
-                })
-        })
-        .collect();
-    if let Err(e) = cache.write(
-        &cache_key,
-        RunArtifacts {
-            record: &record,
-            stdout: &hit.stdout,
-            stderr: &hit.stderr,
-            reports: &reports,
-        },
-    ) {
-        eprintln!(
-            "warning: failed to hydrate local cache for task '{}': {e}",
-            task_id
-        );
-    }
-}
-
-/// Replay restored logs to the progress reporter.
-///
-/// This mirrors how the normal run path emits logs so output appears
-/// as if the task actually ran.
-pub(super) fn replay_logs(hit: &RestoredHit, _reporter: &Arc<ProgressReporter>) {
-    // Replay stdout
-    if !hit.stdout.is_empty() {
-        if let Ok(stdout_str) = std::str::from_utf8(&hit.stdout) {
-            for line in stdout_str.lines() {
-                println!("{line}");
-            }
-        }
-    }
-    // Replay stderr
-    if !hit.stderr.is_empty() {
-        if let Ok(stderr_str) = std::str::from_utf8(&hit.stderr) {
-            for line in stderr_str.lines() {
-                eprintln!("{line}");
-            }
-        }
-    }
-}
-
 /// Refresh a shared-cache entry on a hit: re-merge it into today's write
 /// bucket and advance its meta's mtime (see `SharedCache::refresh_entry`).
 ///
@@ -2137,6 +2114,7 @@ mod tests {
             },
             task_watch_registry: crate::watch::registry::empty_task_watch_registry(),
             pre_snapshot: Some(Vec::new()),
+            output: ProgressOutput::new(false),
         }
     }
 
@@ -2244,6 +2222,7 @@ mod tests {
             repo_root: &cache_ctx.repo_root,
             task_id: &cache_ctx.task_id,
             inputs_from_worker: cache_ctx.inputs_from_worker,
+            output: &cache_ctx.output,
         }));
         assert!(
             cache_ctx
@@ -2313,6 +2292,7 @@ mod tests {
             repo_root: &cache_ctx.repo_root,
             task_id: &cache_ctx.task_id,
             inputs_from_worker: cache_ctx.inputs_from_worker,
+            output: &cache_ctx.output,
         }));
         // Concurrent edit before the record is written.
         std::fs::write(&input_path, "H2-changed\n").expect("edit input");
@@ -2453,7 +2433,12 @@ mod tests {
             }],
         };
 
-        hydrate_local_cache(Arc::clone(&cache), task_id.clone(), &hit);
+        hydrate_local_cache(
+            Arc::clone(&cache),
+            task_id.clone(),
+            &hit,
+            &ProgressOutput::new(false),
+        );
 
         let hydrated = cache
             .read(&task_id.to_string())

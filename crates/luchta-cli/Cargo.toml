@@ -43,6 +43,8 @@ luchta-worker = { path = "../luchta-worker" }
 blake3 = { workspace = true }
 tracing = "0.1"
 arc-swap = "1.7"
+terminal_size = "0.4.4"
+unicode-width = "0.2.2"
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }

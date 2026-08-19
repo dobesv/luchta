@@ -35,12 +35,13 @@ use crate::cache_ctx::{
     build_current_state, load_lockfile_state, LockfileState, PackageDirResolver,
 };
 use crate::cli::OutputMode;
-use crate::progress::ProgressReporter;
+use crate::progress::{ProgressOutput, ProgressReporter};
 use crate::watch::registry::TaskWatchRegistry;
 use tokio_util::sync::CancellationToken;
 
 mod dispatch;
 mod input_stability;
+mod output;
 mod pause;
 use dispatch::{
     build_command_map, dispatch_decision_result, dispatch_ready_task, dispatch_ready_task_async,
@@ -524,6 +525,7 @@ struct TaskRunContext {
     output_hash_record: Option<OutputHashRecordContext>,
     /// Shared cache for cross-worktree cache hits. `None` if shared cache disabled.
     shared_cache: Option<Arc<SharedCache>>,
+    output: ProgressOutput,
 }
 
 #[derive(Clone)]
@@ -554,6 +556,7 @@ struct CacheWriteContext {
     /// Captured lazily AFTER run decision but BEFORE task execution so skipped
     /// tasks avoid input hashing while executed tasks still get TOCTOU checks.
     pre_snapshot: Option<Vec<FileEntry>>,
+    output: ProgressOutput,
 }
 
 impl CacheWriteContext {
@@ -577,6 +580,7 @@ impl CacheWriteContext {
             repo_root: &self.repo_root,
             task_id: &self.task_id,
             inputs_from_worker: self.inputs_from_worker,
+            output: &self.output,
         }));
     }
 
@@ -650,19 +654,28 @@ enum CacheInputState {
     Disabled,
 }
 
-/// Interval between periodic progress lines.
+/// Interval between progress updates.
 ///
-/// Defaults to 5 seconds. Overridable via the `LUCHTA_PROGRESS_INTERVAL_MS`
-/// environment variable (milliseconds), primarily so tests can exercise the
-/// periodic-progress path quickly. A missing, empty, unparseable, or zero value
-/// falls back to the 5-second default.
-fn progress_interval_duration() -> Duration {
-    const DEFAULT_MS: u64 = 5_000;
-    let ms = std::env::var("LUCHTA_PROGRESS_INTERVAL_MS")
-        .ok()
-        .and_then(|raw| raw.trim().parse::<u64>().ok())
-        .filter(|&ms| ms > 0)
-        .unwrap_or(DEFAULT_MS);
+/// Interactive terminals refresh the same line ten times per second. Redirected
+/// output retains the existing five-second append-only cadence. Either default
+/// can be overridden via `LUCHTA_PROGRESS_INTERVAL_MS`, primarily for tests.
+fn progress_interval_duration(live_status: bool) -> Duration {
+    let raw = std::env::var("LUCHTA_PROGRESS_INTERVAL_MS").ok();
+    progress_interval_duration_from_value(live_status, raw.as_deref())
+}
+
+fn progress_interval_duration_from_value(live_status: bool, raw: Option<&str>) -> Duration {
+    const LIVE_DEFAULT_MS: u64 = 100;
+    const REDIRECTED_DEFAULT_MS: u64 = 5_000;
+    let default_ms = if live_status {
+        LIVE_DEFAULT_MS
+    } else {
+        REDIRECTED_DEFAULT_MS
+    };
+    let ms = raw
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(default_ms);
     Duration::from_millis(ms)
 }
 
@@ -983,7 +996,7 @@ fn compute_execution_waves(
     waves
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ShutdownSignal {
     CtrlC,
     #[cfg(unix)]

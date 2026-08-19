@@ -15,8 +15,17 @@ use owo_colors::{OwoColorize, Stream};
 use crate::{
     cli::OutputMode,
     memory_pressure::{PressureReason, PressureSnapshot},
-    progress_task_list::{render_task_id_list, render_task_id_list_with_progress},
+    progress_task_list::render_task_id_list,
 };
+
+mod console_output;
+mod status_line;
+
+pub(crate) use console_output::ProgressOutput;
+use status_line::{render_status_line, StatusLineCounts, StatusLineInput};
+
+#[cfg(test)]
+use console_output::{truncate_ansi, visible_width, InteractiveStatusState};
 
 /// Outcome of a task as recorded by the progress reporter.
 ///
@@ -55,6 +64,15 @@ pub struct ProgressReporter {
     pub total_waves: usize,
     pub wave_total: Vec<usize>,
     pub start: Instant,
+    output: ProgressOutput,
+}
+
+pub(crate) struct ProgressRenderContext<'a> {
+    pub(crate) rss_formatted: &'a str,
+    pub(crate) warnings: &'a [PressureReason],
+    pub(crate) pressure: &'a PressureSnapshot,
+    pub(crate) stream: Stream,
+    pub(crate) max_width: Option<usize>,
 }
 
 impl ProgressReporter {
@@ -82,7 +100,16 @@ impl ProgressReporter {
             skipped: AtomicUsize::new(0),
             failed: AtomicUsize::new(0),
             shared_hits: AtomicUsize::new(0),
+            output: ProgressOutput::detect(mode),
         }
+    }
+
+    pub(crate) fn output(&self) -> ProgressOutput {
+        self.output.clone()
+    }
+
+    pub(crate) fn uses_live_status(&self) -> bool {
+        self.output.is_live()
     }
 
     pub fn task_started(&self, id: &TaskId) {
@@ -167,6 +194,7 @@ impl ProgressReporter {
         running.len()
     }
 
+    #[cfg(test)]
     pub fn render_progress(
         &self,
         rss_formatted: &str,
@@ -174,37 +202,50 @@ impl ProgressReporter {
         pressure: &PressureSnapshot,
         stream: Stream,
     ) -> String {
-        let running = self
-            .running
-            .lock()
-            .expect("progress reporter running mutex poisoned");
-        let counts = self.progress_counts(&running);
-        let task_progress = self.worker_progress();
-
-        let mut segments = vec![format!("✔ {}", counts.done_or_skipped)
-            .if_supports_color(stream, |t| t.green())
-            .to_string()];
-        extend_progress_segments(
-            &mut segments,
-            stream,
-            &running,
-            &task_progress,
-            self.failed_segment(stream),
-            ProgressSegmentCounts {
-                skipped: counts.skipped,
-                shared_hits: counts.shared_hits,
-                pending: counts.pending,
-                running_count: counts.running_count,
-                elapsed_total: counts.elapsed_total,
-                waves_done: counts.waves_done,
-                total_waves: self.total_waves,
-            },
+        self.render_progress_for_width(ProgressRenderContext {
             rss_formatted,
-        );
+            warnings,
+            pressure,
+            stream,
+            max_width: None,
+        })
+    }
 
-        let mut line = segments.join(" ");
-        line.push_str(&pressure_suffix(warnings, pressure, stream));
-        line
+    pub(crate) fn render_progress_for_width(&self, context: ProgressRenderContext<'_>) -> String {
+        let (counts, running_tasks) = {
+            let running = self
+                .running
+                .lock()
+                .expect("progress reporter running mutex poisoned");
+            (
+                self.progress_counts(&running),
+                running.keys().cloned().collect::<Vec<_>>(),
+            )
+        };
+        let task_progress = self.worker_progress();
+        let segment_counts = StatusLineCounts {
+            done_or_skipped: counts.done_or_skipped,
+            skipped: counts.skipped,
+            shared_hits: counts.shared_hits,
+            pending: counts.pending,
+            running: counts.running_count,
+            elapsed_total: counts.elapsed_total,
+            waves_done: counts.waves_done,
+            total_waves: self.total_waves,
+        };
+        let failed_segment = self.failed_segment(context.stream);
+        let warning_suffix = pressure_suffix(context.warnings, context.pressure, context.stream);
+        let running_task_refs = running_tasks.iter().collect();
+        render_status_line(StatusLineInput {
+            stream: context.stream,
+            running_tasks: running_task_refs,
+            task_progress: &task_progress,
+            failed_segment: failed_segment.as_deref(),
+            counts: segment_counts,
+            rss_formatted: context.rss_formatted,
+            warning_suffix: &warning_suffix,
+            max_width: context.max_width,
+        })
     }
 
     pub fn render_summary(
@@ -377,77 +418,6 @@ struct ProgressCounts {
     waves_done: usize,
 }
 
-struct ProgressSegmentCounts {
-    skipped: usize,
-    shared_hits: usize,
-    pending: usize,
-    running_count: usize,
-    elapsed_total: u64,
-    waves_done: usize,
-    total_waves: usize,
-}
-
-fn extend_progress_segments(
-    segments: &mut Vec<String>,
-    stream: Stream,
-    running: &HashMap<TaskId, Instant>,
-    task_progress: &HashMap<TaskId, TaskProgress>,
-    failed_segment: Option<String>,
-    counts: ProgressSegmentCounts,
-    rss_formatted: &str,
-) {
-    push_optional_segment(segments, counts.skipped > 0, || {
-        format!("⏩ {}", counts.skipped)
-            .if_supports_color(stream, |value| value.cyan())
-            .to_string()
-    });
-    push_optional_segment(segments, counts.shared_hits > 0, || {
-        format!("📥 {}", counts.shared_hits)
-            .if_supports_color(stream, |value| value.cyan())
-            .to_string()
-    });
-    push_optional_segment(segments, counts.pending > 0, || {
-        format!("⌛ {}", counts.pending)
-            .if_supports_color(stream, |value| value.dimmed())
-            .to_string()
-    });
-    push_optional_segment(segments, counts.running_count > 0, || {
-        format!(
-            "🏃 {} ({})",
-            counts.running_count,
-            render_task_id_list_with_progress(running.keys().collect(), task_progress)
-        )
-        .if_supports_color(stream, |value| value.bright_black())
-        .to_string()
-    });
-    if let Some(segment) = failed_segment {
-        segments.push(segment);
-    }
-    segments.push(
-        format!("⌚ {}s", counts.elapsed_total)
-            .if_supports_color(stream, |value| value.dimmed())
-            .to_string(),
-    );
-    segments.push(
-        format!("🐏 {rss_formatted}")
-            .if_supports_color(stream, |value| value.dimmed())
-            .to_string(),
-    );
-    segments.push(
-        format!("🌊 {} / {}", counts.waves_done, counts.total_waves)
-            .if_supports_color(stream, |value| value.dimmed())
-            .to_string(),
-    );
-}
-
-fn push_optional_segment<F>(segments: &mut Vec<String>, include: bool, build: F)
-where
-    F: FnOnce() -> String,
-{
-    if include {
-        segments.push(build());
-    }
-}
 fn pressure_suffix(
     warnings: &[PressureReason],
     pressure: &PressureSnapshot,

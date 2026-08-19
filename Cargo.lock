@@ -2875,10 +2875,12 @@ dependencies = [
  "serde_path_to_error",
  "sysinfo",
  "tempfile",
+ "terminal_size",
  "thiserror 1.0.69",
  "tokio",
  "tokio-util",
  "tracing",
+ "unicode-width 0.2.2",
 ]
 
 [[package]]

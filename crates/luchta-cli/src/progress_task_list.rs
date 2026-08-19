@@ -19,6 +19,13 @@ pub(crate) fn render_task_id_list_with_progress(
     render_running_task_groups_with_progress(&all, progress)
 }
 
+pub(crate) fn render_task_id_with_progress(
+    task: &TaskId,
+    progress: &HashMap<TaskId, TaskProgress>,
+) -> String {
+    render_single_task(task, None, progress)
+}
+
 #[cfg(test)]
 pub(crate) fn render_running_task_groups(shown: &[&TaskId]) -> String {
     render_running_task_groups_with_progress(shown, &HashMap::new())
