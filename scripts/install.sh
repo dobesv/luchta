@@ -195,9 +195,9 @@ triple_for() {
     case "$os:$arch" in
         linux:x86_64) printf 'x86_64-unknown-linux-musl\n' ;;
         linux:aarch64) printf 'aarch64-unknown-linux-musl\n' ;;
-        darwin:x86_64) printf 'x86_64-apple-darwin\n' ;;
         darwin:aarch64) printf 'aarch64-apple-darwin\n' ;;
         windows:*) err "Windows detected. Use scripts/install.ps1 instead." ;;
+        darwin:x86_64) err "Intel macOS is not supported. No x86_64-apple-darwin release is published; build from source instead." ;;
         linux:i686) err "32-bit Linux is not supported. No i686 Linux release is published." ;;
         *) err "unsupported platform combination: $os/$arch" ;;
     esac
