@@ -885,10 +885,27 @@ fn nix_killpg(pgid: i32, signal: i32) -> Result<(), ProxyError> {
     }
 
     let error = std::io::Error::last_os_error();
-    if matches!(error.raw_os_error(), Some(libc::ESRCH)) {
+    if is_process_group_gone(error.raw_os_error(), cfg!(target_vendor = "apple")) {
         Ok(())
     } else {
         Err(ProxyError::Io(error))
+    }
+}
+
+/// Whether a failed `kill(-pgid)` just means the group has no members left,
+/// which is a normal shutdown outcome for a delegate that already exited.
+///
+/// POSIX reports that as ESRCH. Darwin instead reports EPERM while the group
+/// record still exists but holds no live process (Apple FB21938996), so a
+/// fast-exiting delegate that the reaper collects before shutdown signals it
+/// would otherwise fail the shutdown. `apple` is passed in rather than read
+/// from `cfg!` here so both platform behaviors stay testable everywhere.
+#[cfg(unix)]
+fn is_process_group_gone(errno: Option<i32>, apple: bool) -> bool {
+    match errno {
+        Some(libc::ESRCH) => true,
+        Some(libc::EPERM) => apple,
+        _ => false,
     }
 }
 
@@ -1588,6 +1605,49 @@ for line in sys.stdin:
         tokio::time::timeout(Duration::from_secs(12), handle.shutdown())
             .await
             .expect("shutdown should complete via kill path")
+            .expect("shutdown ok");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn empty_process_group_errno_is_gone() {
+        // POSIX says ESRCH; Darwin says EPERM for a group that still exists but
+        // has no live members. Both mean "nothing left to signal".
+        assert!(is_process_group_gone(Some(libc::ESRCH), false));
+        assert!(is_process_group_gone(Some(libc::ESRCH), true));
+        assert!(is_process_group_gone(Some(libc::EPERM), true));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_signal_failures_are_not_treated_as_gone() {
+        // EPERM off Darwin is a genuine permission failure, not an empty group.
+        assert!(!is_process_group_gone(Some(libc::EPERM), false));
+        assert!(!is_process_group_gone(Some(libc::EINVAL), true));
+        assert!(!is_process_group_gone(None, true));
+    }
+
+    #[tokio::test]
+    async fn raw_delegate_shutdown_succeeds_after_child_already_reaped() {
+        let (handle, mut stdout) = spawn_raw_delegate(raw_delegate_command(&["true"]));
+
+        // Wait for the reaper to collect the child so shutdown signals a process
+        // group with no members left.
+        let closed = tokio::time::timeout(Duration::from_secs(2), stdout.recv())
+            .await
+            .expect("stdout should close after exit");
+        assert!(closed.is_none());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while handle.exit_status().await.is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("child should be reaped");
+
+        tokio::time::timeout(Duration::from_secs(2), handle.shutdown())
+            .await
+            .expect("shutdown should finish quickly")
             .expect("shutdown ok");
     }
 

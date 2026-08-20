@@ -92,7 +92,7 @@ function Get-TargetTriple {
     switch -Regex ($arch) {
         '^X64$|^AMD64$' { return 'x86_64-pc-windows-msvc' }
         '^Arm64$|^ARM64$' { return 'aarch64-pc-windows-msvc' }
-        '^X86$|^x86$|^i386$' { return 'i686-pc-windows-msvc' }
+        '^X86$|^x86$|^i386$' { Fail "32-bit Windows is not supported. No i686-pc-windows-msvc release is published; build from source instead." }
         default { Fail "Unsupported Windows architecture: $arch" }
     }
 }

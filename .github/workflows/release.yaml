@@ -25,10 +25,15 @@ jobs:
       # first error. Each platform builds independently and partial success is
       # still useful to ship.
       fail-fast: false
-      # Same three-platform coverage as harnx: Linux (x86_64 + aarch64, musl
-      # static via cross), macOS (x86_64 + aarch64), and Windows (x86_64 +
-      # aarch64 + i686). `use-cross: true` jobs build inside a cross container;
-      # the rest build natively on the matching runner.
+      # Linux (x86_64 + aarch64, musl static via cross), macOS (aarch64), and
+      # Windows (x86_64 + aarch64). `use-cross: true` jobs build inside a cross
+      # container; the rest build natively on the matching runner.
+      #
+      # Intel macOS (x86_64-apple-darwin) and 32-bit Windows
+      # (i686-pc-windows-msvc) are deliberately not shipped — both are legacy
+      # hardware we don't support, and the Intel macOS artifact could only be
+      # smoke-tested through Rosetta 2 on the ARM runner, which never exercised
+      # a real Intel Mac anyway.
       matrix:
         include:
         - target: aarch64-unknown-linux-musl
@@ -41,17 +46,11 @@ jobs:
         - target: aarch64-pc-windows-msvc
           os: windows-latest
           use-cross: true
-        - target: x86_64-apple-darwin
-          os: macos-latest
-          use-cross: false
         - target: x86_64-pc-windows-msvc
           os: windows-latest
           use-cross: false
         - target: x86_64-unknown-linux-musl
           os: ubuntu-latest
-          use-cross: true
-        - target: i686-pc-windows-msvc
-          os: windows-latest
           use-cross: true
 
     runs-on: ${{ matrix.os }}
@@ -158,19 +157,19 @@ jobs:
     # Smoke test: run each freshly built binary so a broken artifact (bad
     # dynamic linking, missing symbols) fails the job before it is published.
     # Only run on native (`use-cross: false`) targets — the host can execute
-    # those: windows-latest is x86_64, and macos-latest (ARM) runs the
-    # x86_64-apple-darwin binary via Rosetta 2. cross targets can't run here.
+    # those directly. cross targets can't run here.
     #
     # Each binary has its own clean exit-0 probe:
     # - `luchta` has no `--version` flag, so `--help` is the probe.
     # - `luchta-yarn-worker` / `luchta-bash-worker` are stdin-driven JSONL workers
     #   without CLI flags; empty stdin hits EOF and exits 0.
     # - The proxy filters/worker require `<args> -- <delegate command>`. Empty
-    #   stdin makes the read loop hit EOF and exit 0 before the delegate is ever
-    #   spawned (it spawns lazily on the first forwarded message), so the
-    #   placeholder `true` delegate is never executed — it only satisfies arg
-    #   validation. command-filter needs a predicate token; file-exists-filter
-    #   needs a glob pattern. extra-resolve-worker needs
+    #   stdin makes the read loop hit EOF and exit 0. Most spawn the delegate
+    #   lazily on the first forwarded message, so the placeholder `true` only
+    #   satisfies arg validation; `luchta-worker-watcher` spawns it eagerly and
+    #   then shuts it down, which is why `true` must be a real command.
+    #   command-filter needs a predicate token; file-exists-filter needs a glob
+    #   pattern. extra-resolve-worker needs
     #   `<resolve-command...> -- <delegate-command...>`; empty stdin hits EOF and
     #   exits 0 before either the resolve or delegate command is spawned.
     - name: Smoke test binaries
