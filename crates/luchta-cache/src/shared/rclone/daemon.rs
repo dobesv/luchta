@@ -41,38 +41,7 @@ pub(super) async fn spawn_daemon(timeout: Duration) -> Result<DaemonState, Rclon
     let socket_path = temp_dir.path().join("rclone.rcd.sock");
     let socket_addr = format!("unix://{}", socket_path.display());
 
-    let mut command = Command::new("rclone");
-    command
-        .arg("rcd")
-        .arg("--rc-addr")
-        .arg(&socket_addr)
-        .arg("--rc-no-auth")
-        .arg("--log-format")
-        .arg("date,time")
-        .arg("--transfers")
-        .arg(
-            super::env_usize(
-                "LUCHTA_SHARED_CACHE_RCLONE_TRANSFERS",
-                super::DEFAULT_RCLONE_TRANSFERS,
-            )
-            .to_string(),
-        )
-        .arg("--checkers")
-        .arg(
-            super::env_usize(
-                "LUCHTA_SHARED_CACHE_RCLONE_CHECKERS",
-                super::DEFAULT_RCLONE_CHECKERS,
-            )
-            .to_string(),
-        )
-        .arg("--rc-job-expire-duration")
-        .arg(super::env_string(
-            "LUCHTA_SHARED_CACHE_RCLONE_JOB_EXPIRE_DURATION",
-            super::DEFAULT_RCLONE_JOB_EXPIRE_DURATION,
-        ))
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .stdin(Stdio::null());
+    let mut command = daemon_command(&socket_addr);
 
     let child = match command.spawn() {
         Ok(child) => child,
@@ -103,6 +72,45 @@ pub(super) async fn spawn_daemon(timeout: Duration) -> Result<DaemonState, Rclon
         .wait_until_ready(timeout.min(RCLONE_READY_TIMEOUT))
         .await?;
     Ok(daemon)
+}
+
+fn daemon_command(socket_addr: &str) -> Command {
+    let mut command = Command::new("rclone");
+    command
+        .arg("rcd")
+        .arg("--rc-addr")
+        .arg(socket_addr)
+        .arg("--rc-no-auth")
+        .arg("--log-format")
+        .arg("date,time")
+        .arg("--transfers")
+        .arg(
+            super::env_usize(
+                "LUCHTA_SHARED_CACHE_RCLONE_TRANSFERS",
+                super::DEFAULT_RCLONE_TRANSFERS,
+            )
+            .to_string(),
+        )
+        .arg("--checkers")
+        .arg(
+            super::env_usize(
+                "LUCHTA_SHARED_CACHE_RCLONE_CHECKERS",
+                super::DEFAULT_RCLONE_CHECKERS,
+            )
+            .to_string(),
+        )
+        .arg("--rc-job-expire-duration")
+        .arg(super::env_string(
+            "LUCHTA_SHARED_CACHE_RCLONE_JOB_EXPIRE_DURATION",
+            super::DEFAULT_RCLONE_JOB_EXPIRE_DURATION,
+        ))
+        // The configured object-store bucket is user-owned and must already
+        // exist. Do not let ordinary S3 cache operations attempt CreateBucket.
+        .env("RCLONE_S3_NO_CHECK_BUCKET", "true")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null());
+    command
 }
 
 pub(super) fn quit_and_wait(
@@ -249,5 +257,26 @@ impl DaemonState {
             Ok(None) => Ok(()),
             Err(err) => Err(RcloneError::Io(err)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsStr;
+
+    use super::*;
+
+    #[test]
+    fn daemon_disables_s3_bucket_creation_checks() {
+        let command = daemon_command("unix:///tmp/rclone.rcd.sock");
+        let no_check_bucket = command.as_std().get_envs().find_map(|(name, value)| {
+            if name == OsStr::new("RCLONE_S3_NO_CHECK_BUCKET") {
+                value
+            } else {
+                None
+            }
+        });
+
+        assert_eq!(no_check_bucket, Some(OsStr::new("true")));
     }
 }
