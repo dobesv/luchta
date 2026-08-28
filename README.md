@@ -871,6 +871,7 @@ Reports are recorded in the task metadata and can be viewed via `luchta logs`.
 Standard worker binaries are resolved via `PATH`. They ship inside each release archive alongside the `luchta` binary. Add the extraction directory to your `PATH` so Luchta can locate them.
 
 - **luchta-tsc-worker** is a high-performance TypeScript/tsc worker built from an in-tree vendored and patched [typescript-go](https://github.com/microsoft/typescript-go).
+- **luchta-ast-grep-worker** scans source files in-process using the custom rules in `sgconfig.yml`. Inline `ast-grep-ignore` comments have the same next-line, same-line, file-level, and rule-specific suppression semantics as the ast-grep CLI, and suppressed matches are also excluded from `--fix`.
 - **luchta-yarn-worker** runs each task through Yarn so that Yarn-injected
   environment variables (`PATH`, `NODE_OPTIONS`, …) are available. For
   yarn-worker tasks, the task's `command` becomes the Yarn subcommand

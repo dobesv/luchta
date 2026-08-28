@@ -1,6 +1,7 @@
 ---
 title: "In-process autofix mode for linting workers (oxlint, oxfmt, ast-grep)"
 date: 2026-07-14
+last_verified: 2026-08-28
 category: integration-issues
 problem_type: integration_issue
 component: luchta-oxlint-worker, luchta-oxfmt-worker, luchta-ast-grep-worker, luchta-worker
@@ -91,18 +92,19 @@ scan_files_with_collection(context, &collection, files)
 let applicable_rules = collection.get_rule_from_lang(Path::new(&selection_path), lang);
 ```
 
-### 4. ast-grep: Skip Severity::Off Before Building Fixers
+### 4. ast-grep: Use CombinedScan for fix candidates
 
 ```rust
-// crates/luchta-ast-grep-worker/src/lint.rs:217-220
-for rule in applicable_rules {
-    if matches!(rule.severity, Severity::Off) {
-        continue;  // matches scan behavior
-    }
-    let fixers = rule.get_fixer()?;
-    // ... collect edits
+// After RuleCollection applies language/path scoping:
+let combined = CombinedScan::new(applicable_rules);
+for (rule, matched) in combined.scan(root, true).diffs {
+    // Build and collect the rule's edit.
 }
 ```
+
+`CombinedScan` applies disabled-rule handling and the same `ast-grep-ignore`
+suppression semantics as the CLI. Direct `rule.matcher.find_all` traversal
+bypasses suppression and can rewrite matches the user explicitly ignored.
 
 ### 5. ast-grep: Overlap Detection with Right-to-Left Application
 
@@ -194,7 +196,7 @@ impl ExpectedFinding {
 ## Why This Works
 
 1. **Single RuleCollection**: Both fix and scan paths use same scoping logic; no two-collection inconsistency possible.
-2. **Severity::Off filter**: Disabled rules skipped in both paths; user expectation of "disabled = no side effects" satisfied.
+2. **CombinedScan filtering**: Disabled and inline-suppressed matches are skipped in both reporting and fix paths; ignored code has no diagnostics or side effects.
 3. **Overlap detection**: Greedy interval selection + warning emission prevents silent dropped edits and output corruption.
 4. **Right-to-left splice**: Preserves byte offsets after each edit.
 5. **UTF-8 validation**: `String::from_utf8` catches any corruption from misaligned offsets.
@@ -205,6 +207,7 @@ impl ExpectedFinding {
 **Test Cases:**
 - Fix-on rewrites file; fix-off leaves untouched and reports findings.
 - `severity: off` rule neither rewrites nor reports.
+- Inline-suppressed matches are neither rewritten nor reported.
 - Path-scoped rule (`files: ['**/*.tsx']`) does not apply fix to out-of-scope file.
 - Overlapping edits at same start position: exactly one applied, warning emitted.
 - Quote-parsing: `--config '/path/with spaces'` produces single path token.
@@ -212,7 +215,7 @@ impl ExpectedFinding {
 
 **Code Review Checklist:**
 - [ ] Fix path uses SAME `RuleCollection::get_rule_from_lang` call as scan path.
-- [ ] `Severity::Off` filtered before fixer construction.
+- [ ] Fix and reporting paths both use `CombinedScan`, never direct matcher traversal.
 - [ ] Overlap detection handles same-start and intersecting ranges.
 - [ ] Edits applied right-to-left to preserve byte offsets.
 - [ ] UTF-8 validation after edit application.

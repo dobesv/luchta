@@ -1,6 +1,7 @@
 ---
 title: "In-process ast-grep worker integration with probe-validated API at 0.43.0"
 date: 2026-07-11
+last_verified: 2026-08-28
 category: integration-issues
 problem_type: integration_issue
 component: luchta-ast-grep-worker
@@ -83,10 +84,11 @@ pub fn load_rules(rule_files: &[PathBuf]) -> Result<Vec<RuleConfig<SupportLang>>
 
 Returns `Result<Vec<...>, _>`, not `Vec` directly.
 
-### Scanning with type inference
+### Rule selection and scanning with type inference
 
 ```rust
-let combined = CombinedScan::new(rules.iter().collect());
+let applicable_rules = collection.get_rule_from_lang(Path::new(&selection_path), lang);
+let combined = CombinedScan::new(applicable_rules);
 let result = combined.scan(&root, false);
 
 for (rule_config, matches) in result.matches {
@@ -104,6 +106,12 @@ for (rule_config, matches) in result.matches {
 ```
 
 `ScanResult` not re-exported — iterate `result.matches: Vec<(&RuleConfig, Vec<NodeMatch>)>`.
+Keep the two phases in this order: `RuleCollection::get_rule_from_lang` applies
+language and path scoping, then `CombinedScan` applies `ast-grep-ignore`
+comments and disabled-rule handling. Directly calling `find_all` on each rule
+matcher bypasses inline suppression. Fix collection must use
+`combined.scan(&root, true).diffs` for the same reason, so suppressed matches
+are neither reported nor rewritten.
 
 ### Severity handling
 
@@ -238,6 +246,8 @@ let exit_code = if findings.iter().any(|f| matches!(f.severity, Severity::Error)
 - Integration test: `run_in_process` with temp dir containing `sgconfig.yml` + rule file
 - Integration test: verify SARIF output shape matches schema
 - Integration test: exit code 1 when `Severity::Error` present
+- Unit and protocol tests: next-line, same-line, file-level, and rule-specific
+  `ast-grep-ignore` comments suppress diagnostics; suppressed fixes stay unchanged
 
 **Best Practices:**
 - Create `/tmp` probe crate with `cargo check` for ANY pre-1.0 dependency API
@@ -250,6 +260,7 @@ let exit_code = if findings.iter().any(|f| matches!(f.severity, Severity::Error)
 - [ ] All imports verified against pinned version (not main branch docs)
 - [ ] Position methods use correct signatures (`column(&node_match)`)
 - [ ] Severity stored with `.clone()`, compared with `matches!()`
+- [ ] Reporting and fixes use `CombinedScan`, never direct matcher traversal
 - [ ] `run_in_process` returns `impl Future<Output=...> + Send`
 - [ ] SARIF line/column are 1-based (library is 0-based)
 

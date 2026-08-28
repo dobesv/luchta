@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 
-use ast_grep_config::{from_yaml_string, GlobalRules, RuleCollection, RuleConfig, Severity};
+use ast_grep_config::{
+    from_yaml_string, CombinedScan, GlobalRules, RuleCollection, RuleConfig, Severity,
+};
 use ast_grep_core::{tree_sitter::StrDoc, NodeMatch};
 use ast_grep_language::{LanguageExt, SupportLang};
 use luchta_worker::ItemProgress;
@@ -326,10 +328,10 @@ fn collect_candidate_edits<'a>(
     applicable_rules: Vec<&'a RuleConfig<SupportLang>>,
 ) -> Result<Vec<FileEdit>, String> {
     let mut edits = Vec::new();
-    for rule in applicable_rules {
-        if matches!(rule.severity, Severity::Off) {
-            continue;
-        }
+    // CombinedScan applies CLI-compatible ast-grep-ignore suppression before
+    // exposing fixable matches. Traversing each matcher directly bypasses it.
+    let combined = CombinedScan::new(applicable_rules);
+    for (rule, matched) in combined.scan(root, true).diffs {
         let fixers = rule
             .get_fixer()
             .map_err(|error| format!("failed to build fixer for {}: {error}", rule.id))?;
@@ -337,15 +339,13 @@ fn collect_candidate_edits<'a>(
             continue;
         }
         let fixer = &fixers[0];
-        for matched in root.root().find_all(&rule.matcher) {
-            let edit = matched.make_edit(&rule.matcher, fixer);
-            edits.push(FileEdit {
-                position: edit.position,
-                deleted_length: edit.deleted_length,
-                inserted_text: edit.inserted_text,
-                rule_id: rule.id.clone(),
-            });
-        }
+        let edit = matched.make_edit(&rule.matcher, fixer);
+        edits.push(FileEdit {
+            position: edit.position,
+            deleted_length: edit.deleted_length,
+            inserted_text: edit.inserted_text,
+            rule_id: rule.id.clone(),
+        });
     }
     Ok(edits)
 }
@@ -433,12 +433,12 @@ fn scan_file(
         return Ok(Vec::new());
     }
 
+    // CombinedScan owns ast-grep-ignore semantics; direct matcher traversal
+    // would report nodes that the CLI treats as suppressed.
+    let combined = CombinedScan::new(applicable_rules);
     let mut findings = Vec::new();
-    for rule in applicable_rules {
-        for matched in root.root().find_all(&rule.matcher) {
-            if matches!(rule.severity, Severity::Off) {
-                continue;
-            }
+    for (rule, matches) in combined.scan(&root, false).matches {
+        for matched in matches {
             findings.push(build_finding(rule, &matched, &relative_uri));
         }
     }
@@ -682,6 +682,63 @@ mod tests {
         }
         .assert_matches(finding);
         assert_eq!(finding.end_line, 1);
+    }
+
+    #[test]
+    fn inline_suppression_comments_match_ast_grep_cli() {
+        let temp = TempDir::new().expect("tempdir");
+        let source = write_basic_rule_fixture(
+            &temp,
+            "id: no-console-log\nlanguage: TypeScript\nseverity: error\nmessage: No console.log allowed\nrule:\n  pattern: console.log($$$)\n",
+            "console.log('reported-before');\n// ast-grep-ignore\nconsole.log('suppressed-next');\nconsole.log('suppressed-same'); // ast-grep-ignore: no-console-log\n// ast-grep-ignore: another-rule\nconsole.log('reported-after');\n/* ast-grep-ignore: no-console-log */\nconsole.log('suppressed-block');\n",
+        );
+
+        let findings = scan_basic_fixture(&temp, source, false).findings;
+
+        assert_eq!(
+            findings
+                .iter()
+                .map(|finding| finding.start_line)
+                .collect::<Vec<_>>(),
+            vec![1, 6]
+        );
+    }
+
+    #[test]
+    fn first_line_suppression_comment_can_ignore_the_whole_file() {
+        let temp = TempDir::new().expect("tempdir");
+        let source = write_basic_rule_fixture(
+            &temp,
+            "id: no-console-log\nlanguage: TypeScript\nseverity: error\nmessage: No console.log allowed\nrule:\n  pattern: console.log($$$)\n",
+            "// ast-grep-ignore: no-console-log\n\nconsole.log('suppressed-file');\n",
+        );
+
+        let findings = scan_basic_fixture(&temp, source, false).findings;
+
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn fix_mode_leaves_suppressed_matches_unchanged() {
+        let temp = TempDir::new().expect("tempdir");
+        let source = write_basic_rule_fixture(
+            &temp,
+            "id: no-console-log\nlanguage: TypeScript\nseverity: error\nmessage: No console.log allowed\nrule:\n  pattern: console.log($ARG)\nfix: logger.info($ARG)\n",
+            "// ast-grep-ignore: no-console-log\nconsole.log('suppressed');\nconsole.log('fixed');\n",
+        );
+
+        let result = scan_basic_fixture(&temp, source.clone(), true);
+        let rewritten = fs::read_to_string(source).expect("rewritten source");
+
+        assert_eq!(
+            (result.fixed_files, result.findings.len(), rewritten),
+            (
+                vec!["src/index.ts".to_owned()],
+                0,
+                "// ast-grep-ignore: no-console-log\nconsole.log('suppressed');\nlogger.info('fixed');\n"
+                    .to_owned()
+            )
+        );
     }
 
     #[test]
