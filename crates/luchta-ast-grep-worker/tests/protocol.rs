@@ -298,6 +298,53 @@ fn violation_emits_log_report_and_done_exit_1() {
     }));
 }
 
+#[test]
+fn inline_suppression_comment_filters_worker_diagnostics() {
+    let fixture = tempdir().expect("tempdir");
+    write_fixture_rule_set(fixture.path());
+    write_file(
+        fixture.path().join("src/index.ts"),
+        "// ast-grep-ignore: no-console-log\nconsole.log('suppressed');\nconsole.log('reported');\n",
+    );
+
+    let input = format!(
+        "{}\n",
+        run_line(
+            WorkerRequest::new("job-suppression", "lint")
+                .with_cwd(fixture.path().display().to_string())
+        )
+    );
+    let (output, _stderr) = run_worker_in(fixture.path(), &input);
+
+    assert_log_line_contains(
+        &output,
+        "job-suppression",
+        "src/index.ts:3:1: error [no-console-log]",
+    );
+    assert!(output.iter().all(|value| {
+        value["line"]
+            .as_str()
+            .is_none_or(|line| !line.contains("src/index.ts:2:1"))
+    }));
+
+    let report = output
+        .iter()
+        .find(|value| value["type"].as_str() == Some("report"))
+        .expect("sarif report present");
+    let sarif: Value = serde_json::from_str(report["content"].as_str().expect("sarif content"))
+        .expect("valid sarif json");
+    assert_eq!(
+        sarif["runs"][0]["results"].as_array().map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(
+        sarif["runs"][0]["results"][0]["locations"][0]["physicalLocation"]["region"]["startLine"]
+            .as_u64(),
+        Some(3)
+    );
+    assert_done_with_exit(&output, "job-suppression", 1);
+}
+
 /// Guards the wiring in `main.rs` that computes `repo_root` from the worker
 /// process's own cwd (mirroring the engine spawning workers with cwd =
 /// workspace root) and threads it into `scan_files_async` separately from
