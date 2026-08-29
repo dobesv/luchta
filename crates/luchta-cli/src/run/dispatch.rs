@@ -8,10 +8,15 @@
 
 use super::*;
 
+mod shared_cache;
+
+use shared_cache::{finalize_shared_cache_hit, prepare_cache_decision, PreparedCacheDecision};
+use std::time::Instant;
+
 use crate::cache_ctx::gather_pkg_dep_pairs_filtered;
 
 use luchta_cache::shared::{
-    combined_dep_outputs_hash, derive_input_key, RestoredHit, SnapshotEntry, StoreOutcome,
+    combined_dep_outputs_hash, derive_input_key, SharedCacheStoreRequest, StoreOutcome,
 };
 use luchta_cache::{
     combined_inputs_hash, decide_shared_restore, task_cache_key, CurrentState, FileEntry,
@@ -144,11 +149,10 @@ pub(super) fn dispatch_ready_task(task: ReadyTask, ctx: &DispatchContext<'_>) {
 /// Begins handling a ready task. Fast-path terminal states (outside selection,
 /// fast-stop, invalid, ordering connector) are finalized immediately and return
 /// `None`. Otherwise the cache-skip decision is computed:
-/// - a pure LOCAL decision is offloaded to a bounded blocking pool and delivered
-///   later via `decision_result_tx` (returns `None`);
-/// - a SHARED-cache or non-cache-enabled decision is computed synchronously here
-///   (kept serialized) and returned as `Some(..)` so the caller can feed it
-///   straight into the sequential completion path.
+/// - local and shared decisions are offloaded to a bounded blocking pool and
+///   delivered later via `decision_result_tx` (returns `None`);
+/// - a non-cache-enabled decision is returned as `Some(..)` so the caller can
+///   feed it straight into the sequential completion path.
 pub(super) fn dispatch_ready_task_async(
     task_node: TaskNode,
     done_tx: CompletionSignal,
@@ -188,27 +192,16 @@ pub(super) fn dispatch_ready_task_async(
         .is_some_and(TaskDefinition::cache_enabled);
     let skip_enabled = cache_enabled && !ctx.no_cache;
 
-    // Only the LOCAL cache-skip decision is safe to run concurrently: it is a
-    // pure filesystem read (glob + stat) with no side effects. The SHARED-cache
-    // decision path (`try_shared_cache_skip`) restores outputs into the package
-    // directory and mutates shared state, so it must stay serialized. Tasks that
-    // are not cache-enabled need no decision at all. For those non-parallelizable
-    // cases we compute synchronously here (on the dispatch loop) and return the
-    // result so the caller feeds it straight into the sequential completion path
-    // — we deliberately do NOT `tokio::spawn` blocking work onto the async
-    // executor or bypass the decision semaphore.
-    if !skip_enabled || ctx.decision_ctx.shared_cache.is_some() {
-        let decision = if skip_enabled {
-            try_cache_skip(&task_id, &ctx.decision_ctx)
-        } else {
-            None
-        };
+    // Tasks with caching disabled need no filesystem decision. Cache-enabled
+    // decisions, including shared-cache fetch/staging, are side-effect-free
+    // with respect to package outputs and run on the bounded blocking pool.
+    if !skip_enabled {
         return Some(DecisionTaskResult {
             task_id,
             request,
             done_tx,
             cache_enabled,
-            outcome: DecisionOutcome::Direct { decision },
+            outcome: DecisionOutcome::Direct,
         });
     }
 
@@ -219,7 +212,7 @@ pub(super) fn dispatch_ready_task_async(
         let task_id_for_decision = task_id.clone();
         let decision_ctx_for_decision = decision_ctx.clone();
         let decision_result = super::pause::run_decision_task(decision_semaphore, move || {
-            try_cache_skip(&task_id_for_decision, &decision_ctx_for_decision)
+            prepare_cache_decision(&task_id_for_decision, &decision_ctx_for_decision)
         })
         .await;
 
@@ -229,7 +222,9 @@ pub(super) fn dispatch_ready_task_async(
                 request,
                 done_tx,
                 cache_enabled,
-                outcome: DecisionOutcome::Parallelizable { decision_result },
+                outcome: DecisionOutcome::Parallelizable {
+                    decision_result: Box::new(decision_result),
+                },
             })
             .await;
     });
@@ -328,17 +323,13 @@ fn handle_cache_skip(
     }
 }
 
-#[derive(Debug)]
 pub(super) enum DecisionOutcome {
     Parallelizable {
-        decision_result: Result<Option<Decision>, miette::Report>,
+        decision_result: Box<Result<PreparedCacheDecision, miette::Report>>,
     },
-    Direct {
-        decision: Option<Decision>,
-    },
+    Direct,
 }
 
-#[derive(Debug)]
 pub(super) struct DecisionTaskResult {
     pub(super) task_id: TaskId,
     pub(super) request: ExecutionRequest,
@@ -359,18 +350,24 @@ pub(super) fn dispatch_decision_result(
         outcome,
     } = result;
 
-    let decision = match outcome {
-        DecisionOutcome::Parallelizable { decision_result } => decision_result?,
-        DecisionOutcome::Direct { decision } => decision,
+    let prepared = match outcome {
+        DecisionOutcome::Parallelizable { decision_result } => (*decision_result)?,
+        DecisionOutcome::Direct => PreparedCacheDecision::run_without_context(),
     };
 
-    if let Some(decision) = decision {
-        match decision {
-            Decision::Skip | Decision::SharedHit => {
-                handle_cache_skip(&task_id, decision, done_tx, ctx);
-                return Ok(None);
+    match prepared.decision {
+        Decision::Skip => {
+            handle_cache_skip(&task_id, Decision::Skip, done_tx, ctx);
+            return Ok(None);
+        }
+        Decision::SharedHit => unreachable!("shared hits are finalized from prepared candidates"),
+        Decision::Run => {
+            if let Some(shared_hit) = prepared.shared_hit {
+                if finalize_shared_cache_hit(&task_id, shared_hit, ctx) {
+                    handle_cache_skip(&task_id, Decision::SharedHit, done_tx, ctx);
+                    return Ok(None);
+                }
             }
-            Decision::Run => {}
         }
     }
 
@@ -379,41 +376,30 @@ pub(super) fn dispatch_decision_result(
         request,
         done_tx,
         cache_enabled,
+        cache_write: prepared.cache_write,
     }))
 }
 
 fn build_task_run_context(
     task_id: &TaskId,
-    cache_enabled: bool,
-    no_cache: bool,
+    prepared_cache_write: Option<CacheWriteContext>,
     ctx: &DispatchContext<'_>,
 ) -> TaskRunContext {
     let output_hash_record =
         build_output_hash_record_context(task_id, ctx.task_graph, ctx.packages, ctx.workspace_root);
-    let cache_write = match build_cache_write_context(task_id, &ctx.decision_ctx) {
-        CacheInputState::Ready(mut cache_ctx) => {
-            if cache_enabled {
-                let decision = build_cache_decision_context(
-                    task_id,
-                    &ctx.decision_ctx,
-                    no_cache,
-                    &mut cache_ctx,
-                );
-                match decision.action {
-                    Decision::Run => {
-                        cache_ctx.capture_pre_execution_snapshot();
-                        Some(*cache_ctx)
-                    }
-                    Decision::Skip => None,
-                    Decision::SharedHit => None,
-                }
-            } else {
+    let cache_write = prepared_cache_write.or_else(|| {
+        match build_cache_write_context(task_id, &ctx.decision_ctx) {
+            CacheInputState::Ready(mut cache_ctx) => {
                 cache_ctx.capture_pre_execution_snapshot();
                 Some(*cache_ctx)
             }
+            CacheInputState::Disabled => None,
         }
-        CacheInputState::Disabled => None,
-    };
+    });
+    let cache_write = cache_write.map(|mut cache_ctx| {
+        cache_ctx.capture_pre_execution_snapshot();
+        cache_ctx
+    });
 
     TaskRunContext {
         executor: Arc::clone(ctx.executor),
@@ -445,6 +431,22 @@ struct SpawnedTaskRun<F> {
     repo_root: PathBuf,
     task_ctx: TaskRunContext,
     task_start_unix_ms: u64,
+    execution_timing: ExecutionTiming,
+}
+
+type ExecutionTiming = Arc<Mutex<Option<(u64, Instant)>>>;
+
+fn mark_execution_start(timing: &ExecutionTiming) {
+    *timing.lock().expect("execution timing poisoned") = Some((now_unix_ms(), Instant::now()));
+}
+
+fn measured_execution_timing(timing: &ExecutionTiming, fallback_start: u64) -> (u64, u64) {
+    timing
+        .lock()
+        .expect("execution timing poisoned")
+        .as_ref()
+        .map(|(start, instant)| (*start, instant.elapsed().as_millis() as u64))
+        .unwrap_or((fallback_start, 0))
 }
 
 fn prepare_task_log_sink(
@@ -471,6 +473,7 @@ where
         repo_root,
         task_ctx,
         task_start_unix_ms,
+        execution_timing,
     } = run;
     let TaskRunContext {
         executor: _,
@@ -478,20 +481,21 @@ where
         interrupted,
         cache,
         output_hashes,
-        cache_write,
+        mut cache_write,
         output_hash_record,
         shared_cache,
         output,
     } = task_ctx;
     let outcome_res = executor.run_with_on_start(&request, on_start).await;
     let end_unix_ms = now_unix_ms();
+    let (start_unix_ms, execution_duration_ms) =
+        measured_execution_timing(&execution_timing, task_start_unix_ms);
+    if let Some(cache_ctx) = cache_write.as_mut() {
+        cache_ctx.start_unix_ms = start_unix_ms;
+    }
     let succeeded = matches!(&outcome_res, Ok(result) if result.status.success());
     let output_hash_record =
         output_hash_record.map(|record| record.with_effective_patterns(outcome_res.as_ref().ok()));
-    let start_unix_ms = cache_write
-        .as_ref()
-        .map(|cache_ctx| cache_ctx.start_unix_ms)
-        .unwrap_or(task_start_unix_ms);
     let persist_failure_record = succeeded || !interrupted.load(Ordering::SeqCst);
     let expansion_error = persist_cache_state(CachePersistInputs {
         cache,
@@ -503,6 +507,7 @@ where
         succeeded,
         persist_failure_record,
         end_unix_ms,
+        execution_duration_ms,
         shared_cache: cache_enabled.then_some(shared_cache).flatten(),
         shared_store_enabled: cache_enabled && !no_cache,
         repo_root,
@@ -861,6 +866,7 @@ async fn write_run_record(
     outcome: Option<&TaskRunOutcome>,
     succeeded: bool,
     end_unix_ms: u64,
+    execution_duration_ms: u64,
     run_reason: Option<RunReason>,
     shared_cache: Option<Arc<SharedCache>>,
     shared_store_enabled: bool,
@@ -908,7 +914,6 @@ async fn write_run_record(
     let env_hash = cache_ctx.env_hash;
     let pkg_dep_hash = cache_ctx.pkg_dep_hash;
     let dep_outputs = cache_ctx.dep_outputs.clone();
-    let start_unix_ms = cache_ctx.start_unix_ms;
     let outputs_hash = record.outputs_hash;
     let record_for_local = (*record).clone();
     let record_for_shared = record_for_local.clone();
@@ -936,7 +941,6 @@ async fn write_run_record(
         // Path-escape at this point is FATAL and propagates as expansion error.
         if shared_store_enabled {
             if let Some(shared) = shared_cache {
-                let _duration_ms = end_unix_ms.saturating_sub(start_unix_ms);
                 // `record_for_shared.inputs` are the stable, already-resolved
                 // inputs captured before the task ran (see
                 // `build_successful_run_record`'s doc comment) — no re-resolve
@@ -965,17 +969,20 @@ async fn write_run_record(
                     .map(|f| std::path::PathBuf::from(&f.path))
                     .collect();
 
-                match shared.store(
-                    &task_id_str,
-                    &input_key,
-                    &outputs_hash,
-                    &package_dir,
-                    &rel_output_paths,
-                    &record_for_shared,
-                    &stdout,
-                    &stderr,
-                    &reports,
-                    &repo_root,
+                match shared.store_with_execution_duration(
+                    SharedCacheStoreRequest {
+                        task_id: &task_id_str,
+                        input_key: &input_key,
+                        outputs_hash: &outputs_hash,
+                        package_dir: &package_dir,
+                        rel_output_paths: &rel_output_paths,
+                        record: &record_for_shared,
+                        stdout: &stdout,
+                        stderr: &stderr,
+                        reports: &reports,
+                        repo_root: &repo_root,
+                    },
+                    execution_duration_ms,
                 ) {
                     Ok(StoreOutcome::Stored) => {}
                     Ok(StoreOutcome::SkippedNotSucceeded) => {}
@@ -1043,238 +1050,6 @@ fn format_task_error(error: &luchta_engine::ExecutorError) -> String {
     format!("failed: {error}")
 }
 
-fn build_cache_decision_context(
-    task_id: &TaskId,
-    ctx: &DecisionContext,
-    no_cache: bool,
-    cache_ctx: &mut CacheWriteContext,
-) -> CacheDecisionContext {
-    let task_def = cache_ctx.task_def.clone();
-    let Some(cache_context) = cache_read_state_context(task_id, ctx, cache_ctx) else {
-        return cache_ctx.decision.clone();
-    };
-    let cache_nonce = cache_ctx.cache_nonce.clone();
-    let merged_env = match ctx.task_envs.get(task_id) {
-        Some(env) => env,
-        None => empty_task_env(),
-    };
-    let current = build_cache_current_state(CacheCurrentStateInput {
-        task_def: &task_def,
-        merged_env,
-        nonce: cache_nonce.as_deref(),
-        cache_context: &cache_context,
-    });
-    let local_record = ctx.cache.read(&task_id.to_string());
-    let decision = decide(local_record.as_ref(), &current);
-    cache_ctx.decision = cache_decision_from_result(&decision);
-    maybe_mark_shared_cache_hit(
-        ctx,
-        no_cache,
-        cache_ctx,
-        SharedCacheSkipInput {
-            task_id,
-            task_def: &task_def,
-            current: &current,
-            decision: &decision,
-            local_record: local_record.as_ref(),
-        },
-        &cache_context.dep_outputs,
-    );
-    if no_cache {
-        cache_ctx.decision = cache_run_decision();
-    }
-    cache_ctx.decision.clone()
-}
-
-fn cache_read_state_context(
-    task_id: &TaskId,
-    ctx: &DecisionContext,
-    cache_ctx: &mut CacheWriteContext,
-) -> Option<CacheStateContext> {
-    let Some(cache_context) = cache_state_context(task_id, ctx) else {
-        cache_ctx.decision = cache_run_decision();
-        return None;
-    };
-    cache_ctx.dep_outputs = cache_context.dep_outputs.clone();
-    Some(cache_context)
-}
-
-fn cache_decision_from_result(decision: &DecisionResult) -> CacheDecisionContext {
-    CacheDecisionContext {
-        action: decision.action,
-        run_reason: decision.reason.clone(),
-    }
-}
-
-fn maybe_mark_shared_cache_hit(
-    ctx: &DecisionContext,
-    no_cache: bool,
-    cache_ctx: &mut CacheWriteContext,
-    input: SharedCacheSkipInput<'_>,
-    dep_outputs: &BTreeMap<String, [u8; 32]>,
-) {
-    if no_cache || !matches!(input.decision.action, Decision::Run) {
-        return;
-    }
-
-    if let Some(shared_decision) = try_shared_cache_skip(
-        input.task_id,
-        ctx,
-        input.task_def,
-        &cache_ctx.package_path,
-        input.current,
-        dep_outputs,
-        input.local_record,
-    ) {
-        if matches!(shared_decision, Decision::SharedHit) {
-            cache_ctx.decision.action = Decision::SharedHit;
-        }
-    }
-}
-
-pub(super) fn try_cache_skip(task_id: &TaskId, ctx: &DecisionContext) -> Option<Decision> {
-    let task_def = ctx.task_graph.task_definition(task_id)?;
-
-    // Resolve nonce using the same helper as the write path.
-    let nonce = ctx.resolve_task_nonce(task_def);
-
-    let mut cache_ctx = match build_cache_write_context(task_id, ctx) {
-        CacheInputState::Ready(cache_ctx) => *cache_ctx,
-        CacheInputState::Disabled => return Some(Decision::Run),
-    };
-    cache_ctx.cache_nonce = nonce;
-
-    Some(build_cache_decision_context(task_id, ctx, false, &mut cache_ctx).action)
-}
-
-fn try_shared_cache_skip(
-    task_id: &TaskId,
-    ctx: &DecisionContext,
-    task_def: &TaskDefinition,
-    package_path: &Path,
-    current: &CurrentState<'_>,
-    dep_outputs: &BTreeMap<String, [u8; 32]>,
-    local_record: Option<&TaskRunRecord>,
-) -> Option<Decision> {
-    let shared_cache = ctx.shared_cache.as_ref()?;
-
-    // Outputs may escape package dir -> not read-eligible for shared cache.
-    // Falls through to run normally (write-time scope check in P4.3).
-    if !outputs_lexically_in_package(&task_def.outputs) {
-        return Some(Decision::Run);
-    }
-
-    // Resolve inputs up front, before the (potentially network-bound) shared
-    // lookup, so the input_key reflects the CURRENT source state rather than
-    // the state of whatever candidate happens to be fetched. `decide()`
-    // frequently reaches here without ever resolving inputs (no local record,
-    // or a changed dependency short-circuits before `check_patterns_unchanged`
-    // runs). Resolving here, against the LOCAL record's inputs as the mtime
-    // prior, is neutral on a warm dev machine (same file states, same hash
-    // reuse) and strictly cheaper on a fresh CI checkout (every mtime differs
-    // from any prior anyway, so every input gets hashed regardless -- doing
-    // that before the network round trip instead of after skips the fetch
-    // entirely on a miss). This is also the ONLY resolve for this task:
-    // `decide_shared_restore` below compares hashes against `inputs_hash`
-    // rather than re-resolving, so a shared-cache HIT doesn't pay to hash
-    // every input twice.
-    //
-    // `current.declared_input_patterns` is the task-definition pattern list,
-    // which is the only sound thing to hash here: an inputs hash requires
-    // patterns to be known before any record is fetched, and
-    // `effective_input_patterns` only falls back to record-carried patterns
-    // when `detected_input_patterns` is true, which `assemble_run_record`
-    // hardcodes to `false` today (see the `debug_assert!` in
-    // `write_run_record` and `derive_input_key`'s doc comment).
-    let prior_inputs: &[FileEntry] = local_record.map_or(&[], |record| record.inputs.as_slice());
-    let Ok(resolved_inputs) = current
-        .resolver
-        .resolve_inputs(current.declared_input_patterns, prior_inputs)
-    else {
-        // Resolve failed -> never restore; let the normal Run path proceed.
-        return Some(Decision::Run);
-    };
-    let inputs_hash = combined_inputs_hash(&resolved_inputs);
-
-    // Compute input_key from the SAME hashes used for local cache.
-    let dep_outputs_hash = combined_dep_outputs_hash(dep_outputs);
-    let input_key = derive_input_key(
-        current.task_spec_hash,
-        current.env_hash,
-        current.pkg_dep_hash,
-        dep_outputs_hash,
-        inputs_hash,
-    );
-
-    // Try restore from shared cache with validation.
-    // Iterate candidates newest-first; validate each before committing.
-    for candidate in
-        shared_cache.try_restore_candidates(&task_id.to_string(), &input_key, package_path)
-    {
-        // VALIDATE: Use decide_shared_restore to check if this candidate matches current tree state.
-        // Unlike full decide(), this does NOT require outputs to exist in the tree —
-        // we're ABOUT to restore outputs from the blob. `inputs_hash` was already
-        // computed above from a live resolve; decide_shared_restore compares it
-        // against the candidate's recorded inputs instead of re-resolving.
-        if decide_shared_restore(&candidate.record, current, inputs_hash) {
-            // Candidate is VALID - inputs match current tree.
-            // Commit the staged restore.
-            match candidate.commit() {
-                Ok((hit, _written_paths)) => {
-                    register_task_watch_state(
-                        &ctx.task_watch_registry,
-                        task_id,
-                        task_id.package.clone(),
-                        package_path.to_path_buf(),
-                        &hit.record,
-                    )
-                    .expect("shared hit task watch registration should compile globs");
-                    // Shared cache HIT (validated):
-                    // (a) Outputs now restored to package dir.
-                    // (b) Hydrate local cache for next build.
-                    hydrate_local_cache(
-                        ctx.cache.clone(),
-                        task_id.clone(),
-                        &hit,
-                        &ctx.reporter.output(),
-                    );
-                    // (c) Keep the restored stdout/stderr captured in the hydrated
-                    // local cache. Successful fresh runs and local cache hits are
-                    // silent, so a shared hit must not replay them to the console.
-                    // (d) Refresh the entry so it survives the day window: a
-                    // hit re-merges it into today's write bucket (already in
-                    // the read set by construction) and advances the meta's
-                    // mtime, so gc_entries_dir doesn't age out an entry still
-                    // in active use. Best-effort -- see `refresh_entry`.
-                    refresh_shared_cache_entry(shared_cache, task_id, &input_key, &hit);
-                    // (e) Record output hash for downstream invalidation.
-                    record_output_hash(&ctx.output_hashes, task_id, hit.outputs_hash);
-                    // (f) Return dedicated shared-hit decision so dispatcher can count it.
-                    return Some(Decision::SharedHit);
-                }
-                Err(e) => {
-                    // Commit failed - log and continue to next candidate
-                    ctx.reporter
-                        .output()
-                        .stderr_line(&format!("warning: shared cache restore commit failed: {e}"));
-                    continue;
-                }
-            }
-        } else {
-            // Candidate is STALE - inputs do not match current tree.
-            // Discard staging and try next candidate.
-            if let Err(e) = candidate.discard() {
-                ctx.reporter
-                    .output()
-                    .stderr_line(&format!("warning: shared cache discard failed: {e}"));
-            }
-            continue;
-        }
-    }
-
-    None
-}
-
 /// A ready task to spawn: what to run, where to report completion, and whether
 /// caching applies. Groups the per-task parameters so `spawn_task_runner` stays
 /// within a sane argument count.
@@ -1283,6 +1058,7 @@ pub(super) struct ReadyTask {
     request: ExecutionRequest,
     done_tx: CompletionSignal,
     cache_enabled: bool,
+    cache_write: Option<CacheWriteContext>,
 }
 
 /// Spawns the async runner that executes the task and reports completion back
@@ -1295,9 +1071,10 @@ fn spawn_task_runner(ready: ReadyTask, ctx: &DispatchContext<'_>) {
         mut request,
         done_tx,
         cache_enabled,
+        cache_write,
     } = ready;
     let task_start_unix_ms = now_unix_ms();
-    let task_ctx = build_task_run_context(&task_id, cache_enabled, ctx.no_cache, ctx);
+    let task_ctx = build_task_run_context(&task_id, cache_write, ctx);
     let reporter = Arc::clone(ctx.reporter);
     let repo_root = ctx.workspace_root.to_path_buf();
 
@@ -1309,7 +1086,13 @@ fn spawn_task_runner(ready: ReadyTask, ctx: &DispatchContext<'_>) {
     let continue_on_failure = ctx.continue_on_failure;
     let no_cache = ctx.no_cache;
     let log_sink = prepare_task_log_sink(&mut request, reporter.output());
-    let on_start = reporter.start_callback(task_id.clone(), log_sink.clone());
+    let reporter_on_start = reporter.start_callback(task_id.clone(), log_sink.clone());
+    let execution_timing = Arc::new(Mutex::new(None));
+    let timing_for_start = Arc::clone(&execution_timing);
+    let on_start = move || {
+        mark_execution_start(&timing_for_start);
+        reporter_on_start();
+    };
 
     tokio::spawn(async move {
         let SpawnedTaskOutcome {
@@ -1327,6 +1110,7 @@ fn spawn_task_runner(ready: ReadyTask, ctx: &DispatchContext<'_>) {
             repo_root,
             task_ctx,
             task_start_unix_ms,
+            execution_timing,
         })
         .await;
 
@@ -1485,6 +1269,7 @@ struct CachePersistInputs<'a> {
     succeeded: bool,
     persist_failure_record: bool,
     end_unix_ms: u64,
+    execution_duration_ms: u64,
     /// Shared cache for storing successful task results.
     shared_cache: Option<Arc<SharedCache>>,
     /// Whether shared-cache store is enabled for this task.
@@ -1515,6 +1300,7 @@ async fn persist_cache_state(inputs: CachePersistInputs<'_>) -> Option<String> {
         succeeded,
         persist_failure_record,
         end_unix_ms,
+        execution_duration_ms,
         shared_cache,
         shared_store_enabled,
         repo_root,
@@ -1531,6 +1317,7 @@ async fn persist_cache_state(inputs: CachePersistInputs<'_>) -> Option<String> {
             succeeded,
             persist_failure_record,
             end_unix_ms,
+            execution_duration_ms,
             shared_cache,
             shared_store_enabled,
             repo_root,
@@ -1551,6 +1338,7 @@ struct CacheWriteInputs<'a> {
     succeeded: bool,
     persist_failure_record: bool,
     end_unix_ms: u64,
+    execution_duration_ms: u64,
     shared_cache: Option<Arc<SharedCache>>,
     shared_store_enabled: bool,
     repo_root: PathBuf,
@@ -1566,6 +1354,7 @@ async fn persist_cache_write(inputs: CacheWriteInputs<'_>) -> Option<String> {
         succeeded,
         persist_failure_record,
         end_unix_ms,
+        execution_duration_ms,
         shared_cache,
         shared_store_enabled,
         repo_root,
@@ -1585,6 +1374,7 @@ async fn persist_cache_write(inputs: CacheWriteInputs<'_>) -> Option<String> {
         outcome,
         succeeded,
         end_unix_ms,
+        execution_duration_ms,
         run_reason,
         shared_cache,
         shared_store_enabled,
@@ -1877,41 +1667,10 @@ fn outputs_lexically_in_package(output_patterns: &[String]) -> bool {
     true
 }
 
-/// Refresh a shared-cache entry on a hit: re-merge it into today's write
-/// bucket and advance its meta's mtime (see `SharedCache::refresh_entry`).
-///
-/// The fields below are read from `hit.record` rather than the caller's
-/// `CurrentState`, but they're the same values: `decide_shared_restore`
-/// already required `record.task_spec_hash == current.task_spec_hash` (and
-/// likewise for `env_hash`/`pkg_dep_hash`) for this to be a hit at all.
-fn refresh_shared_cache_entry(
-    shared_cache: &SharedCache,
-    task_id: &TaskId,
-    input_key: &[u8; 32],
-    hit: &RestoredHit,
-) {
-    let output_bytes: u64 = hit.record.outputs.iter().map(|file| file.size).sum();
-    let entry = SnapshotEntry {
-        task_id: task_id.to_string(),
-        input_key: *input_key,
-        outputs_hash: hit.outputs_hash,
-        task_spec_hash: hit.record.task_spec_hash,
-        env_hash: hit.record.env_hash,
-        pkg_dep_hash: hit.record.pkg_dep_hash,
-        duration_ms: hit
-            .record
-            .end_unix_ms
-            .saturating_sub(hit.record.start_unix_ms),
-        output_bytes,
-        cached_at_unix_ms: hit.record.end_unix_ms,
-        tool_version: None,
-    };
-    shared_cache.refresh_entry(input_key, &entry);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use luchta_cache::shared::RestoredHit;
 
     use crate::cli::OutputMode;
     use crate::progress::ProgressReporter;
@@ -2306,6 +2065,7 @@ mod tests {
             None,
             true,
             20,
+            10,
             Some(RunReason::NoPriorRecord),
             None,
             false,
@@ -2557,7 +2317,11 @@ mod tests {
             done_tx,
             cache_enabled: true,
             outcome: DecisionOutcome::Parallelizable {
-                decision_result: Ok(Some(Decision::Skip)),
+                decision_result: Box::new(Ok(PreparedCacheDecision {
+                    decision: Decision::Skip,
+                    cache_write: None,
+                    shared_hit: None,
+                })),
             },
         };
 
@@ -2587,9 +2351,7 @@ mod tests {
             request: decision_result_execution_request(&task_id),
             done_tx,
             cache_enabled: true,
-            outcome: DecisionOutcome::Direct {
-                decision: Some(Decision::Run),
-            },
+            outcome: DecisionOutcome::Direct,
         };
 
         let ready = dispatch_decision_result(result, &fixture.ctx).expect("decision result ok");
@@ -2610,9 +2372,9 @@ mod tests {
         );
     }
 
-    // A cache-disabled task (or a shared-cache fallback miss) yields a `Direct`
-    // outcome with `None` decision. It must be treated as Run: no completion is
-    // signalled here; the task is returned for pressure-gated dispatch.
+    // A cache-disabled task yields a `Direct` outcome. It must be treated as
+    // Run: no completion is signalled here; the task is returned for
+    // pressure-gated dispatch.
     #[test]
     fn dispatch_decision_result_direct_none_defers_as_run() {
         let fixture = FastStopInvalidTaskFixture::new();
@@ -2624,7 +2386,7 @@ mod tests {
             request: decision_result_execution_request(&task_id),
             done_tx,
             cache_enabled: false,
-            outcome: DecisionOutcome::Direct { decision: None },
+            outcome: DecisionOutcome::Direct,
         };
 
         let ready = dispatch_decision_result(result, &fixture.ctx).expect("decision result ok");
@@ -2645,6 +2407,41 @@ mod tests {
     #[test]
     fn decision_parallelism_is_at_least_one() {
         assert!(super::super::pause::decision_parallelism_for_test() >= 1);
+    }
+
+    #[tokio::test]
+    async fn execution_timing_excludes_weighted_permit_wait() {
+        let fixture = FastStopInvalidTaskFixture::new();
+        let executor = Arc::new(WeightedExecutor::new(1));
+        let held_permit = executor.semaphore().clone().acquire_owned().await.unwrap();
+        let mut request = decision_result_execution_request(&fixture.task_id);
+        request.worker = Some("missing-worker".to_owned());
+        let execution_timing: ExecutionTiming = Arc::new(Mutex::new(None));
+        let timing_for_start = Arc::clone(&execution_timing);
+        let executor_for_run = Arc::clone(&executor);
+        let timing_after_run = Arc::clone(&execution_timing);
+        let wait_started = Instant::now();
+        let run = tokio::spawn(async move {
+            let result = executor_for_run
+                .run_with_on_start(&request, move || mark_execution_start(&timing_for_start))
+                .await;
+            (result, measured_execution_timing(&timing_after_run, 0))
+        });
+
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert!(execution_timing.lock().unwrap().is_none());
+        drop(held_permit);
+
+        let (result, (_, duration_ms)) = run.await.unwrap();
+        assert!(matches!(
+            result,
+            Err(luchta_engine::ExecutorError::MissingWorkerManager { .. })
+        ));
+        assert!(wait_started.elapsed() >= Duration::from_millis(100));
+        assert!(
+            duration_ms < 100,
+            "permit wait must not count toward measured execution duration"
+        );
     }
 
     /// Fast-stop latch: continue mode sets any_failed but leaves interrupted false.

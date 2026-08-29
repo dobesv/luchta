@@ -18,6 +18,13 @@ use crate::store::ReportInput;
 
 /// Schema version for the on-disk entry meta object.
 pub const ENTRY_META_SCHEMA_VERSION: u32 = 1;
+/// Maximum compressed entry metadata size embedded directly in a schema-v3
+/// snapshot. Larger entries retain the fallback `entries/` object.
+pub const INLINE_ENTRY_META_MAX_BYTES: usize = 16 * 1024;
+/// Maximum resident size of metadata retained inline in the merged snapshot
+/// index. This guards highly-compressible metadata from expanding into a large
+/// long-lived allocation while preserving the 16 KiB compressed wire cutoff.
+pub(crate) const INLINE_ENTRY_META_MAX_RESIDENT_BYTES: usize = 1024 * 1024;
 
 const ENTRY_META_ZSTD_LEVEL: i32 = 3;
 const ENTRY_META_FILE_EXTENSION: &str = "bin";
@@ -50,6 +57,31 @@ pub struct EntryMeta {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub reports: Vec<EntryReport>,
+}
+
+/// Approximate heap and inline storage retained by an [`EntryMeta`].
+///
+/// The calculation includes every variable-length payload and the fixed
+/// report descriptors. Allocator bookkeeping is deliberately excluded; the
+/// result is used as a conservative content budget, not a memory profiler.
+#[must_use]
+pub(crate) fn entry_meta_resident_bytes(meta: &EntryMeta) -> usize {
+    meta.record
+        .len()
+        .saturating_add(meta.stdout.len())
+        .saturating_add(meta.stderr.len())
+        .saturating_add(std::mem::size_of_val(meta))
+        .saturating_add(
+            meta.reports
+                .len()
+                .saturating_mul(std::mem::size_of::<EntryReport>()),
+        )
+        .saturating_add(meta.reports.iter().fold(0_usize, |total, report| {
+            total
+                .saturating_add(report.filename.len())
+                .saturating_add(report.mime_type.len())
+                .saturating_add(report.content.len())
+        }))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

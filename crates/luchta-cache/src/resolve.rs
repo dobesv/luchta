@@ -35,7 +35,7 @@ const COMBINED_INPUTS_HASH_DOMAIN: &[u8] = b"luchta-cache:combined-inputs:v1";
 /// This read/write asymmetry now reaches further than a same-vs-changed
 /// comparison: the shared-cache *key* itself is derived from a
 /// `combined_inputs_hash` computed on each side independently.
-/// `try_shared_cache_skip` resolves against this cache (a listing snapshot
+/// `try_shared_cache_prepare` resolves against this cache (a listing snapshot
 /// taken at the start of the run) to compute the key it looks up **before**
 /// the task runs; `write_run_record` hashes the record's inputs (a fresh,
 /// uncached resolve taken **after** the task runs, effectively the
