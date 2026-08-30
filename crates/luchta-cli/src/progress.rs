@@ -29,20 +29,20 @@ use console_output::{truncate_ansi, visible_width, InteractiveStatusState};
 
 /// Outcome of a task as recorded by the progress reporter.
 ///
-/// A successful run increments the wave's `done` bucket; a cache hit increments
-/// `skipped`. Shared-cache hits also increment a dedicated `shared_hits`
-/// counter. Everything else — ordering-only no-worker nodes, previous-failure
-/// skips, config errors, tasks outside the requested subgraph, and execution
-/// failures — is `Uncounted`: removed from running set but not added to done or
-/// skipped totals.
+/// A successful run increments the wave's `done` bucket, a local-cache hit
+/// increments `skipped`, and a shared-cache hit increments `shared_hits`.
+/// Everything else — ordering-only no-worker nodes, previous-failure skips,
+/// config errors, tasks outside the requested subgraph, and execution failures
+/// — is `Uncounted`: removed from the running set but not added to a successful
+/// completion bucket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskOutcome {
     /// Task executed successfully (increments the wave's done count).
     Ran,
     /// Task skipped due to a local cache hit.
     SkippedLocalCache,
-    /// Task skipped due to a shared cache hit.
-    SkippedSharedCache,
+    /// Task satisfied by a shared cache hit.
+    SharedCacheHit,
     /// Outcome that contributes to neither the done nor the skipped totals.
     Uncounted,
 }
@@ -52,6 +52,7 @@ pub struct ProgressReporter {
     pub wave_of: HashMap<TaskId, usize>,
     pub wave_done: Vec<AtomicUsize>,
     pub wave_skipped: Vec<AtomicUsize>,
+    pub wave_shared_hits: Vec<AtomicUsize>,
     pub wave_failed: Vec<AtomicUsize>,
     pub running: Mutex<HashMap<TaskId, Instant>>,
     progress_sinks: Mutex<HashMap<TaskId, ExecutionLogSink>>,
@@ -90,6 +91,7 @@ impl ProgressReporter {
             total_waves,
             wave_done: (0..total_waves).map(|_| AtomicUsize::new(0)).collect(),
             wave_skipped: (0..total_waves).map(|_| AtomicUsize::new(0)).collect(),
+            wave_shared_hits: (0..total_waves).map(|_| AtomicUsize::new(0)).collect(),
             wave_failed: (0..total_waves).map(|_| AtomicUsize::new(0)).collect(),
             wave_total,
             running: Mutex::new(HashMap::new()),
@@ -152,8 +154,8 @@ impl ProgressReporter {
         self.finish_task(id, TaskOutcome::SkippedLocalCache);
     }
 
-    pub fn task_skipped_shared_cache(&self, id: &TaskId) {
-        self.finish_task(id, TaskOutcome::SkippedSharedCache);
+    pub fn task_shared_cache_hit(&self, id: &TaskId) {
+        self.finish_task(id, TaskOutcome::SharedCacheHit);
     }
 
     pub fn task_finished_uncounted(&self, id: &TaskId) {
@@ -224,7 +226,7 @@ impl ProgressReporter {
         };
         let task_progress = self.worker_progress();
         let segment_counts = StatusLineCounts {
-            done_or_skipped: counts.done_or_skipped,
+            completed: counts.completed,
             skipped: counts.skipped,
             shared_hits: counts.shared_hits,
             pending: counts.pending,
@@ -258,14 +260,18 @@ impl ProgressReporter {
         let done = self.done.load(Ordering::SeqCst);
         let skipped = self.skipped.load(Ordering::SeqCst);
         let shared_hits = self.shared_hits.load(Ordering::SeqCst);
-        let done_or_skipped = done + skipped;
-        let done_str = format!("✔ {done_or_skipped}")
+        let completed = done + skipped + shared_hits;
+        let done_str = format!("✔ {completed}")
             .if_supports_color(stream, |t| t.green())
             .to_string();
 
-        let skipped_str = format!("⏩ {skipped}")
-            .if_supports_color(stream, |t| t.cyan())
-            .to_string();
+        let skipped_segment = if skipped > 0 {
+            format!(" ⏩ {skipped}")
+                .if_supports_color(stream, |t| t.cyan())
+                .to_string()
+        } else {
+            String::new()
+        };
 
         let failed_segment = self
             .failed_segment(stream)
@@ -298,7 +304,7 @@ impl ProgressReporter {
             String::new()
         };
 
-        format!("{done_str} {skipped_str}{failed_segment}{shared_segment} {elapsed_str} {rss_str} {waves_str}{cancelled_segment}")
+        format!("{done_str}{skipped_segment}{failed_segment}{shared_segment} {elapsed_str} {rss_str} {waves_str}{cancelled_segment}")
     }
 
     fn finish_task(&self, id: &TaskId, kind: TaskOutcome) {
@@ -323,9 +329,8 @@ impl ProgressReporter {
                 self.wave_skipped[wave_index].fetch_add(1, Ordering::SeqCst);
                 self.skipped.fetch_add(1, Ordering::SeqCst);
             }
-            TaskOutcome::SkippedSharedCache => {
-                self.wave_skipped[wave_index].fetch_add(1, Ordering::SeqCst);
-                self.skipped.fetch_add(1, Ordering::SeqCst);
+            TaskOutcome::SharedCacheHit => {
+                self.wave_shared_hits[wave_index].fetch_add(1, Ordering::SeqCst);
                 self.shared_hits.fetch_add(1, Ordering::SeqCst);
             }
             TaskOutcome::Uncounted => {}
@@ -378,12 +383,12 @@ impl ProgressReporter {
         let skipped = self.skipped.load(Ordering::SeqCst);
         let failed = self.failed.load(Ordering::SeqCst);
         let shared_hits = self.shared_hits.load(Ordering::SeqCst);
-        let done_or_skipped = done + skipped;
+        let completed = done + skipped + shared_hits;
         let running_count = running.len();
-        let pending = total_tasks.saturating_sub(done_or_skipped + running_count + failed);
+        let pending = total_tasks.saturating_sub(completed + running_count + failed);
 
         ProgressCounts {
-            done_or_skipped,
+            completed,
             skipped,
             shared_hits,
             running_count,
@@ -401,6 +406,7 @@ impl ProgressReporter {
                 **wave_total == 0
                     || self.wave_done[*wave_index].load(Ordering::SeqCst)
                         + self.wave_skipped[*wave_index].load(Ordering::SeqCst)
+                        + self.wave_shared_hits[*wave_index].load(Ordering::SeqCst)
                         + self.wave_failed[*wave_index].load(Ordering::SeqCst)
                         == **wave_total
             })
@@ -409,7 +415,7 @@ impl ProgressReporter {
 }
 
 struct ProgressCounts {
-    done_or_skipped: usize,
+    completed: usize,
     skipped: usize,
     shared_hits: usize,
     running_count: usize,

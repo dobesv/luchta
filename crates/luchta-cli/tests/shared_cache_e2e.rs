@@ -611,8 +611,8 @@ fn e2e_cross_build_shared_cache_hit() {
         "second build should report shared hit stats, stdout was:\n{second_stdout}"
     );
     assert!(
-        second_stdout.contains("⏩ 1 📥 1"),
-        "second build summary should report shared hit stats, stdout was:\n{second_stdout}"
+        second_stdout.contains("✔ 1 📥 1") && !second_stdout.contains("⏩"),
+        "second build should not count a shared hit as skipped, stdout was:\n{second_stdout}"
     );
 
     assert!(
