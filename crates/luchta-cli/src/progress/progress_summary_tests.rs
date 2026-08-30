@@ -71,11 +71,36 @@ fn render_summary_includes_shared_hits_suffix_when_present() {
     );
 
     reporter.task_ran(&task_a);
-    reporter.task_skipped_shared_cache(&task_b);
+    reporter.task_shared_cache_hit(&task_b);
 
     let summary = reporter.render_summary("10 MB", false, owo_colors::Stream::Stdout);
 
-    assert!(summary.contains("✔ 2 ⏩ 1 📥 1"), "summary was: {summary}");
+    assert!(summary.contains("✔ 2 📥 1"), "summary was: {summary}");
+    assert!(!summary.contains("⏩"), "summary was: {summary}");
+}
+
+#[test]
+fn render_summary_keeps_local_and_shared_cache_hits_separate() {
+    let task_a = task_id("pkg-a", "build");
+    let task_b = task_id("pkg-b", "build");
+    let task_c = task_id("pkg-c", "build");
+    let reporter = ProgressReporter::new(
+        OutputMode::Default,
+        HashMap::from([
+            (task_a.clone(), 0),
+            (task_b.clone(), 0),
+            (task_c.clone(), 0),
+        ]),
+        1,
+    );
+
+    reporter.task_ran(&task_a);
+    reporter.task_skipped_cache_hit(&task_b);
+    reporter.task_shared_cache_hit(&task_c);
+
+    let summary = reporter.render_summary("10 MB", false, owo_colors::Stream::Stdout);
+
+    assert!(summary.contains("✔ 3 ⏩ 1 📥 1"), "summary was: {summary}");
 }
 
 #[test]

@@ -11,7 +11,7 @@ const HIDDEN_TASK_MARKER: &str = "…";
 
 #[derive(Clone, Copy)]
 pub(super) struct StatusLineCounts {
-    pub(super) done_or_skipped: usize,
+    pub(super) completed: usize,
     pub(super) skipped: usize,
     pub(super) shared_hits: usize,
     pub(super) pending: usize,
@@ -70,7 +70,7 @@ struct StatusLineParts<'a> {
 
 impl StatusLineParts<'_> {
     fn render(&self, running_task_list: &str) -> String {
-        let mut segments = vec![format!("✔ {}", self.counts.done_or_skipped)
+        let mut segments = vec![format!("✔ {}", self.counts.completed)
             .if_supports_color(self.stream, |value| value.green())
             .to_string()];
         self.append_segments(&mut segments, running_task_list);

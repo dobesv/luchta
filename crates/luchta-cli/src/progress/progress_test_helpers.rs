@@ -12,12 +12,23 @@ pub(super) struct DoneSummaryExpectation {
 
 impl DoneSummaryExpectation {
     pub(super) fn assert_in(&self, out: &str) {
+        let done_segment = format!("✔ {}", self.done);
         assert!(
-            out.contains(&format!("✔ {} ⏩ {}", self.done, self.skipped)),
-            "expected done summary '✔ {} ⏩ {}', got: {out}",
-            self.done,
-            self.skipped
+            out.contains(&done_segment),
+            "expected done summary '{done_segment}', got: {out}"
         );
+        if self.skipped > 0 {
+            let skipped_segment = format!("⏩ {}", self.skipped);
+            assert!(
+                out.contains(&skipped_segment),
+                "expected skipped summary '{skipped_segment}', got: {out}"
+            );
+        } else {
+            assert!(
+                !out.contains("⏩"),
+                "expected zero skipped tasks to be omitted, got: {out}"
+            );
+        }
         assert!(
             out.contains(&format!("🌊 {} / {}", self.waves, self.waves)),
             "expected wave summary '🌊 {} / {}', got: {out}",

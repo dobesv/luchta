@@ -185,7 +185,7 @@ fn render_progress_emits_ansi_when_color_forced() {
         1,
     );
     reporter.task_ran(&task);
-    reporter.task_skipped_shared_cache(&shared);
+    reporter.task_shared_cache_hit(&shared);
 
     let sample = MemorySample {
         tree_rss: 32 * 1024 * 1024,

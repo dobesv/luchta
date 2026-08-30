@@ -70,7 +70,7 @@ fn render_progress_includes_shared_hits_segment_when_present() {
     );
 
     reporter.task_ran(&task_a);
-    reporter.task_skipped_shared_cache(&task_b);
+    reporter.task_shared_cache_hit(&task_b);
 
     let out = reporter.render_progress(
         "10 MB",
@@ -79,8 +79,10 @@ fn render_progress_includes_shared_hits_segment_when_present() {
         owo_colors::Stream::Stdout,
     );
 
-    assert!(out.contains("📥 1"), "output was: {out}");
-    assert!(out.contains("⏩ 1"), "output was: {out}");
+    assert!(
+        out.contains("✔ 2 📥 1") && out.contains("🌊 1 / 1") && !out.contains("⏩"),
+        "output was: {out}"
+    );
 }
 
 #[test]

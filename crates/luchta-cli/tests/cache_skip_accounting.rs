@@ -1,4 +1,4 @@
-//! Tests for skip accounting: "skipped" count = cache-hit ONLY.
+//! Tests for skip accounting: "skipped" count = local-cache hit only.
 
 use std::fs;
 use std::path::Path;
@@ -15,12 +15,24 @@ struct DoneLine {
 }
 
 fn assert_done_line(out: &str, label: &str, expected: DoneLine) {
-    let done_token = format!("✔ {} ⏩ {}", expected.done, expected.skipped);
+    let done_token = format!("✔ {}", expected.done);
     let wave_token = format!("🌊 {} / {}", expected.waves, expected.waves);
     assert!(
         out.contains(&done_token),
         "{label} stdout should contain '{done_token}', got: {out}"
     );
+    if expected.skipped > 0 {
+        let skipped_token = format!("⏩ {}", expected.skipped);
+        assert!(
+            out.contains(&skipped_token),
+            "{label} stdout should contain '{skipped_token}', got: {out}"
+        );
+    } else {
+        assert!(
+            !out.contains("⏩"),
+            "{label} stdout should omit the zero skipped count, got: {out}"
+        );
+    }
     assert!(
         out.contains(&wave_token),
         "{label} stdout should contain '{wave_token}', got: {out}"
@@ -175,10 +187,10 @@ fn skip_count_is_cache_hit_only() {
         "first run should succeed, stderr: {}",
         String::from_utf8_lossy(&output1.stderr)
     );
-    // First run: 1 done, 0 skipped
+    // First run: one completion and no skipped segment.
     assert!(
-        stdout1.contains("✔ 1 ⏩ 0"),
-        "first run stdout should contain '✔ 1 ⏩ 0', got: {stdout1}"
+        stdout1.contains("✔ 1 ⌚") && !stdout1.contains("⏩"),
+        "first run stdout should omit the zero skipped count, got: {stdout1}"
     );
     assert!(
         stdout1.contains("🌊 1 / 1"),

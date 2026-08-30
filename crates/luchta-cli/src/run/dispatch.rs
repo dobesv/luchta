@@ -314,7 +314,7 @@ fn handle_cache_skip(
             let _ = done_tx.send(true);
         }
         Decision::SharedHit => {
-            ctx.reporter.task_skipped_shared_cache(task_id);
+            ctx.reporter.task_shared_cache_hit(task_id);
             let _ = done_tx.send(true);
         }
         Decision::Run => {
