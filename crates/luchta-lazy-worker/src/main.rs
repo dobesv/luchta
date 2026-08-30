@@ -2,13 +2,12 @@ use std::process;
 use std::sync::Arc;
 
 use luchta_worker::{
-    split_current_process_argv, version_requested, DelegateHandle, ProxyError, ResolveResult,
-    WorkerMessage, WorkerResponse,
+    run_concurrent_middleware, split_current_process_argv, version_requested,
+    write_worker_response, DelegateHandle, ResolveResult, SharedWriter, WorkerMessage,
+    WorkerResponse,
 };
-use tokio::io::{stdin, stdout, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::stdout;
 use tokio::sync::Mutex;
-
-type SharedWriter = Arc<Mutex<Box<dyn AsyncWrite + Unpin + Send>>>;
 
 fn main() {
     let exit_code = match tokio::runtime::Builder::new_current_thread()
@@ -42,62 +41,25 @@ async fn async_main() -> i32 {
     }
 
     let stdout_writer: SharedWriter = Arc::new(Mutex::new(Box::new(stdout())));
-    let delegate = DelegateHandle::with_writers(
+    let delegate = Arc::new(DelegateHandle::with_writers(
         split.delegate_command,
         Arc::clone(&stdout_writer),
         Arc::new(Mutex::new(Box::new(tokio::io::stderr()))),
         None,
-    );
+    ));
 
     let mut exit_code = 0;
-    let mut lines = BufReader::new(stdin()).lines();
-    loop {
-        let Some(line) = (match lines.next_line().await {
-            Ok(line) => line,
-            Err(error) => {
-                eprintln!("failed to read worker stdin: {error}");
-                exit_code = 1;
-                break;
-            }
-        }) else {
-            break;
-        };
-
-        let message = match serde_json::from_str::<WorkerMessage>(&line) {
-            Ok(message) => message,
-            Err(error) => {
-                eprintln!("failed to parse worker message: {error}");
-                exit_code = 1;
-                break;
-            }
-        };
-
-        match message {
-            WorkerMessage::ResolveTask(resolve) => {
-                let response = WorkerResponse::resolved(resolve.id, ResolveResult::accept());
-                if let Err(error) = write_response(&stdout_writer, &response).await {
-                    eprintln!("failed to write resolve response: {error}");
-                    exit_code = 1;
-                    break;
-                }
-            }
-            WorkerMessage::Run(request) => {
-                if let Err(error) = delegate.send(WorkerMessage::Run(request)).await {
-                    let exit = match delegate.exit_status().await {
-                        Some(status) => status.to_string(),
-                        None => "<unknown>".to_owned(),
-                    };
-                    eprintln!(
-                        "delegate failed: command={:?}, exit={}, error={}",
-                        delegate.delegate_command(),
-                        exit,
-                        error
-                    );
-                    exit_code = 1;
-                    break;
-                }
-            }
-        }
+    let dispatch_delegate = Arc::clone(&delegate);
+    let dispatch_writer = Arc::clone(&stdout_writer);
+    if let Err(error) = run_concurrent_middleware(move |message| {
+        let delegate = Arc::clone(&dispatch_delegate);
+        let stdout_writer = Arc::clone(&dispatch_writer);
+        async move { dispatch_message(&delegate, &stdout_writer, message).await }
+    })
+    .await
+    {
+        eprintln!("{error}");
+        exit_code = 1;
     }
 
     if let Err(error) = delegate.shutdown().await {
@@ -112,14 +74,21 @@ async fn async_main() -> i32 {
     exit_code
 }
 
-async fn write_response(
-    writer: &SharedWriter,
-    response: &WorkerResponse,
-) -> Result<(), ProxyError> {
-    let line = serde_json::to_string(response)?;
-    let mut writer = writer.lock().await;
-    writer.write_all(line.as_bytes()).await?;
-    writer.write_all(b"\n").await?;
-    writer.flush().await?;
-    Ok(())
+async fn dispatch_message(
+    delegate: &DelegateHandle,
+    stdout_writer: &SharedWriter,
+    message: WorkerMessage,
+) -> Result<(), String> {
+    match message {
+        WorkerMessage::ResolveTask(resolve) => {
+            let response = WorkerResponse::resolved(resolve.id, ResolveResult::accept());
+            write_worker_response(stdout_writer, &response)
+                .await
+                .map_err(|error| format!("failed to write resolve response: {error}"))
+        }
+        WorkerMessage::Run(request) => match delegate.send(WorkerMessage::Run(request)).await {
+            Ok(_) => Ok(()),
+            Err(error) => Err(delegate.failure_message("delegate failed", error).await),
+        },
+    }
 }

@@ -5,6 +5,9 @@ use std::process::{Command, Output, Stdio};
 use assert_cmd::cargo::cargo_bin;
 use serde_json::{json, Value};
 
+const CONCURRENCY_GATE_MAX_ATTEMPTS: usize = 500;
+const CONCURRENCY_GATE_POLL_SECONDS: f64 = 0.01;
+
 #[derive(Clone, Copy)]
 struct CaseId(&'static str);
 
@@ -434,4 +437,162 @@ fn run_forwards_done_from_delegate() {
     assert_eq!(responses[0]["type"], "done");
     assert_eq!(responses[0]["id"], id.as_str());
     assert_eq!(responses[0]["exitCode"], 0);
+}
+
+#[test]
+fn independent_runs_reach_delegate_concurrently() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let started = temp.path().join("delegate.started");
+    let gate = temp.path().join("delegate.gate");
+    let delegate_script = format!(
+        r#"while IFS= read -r line; do
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  case "$line" in
+    *'"type":"run"'*)
+      printf '%s\n' "$id" >> {started}
+      if [ "$(wc -l < {started})" -ge 2 ]; then
+        touch {gate}
+      fi
+      (
+        attempts=0
+        while [ ! -f {gate} ] && [ "$attempts" -lt {max_attempts} ]; do
+          sleep {poll_seconds}
+          attempts=$((attempts + 1))
+        done
+        if [ -f {gate} ]; then
+          exit_code=0
+        else
+          exit_code=1
+        fi
+        printf '{{"type":"done","id":"%s","exitCode":%s}}\n' "$id" "$exit_code"
+      ) &
+      ;;
+  esac
+done
+wait
+"#,
+        started = started.display(),
+        gate = gate.display(),
+        max_attempts = CONCURRENCY_GATE_MAX_ATTEMPTS,
+        poll_seconds = CONCURRENCY_GATE_POLL_SECONDS,
+    );
+    let output = run_worker(
+        &shell_program("while IFS= read -r _line; do :; done\n"),
+        &shell_program(&delegate_script),
+        &[
+            run_message(CaseId("run-one")),
+            run_message(CaseId("run-two")),
+        ],
+    );
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let responses = parse_jsonl(&output.stdout);
+    assert_eq!(responses.len(), 2, "responses: {responses:?}");
+    assert!(responses
+        .iter()
+        .all(|response| { response["type"] == "done" && response["exitCode"] == 0 }));
+    let started_ids = std::fs::read_to_string(&started).expect("read started ids");
+    assert_eq!(started_ids.lines().count(), 2, "started ids: {started_ids}");
+    assert!(
+        gate.exists(),
+        "delegate never observed two simultaneous in-flight runs"
+    );
+}
+
+#[test]
+fn concurrent_resolve_suppression_preserves_run_response() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let resolve_id = CaseId("resolve-concurrent");
+    let run_id = CaseId("run-concurrent");
+    let delegate_argv = concurrent_resolve_run_delegate(temp.path(), resolve_id, run_id);
+    let output = run_worker(
+        &resolve_worker_argv(resolve_id, ResolveDecisionSpec::Accept),
+        &delegate_argv,
+        &[resolve_message(resolve_id), run_message(run_id)],
+    );
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_concurrent_resolve_run_responses(&parse_jsonl(&output.stdout), resolve_id, run_id);
+}
+
+fn concurrent_resolve_run_delegate(temp: &Path, resolve_id: CaseId, run_id: CaseId) -> Vec<String> {
+    let resolve_seen = temp.join("delegate.resolve-seen");
+    let run_done = temp.join("delegate.run-done");
+    let resolved = resolve_response(resolve_id, ResolveDecisionSpec::Accept);
+    let timed_out = resolve_response(
+        resolve_id,
+        ResolveDecisionSpec::Reject(Text("run did not arrive concurrently")),
+    );
+    let done = json!({"type":"done","id":run_id.as_str(),"exitCode":0}).to_string();
+    let failed_done = json!({"type":"done","id":run_id.as_str(),"exitCode":1}).to_string();
+    shell_program(&format!(
+        r#"while IFS= read -r line; do
+  case "$line" in
+    *'"type":"resolveTask"'*)
+      touch {resolve_seen}
+      (
+        attempts=0
+        while [ ! -f {run_done} ] && [ "$attempts" -lt {max_attempts} ]; do
+          sleep {poll_seconds}
+          attempts=$((attempts + 1))
+        done
+        if [ -f {run_done} ]; then
+          printf '%s\n' '{resolved}'
+        else
+          printf '%s\n' '{timed_out}'
+        fi
+      ) &
+      ;;
+    *'"type":"run"'*)
+      (
+        attempts=0
+        while [ ! -f {resolve_seen} ] && [ "$attempts" -lt {max_attempts} ]; do
+          sleep {poll_seconds}
+          attempts=$((attempts + 1))
+        done
+        if [ -f {resolve_seen} ]; then
+          printf '%s\n' '{done}'
+        else
+          printf '%s\n' '{failed_done}'
+        fi
+        touch {run_done}
+      ) &
+      ;;
+  esac
+done
+wait
+"#,
+        resolve_seen = resolve_seen.display(),
+        run_done = run_done.display(),
+        max_attempts = CONCURRENCY_GATE_MAX_ATTEMPTS,
+        poll_seconds = CONCURRENCY_GATE_POLL_SECONDS,
+    ))
+}
+
+fn assert_concurrent_resolve_run_responses(
+    responses: &[Value],
+    resolve_id: CaseId,
+    run_id: CaseId,
+) {
+    assert_eq!(responses.len(), 2, "responses: {responses:?}");
+    let run_response = responses
+        .iter()
+        .find(|response| response["id"] == run_id.as_str())
+        .expect("run response");
+    assert_eq!(run_response["type"], "done");
+    assert_eq!(run_response["exitCode"], 0);
+    let resolve_response = responses
+        .iter()
+        .find(|response| response["id"] == resolve_id.as_str())
+        .expect("resolve response");
+    assert_eq!(resolve_response["type"], "resolved");
+    assert_eq!(resolve_response["result"]["decision"], "accept");
 }

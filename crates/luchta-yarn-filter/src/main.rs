@@ -3,14 +3,13 @@ use std::process;
 use std::sync::Arc;
 
 use luchta_worker::{
-    split_current_process_argv, version_requested, DelegateHandle, ProxyError, ResolveResult,
-    ResolveTask, WorkerMessage, WorkerResponse,
+    run_concurrent_middleware, split_current_process_argv, version_requested,
+    write_worker_response, DelegateHandle, ProxyError, ResolveResult, ResolveTask, SharedWriter,
+    WorkerMessage, WorkerResponse,
 };
 use serde_json::Value;
-use tokio::io::{stdin, stdout, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::stdout;
 use tokio::sync::Mutex;
-
-type SharedWriter = Arc<Mutex<Box<dyn AsyncWrite + Unpin + Send>>>;
 
 /// Bound on how long the delegate may take to answer a forwarded `resolve`.
 /// `resolve` runs during graph build and must be fast; a delegate that is alive
@@ -54,7 +53,7 @@ async fn async_main() -> i32 {
     let usage = "usage: luchta-yarn-filter [--script NAME]... [--dependency NAME]... -- <delegate command...>";
 
     let config = match parse_stage_args(&stage_args) {
-        Ok(config) => config,
+        Ok(config) => Arc::new(config),
         Err(error) => {
             eprintln!("{error}; {usage}");
             return 1;
@@ -67,77 +66,27 @@ async fn async_main() -> i32 {
     }
 
     let stdout_writer: SharedWriter = Arc::new(Mutex::new(Box::new(stdout())));
-    let delegate = DelegateHandle::with_writers(
+    let delegate = Arc::new(DelegateHandle::with_writers(
         argv.delegate_command,
         Arc::clone(&stdout_writer),
         Arc::new(Mutex::new(Box::new(tokio::io::stderr()))),
         Some("delegate stderr: ".to_owned()),
-    );
+    ));
 
     let mut exit_code = 0;
-    let mut lines = BufReader::new(stdin()).lines();
-
-    loop {
-        let Some(line) = (match lines.next_line().await {
-            Ok(line) => line,
-            Err(error) => {
-                eprintln!("failed to read worker stdin: {error}");
-                exit_code = 1;
-                break;
-            }
-        }) else {
-            break;
-        };
-
-        let message = match serde_json::from_str::<WorkerMessage>(&line) {
-            Ok(message) => message,
-            Err(error) => {
-                eprintln!("failed to parse worker message: {error}");
-                exit_code = 1;
-                break;
-            }
-        };
-
-        match message {
-            WorkerMessage::ResolveTask(resolve) => {
-                let request_id = resolve.id.clone();
-                if should_keep(&config, &resolve) {
-                    if let Err(error) = delegate
-                        .send_with_timeout(
-                            WorkerMessage::ResolveTask(resolve),
-                            RESOLVE_FORWARD_TIMEOUT,
-                        )
-                        .await
-                    {
-                        eprintln!(
-                            "{}",
-                            delegate
-                                .failure_message("delegate failed before resolve decision", error)
-                                .await
-                        );
-                        exit_code = 1;
-                        break;
-                    }
-                } else {
-                    let response = WorkerResponse::resolved(request_id, ResolveResult::prune(None));
-                    if let Err(error) = write_response(&stdout_writer, &response).await {
-                        eprintln!("failed to write prune response: {error}");
-                        exit_code = 1;
-                        break;
-                    }
-                }
-            }
-            WorkerMessage::Run(request) => {
-                if let Err(error) = delegate.send(WorkerMessage::Run(request)).await {
-                    eprintln!(
-                        "{}",
-                        delegate.failure_message("delegate failed", error).await
-                    );
-                    exit_code = 1;
-                    break;
-                }
-            }
-        }
+    let dispatch_config = Arc::clone(&config);
+    let dispatch_delegate = Arc::clone(&delegate);
+    let dispatch_writer = Arc::clone(&stdout_writer);
+    if let Err(error) = run_concurrent_middleware(move |message| {
+        let config = Arc::clone(&dispatch_config);
+        let delegate = Arc::clone(&dispatch_delegate);
+        let stdout_writer = Arc::clone(&dispatch_writer);
+        async move { dispatch_message(config, &delegate, &stdout_writer, message).await }
+    })
+    .await
+    {
+        eprintln!("{error}");
+        exit_code = 1;
     }
 
     if let Err(error) = delegate.shutdown().await {
@@ -150,6 +99,46 @@ async fn async_main() -> i32 {
     }
 
     exit_code
+}
+
+async fn dispatch_message(
+    config: Arc<Config>,
+    delegate: &DelegateHandle,
+    stdout_writer: &SharedWriter,
+    message: WorkerMessage,
+) -> Result<(), String> {
+    match message {
+        WorkerMessage::ResolveTask(resolve) => {
+            let request_id = resolve.id.clone();
+            let (resolve, keep) = tokio::task::spawn_blocking(move || {
+                let keep = should_keep(&config, &resolve);
+                (resolve, keep)
+            })
+            .await
+            .map_err(|error| format!("yarn filter task failed: {error}"))?;
+
+            if keep {
+                if let Err(error) = delegate
+                    .send_with_timeout(WorkerMessage::ResolveTask(resolve), RESOLVE_FORWARD_TIMEOUT)
+                    .await
+                {
+                    return Err(delegate
+                        .failure_message("delegate failed before resolve decision", error)
+                        .await);
+                }
+                Ok(())
+            } else {
+                let response = WorkerResponse::resolved(request_id, ResolveResult::prune(None));
+                write_worker_response(stdout_writer, &response)
+                    .await
+                    .map_err(|error| format!("failed to write prune response: {error}"))
+            }
+        }
+        WorkerMessage::Run(request) => match delegate.send(WorkerMessage::Run(request)).await {
+            Ok(_) => Ok(()),
+            Err(error) => Err(delegate.failure_message("delegate failed", error).await),
+        },
+    }
 }
 
 fn parse_stage_args(args: &[String]) -> Result<Config, String> {
@@ -276,18 +265,6 @@ fn dependency_map_contains(value: &Value, key: &str, dependency: &str) -> bool {
         .get(key)
         .and_then(Value::as_object)
         .is_some_and(|dependencies| dependencies.contains_key(dependency))
-}
-
-async fn write_response(
-    writer: &SharedWriter,
-    response: &WorkerResponse,
-) -> Result<(), ProxyError> {
-    let line = serde_json::to_string(response)?;
-    let mut writer = writer.lock().await;
-    writer.write_all(line.as_bytes()).await?;
-    writer.write_all(b"\n").await?;
-    writer.flush().await?;
-    Ok(())
 }
 
 #[cfg(test)]

@@ -4,20 +4,26 @@ use std::sync::Arc;
 
 use globset::{GlobSet, GlobSetBuilder};
 use luchta_worker::{
-    split_current_process_argv, version_requested, DelegateHandle, ProxyError, ResolveResult,
-    WorkerMessage, WorkerResponse,
+    run_concurrent_middleware, split_current_process_argv, version_requested,
+    write_worker_response, DelegateHandle, ProxyError, ResolveResult, SharedWriter, WorkerMessage,
+    WorkerResponse,
 };
-use tokio::io::{stdin, stdout, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::stdout;
 use tokio::sync::Mutex;
 use walkdir::WalkDir;
-
-type SharedWriter = Arc<Mutex<Box<dyn AsyncWrite + Unpin + Send>>>;
 
 /// Bound on how long the delegate may take to answer a forwarded `resolve`.
 /// `resolve` runs during graph build and must be fast; a delegate that is alive
 /// but never responds would otherwise hang the whole build. A timeout fails the
 /// worker.
 const RESOLVE_FORWARD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+struct DispatchContext {
+    patterns: Vec<String>,
+    globs: GlobSet,
+    delegate: Arc<DelegateHandle>,
+    stdout_writer: SharedWriter,
+}
 
 fn main() {
     let exit_code = match tokio::runtime::Builder::new_current_thread()
@@ -70,91 +76,28 @@ async fn async_main() -> i32 {
     };
 
     let stdout_writer: SharedWriter = Arc::new(Mutex::new(Box::new(stdout())));
-    let delegate = DelegateHandle::with_writers(
+    let delegate = Arc::new(DelegateHandle::with_writers(
         argv.delegate_command,
         Arc::clone(&stdout_writer),
         Arc::new(Mutex::new(Box::new(tokio::io::stderr()))),
         Some("delegate stderr: ".to_owned()),
-    );
+    ));
 
     let mut exit_code = 0;
-    let mut lines = BufReader::new(stdin()).lines();
-
-    loop {
-        let Some(line) = (match lines.next_line().await {
-            Ok(line) => line,
-            Err(error) => {
-                eprintln!("failed to read worker stdin: {error}");
-                exit_code = 1;
-                break;
-            }
-        }) else {
-            break;
-        };
-
-        let message = match serde_json::from_str::<WorkerMessage>(&line) {
-            Ok(message) => message,
-            Err(error) => {
-                eprintln!("failed to parse worker message: {error}");
-                exit_code = 1;
-                break;
-            }
-        };
-
-        match message {
-            WorkerMessage::ResolveTask(resolve) => {
-                let request_id = resolve.id.clone();
-                match resolve_matches_any_pattern(&resolve, &globs) {
-                    Ok(true) => {
-                        if let Err(error) = delegate
-                            .send_with_timeout(
-                                WorkerMessage::ResolveTask(resolve),
-                                RESOLVE_FORWARD_TIMEOUT,
-                            )
-                            .await
-                        {
-                            eprintln!(
-                                "{}",
-                                delegate
-                                    .failure_message(
-                                        "delegate failed before resolve decision",
-                                        error,
-                                    )
-                                    .await
-                            );
-                            exit_code = 1;
-                            break;
-                        }
-                    }
-                    Ok(false) => {
-                        let response =
-                            WorkerResponse::resolved(request_id, ResolveResult::prune(None));
-                        if let Err(error) = write_response(&stdout_writer, &response).await {
-                            eprintln!("failed to write prune response: {error}");
-                            exit_code = 1;
-                            break;
-                        }
-                    }
-                    Err(error) => {
-                        eprintln!(
-                            "failed to evaluate file-exists patterns: patterns={patterns:?}, error={error}"
-                        );
-                        exit_code = 1;
-                        break;
-                    }
-                }
-            }
-            WorkerMessage::Run(request) => {
-                if let Err(error) = delegate.send(WorkerMessage::Run(request)).await {
-                    eprintln!(
-                        "{}",
-                        delegate.failure_message("delegate failed", error).await
-                    );
-                    exit_code = 1;
-                    break;
-                }
-            }
-        }
+    let context = Arc::new(DispatchContext {
+        patterns,
+        globs,
+        delegate: Arc::clone(&delegate),
+        stdout_writer,
+    });
+    if let Err(error) = run_concurrent_middleware(move |message| {
+        let context = Arc::clone(&context);
+        async move { dispatch_message(context, message).await }
+    })
+    .await
+    {
+        eprintln!("{error}");
+        exit_code = 1;
     }
 
     if let Err(error) = delegate.shutdown().await {
@@ -167,6 +110,62 @@ async fn async_main() -> i32 {
     }
 
     exit_code
+}
+
+async fn dispatch_message(
+    context: Arc<DispatchContext>,
+    message: WorkerMessage,
+) -> Result<(), String> {
+    match message {
+        WorkerMessage::ResolveTask(resolve) => {
+            let request_id = resolve.id.clone();
+            let evaluation_context = Arc::clone(&context);
+            let (resolve, matches) = tokio::task::spawn_blocking(move || {
+                let matches = resolve_matches_any_pattern(&resolve, &evaluation_context.globs);
+                (resolve, matches)
+            })
+            .await
+            .map_err(|error| format!("file-exists filter task failed: {error}"))?;
+
+            match matches {
+                Ok(true) => {
+                    if let Err(error) = context
+                        .delegate
+                        .send_with_timeout(
+                            WorkerMessage::ResolveTask(resolve),
+                            RESOLVE_FORWARD_TIMEOUT,
+                        )
+                        .await
+                    {
+                        return Err(context
+                            .delegate
+                            .failure_message("delegate failed before resolve decision", error)
+                            .await);
+                    }
+                    Ok(())
+                }
+                Ok(false) => {
+                    let response = WorkerResponse::resolved(request_id, ResolveResult::prune(None));
+                    write_worker_response(&context.stdout_writer, &response)
+                        .await
+                        .map_err(|error| format!("failed to write prune response: {error}"))
+                }
+                Err(error) => Err(format!(
+                    "failed to evaluate file-exists patterns: patterns={:?}, error={error}",
+                    context.patterns
+                )),
+            }
+        }
+        WorkerMessage::Run(request) => {
+            match context.delegate.send(WorkerMessage::Run(request)).await {
+                Ok(_) => Ok(()),
+                Err(error) => Err(context
+                    .delegate
+                    .failure_message("delegate failed", error)
+                    .await),
+            }
+        }
+    }
 }
 
 fn build_globset(patterns: &[String]) -> Result<GlobSet, globset::Error> {
@@ -214,18 +213,6 @@ fn resolve_matches_any_pattern(
     }
 
     Ok(false)
-}
-
-async fn write_response(
-    writer: &SharedWriter,
-    response: &WorkerResponse,
-) -> Result<(), ProxyError> {
-    let line = serde_json::to_string(response)?;
-    let mut writer = writer.lock().await;
-    writer.write_all(line.as_bytes()).await?;
-    writer.write_all(b"\n").await?;
-    writer.flush().await?;
-    Ok(())
 }
 
 #[cfg(test)]

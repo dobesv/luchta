@@ -11,9 +11,9 @@
 //!   final resolve response itself
 //! - run delegate normally auto-forwards to real stdout for streaming run-phase
 //!   logs/done messages
-//! - during resolve-phase forwards, wrapper temporarily switches run delegate
-//!   stdout to sink to prevent duplicate protocol output while still awaiting its
-//!   terminal `Resolved` response
+//! - the run delegate's response writer suppresses only the matching resolve id
+//!   while the wrapper awaits its terminal `Resolved` response, so unrelated
+//!   concurrent run output continues streaming
 //!
 //! Precedence:
 //! - if resolve worker returns `Modify` and run delegate returns `Accept`,
@@ -21,90 +21,35 @@
 //!   criteria
 //! - if both modify, or delegate prunes/rejects, delegate decision wins
 
-use std::pin::Pin;
 use std::process;
-use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
-use std::task::{Context, Poll};
 use std::time::Duration;
 
+mod response_filter;
+
 use luchta_worker::{
-    split_current_process_argv, version_requested, DelegateHandle, ProxyError, ResolveDecision,
-    ResolveResult, ResolveTask, TaskModification, WorkerMessage, WorkerRequest, WorkerResponse,
+    run_concurrent_middleware, split_current_process_argv, version_requested,
+    write_worker_response, DelegateHandle, ProxyError, ResolveDecision, ResolveResult, ResolveTask,
+    SharedWriter, TaskModification, WorkerMessage, WorkerRequest, WorkerResponse,
 };
-use tokio::io::{
-    sink, stdin, stdout, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader, Sink, Stdout,
-};
+use tokio::io::stdout;
 use tokio::sync::Mutex;
 
-type SharedWriter = Arc<Mutex<Box<dyn AsyncWrite + Unpin + Send>>>;
+use response_filter::{ResponseFilter, ResponseFilteringWriter};
 
-const RESOLVE_TIMEOUT: Duration = Duration::from_secs(30);
-const FORWARD_REAL: u8 = 0;
-const FORWARD_SINK: u8 = 1;
+const RESOLVE_FORWARD_TIMEOUT: Duration = Duration::from_secs(30);
 
 struct App {
     stdout_writer: SharedWriter,
     resolve_delegate: DelegateHandle,
     run_delegate: DelegateHandle,
-    run_forward_mode: Arc<AtomicU8>,
+    run_response_filter: ResponseFilter,
 }
 
-struct SwitchableStdoutWriter {
-    mode: Arc<AtomicU8>,
-    real: Stdout,
-    sink: Sink,
-}
-
-impl SwitchableStdoutWriter {
-    fn new(mode: Arc<AtomicU8>) -> Self {
-        Self {
-            mode,
-            real: stdout(),
-            sink: sink(),
-        }
-    }
-
-    fn active(self: Pin<&mut Self>) -> ActiveWriter<'_> {
-        let this = self.get_mut();
-        if this.mode.load(Ordering::SeqCst) == FORWARD_SINK {
-            ActiveWriter::Sink(Pin::new(&mut this.sink))
-        } else {
-            ActiveWriter::Stdout(Pin::new(&mut this.real))
-        }
-    }
-}
-
-enum ActiveWriter<'a> {
-    Sink(Pin<&'a mut Sink>),
-    Stdout(Pin<&'a mut Stdout>),
-}
-
-impl ActiveWriter<'_> {
-    fn with<R>(self, f: impl FnOnce(Pin<&mut (dyn AsyncWrite + Send)>) -> R) -> R {
-        match self {
-            Self::Sink(writer) => f(writer),
-            Self::Stdout(writer) => f(writer),
-        }
-    }
-}
-
-impl AsyncWrite for SwitchableStdoutWriter {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        self.active().with(|writer| writer.poll_write(cx, buf))
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        self.active().with(|writer| writer.poll_flush(cx))
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        self.active().with(|writer| writer.poll_shutdown(cx))
-    }
+#[derive(Clone, Copy)]
+enum DelegateOutput<'a> {
+    Forward,
+    Suppress(&'a ResponseFilter),
 }
 
 fn main() {
@@ -130,40 +75,33 @@ async fn async_main() -> i32 {
         Err(exit_code) => return exit_code,
     };
 
-    let app = build_app(resolve_cmd, delegate_cmd);
+    let app = Arc::new(build_app(resolve_cmd, delegate_cmd));
     let mut exit_code = 0;
-    let mut lines = BufReader::new(stdin()).lines();
-
-    loop {
-        let Some(line) = (match lines.next_line().await {
-            Ok(line) => line,
-            Err(error) => {
-                eprintln!("failed to read worker stdin: {error}");
-                exit_code = 1;
-                break;
-            }
-        }) else {
-            break;
-        };
-
-        let message = match serde_json::from_str::<WorkerMessage>(&line) {
-            Ok(message) => message,
-            Err(error) => {
-                eprintln!("failed to parse worker message: {error}");
-                exit_code = 1;
-                break;
-            }
-        };
-
-        if let Err(message) = dispatch_message(&app, message).await {
-            eprintln!("{message}");
-            exit_code = 1;
-            break;
-        }
+    let dispatch_app = Arc::clone(&app);
+    if let Err(error) = run_concurrent_middleware(move |message| {
+        let app = Arc::clone(&dispatch_app);
+        async move { dispatch_message(&app, message).await }
+    })
+    .await
+    {
+        eprintln!("{error}");
+        exit_code = 1;
     }
 
-    let _ = app.resolve_delegate.shutdown().await;
-    let _ = app.run_delegate.shutdown().await;
+    if let Err(error) = app.resolve_delegate.shutdown().await {
+        eprintln!(
+            "failed to shut down resolve delegate: command={:?}, error={error}",
+            app.resolve_delegate.delegate_command()
+        );
+        exit_code = 1;
+    }
+    if let Err(error) = app.run_delegate.shutdown().await {
+        eprintln!(
+            "failed to shut down run delegate: command={:?}, error={error}",
+            app.run_delegate.delegate_command()
+        );
+        exit_code = 1;
+    }
 
     exit_code
 }
@@ -193,9 +131,9 @@ fn build_app(resolve_cmd: Vec<String>, delegate_cmd: Vec<String>) -> App {
     let stdout_writer: SharedWriter = Arc::new(Mutex::new(Box::new(stdout())));
     let stderr_writer: SharedWriter = Arc::new(Mutex::new(Box::new(tokio::io::stderr())));
     let resolve_sink: SharedWriter = Arc::new(Mutex::new(Box::new(tokio::io::sink())));
-    let run_forward_mode = Arc::new(AtomicU8::new(FORWARD_REAL));
+    let run_response_filter = ResponseFilter::default();
     let run_forward_writer: SharedWriter = Arc::new(Mutex::new(Box::new(
-        SwitchableStdoutWriter::new(Arc::clone(&run_forward_mode)),
+        ResponseFilteringWriter::new(stdout(), run_response_filter.clone()),
     )));
 
     let resolve_delegate = DelegateHandle::with_writers(
@@ -215,7 +153,7 @@ fn build_app(resolve_cmd: Vec<String>, delegate_cmd: Vec<String>) -> App {
         stdout_writer,
         resolve_delegate,
         run_delegate,
-        run_forward_mode,
+        run_response_filter,
     }
 }
 
@@ -228,7 +166,13 @@ async fn dispatch_message(app: &App, message: WorkerMessage) -> Result<(), Strin
 
 async fn handle_resolve_task(app: &App, resolve: ResolveTask) -> Result<(), String> {
     let resolve_id = resolve.id.clone();
-    let result = match resolve_via_delegate(&app.resolve_delegate, resolve.clone()).await {
+    let result = match resolve_via_delegate(
+        &app.resolve_delegate,
+        resolve.clone(),
+        DelegateOutput::Forward,
+    )
+    .await
+    {
         Ok(result) => result,
         Err(error) => {
             return Err(app
@@ -253,7 +197,13 @@ async fn handle_resolve_task(app: &App, resolve: ResolveTask) -> Result<(), Stri
 }
 
 async fn handle_accept(app: &App, resolve_id: String, resolve: ResolveTask) -> Result<(), String> {
-    match resolve_via_run_delegate(app, resolve).await {
+    match resolve_via_delegate(
+        &app.run_delegate,
+        resolve,
+        DelegateOutput::Suppress(&app.run_response_filter),
+    )
+    .await
+    {
         Ok(result) => emit_resolve_result(app, resolve_id, result).await,
         Err(error) => Err(app
             .run_delegate
@@ -269,7 +219,13 @@ async fn handle_modify(
     modification: TaskModification,
 ) -> Result<(), String> {
     let modified_resolve = apply_modification(&original_resolve, &modification);
-    let delegate_result = match resolve_via_run_delegate(app, modified_resolve).await {
+    let delegate_result = match resolve_via_delegate(
+        &app.run_delegate,
+        modified_resolve,
+        DelegateOutput::Suppress(&app.run_response_filter),
+    )
+    .await
+    {
         Ok(result) => result,
         Err(error) => {
             return Err(app
@@ -302,30 +258,20 @@ async fn handle_run_request(app: &App, request: WorkerRequest) -> Result<(), Str
 async fn resolve_via_delegate(
     delegate: &DelegateHandle,
     resolve: ResolveTask,
+    output: DelegateOutput<'_>,
 ) -> Result<ResolveResult, ProxyError> {
-    match delegate
-        .send_with_timeout(WorkerMessage::ResolveTask(resolve), RESOLVE_TIMEOUT)
-        .await?
-    {
-        WorkerResponse::Resolved { result, .. } => Ok(result),
-        _ => Err(ProxyError::DelegateClosed(
-            "delegate returned non-resolved response for resolve task".to_owned(),
-        )),
+    if let DelegateOutput::Suppress(filter) = output {
+        filter.suppress(resolve.id.clone());
     }
-}
+    let message = WorkerMessage::ResolveTask(resolve);
+    // Keep the id suppressed if the delegate fails or times out. The request
+    // error terminates this worker, and a late internal response must not leak
+    // onto stdout while delegate shutdown is in progress.
+    let response = delegate
+        .send_with_timeout(message, RESOLVE_FORWARD_TIMEOUT)
+        .await?;
 
-async fn resolve_via_run_delegate(
-    app: &App,
-    resolve: ResolveTask,
-) -> Result<ResolveResult, ProxyError> {
-    app.run_forward_mode.store(FORWARD_SINK, Ordering::SeqCst);
-    let result = app
-        .run_delegate
-        .send_with_timeout(WorkerMessage::ResolveTask(resolve), RESOLVE_TIMEOUT)
-        .await;
-    app.run_forward_mode.store(FORWARD_REAL, Ordering::SeqCst);
-
-    match result? {
+    match response {
         WorkerResponse::Resolved { result, .. } => Ok(result),
         _ => Err(ProxyError::DelegateClosed(
             "delegate returned non-resolved response for resolve task".to_owned(),
@@ -353,19 +299,7 @@ async fn emit_resolve_result(
     result: ResolveResult,
 ) -> Result<(), String> {
     let response = WorkerResponse::resolved(resolve_id, result);
-    write_response(&app.stdout_writer, &response)
+    write_worker_response(&app.stdout_writer, &response)
         .await
         .map_err(|error| format!("failed to write resolve response: {error}"))
-}
-
-async fn write_response(
-    writer: &SharedWriter,
-    response: &WorkerResponse,
-) -> Result<(), ProxyError> {
-    let line = serde_json::to_string(response)?;
-    let mut writer = writer.lock().await;
-    writer.write_all(line.as_bytes()).await?;
-    writer.write_all(b"\n").await?;
-    writer.flush().await?;
-    Ok(())
 }
