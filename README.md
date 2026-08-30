@@ -1107,16 +1107,17 @@ The shared build cache is a cross-worktree, cross-clone cache that restores task
 - **Computed Keys, Not Discovered:** Shard keys are `<YYYYMMDD>-<shard>`, derived from the UTC wall clock and a fixed shard count — never listed or walked. The previous design indexed by git commit hash, discovered by walking first-parent ancestry from `HEAD`. That never matched across pull requests, because CI builds run on feature branches and ephemeral merge commits that no other build shares (GitHub #277).
 - **Input-Keyed Entries:** The cache key (`input_key`) folds in the task spec, environment, package-dependency versions, upstream task outputs, and the resolved content of the task's own inputs. Two branches that change a task's source differently land in distinct entries instead of racing for one shared slot — both stay cached and reusable, and reverting one back to the other's state is a hit, not a miss.
 - **Content-Addressed Blobs:** Build outputs are compressed and stored in a deduped blob store, addressed by `outputs_hash`.
-- **Read Window:** On cache lookup, Luchta fetches every shard from the last `LUCHTA_SHARED_CACHE_DAYS` UTC days (default 3) directly — `day_window * 6` key fetches, no object-store listing involved.
-- **Refresh on Hit:** A cache hit re-inserts its entry into today's shard, and, with remote sync on, re-pushes that shard, so a hot entry keeps getting a fresh day stamp instead of aging out of the read window on a fixed schedule. The re-insert and the push both happen in the end-of-run flush described next, not at hit time. A refresh hit does not re-push the remote `entries/<input_key>.bin` object. If that object goes missing, a later store of the same entry uploads it again — the push is guarded by a remote existence check, not by a once-per-entry rule. See the `entries/` note under Garbage Collection below.
-- **Batched Index Writes:** A store writes its blob and entry metadata as soon as the task finishes, so a restore on another machine can find them right away. The index shard — the thing a lookup actually reads — is written once at the end of the run, covering every task stored or refreshed since, instead of once per task. Ctrl-C is mostly fine: SIGINT and SIGTERM both reach that flush, though a task still finishing when the signal lands can be missed and re-run next time. Being SIGKILL'd (or OOM-killed, or losing power) is what loses it, and then no shard points at the run's blobs and entry metadata, so the next run treats those tasks as misses and redoes the work. Remote pushes are queued to a background worker, so a SIGKILL can lose the tail of that queue too. Nothing is corrupted, just repeated.
+- **Read Window:** On cache lookup, Luchta concurrently fetches every shard from the last `LUCHTA_SHARED_CACHE_DAYS` UTC days (default 3) directly — `day_window * 6` key fetches, no object-store listing involved. Task restore preparation also runs concurrently. Only the chosen entry's fallback metadata and output blob are fetched; historical candidates are not downloaded eagerly.
+- **Inline Restore Metadata:** Schema-v3 snapshots embed complete entry metadata when its compressed encoding is at most 16 KiB. This includes the run record, output-presence bit, stdout, stderr, and reports. Small no-output tasks therefore restore with no per-entry remote request and store without a separate metadata upload. Larger records use `entries/<input_key>.bin` as a fallback.
+- **Refresh on Hit:** A cache hit re-inserts its entry into today's shard, and, with remote sync on, re-pushes that shard, so a hot entry keeps getting a fresh day stamp instead of aging out of the read window on a fixed schedule. The re-insert and the push both happen in the end-of-run flush described next, not at hit time. Legacy schema-v2 entries remain readable through fallback metadata but are not refreshed because their recorded duration includes queueing time; they naturally age out.
+- **Fail-Open Batched Writes:** Output blobs and oversized metadata are admitted to a nonblocking background worker pool. The index shard is gated behind every accepted artifact job that precedes it, then written once at the end of the cycle for all stores and refreshes. A saturated queue drops optional remote work rather than delaying task completion; a missing or partial remote artifact remains a safe cache miss. Normal draining has one total timeout budget. Interrupt and watch cancellation discard queued work immediately and force-stop rclone.
 - **Remote Synchronization:** Opt-in synchronization with S3 or other object stores via `rclone`.
 
 #### Layout
 By default, the cache is stored at `~/.cache/luchta` (on Linux/macOS), under three prefixes:
 - `blobs/<outputs_hash>.tar.zst` — Content-addressed compressed output archives.
-- `snapshots/<YYYYMMDD>-<shard>/<shard_id>.bincode` — Metadata index shards, one directory per UTC day and shard number (`00`-`05`), holding append-only content-addressed files (zstd-compressed at rest; `<shard_id>` is the BLAKE3 hash of the uncompressed bincode bytes) plus a `.merged` sidecar recording which files a compaction has subsumed.
-- `entries/<input_key>.bin` — Per-entry metadata (the run record, captured stdout/stderr, and reports), keyed by the hex encoding of `input_key` — itself a BLAKE3 hash of the task spec, environment, package-dependency versions, upstream task outputs, and the resolved content of the task's own inputs. Split out from the outputs blob (GitHub #278) because every task with no outputs shares the same `outputs_hash`, and bundling meta into that blob meant they all collided on one object.
+- `snapshots/<YYYYMMDD>-<shard>/<shard_id>.bincode` — Schema-v3 metadata index shards, one directory per UTC day and shard number (`00`-`05`), holding append-only content-addressed files. Shards are zstd-compressed at rest; `<shard_id>` is the BLAKE3 hash of the uncompressed bincode bytes. Schema-v2 shards remain readable, and shards from future schemas are preserved rather than consolidated or deleted.
+- `entries/<input_key>.bin` — Fallback metadata objects only for entries whose compressed metadata exceeds 16 KiB, plus legacy schema-v2 entries. The key is the hex encoding of `input_key`, itself a BLAKE3 hash of the task spec, environment, package-dependency versions, upstream task outputs, and resolved task inputs.
 
 The date baked into each `snapshots/` directory name makes lifecycle rules straightforward to write: target `snapshots/<date>-*` prefixes for a given cutoff directly, no need to inspect individual object ages. `blobs/` and `entries/` have no date in their keys, so expire those by object age instead — matching `LUCHTA_SHARED_CACHE_GC_DAYS` keeps remote retention roughly in step with local GC.
 
@@ -1136,7 +1137,7 @@ The shared cache is **OPT-IN** and is configured exclusively via environment var
     - `local`, `1`, `true`, `on` — Local-only shared cache.
     - `rclone:<spec>` — Enable remote-sync via rclone, where `<spec>` is an rclone Fs base that points at a bucket and (recommended) a prefix, e.g. `rclone:my-s3:my-bucket/luchta-cache`.
 - `LUCHTA_SHARED_CACHE_DIR` — Override the cache root directory.
-- `LUCHTA_SHARED_CACHE_SYNC_TIMEOUT` — Maximum seconds for the initial remote sync. Default: `30`.
+- `LUCHTA_SHARED_CACHE_SYNC_TIMEOUT` — Maximum seconds for each normal remote operation and the total end-of-cycle upload drain. Default: `30`.
 - `LUCHTA_SHARED_CACHE_GC_DAYS` — Retention period for local cache entries. Default: `14`.
 - `LUCHTA_SHARED_CACHE_MAX_OUTPUT_MB` — Maximum size for a single task's output to be cached. Default: `250`.
 - `LUCHTA_SHARED_CACHE_DAYS` — Number of UTC days of shard history to read. Default: `3`. Deprecated alias `LUCHTA_SHARED_CACHE_HISTORY` (which counted commits, not days) is still read for one release; setting it prints a deprecation warning, and if both are set, `LUCHTA_SHARED_CACHE_DAYS` wins.
@@ -1144,14 +1145,15 @@ The shared cache is **OPT-IN** and is configured exclusively via environment var
 Invalid numeric values will trigger a warning and fall back to their defaults.
 
 #### Shared cache tuning
-- `LUCHTA_SHARED_CACHE_TIMEOUT_DISABLE_THRESHOLD` — Consecutive timeout threshold before disabling remote sync for the run. Default: `8`.
-- `LUCHTA_SHARED_CACHE_RCLONE_CONCURRENCY` — Maximum concurrent rclone submissions from Luchta's client-side limiter. Default: `16`.
+- `LUCHTA_SHARED_CACHE_TIMEOUT_DISABLE_THRESHOLD` — Cumulative timeout threshold before disabling remote sync for the run. Successful requests do not erase earlier timeout evidence. Default: `8`.
+- `LUCHTA_SHARED_CACHE_RCLONE_CONCURRENCY` — Maximum logical remote operations and background upload workers. Admission is held through complete rclone jobs, including status polling. Default: `16`.
 - `LUCHTA_SHARED_CACHE_RCLONE_SUBMIT_TIMEOUT` — Bounded submit timeout for async rclone jobs. Default: `5s`.
 - `LUCHTA_SHARED_CACHE_RCLONE_TRANSFERS` — rclone rcd `--transfers` setting. Default: `4`.
 - `LUCHTA_SHARED_CACHE_RCLONE_CHECKERS` — rclone rcd `--checkers` setting. Default: `8`.
 - `LUCHTA_SHARED_CACHE_RCLONE_JOB_EXPIRE_DURATION` — rclone rcd `--rc-job-expire-duration`; must exceed execution timeout so finished jobs are not reaped before polling completes. Default: `10m`.
-- `LUCHTA_SHARED_CACHE_PUSH_QUEUE_CAPACITY` — Bounded background push queue depth; when full, producers block instead of dropping remote cache writes. Default: `256`.
-- `LUCHTA_SHARED_CACHE_MIN_DURATION_MS` — Tasks faster than this are not stored; the round trip costs more than re-running them. Raise it to keep cheap tasks out of the cache. Default: `100`.
+- `LUCHTA_SHARED_CACHE_PUSH_QUEUE_CAPACITY` — Bounded background push queue depth. When full, producers continue immediately and optional remote cache work is dropped with one warning. Default: `256`.
+- `LUCHTA_SHARED_CACHE_MIN_DURATION_MS` — Tasks whose measured execution is faster than this are not stored; semaphore wait and cache-decision time are excluded. Trusted schema-v3 entries below the reader's threshold are also skipped. Default: `100`.
+- `LUCHTA_SHARED_CACHE_STATS` — Set to `1` to print one concise aggregate diagnostics line at the end of each run or watch cycle. It includes snapshot, inline/fallback restore, blob, byte/latency, queue, upload, and disable-reason counters. Disabled by default.
 
 #### Remote Synchronization (S3/rclone)
 Luchta can synchronize the shared cache with a remote object store (like S3, GCS, or Azure) using [rclone](https://rclone.org/).
@@ -1171,15 +1173,15 @@ This fails safe: when the daemon won't start, Luchta records the error, disables
 3. **Credentials:** Luchta does not handle credentials directly. It uses the `rclone` binary on your `PATH` and relies on your `rclone.conf` or `RCLONE_*` environment variables.
 
 **Resilience & Performance:**
-- **Build Safety:** Remote cache problems (timeouts or rclone errors) never fail a build. If an error occurs, Luchta issues a warning, disables the remote cache for the rest of the run, and continues using only the local cache.
+- **Build Safety:** Remote cache problems never fail a build. Health failures disable remote access immediately; isolated timeouts fail open and count toward the configured cumulative threshold. Warnings identify the failed phase, such as snapshot download, metadata fallback, blob restore, upload preflight, artifact upload, or final flush.
 - **No CAS Required:** Snapshots are stored as append-only content-addressed shards, eliminating the need for complex "Compare-and-Swap" operations on the remote store.
-- **Garbage Collection:** Remote GC is not managed by Luchta. Use S3 bucket lifecycle rules or similar object store features to expire old objects under all three prefixes — `blobs/`, `snapshots/`, *and* `entries/`. Leaving `entries/` out of those rules lets it grow without bound, since nothing else ever deletes those objects remotely.
-  Set the `entries/` cutoff generously relative to the day window (`LUCHTA_SHARED_CACHE_DAYS`), or use last-access-based expiry if your object store supports it. A hit refreshes the index shard, not the remote `entries/` object's timestamp, so an entry that gets hit daily for a month can still age past an object-age cutoff while its index key stays discoverable. When that happens the next lookup finds the key, gets a 404 fetching the meta object, and misses — the task reruns and re-stores, so it self-heals, but an age cutoff close to the day window turns your hottest entries into a periodic fleet-wide rebuild.
+- **Garbage Collection:** Remote GC is not managed by Luchta. Use S3 bucket lifecycle rules or similar object store features to expire old objects under all three prefixes — `blobs/`, `snapshots/`, *and* fallback-only `entries/`. Leaving `entries/` out of those rules lets oversized and legacy metadata grow without bound.
+  Set the `entries/` cutoff generously relative to the day window (`LUCHTA_SHARED_CACHE_DAYS`), or use last-access-based expiry if your object store supports it. A hit refreshes the v3 index shard, not a fallback object's timestamp. If fallback metadata expires while its index remains discoverable, the lookup safely misses and the task re-stores it.
 
 #### Cacheability
 A task is eligible for the shared cache if all the following are true:
 - The task succeeded.
-- It took at least 100ms to run.
+- Its post-semaphore execution took at least 100ms (or the configured minimum).
 - Its total output size is within the `LUCHTA_SHARED_CACHE_MAX_OUTPUT_MB` limit.
 - All its outputs are contained within its own package directory (outputs escaping the repository root are a hard error).
 
@@ -1189,7 +1191,7 @@ The working tree's git status plays no part in eligibility: uncommitted changes 
 Luchta automatically performs throttled garbage collection of old local cache entries, snapshot shards, and blobs (those older than `LUCHTA_SHARED_CACHE_GC_DAYS`). The cache is read-tolerant; if a blob or entry is missing due to GC or other reasons, it is treated as a cache miss.
 
 #### Stats
-Shared cache hits are shown in the build summary: `📥 <n>`.
+Shared cache hits are shown in the build summary: `📥 <n>`. Set `LUCHTA_SHARED_CACHE_STATS=1` for the optional per-cycle diagnostics line; normal and summary output are unchanged otherwise.
 
 ### Build Lock
 

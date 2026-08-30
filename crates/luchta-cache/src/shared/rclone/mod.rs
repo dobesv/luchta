@@ -10,7 +10,7 @@ mod transport;
 
 use async_job::{poll_async_job, submit_async_job, DEFAULT_RCLONE_SUBMIT_TIMEOUT};
 use bytes::Bytes;
-use daemon::{quit_and_wait, spawn_daemon, State};
+use daemon::{quit_and_wait, spawn_daemon, DaemonState, State};
 use hyper_util::client::legacy::Client;
 use hyperlocal::UnixClientExt;
 use serde::de::DeserializeOwned;
@@ -185,6 +185,14 @@ impl RcloneRcd {
         self.default_timeout
     }
 
+    pub(crate) fn concurrency_limit(&self) -> usize {
+        self.limiter
+            .state
+            .lock()
+            .expect("rclone operation limiter poisoned")
+            .max_in_flight
+    }
+
     pub fn child_pid(&self) -> Option<u32> {
         self.state
             .lock()
@@ -281,8 +289,7 @@ impl RcloneRcd {
         remote: &str,
         timeout: Duration,
     ) -> Result<Vec<Entry>, RcloneError> {
-        let _permit = self.limiter.acquire();
-        let response: ListResponse = self.call(
+        let response: ListResponse = self.call_async(
             "operations/list",
             json!({
                 "fs": fs,
@@ -323,19 +330,41 @@ impl RcloneRcd {
     }
 
     pub fn shutdown(&self, timeout: Duration) -> Result<(), RcloneError> {
-        let mut state = self.lock_state()?;
-        let Some(daemon) = state.daemon.take() else {
+        self.run_with_daemon("rclone shutdown thread panicked", move |runtime, daemon| {
+            quit_and_wait(runtime, daemon, timeout)
+        })
+    }
+
+    /// Immediately remove and kill the daemon. Used when the shared cache's
+    /// total end-of-cycle budget expires; in-flight calls then fail open.
+    pub(crate) fn force_shutdown(&self) -> Result<(), RcloneError> {
+        self.run_with_daemon(
+            "rclone force-shutdown thread panicked",
+            |runtime, mut daemon| runtime.block_on(daemon.kill_force()),
+        )
+    }
+
+    fn run_with_daemon(
+        &self,
+        panic_reason: &'static str,
+        operation: impl FnOnce(&Runtime, DaemonState) -> Result<(), RcloneError> + Send,
+    ) -> Result<(), RcloneError> {
+        let Some(daemon) = self.take_daemon()? else {
             return Ok(());
         };
         let runtime = self.runtime();
         std::thread::scope(|scope| {
             scope
-                .spawn(move || quit_and_wait(runtime, daemon, timeout))
+                .spawn(move || operation(runtime, daemon))
                 .join()
                 .map_err(|_| RcloneError::Process {
-                    reason: "rclone shutdown thread panicked".to_string(),
+                    reason: panic_reason.to_string(),
                 })?
         })
+    }
+
+    fn take_daemon(&self) -> Result<Option<DaemonState>, RcloneError> {
+        Ok(self.lock_state()?.daemon.take())
     }
 
     fn call<P, T>(&self, endpoint: &str, payload: P, timeout: Duration) -> Result<T, RcloneError>
@@ -376,6 +405,10 @@ impl RcloneRcd {
         P: Serialize,
         T: DeserializeOwned + Send,
     {
+        // Admission covers the complete remote job, including status polling.
+        // Limiting only submission allows an unbounded number of jobs to run
+        // behind rclone and defeats the caller's concurrency setting.
+        let _permit = self.limiter.acquire();
         let payload = serde_json::to_value(payload)?;
         let runtime = self.runtime();
         let socket_path = self.ensure_daemon_socket(timeout)?;
@@ -385,17 +418,14 @@ impl RcloneRcd {
                 .spawn(move || -> Result<T, RcloneError> {
                     let client = Client::unix();
                     runtime.block_on(async move {
-                        let submitted = {
-                            let _permit = self.limiter.acquire();
-                            submit_async_job(
-                                &client,
-                                &socket_path,
-                                endpoint,
-                                payload,
-                                submit_timeout,
-                            )
-                            .await?
-                        };
+                        let submitted = submit_async_job(
+                            &client,
+                            &socket_path,
+                            endpoint,
+                            payload,
+                            submit_timeout,
+                        )
+                        .await?;
                         poll_async_job::<T>(&client, &socket_path, submitted, timeout).await
                     })
                 })

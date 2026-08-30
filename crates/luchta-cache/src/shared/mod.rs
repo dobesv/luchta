@@ -1,15 +1,19 @@
 pub(crate) mod atomicio;
 pub mod blob;
+mod cycle;
 mod discovery;
 pub mod entry_meta;
 pub mod gc;
 pub mod paths;
+mod prepared;
 #[cfg(unix)]
 pub mod rclone;
 #[cfg(unix)]
 mod remote;
 pub mod scope;
 pub mod snapshot;
+mod stats;
+mod store_request;
 
 pub(crate) use atomicio::atomic_write;
 pub use blob::{
@@ -23,13 +27,15 @@ pub use discovery::{
 };
 pub use entry_meta::{
     encode_entry_meta, entry_meta_path, read_entry_meta, write_entry_meta, EntryMeta,
-    EntryMetaWriteResult, EntryReport, ENTRY_META_SCHEMA_VERSION,
+    EntryMetaWriteResult, EntryReport, ENTRY_META_SCHEMA_VERSION, INLINE_ENTRY_META_MAX_BYTES,
 };
+use entry_meta::{entry_meta_resident_bytes, INLINE_ENTRY_META_MAX_RESIDENT_BYTES};
 pub use gc::{maybe_run_gc, run_gc, GcStats, DEFAULT_GC_RETENTION, DEFAULT_GC_THROTTLE};
 pub use paths::{
     open_shared_paths, resolve_shared_cache_dir, SharedCachePaths, BLOBS_DIR_NAME,
     ENTRIES_DIR_NAME, SHARED_CACHE_DIR_ENV, SNAPSHOTS_DIR_NAME,
 };
+pub use prepared::PreparedRestore;
 #[cfg(unix)]
 pub use rclone::RcloneRcd;
 #[cfg(unix)]
@@ -45,15 +51,18 @@ pub use snapshot::{
     combined_dep_outputs_hash, derive_input_key, input_key_hex, MergeEntryOutcome, MergeResult,
     Snapshot, SnapshotEntry, SnapshotStore, SnapshotUpload, SNAPSHOT_SCHEMA_VERSION,
 };
+use std::collections::HashMap;
 #[cfg(unix)]
 use std::collections::VecDeque;
-use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::fs::OpenOptions;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
+pub use store_request::SharedCacheStoreRequest;
+use store_request::StoreTiming;
 
 #[cfg(unix)]
 use tokio::task::JoinSet;
@@ -85,6 +94,30 @@ fn min_store_duration_ms() -> u64 {
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(DEFAULT_MIN_STORE_DURATION_MS)
     })
+}
+
+fn store_preflight(
+    request: SharedCacheStoreRequest<'_>,
+    duration_ms: u64,
+) -> io::Result<Option<StoreOutcome>> {
+    if !request.record.succeeded {
+        return Ok(Some(StoreOutcome::SkippedNotSucceeded));
+    }
+    if duration_ms < min_store_duration_ms() {
+        return Ok(Some(StoreOutcome::SkippedTooFast { duration_ms }));
+    }
+    match classify_outputs(
+        request.repo_root,
+        request.package_dir,
+        request.rel_output_paths,
+    ) {
+        Ok(OutputScope::InPackage) => Ok(None),
+        Ok(OutputScope::CrossPackage) => Ok(Some(StoreOutcome::SkippedCrossPackage)),
+        Err(ScopeError::PathEscape { .. }) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "output path escapes repository root",
+        )),
+    }
 }
 
 pub const META_DIR_NAME: &str = ".luchta-meta";
@@ -176,33 +209,38 @@ pub enum StoreOutcome {
 }
 
 /// Merged index from all candidate snapshots, built lazily on first access.
-///
-/// Just a presence set: `try_restore_candidates` only asks "did *any* candidate
-/// ever record this input_key as cacheable" (`contains`). The actual record,
-/// outputs_hash, and streams for a hit are resolved afterward from the single
-/// `entries/<input_key>` object (see `stage_entry`), not from anything carried
-/// here — so there is nothing to arbitrate between shards that both mention the
-/// same input_key. An earlier version stored `(SnapshotEntry, String)` per key
-/// and picked a "winner" on conflict; that payload had no reader outside tests
-/// and its comparator (`cached_at_unix_ms`, a wall clock from whichever machine
-/// wrote the entry) was unsound across machines with skewed clocks. Removed
-/// rather than kept and documented, since Task 9 would otherwise inherit it
-/// silently when merging remote listings into this same index.
+/// First writer wins for differing output hashes. Same-output schema-v3 data
+/// can enrich a legacy observation with inline metadata and trusted timing.
 #[derive(Debug, Clone)]
 pub struct MergedIndex {
-    /// Set of input_key_hex values recorded as cacheable by some candidate shard.
-    entries: HashSet<String>,
+    entries: HashMap<String, SnapshotEntry>,
 }
 
 impl MergedIndex {
     fn new() -> Self {
         Self {
-            entries: HashSet::new(),
+            entries: HashMap::new(),
         }
     }
 
-    fn insert_entry(&mut self, input_key_hex: String) {
-        self.entries.insert(input_key_hex);
+    fn insert_entry(&mut self, input_key_hex: String, mut entry: SnapshotEntry) {
+        if entry.inline_meta.as_ref().is_some_and(|meta| {
+            entry_meta_resident_bytes(meta) > INLINE_ENTRY_META_MAX_RESIDENT_BYTES
+        }) {
+            // Remote shards are cache input, not trusted allocation policy.
+            // An oversized inline value becomes a fallback lookup (and a safe
+            // miss if its producer omitted the fallback object).
+            entry.inline_meta = None;
+        }
+        match self.entries.get_mut(&input_key_hex) {
+            None => {
+                self.entries.insert(input_key_hex, entry);
+            }
+            Some(existing) if existing.outputs_hash == entry.outputs_hash => {
+                snapshot::enrich_same_output_entry(existing, entry);
+            }
+            Some(_) => {}
+        }
     }
 }
 
@@ -241,6 +279,7 @@ pub struct SharedCache {
     index: OnceLock<MergedIndex>,
     /// Size cap for individual blobs.
     size_cap_bytes: u64,
+    stats: Arc<stats::SharedCacheStats>,
     /// Entries accumulated this run for the single end-of-run index merge,
     /// keyed by `input_key` so repeat writes of the same key collapse to one
     /// entry. Two callers feed this same map:
@@ -450,11 +489,13 @@ impl SharedCache {
         let write_bucket_key = Some(discovery::current_write_bucket_key());
 
         let snapshot_store = SnapshotStore::new((*paths).clone());
+        let stats = Arc::new(stats::SharedCacheStats::default());
         #[cfg(unix)]
         let remote = match extras.remote {
-            Some(config) => match RemoteSync::from_config(config) {
+            Some(config) => match RemoteSync::from_config(config, Arc::clone(&stats)) {
                 Ok(remote) => Some(remote),
                 Err(err) => {
+                    stats.set_disable_reason(&format!("remote initialization failed: {err}"));
                     eprintln!("warn: shared cache remote disabled: {err}");
                     None
                 }
@@ -471,6 +512,7 @@ impl SharedCache {
             remote,
             index: OnceLock::new(),
             size_cap_bytes,
+            stats,
             pending: Mutex::new(PendingState::default()),
         })
     }
@@ -500,6 +542,7 @@ impl SharedCache {
             remote: None,
             index: OnceLock::new(),
             size_cap_bytes,
+            stats: Arc::new(stats::SharedCacheStats::default()),
             pending: Mutex::new(PendingState::default()),
         })
     }
@@ -509,16 +552,9 @@ impl SharedCache {
     /// Lookup proceeds as follows:
     /// 1. Build merged index on first access (lazy, ONCE).
     /// 2. O(1) lookup by input_key in merged index — no disk read.
-    /// 3. If found, stage from `entries/<input_key>` (and its outputs blob, if
-    ///    any) and return a StagedCandidate for validation.
-    /// 4. Caller validates candidate by calling `validate()` with a FileStateResolver.
+    /// 3. If found, stage its inline or fallback metadata and any outputs blob.
+    /// 4. Caller validates the staged candidate without mutating outputs.
     /// 5. If valid, caller calls `commit()` to move files into package_dir.
-    ///
-    /// There is at most one candidate per input_key: `stage_entry` resolves
-    /// everything (record, outputs_hash, stdout/stderr) from the single
-    /// `entries/<input_key>` object, so trying a different `SnapshotEntry` for
-    /// the same input_key across buckets can never produce a different
-    /// result. A blob that's been GC'd is a rebuild, not a fallback.
     pub fn try_restore_candidates(
         &self,
         _task_id: &str,
@@ -529,18 +565,15 @@ impl SharedCache {
         self.pull_remote_snapshots_for_restore();
         let index = self.get_or_build_index();
         let input_key_hex = input_key_hex(*input_key);
-
-        // O(1) lookup in the merged index — NO disk read. Only gates whether
-        // any snapshot ever recorded this input_key as cacheable.
-        let candidate = index.entries.contains(&input_key_hex).then_some(*input_key);
+        let entry = index.entries.get(&input_key_hex).cloned();
 
         let paths = self.paths.clone();
         let package_dir = package_dir.to_path_buf();
         #[cfg(unix)]
         let remote = self.remote.clone();
-        candidate.into_iter().filter_map(move |input_key| {
+        entry.into_iter().filter_map(move |entry| {
             Self::stage_entry(
-                &input_key,
+                &entry,
                 &paths,
                 &package_dir,
                 #[cfg(unix)]
@@ -557,24 +590,39 @@ impl SharedCache {
         self.index.get_or_init(|| self.build_index(Some(remote)));
     }
 
-    /// Stage a single entry, returning a StagedCandidate for validation.
+    /// Stage a single entry, returning a candidate for validation.
     ///
-    /// Two-phase: fetch the small `entries/<input_key>` object first and decode
-    /// the record from it. Only pull the outputs blob if the entry actually has
-    /// outputs. A candidate rejected by `decide_shared_restore` therefore never
-    /// costs an outputs download.
+    /// Uses inline v3 metadata when available, otherwise fetches the fallback
+    /// `entries/<input_key>` object. It pulls and stages the outputs blob only
+    /// when the metadata says one exists; staging never mutates package files.
     fn stage_entry(
-        input_key: &[u8; 32],
+        entry: &SnapshotEntry,
         paths: &SharedCachePaths,
         package_dir: &Path,
         #[cfg(unix)] remote: Option<&RemoteSync>,
     ) -> Option<StagedCandidate> {
+        if entry.duration_trusted && entry.duration_ms < min_store_duration_ms() {
+            return None;
+        }
+
+        let input_key = &entry.input_key;
+        if let Some(meta) = entry.inline_meta.clone() {
+            return Self::stage_meta(
+                meta,
+                input_key,
+                paths,
+                package_dir,
+                #[cfg(unix)]
+                remote,
+            );
+        }
+
         #[cfg(unix)]
         if let Some(remote) = remote {
             if !entry_meta_path(paths, input_key).exists() {
                 if let Err(err) = remote.pull_entry_meta(paths, input_key) {
                     eprintln!(
-                        "debug: remote entry meta pull failed for input_key={}: {err}",
+                        "warn: shared cache metadata fallback GET failed for input_key={}: {err}",
                         hex_hash(*input_key)
                     );
                 }
@@ -582,7 +630,23 @@ impl SharedCache {
         }
 
         let meta = read_entry_meta(paths, input_key)?;
+        Self::stage_meta(
+            meta,
+            input_key,
+            paths,
+            package_dir,
+            #[cfg(unix)]
+            remote,
+        )
+    }
 
+    fn stage_meta(
+        meta: EntryMeta,
+        input_key: &[u8; 32],
+        paths: &SharedCachePaths,
+        package_dir: &Path,
+        #[cfg(unix)] remote: Option<&RemoteSync>,
+    ) -> Option<StagedCandidate> {
         let record: TaskRunRecord =
             match bincode::serde::decode_from_slice(&meta.record, bincode_config()) {
                 Ok((record, _)) => record,
@@ -620,7 +684,7 @@ impl SharedCache {
             if let Some(remote) = remote {
                 if let Err(err) = remote.pull_blob(paths, &meta.outputs_hash) {
                     eprintln!(
-                        "debug: remote blob pull failed for outputs_hash={}: {err}",
+                        "warn: shared cache blob restore failed for outputs_hash={}: {err}",
                         hex_hash(meta.outputs_hash)
                     );
                 }
@@ -642,6 +706,37 @@ impl SharedCache {
             stderr: meta.stderr,
             reports,
             staged,
+        })
+    }
+
+    /// Prepare the single merged candidate for concurrent validation without
+    /// modifying package outputs.
+    pub fn prepare_restore(
+        &self,
+        input_key: &[u8; 32],
+        package_dir: &Path,
+    ) -> Option<PreparedRestore> {
+        #[cfg(unix)]
+        self.pull_remote_snapshots_for_restore();
+        let entry = self
+            .get_or_build_index()
+            .entries
+            .get(&input_key_hex(*input_key))?
+            .clone();
+        let used_inline_meta = entry.inline_meta.is_some();
+        let candidate = Self::stage_entry(
+            &entry,
+            &self.paths,
+            package_dir,
+            #[cfg(unix)]
+            self.remote.as_ref(),
+        )?;
+        if used_inline_meta {
+            self.stats.inline_hits.fetch_add(1, Ordering::AcqRel);
+        }
+        Some(PreparedRestore {
+            candidate,
+            snapshot_entry: entry,
         })
     }
 
@@ -792,12 +887,13 @@ impl SharedCache {
         let Some(snapshot) = self.snapshot_store.load(commit_key) else {
             return;
         };
-        for input_key_hex in snapshot.entries.keys() {
-            merged.insert_entry(input_key_hex.clone());
+        for (input_key_hex, entry) in snapshot.entries {
+            merged.insert_entry(input_key_hex, entry);
         }
     }
 
-    /// Store task outputs in the shared cache.
+    /// Compatibility store for callers without a monotonic executor duration.
+    /// The wall-clock record span is accepted but marked untrusted, like v2.
     ///
     /// Requirements for cacheable:
     /// - Task succeeded
@@ -805,9 +901,7 @@ impl SharedCache {
     /// - OutputScope::InPackage
     /// - Total size <= size_cap_bytes
     ///
-    /// Stores:
-    /// - Blob with meta files (.luchta-meta/{stdout.log,stderr.log,meta.bincode})
-    /// - Snapshot entry via merge_entry to write_bucket_key
+    /// Production execution paths should use [`Self::store_with_execution_duration`].
     #[allow(clippy::too_many_arguments)]
     pub fn store(
         &self,
@@ -822,37 +916,60 @@ impl SharedCache {
         reports: &[crate::store::ReportInput],
         repo_root: &Path,
     ) -> io::Result<StoreOutcome> {
-        // Check if cache is disabled (no write key).
         if self.write_bucket_key.is_none() {
             return Ok(StoreOutcome::Disabled);
         }
+        self.store_internal(
+            SharedCacheStoreRequest {
+                task_id,
+                input_key,
+                outputs_hash,
+                package_dir,
+                rel_output_paths,
+                record,
+                stdout,
+                stderr,
+                reports,
+                repo_root,
+            },
+            StoreTiming {
+                duration_ms: record.end_unix_ms.saturating_sub(record.start_unix_ms),
+                trusted: false,
+            },
+        )
+    }
 
-        // Check if task succeeded.
-        if !record.succeeded {
-            return Ok(StoreOutcome::SkippedNotSucceeded);
+    /// Store using the monotonic post-permit execution duration measured by
+    /// the executor. Queueing and cache-decision time are deliberately absent.
+    pub fn store_with_execution_duration(
+        &self,
+        request: SharedCacheStoreRequest<'_>,
+        execution_duration_ms: u64,
+    ) -> io::Result<StoreOutcome> {
+        if self.write_bucket_key.is_none() {
+            return Ok(StoreOutcome::Disabled);
         }
+        self.store_internal(
+            request,
+            StoreTiming {
+                duration_ms: execution_duration_ms,
+                trusted: true,
+            },
+        )
+    }
 
-        // Check duration threshold.
-        let duration_ms = record.end_unix_ms.saturating_sub(record.start_unix_ms);
-        if duration_ms < min_store_duration_ms() {
-            return Ok(StoreOutcome::SkippedTooFast { duration_ms });
-        }
-
-        // Check output scope.
-        match classify_outputs(repo_root, package_dir, rel_output_paths) {
-            Ok(OutputScope::InPackage) => {}
-            Ok(OutputScope::CrossPackage) => return Ok(StoreOutcome::SkippedCrossPackage),
-            Err(ScopeError::PathEscape { .. }) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "output path escapes repository root",
-                ));
-            }
+    fn store_internal(
+        &self,
+        request: SharedCacheStoreRequest<'_>,
+        timing: StoreTiming,
+    ) -> io::Result<StoreOutcome> {
+        if let Some(outcome) = store_preflight(request, timing.duration_ms)? {
+            return Ok(outcome);
         }
 
         // Prepare per-entry meta. Keyed by input_key, never by outputs_hash.
-        let meta_record =
-            bincode::serde::encode_to_vec(record, bincode_config()).map_err(io::Error::other)?;
+        let meta_record = bincode::serde::encode_to_vec(request.record, bincode_config())
+            .map_err(io::Error::other)?;
 
         // `has_outputs` is provisional here — the size-cap estimate below
         // doesn't depend on its value (encoding a bool costs the same byte
@@ -860,17 +977,17 @@ impl SharedCache {
         // whether `write_outputs_blob` actually wrote a blob.
         let mut meta = EntryMeta {
             schema_version: ENTRY_META_SCHEMA_VERSION,
-            outputs_hash: *outputs_hash,
-            has_outputs: !rel_output_paths.is_empty(),
+            outputs_hash: *request.outputs_hash,
+            has_outputs: !request.rel_output_paths.is_empty(),
             record: meta_record,
-            stdout: stdout.to_vec(),
-            stderr: stderr.to_vec(),
-            reports: reports.iter().map(EntryReport::from).collect(),
+            stdout: request.stdout.to_vec(),
+            stderr: request.stderr.to_vec(),
+            reports: request.reports.iter().map(EntryReport::from).collect(),
         };
 
         // Meta counts toward the size cap, same as when it lived in the blob.
         let meta_bytes = encode_entry_meta(&meta)?.len() as u64;
-        let output_bytes: u64 = record.outputs.iter().map(|file| file.size).sum();
+        let output_bytes: u64 = request.record.outputs.iter().map(|file| file.size).sum();
         let total_bytes = output_bytes.saturating_add(meta_bytes);
         if total_bytes > self.size_cap_bytes {
             return Ok(StoreOutcome::SkippedTooLarge { bytes: total_bytes });
@@ -878,9 +995,9 @@ impl SharedCache {
 
         let blob_result = write_outputs_blob(
             &self.paths,
-            outputs_hash,
-            package_dir,
-            rel_output_paths,
+            request.outputs_hash,
+            request.package_dir,
+            request.rel_output_paths,
             self.size_cap_bytes,
         )?;
 
@@ -895,26 +1012,36 @@ impl SharedCache {
         // re-derive it from the record.
         meta.has_outputs = !matches!(blob_result, BlobWriteResult::NoOutputs);
 
-        write_entry_meta(&self.paths, input_key, &meta)?;
+        let encoded_meta = encode_entry_meta(&meta)?;
+        let inline_meta = (encoded_meta.len() <= INLINE_ENTRY_META_MAX_BYTES
+            && entry_meta_resident_bytes(&meta) <= INLINE_ENTRY_META_MAX_RESIDENT_BYTES)
+            .then(|| meta.clone());
+        if inline_meta.is_none() {
+            write_entry_meta(&self.paths, request.input_key, &meta)?;
+        }
 
         let entry = SnapshotEntry {
-            task_id: task_id.to_string(),
-            input_key: *input_key,
-            outputs_hash: *outputs_hash,
-            task_spec_hash: record.task_spec_hash,
-            env_hash: record.env_hash,
-            pkg_dep_hash: record.pkg_dep_hash,
-            duration_ms,
+            task_id: request.task_id.to_string(),
+            input_key: *request.input_key,
+            outputs_hash: *request.outputs_hash,
+            task_spec_hash: request.record.task_spec_hash,
+            env_hash: request.record.env_hash,
+            pkg_dep_hash: request.record.pkg_dep_hash,
+            duration_ms: timing.duration_ms,
             output_bytes,
-            cached_at_unix_ms: record.end_unix_ms,
+            cached_at_unix_ms: request.record.end_unix_ms,
             tool_version: None,
+            inline_meta,
+            duration_trusted: timing.trusted,
         };
         self.finish_store(
             blob_result,
             #[cfg(unix)]
-            input_key,
+            request.input_key,
             #[cfg(unix)]
             meta.has_outputs,
+            #[cfg(unix)]
+            entry.inline_meta.is_none(),
             entry,
         )
     }
@@ -937,6 +1064,7 @@ impl SharedCache {
         blob_result: BlobWriteResult,
         #[cfg(unix)] input_key: &[u8; 32],
         #[cfg(unix)] has_outputs: bool,
+        #[cfg(unix)] has_entry_meta: bool,
         entry: SnapshotEntry,
     ) -> io::Result<StoreOutcome> {
         match blob_result {
@@ -945,7 +1073,15 @@ impl SharedCache {
             | BlobWriteResult::AlreadyExists
             | BlobWriteResult::NoOutputs => {
                 #[cfg(unix)]
-                self.enqueue_entry_artifacts(entry.outputs_hash, *input_key, has_outputs);
+                self.enqueue_entry_artifacts(remote::OwnedEntryArtifacts {
+                    paths: Arc::clone(&self.paths),
+                    outputs_hash: entry.outputs_hash,
+                    input_key: *input_key,
+                    presence: remote::ArtifactPresence {
+                        outputs: has_outputs,
+                        entry_meta: has_entry_meta,
+                    },
+                });
                 self.record_pending_entry(entry);
                 Ok(StoreOutcome::Stored)
             }
@@ -963,24 +1099,14 @@ impl SharedCache {
     /// run's index push has happened, so callers may dispatch this half
     /// without the other (see `RemoteSync::push_entry_artifacts`).
     #[cfg(unix)]
-    fn enqueue_entry_artifacts(
-        &self,
-        outputs_hash: [u8; 32],
-        input_key: [u8; 32],
-        has_outputs: bool,
-    ) {
+    fn enqueue_entry_artifacts(&self, request: remote::OwnedEntryArtifacts) {
         let Some(remote) = &self.remote else {
             return;
         };
         if remote.is_disabled() {
             return;
         }
-        remote.enqueue_entry_artifacts(remote::OwnedEntryArtifacts {
-            paths: Arc::clone(&self.paths),
-            outputs_hash,
-            input_key,
-            has_outputs,
-        });
+        remote.enqueue_entry_artifacts(request);
     }
 
     /// Enqueues the merged index shard (and its subsumed-shard deletes) for
@@ -1116,6 +1242,10 @@ impl SharedCache {
     pub fn refresh_entry(&self, input_key: &[u8; 32], entry: &SnapshotEntry) {
         self.record_pending_refresh(entry.clone());
 
+        if entry.inline_meta.is_some() {
+            return;
+        }
+
         let path = entry_meta_path(&self.paths, input_key);
         match OpenOptions::new().write(true).open(&path) {
             Ok(file) => {
@@ -1250,14 +1380,24 @@ impl SharedCache {
                         .catchup_representative
                         .take();
                     if let Some(representative) = representative {
-                        let has_outputs = read_entry_meta(&self.paths, &representative.input_key)
+                        let has_outputs = representative
+                            .inline_meta
+                            .as_ref()
                             .map(|meta| meta.has_outputs)
+                            .or_else(|| {
+                                read_entry_meta(&self.paths, &representative.input_key)
+                                    .map(|meta| meta.has_outputs)
+                            })
                             .unwrap_or(false);
-                        self.enqueue_entry_artifacts(
-                            representative.outputs_hash,
-                            representative.input_key,
-                            has_outputs,
-                        );
+                        self.enqueue_entry_artifacts(remote::OwnedEntryArtifacts {
+                            paths: Arc::clone(&self.paths),
+                            outputs_hash: representative.outputs_hash,
+                            input_key: representative.input_key,
+                            presence: remote::ArtifactPresence {
+                                outputs: has_outputs,
+                                entry_meta: representative.inline_meta.is_none(),
+                            },
+                        });
                     }
                     self.enqueue_index_push(write_key, merge);
                 }
@@ -1268,8 +1408,17 @@ impl SharedCache {
 
 #[cfg(test)]
 mod tests {
+    #[path = "helpers.rs"]
+    mod helpers;
+    #[path = "schema_v2.rs"]
+    mod schema_v2;
+
     use super::*;
     use crate::record::FileEntry;
+    use helpers::{
+        assert_inline_stdout, assert_round_trip_hit, input_hash_with_content, no_output_record,
+        open_test_cache, store_no_output, NoOutputStore,
+    };
     use std::collections::BTreeMap;
     use std::fs;
     use std::path::PathBuf;
@@ -1358,13 +1507,7 @@ mod tests {
         let _commit = create_commit(temp_repo.path());
 
         let temp_cache = TempDir::new().unwrap();
-        let cache = SharedCache::open_with_cache_dir(
-            temp_repo.path(),
-            1_000_000,
-            10,
-            Some(temp_cache.path()),
-        )
-        .unwrap();
+        let cache = open_test_cache(temp_repo.path(), temp_cache.path(), 10);
 
         // Create outputs.
         let package_dir = temp_repo.path().join("pkg");
@@ -1404,11 +1547,7 @@ mod tests {
             .expect("expected at least one candidate")
             .commit()
             .expect("commit should succeed");
-        assert_eq!(hit.outputs_hash, [7; 32]);
-        assert_eq!(hit.stdout, b"stdout output");
-        assert_eq!(hit.stderr, b"stderr output");
-        assert!(hit.record.succeeded);
-        assert_eq!(written_paths, vec![restore_dir.join("dist/main.js")]);
+        assert_round_trip_hit(&hit, &written_paths, &restore_dir);
 
         // Check file content.
         let restored_content = fs::read(restore_dir.join("dist/main.js")).unwrap();
@@ -1434,6 +1573,97 @@ mod tests {
 
         let read_back = local_cache.read("pkg#build").unwrap();
         assert_eq!(read_back, hit.record);
+    }
+
+    #[test]
+    fn prepare_restore_does_not_mutate_package_outputs_before_commit() {
+        let temp_repo = TempDir::new().unwrap();
+        setup_git_repo(temp_repo.path());
+        create_commit(temp_repo.path());
+        let temp_cache = TempDir::new().unwrap();
+        let cache = open_test_cache(temp_repo.path(), temp_cache.path(), 10);
+
+        let package_dir = temp_repo.path().join("pkg");
+        fs::create_dir_all(package_dir.join("dist")).unwrap();
+        let output_path = package_dir.join("dist/main.js");
+        fs::write(&output_path, "cached output").unwrap();
+        let input_key = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32], [5; 32]);
+        cache
+            .store(
+                "pkg#build",
+                &input_key,
+                &[7; 32],
+                &package_dir,
+                &[PathBuf::from("dist/main.js")],
+                &sample_record(true, 200),
+                b"stdout",
+                b"stderr",
+                &[],
+                temp_repo.path(),
+            )
+            .unwrap();
+        cache.flush_pending_entries();
+
+        fs::write(&output_path, "live output").unwrap();
+        let prepared = cache
+            .prepare_restore(&input_key, &package_dir)
+            .expect("restore should stage");
+        assert_eq!(fs::read_to_string(&output_path).unwrap(), "live output");
+
+        let (candidate, _) = prepared.into_parts();
+        candidate.commit().unwrap();
+        assert_eq!(fs::read_to_string(&output_path).unwrap(), "cached output");
+    }
+
+    #[test]
+    fn trusted_fast_entries_are_filtered_but_legacy_duration_is_allowed() {
+        let temp_repo = TempDir::new().unwrap();
+        setup_git_repo(temp_repo.path());
+        create_commit(temp_repo.path());
+        let temp_cache = TempDir::new().unwrap();
+        let cache = SharedCache::open_with_cache_dir(
+            temp_repo.path(),
+            1_000_000,
+            10,
+            Some(temp_cache.path()),
+        )
+        .unwrap();
+        let package_dir = temp_repo.path().join("pkg");
+        fs::create_dir_all(&package_dir).unwrap();
+
+        let record = sample_record(true, 1);
+        let meta = EntryMeta {
+            schema_version: ENTRY_META_SCHEMA_VERSION,
+            outputs_hash: [0; 32],
+            has_outputs: false,
+            record: bincode::serde::encode_to_vec(&record, bincode_config()).unwrap(),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            reports: Vec::new(),
+        };
+        let mut entry = sample_entry_with_seed(50, [0; 32]);
+        entry.duration_ms = 1;
+        entry.inline_meta = Some(meta);
+
+        assert!(SharedCache::stage_entry(
+            &entry,
+            cache.paths(),
+            &package_dir,
+            #[cfg(unix)]
+            None,
+        )
+        .is_none());
+
+        entry.duration_trusted = false;
+        let candidate = SharedCache::stage_entry(
+            &entry,
+            cache.paths(),
+            &package_dir,
+            #[cfg(unix)]
+            None,
+        )
+        .expect("legacy duration must not filter a fallback restore");
+        candidate.discard().unwrap();
     }
 
     #[test]
@@ -1569,6 +1799,45 @@ mod tests {
                 temp_repo.path(),
             )
             .unwrap();
+        assert_eq!(result, StoreOutcome::SkippedTooFast { duration_ms: 50 });
+    }
+
+    #[test]
+    fn explicit_execution_duration_controls_eligibility_not_wall_record_span() {
+        let temp_repo = TempDir::new().unwrap();
+        setup_git_repo(temp_repo.path());
+        create_commit(temp_repo.path());
+        let temp_cache = TempDir::new().unwrap();
+        let cache = SharedCache::open_with_cache_dir(
+            temp_repo.path(),
+            1_000_000,
+            10,
+            Some(temp_cache.path()),
+        )
+        .unwrap();
+        let package_dir = temp_repo.path().join("pkg");
+        fs::create_dir_all(&package_dir).unwrap();
+        let input_key = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32], [5; 32]);
+        let record = sample_record(true, 10_000);
+
+        let result = cache
+            .store_with_execution_duration(
+                SharedCacheStoreRequest {
+                    task_id: "pkg#lint",
+                    input_key: &input_key,
+                    outputs_hash: &[7; 32],
+                    package_dir: &package_dir,
+                    rel_output_paths: &[],
+                    record: &record,
+                    stdout: b"",
+                    stderr: b"",
+                    reports: &[],
+                    repo_root: temp_repo.path(),
+                },
+                50,
+            )
+            .unwrap();
+
         assert_eq!(result, StoreOutcome::SkippedTooFast { duration_ms: 50 });
     }
 
@@ -1825,14 +2094,11 @@ mod tests {
         let entry = SnapshotEntry {
             task_id: "pkg#build".to_string(),
             input_key,
-            outputs_hash: [7; 32],
-            task_spec_hash: [1; 32],
-            env_hash: [2; 32],
-            pkg_dep_hash: [3; 32],
             duration_ms: 200,
             output_bytes: 100,
             cached_at_unix_ms: 1_000_000_000_000,
             tool_version: None,
+            ..sample_entry_with_seed(1, [7; 32])
         };
         // Must land in a computed bucket key, not an arbitrary string (e.g. a
         // git commit hash): `candidate_keys()` only ever asks for keys
@@ -1885,13 +2151,7 @@ mod tests {
             .commit()
             .expect("commit should succeed");
 
-        assert_eq!(hit.stdout, b"stdout v1");
-        assert_eq!(written_paths, vec![restore_dir.join("dist/main.js")]);
-        assert_eq!(fs::read(restore_dir.join("dist/main.js")).unwrap(), b"v1");
-        assert!(
-            !restore_dir.join(".luchta-meta").exists(),
-            "embedded legacy meta must be filtered out on commit"
-        );
+        assert_legacy_restore(&hit, &written_paths, &restore_dir);
     }
 
     fn write_snapshot_fixture(snapshot_dir: &Path, commit: &str, entry: SnapshotEntry) {
@@ -1935,14 +2195,11 @@ mod tests {
             SnapshotEntry {
                 task_id: "pkg#build".to_string(),
                 input_key: input_key1,
-                outputs_hash: [7; 32],
-                task_spec_hash: [1; 32],
-                env_hash: [2; 32],
-                pkg_dep_hash: [3; 32],
                 duration_ms: 200,
                 output_bytes: 100,
                 cached_at_unix_ms: 1_000_000_000_000,
                 tool_version: None,
+                ..sample_entry_with_seed(1, [7; 32])
             },
         );
         write_snapshot_fixture(
@@ -1951,14 +2208,11 @@ mod tests {
             SnapshotEntry {
                 task_id: "pkg#build".to_string(),
                 input_key: input_key2,
-                outputs_hash: [8; 32],
-                task_spec_hash: [5; 32],
-                env_hash: [6; 32],
-                pkg_dep_hash: [7; 32],
                 duration_ms: 100,
                 output_bytes: 50,
                 cached_at_unix_ms: 2_000_000_000_000,
                 tool_version: None,
+                ..sample_entry_with_seed(5, [8; 32])
             },
         );
 
@@ -2029,14 +2283,13 @@ mod tests {
                 SnapshotEntry {
                     task_id: "pkg#old".to_string(),
                     input_key: old_input_key,
-                    outputs_hash: [0; 32],
-                    task_spec_hash: [1; 32],
                     env_hash: [1; 32],
                     pkg_dep_hash: [1; 32],
                     duration_ms: 200,
                     output_bytes: 0,
                     cached_at_unix_ms: 1,
                     tool_version: None,
+                    ..sample_entry_with_seed(1, [0; 32])
                 },
             );
             write_entry_meta(
@@ -2264,19 +2517,13 @@ mod tests {
     }
 
     #[test]
-    fn two_no_output_tasks_keep_separate_meta() {
+    fn two_no_output_tasks_keep_separate_inline_meta() {
         let temp_repo = TempDir::new().unwrap();
         setup_git_repo(temp_repo.path());
         create_commit(temp_repo.path());
 
         let temp_cache = TempDir::new().unwrap();
-        let cache = SharedCache::open_with_cache_dir(
-            temp_repo.path(),
-            1_000_000,
-            10,
-            Some(temp_cache.path()),
-        )
-        .unwrap();
+        let cache = open_test_cache(temp_repo.path(), temp_cache.path(), 10);
 
         let empty_hash = crate::resolve::combined_outputs_hash(&[]);
 
@@ -2285,56 +2532,37 @@ mod tests {
         fs::create_dir_all(&pkg_a).unwrap();
         fs::create_dir_all(&pkg_b).unwrap();
 
-        let mut record_a = sample_record(true, 200);
-        record_a.output_patterns = vec![];
-        record_a.outputs = vec![];
-        record_a.outputs_hash = empty_hash;
-        record_a.task_spec_hash = [11; 32];
+        let record_a = no_output_record([11; 32], empty_hash);
         let key_a = derive_input_key([11; 32], [2; 32], [3; 32], [4; 32], [5; 32]);
 
-        let mut record_b = record_a.clone();
-        record_b.task_spec_hash = [22; 32];
+        let record_b = no_output_record([22; 32], empty_hash);
         let key_b = derive_input_key([22; 32], [2; 32], [3; 32], [4; 32], [5; 32]);
 
-        cache
-            .store(
-                "pkg-a#lint",
-                &key_a,
-                &empty_hash,
-                &pkg_a,
-                &[],
-                &record_a,
-                b"A stdout",
-                b"",
-                &[],
-                temp_repo.path(),
-            )
-            .unwrap();
-        cache
-            .store(
-                "pkg-b#lint",
-                &key_b,
-                &empty_hash,
-                &pkg_b,
-                &[],
-                &record_b,
-                b"B stdout",
-                b"",
-                &[],
-                temp_repo.path(),
-            )
-            .unwrap();
-
-        let meta_a = read_entry_meta(cache.paths(), &key_a).expect("meta for A");
-        let meta_b = read_entry_meta(cache.paths(), &key_b).expect("meta for B");
-
-        assert_eq!(meta_a.stdout, b"A stdout");
-        assert_eq!(meta_b.stdout, b"B stdout");
+        store_no_output(NoOutputStore {
+            cache: &cache,
+            repo: temp_repo.path(),
+            package: &pkg_a,
+            task_id: "pkg-a#lint",
+            input_key: &key_a,
+            record: &record_a,
+            stdout: b"A stdout",
+        });
+        store_no_output(NoOutputStore {
+            cache: &cache,
+            repo: temp_repo.path(),
+            package: &pkg_b,
+            task_id: "pkg-b#lint",
+            input_key: &key_b,
+            record: &record_b,
+            stdout: b"B stdout",
+        });
 
         assert!(
             !blob_path(cache.paths(), &empty_hash).exists(),
             "no outputs means no blob file"
         );
+        assert!(!entry_meta_path(cache.paths(), &key_a).exists());
+        assert!(!entry_meta_path(cache.paths(), &key_b).exists());
 
         // NoOutputs is a success path: the entry must still be indexed, once
         // the deferred index merge is flushed.
@@ -2345,6 +2573,8 @@ mod tests {
             .load(write_key)
             .expect("snapshot should exist for no-output entries");
         assert_eq!(snapshot.entries.len(), 2, "both no-output entries indexed");
+        assert_inline_stdout(&snapshot, key_a, b"A stdout");
+        assert_inline_stdout(&snapshot, key_b, b"B stdout");
         assert!(
             snapshot.entries.contains_key(&input_key_hex(key_a)),
             "entry A should be recorded in the snapshot"
@@ -2660,33 +2890,15 @@ mod tests {
         setup_git_repo(temp_repo.path());
         create_commit(temp_repo.path());
         let temp_cache = TempDir::new().unwrap();
-        let cache = SharedCache::open_with_cache_dir(
-            temp_repo.path(),
-            1_000_000,
-            3,
-            Some(temp_cache.path()),
-        )
-        .unwrap();
+        let cache = open_test_cache(temp_repo.path(), temp_cache.path(), 3);
 
         let package_dir = temp_repo.path().join("pkg");
         fs::create_dir_all(&package_dir).unwrap();
         let empty_outputs = crate::resolve::combined_outputs_hash(&[]);
 
         // Same task, same env, same deps — only the input CONTENT differs.
-        let inputs_a = crate::resolve::combined_inputs_hash(&[FileEntry {
-            path: "src/main.ts".to_string(),
-            size: 10,
-            mtime_ns: 0,
-            hash: [0xAA; 32],
-            absent: false,
-        }]);
-        let inputs_b = crate::resolve::combined_inputs_hash(&[FileEntry {
-            path: "src/main.ts".to_string(),
-            size: 10,
-            mtime_ns: 0,
-            hash: [0xBB; 32],
-            absent: false,
-        }]);
+        let inputs_a = input_hash_with_content([0xAA; 32]);
+        let inputs_b = input_hash_with_content([0xBB; 32]);
         assert_ne!(
             inputs_a, inputs_b,
             "fixture must model two distinct source states"
@@ -2700,36 +2912,27 @@ mod tests {
         );
 
         for (key, marker) in [(key_a, &b"variant-a"[..]), (key_b, &b"variant-b"[..])] {
-            let mut record = sample_record(true, 200);
-            record.output_patterns = vec![];
-            record.outputs = vec![];
-            record.outputs_hash = empty_outputs;
-            let outcome = cache
-                .store(
-                    "pkg#build",
-                    &key,
-                    &empty_outputs,
-                    &package_dir,
-                    &[],
-                    &record,
-                    marker,
-                    b"",
-                    &[],
-                    temp_repo.path(),
-                )
-                .unwrap();
+            let record = no_output_record([1; 32], empty_outputs);
+            let outcome = store_no_output(NoOutputStore {
+                cache: &cache,
+                repo: temp_repo.path(),
+                package: &package_dir,
+                task_id: "pkg#build",
+                input_key: &key,
+                record: &record,
+                stdout: marker,
+            });
             assert_eq!(outcome, StoreOutcome::Stored, "both variants must store");
         }
 
-        // Each key resolves to its own meta — neither evicted the other.
-        assert_eq!(
-            read_entry_meta(cache.paths(), &key_a).unwrap().stdout,
-            b"variant-a"
-        );
-        assert_eq!(
-            read_entry_meta(cache.paths(), &key_b).unwrap().stdout,
-            b"variant-b"
-        );
+        cache.flush_pending_entries();
+        let snapshot = cache
+            .snapshot_store
+            .load(cache.write_bucket_key().unwrap())
+            .unwrap();
+        // Each key resolves to its own inline meta — neither evicted the other.
+        assert_inline_stdout(&snapshot, key_a, b"variant-a");
+        assert_inline_stdout(&snapshot, key_b, b"variant-b");
     }
 
     fn sample_entry_with_seed(seed: u8, outputs_hash: [u8; 32]) -> SnapshotEntry {
@@ -2755,7 +2958,43 @@ mod tests {
             output_bytes: 1_000 + u64::from(seed),
             cached_at_unix_ms: 1_700_000_000_000 + u64::from(seed),
             tool_version: Some("0.1.0".to_owned()),
+            inline_meta: None,
+            duration_trusted: true,
         }
+    }
+
+    fn assert_legacy_restore(hit: &RestoredHit, written_paths: &[PathBuf], restore_dir: &Path) {
+        assert!(
+            hit.stdout == b"stdout v1"
+                && written_paths == [restore_dir.join("dist/main.js")]
+                && fs::read(restore_dir.join("dist/main.js")).unwrap() == b"v1",
+            "legacy restore must preserve fallback logs, output paths, and output contents"
+        );
+        assert!(
+            !restore_dir.join(".luchta-meta").exists(),
+            "embedded legacy meta must be filtered out on commit"
+        );
+    }
+
+    #[test]
+    fn merged_index_drops_inline_meta_over_resident_budget() {
+        let outputs_hash = [9; 32];
+        let mut entry = sample_entry_with_seed(9, outputs_hash);
+        entry.inline_meta = Some(EntryMeta {
+            schema_version: ENTRY_META_SCHEMA_VERSION,
+            outputs_hash,
+            has_outputs: false,
+            record: Vec::new(),
+            stdout: vec![b'x'; INLINE_ENTRY_META_MAX_RESIDENT_BYTES],
+            stderr: Vec::new(),
+            reports: Vec::new(),
+        });
+        let input_key_hex = hex_hash(entry.input_key);
+        let mut merged = MergedIndex::new();
+
+        merged.insert_entry(input_key_hex.clone(), entry);
+
+        assert!(merged.entries[&input_key_hex].inline_meta.is_none());
     }
 
     #[test]
@@ -3112,7 +3351,7 @@ mod tests {
     }
 
     #[test]
-    fn store_writes_blob_and_entry_meta_immediately_before_any_flush() {
+    fn store_writes_blob_but_keeps_small_meta_inline_before_flush() {
         // The invariant most at risk from batching the index merge: a
         // restore on another machine has to find a store's artifacts
         // whether or not this run's index push (now deferred to
@@ -3160,15 +3399,135 @@ mod tests {
             .unwrap();
         assert_eq!(outcome, StoreOutcome::Stored);
 
-        // No flush anywhere above: the entry meta and blob must already be
-        // on disk, since only the index merge is deferred.
+        // No flush anywhere above: small meta is pending inline while the
+        // content-addressed output blob is already available.
         assert!(
-            read_entry_meta(cache.paths(), &input_key).is_some(),
-            "entry meta must be written immediately by store(), not deferred to flush"
+            !entry_meta_path(cache.paths(), &input_key).exists(),
+            "small entry meta must not be duplicated in entries/"
         );
+        assert!(cache
+            .pending
+            .lock()
+            .unwrap()
+            .entries
+            .get(&input_key)
+            .and_then(|entry| entry.inline_meta.as_ref())
+            .is_some());
         assert!(
             blob_path(cache.paths(), &outputs_hash).exists(),
             "the blob must be written immediately by store(), not deferred to flush"
         );
+    }
+
+    #[test]
+    fn store_keeps_oversized_meta_as_fallback_entry_object() {
+        let temp_repo = TempDir::new().unwrap();
+        setup_git_repo(temp_repo.path());
+        create_commit(temp_repo.path());
+        let temp_cache = TempDir::new().unwrap();
+        let cache = SharedCache::open_with_cache_dir(
+            temp_repo.path(),
+            1_000_000,
+            3,
+            Some(temp_cache.path()),
+        )
+        .unwrap();
+        let package_dir = temp_repo.path().join("pkg");
+        fs::create_dir_all(&package_dir).unwrap();
+        let input_key = derive_input_key([8; 32], [2; 32], [3; 32], [4; 32], [5; 32]);
+        let empty_hash = crate::resolve::combined_outputs_hash(&[]);
+        let mut record = sample_record(true, 200);
+        record.output_patterns.clear();
+        record.outputs.clear();
+        record.outputs_hash = empty_hash;
+        let mut stdout = Vec::with_capacity(32 * 1_024);
+        for value in 0_u64..1_024 {
+            stdout.extend_from_slice(blake3::hash(&value.to_le_bytes()).as_bytes());
+        }
+
+        let outcome = cache
+            .store(
+                "pkg#lint",
+                &input_key,
+                &empty_hash,
+                &package_dir,
+                &[],
+                &record,
+                &stdout,
+                b"",
+                &[],
+                temp_repo.path(),
+            )
+            .unwrap();
+
+        assert_eq!(outcome, StoreOutcome::Stored);
+        assert!(entry_meta_path(cache.paths(), &input_key).is_file());
+        assert!(cache
+            .pending
+            .lock()
+            .unwrap()
+            .entries
+            .get(&input_key)
+            .unwrap()
+            .inline_meta
+            .is_none());
+    }
+
+    #[test]
+    fn store_keeps_highly_compressible_large_meta_out_of_merged_index() {
+        let temp_repo = TempDir::new().unwrap();
+        setup_git_repo(temp_repo.path());
+        create_commit(temp_repo.path());
+        let temp_cache = TempDir::new().unwrap();
+        let cache = SharedCache::open_with_cache_dir(
+            temp_repo.path(),
+            1_000_000,
+            3,
+            Some(temp_cache.path()),
+        )
+        .unwrap();
+        let package_dir = temp_repo.path().join("pkg");
+        fs::create_dir_all(&package_dir).unwrap();
+        let input_key = derive_input_key([9; 32], [2; 32], [3; 32], [4; 32], [5; 32]);
+        let empty_hash = crate::resolve::combined_outputs_hash(&[]);
+        let mut record = sample_record(true, 200);
+        record.output_patterns.clear();
+        record.outputs.clear();
+        record.outputs_hash = empty_hash;
+        let stdout = vec![b'x'; INLINE_ENTRY_META_MAX_RESIDENT_BYTES];
+
+        let outcome = cache
+            .store(
+                "pkg#lint",
+                &input_key,
+                &empty_hash,
+                &package_dir,
+                &[],
+                &record,
+                &stdout,
+                b"",
+                &[],
+                temp_repo.path(),
+            )
+            .unwrap();
+
+        assert_eq!(outcome, StoreOutcome::Stored);
+        assert!(
+            encode_entry_meta(&read_entry_meta(cache.paths(), &input_key).unwrap())
+                .unwrap()
+                .len()
+                <= INLINE_ENTRY_META_MAX_BYTES,
+            "the fallback must be selected by resident size, not compressed size"
+        );
+        assert!(entry_meta_path(cache.paths(), &input_key).is_file());
+        assert!(cache
+            .pending
+            .lock()
+            .unwrap()
+            .entries
+            .get(&input_key)
+            .unwrap()
+            .inline_meta
+            .is_none());
     }
 }

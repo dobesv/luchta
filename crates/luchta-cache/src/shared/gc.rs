@@ -301,6 +301,8 @@ mod tests {
             output_bytes: 15,
             cached_at_unix_ms: 1,
             tool_version: None,
+            inline_meta: None,
+            duration_trusted: true,
         }
     }
 

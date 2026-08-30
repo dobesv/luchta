@@ -170,11 +170,11 @@ fn check_patterns_unchanged(prior: &TaskRunRecord, current: &CurrentState<'_>) -
 ///
 /// ## `inputs_hash` is a key-integrity guard, not a resolve
 ///
-/// The caller (`try_shared_cache_skip`) resolves inputs exactly once, up
+/// The caller (`try_shared_cache_prepare`) resolves inputs exactly once, up
 /// front, against the task-definition patterns, and folds the result into
 /// `input_key` as `derive_input_key`'s `inputs_hash` component *before* ever
-/// looking up a candidate. Every candidate `try_restore_candidates` returns
-/// was already filtered by that exact key, so under normal operation its
+/// looking up a candidate. The candidate `prepare_restore` returns was
+/// already filtered by that exact key, so under normal operation its
 /// `record.inputs` is guaranteed to hash to the same value -- the write path
 /// computes the key from that same field (see `write_run_record`). Re-resolving
 /// inputs a second time here, against the filesystem, would cost a directory
@@ -188,7 +188,7 @@ fn check_patterns_unchanged(prior: &TaskRunRecord, current: &CurrentState<'_>) -
 /// catching -- a candidate whose recorded inputs don't actually match what
 /// its own key claims -- but it does NOT catch a resolve error, because
 /// there is no resolve here to fail: the caller already resolved
-/// successfully before this function is ever reached (`try_shared_cache_skip`
+/// successfully before this function is ever reached (`try_shared_cache_prepare`
 /// returns `Decision::Run` on resolve failure without calling this function
 /// at all).
 #[must_use]

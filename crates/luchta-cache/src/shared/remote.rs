@@ -4,26 +4,33 @@
 //! rclone rcd sidecar — and its run-wide disable-and-warn state. Kept separate
 //! from `mod.rs` so the local cache and the remote sync concerns stay cohesive.
 
+mod limiter;
+#[cfg(test)]
+mod queue_tests;
+
+use std::collections::BTreeSet;
 use std::fs;
 use std::io;
-use std::sync::mpsc::{self, SyncSender};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{self, Sender};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
-/// Default threshold for consecutive timeouts before disabling remote sync.
-/// A 0 threshold would disable remote on the first queued timeout, defeating
-/// the backpressure policy's purpose.
+/// Default threshold for cumulative timeouts before disabling remote sync.
+/// Successful requests intentionally do not erase timeout evidence: an
+/// intermittently unhealthy backend must eventually leave the critical path.
 pub const DEFAULT_TIMEOUT_DISABLE_THRESHOLD: usize = 8;
 pub const DEFAULT_PUSH_QUEUE_CAPACITY: usize = 256;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::snapshot::{SnapshotUpload, SNAPSHOT_FILE_EXTENSION, SNAPSHOT_MERGED_EXTENSION};
+use super::stats::{directory_file_bytes, SharedCacheStats};
 use super::{
     blob_path, entry_meta_path, hex_hash, rclone, MergeEntryOutcome, RcloneRcd, SharedCachePaths,
     SnapshotStore, BLOBS_DIR_NAME, ENTRIES_DIR_NAME, SNAPSHOTS_DIR_NAME,
 };
+use limiter::RemoteOperationLimiter;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteConfig {
@@ -44,21 +51,29 @@ struct RemoteState {
     disabled: AtomicBool,
     /// Ensures the "remote cache disabled" warning is emitted only once.
     warned: AtomicBool,
-    /// Consecutive timeout streak; queued rcd backpressure can time out transiently.
-    consecutive_timeouts: AtomicUsize,
+    /// Cumulative timeout evidence. Intermittent successes must not keep a
+    /// degraded backend on the critical path indefinitely.
+    timeout_count: AtomicUsize,
     timeout_disable_threshold: usize,
+    limiter: RemoteOperationLimiter,
+    stats: Arc<SharedCacheStats>,
 }
 
 impl RemoteState {
-    fn new(timeout_disable_threshold: usize) -> Self {
+    fn new(
+        timeout_disable_threshold: usize,
+        concurrency: usize,
+        stats: Arc<SharedCacheStats>,
+    ) -> Self {
         Self {
             disabled: AtomicBool::new(false),
             warned: AtomicBool::new(false),
-            consecutive_timeouts: AtomicUsize::new(0),
-            // A threshold of 0 would disable the remote on the first queued
-            // timeout, defeating the point of the backpressure policy. Clamp to
-            // at least 1 so the invariant holds regardless of the caller.
+            timeout_count: AtomicUsize::new(0),
+            // Clamp to at least 1 so zero cannot accidentally disable remote
+            // sync before any timeout has been observed.
             timeout_disable_threshold: timeout_disable_threshold.max(1),
+            limiter: RemoteOperationLimiter::new(concurrency.max(1)),
+            stats,
         }
     }
 
@@ -68,21 +83,21 @@ impl RemoteState {
 
     fn disable_with_warning(&self, reason: &str) {
         self.disabled.store(true, Ordering::Release);
-        self.consecutive_timeouts.store(0, Ordering::Release);
+        self.stats.set_disable_reason(reason);
         if !self.warned.swap(true, Ordering::AcqRel) {
             eprintln!("warning: remote cache disabled: {reason}");
         }
     }
 
     fn record_timeout(&self, reason: &str) {
-        let streak = self.consecutive_timeouts.fetch_add(1, Ordering::AcqRel) + 1;
-        if streak >= self.timeout_disable_threshold {
+        let count = self.timeout_count.fetch_add(1, Ordering::AcqRel) + 1;
+        if count >= self.timeout_disable_threshold {
             self.disable_with_warning(reason);
         }
     }
 
     fn record_success(&self) {
-        self.consecutive_timeouts.store(0, Ordering::Release);
+        // Timeout evidence is deliberately cumulative for the run.
     }
 }
 
@@ -111,6 +126,8 @@ pub struct RemoteSync {
     pub(crate) remote_base_fs: String,
     state: Arc<RemoteState>,
     push_queue: Arc<PushQueue>,
+    push_runtime: Arc<PushRuntime>,
+    sync_timeout: Duration,
     /// True only for the instance `new` returned. Clones share `rclone` and
     /// `state` but must never tear either down: `RcloneRcd::shutdown` quits
     /// the daemon behind the shared `Arc`, so a clone running it would kill
@@ -125,6 +142,8 @@ impl Clone for RemoteSync {
             remote_base_fs: self.remote_base_fs.clone(),
             state: Arc::clone(&self.state),
             push_queue: Arc::clone(&self.push_queue),
+            push_runtime: Arc::clone(&self.push_runtime),
+            sync_timeout: self.sync_timeout,
             // Never inherited. A derived `Clone` would hand every transient
             // handle the right to shut down the shared daemon, and the
             // restore path clones per candidate pull.
@@ -135,8 +154,35 @@ impl Clone for RemoteSync {
 
 #[derive(Debug)]
 struct PushQueue {
-    tx: Mutex<Option<SyncSender<PushMsg>>>,
-    worker: Mutex<Option<JoinHandle<()>>>,
+    tx: Mutex<Option<Sender<PushJob>>>,
+    workers: Mutex<Vec<JoinHandle<()>>>,
+}
+
+#[derive(Debug)]
+struct PushRuntime {
+    receiver: Mutex<mpsc::Receiver<PushJob>>,
+    capacity: usize,
+    depth: AtomicUsize,
+    next_job_id: AtomicUsize,
+    progress: Mutex<PushProgress>,
+    progress_ready: Condvar,
+    cancelled: AtomicBool,
+    drop_warned: AtomicBool,
+    flush_timeout_warned: AtomicBool,
+    deadline: Mutex<Option<Instant>>,
+    stats: Arc<SharedCacheStats>,
+}
+
+#[derive(Debug, Default)]
+struct PushProgress {
+    completed_through: usize,
+    completed_out_of_order: BTreeSet<usize>,
+}
+
+#[derive(Debug)]
+struct PushJob {
+    id: usize,
+    message: PushMsg,
 }
 
 /// Closes the push queue and quits the rclone daemon when the last
@@ -165,8 +211,14 @@ impl Drop for RemoteSync {
 enum PushMsg {
     EntryArtifacts(OwnedEntryArtifacts),
     IndexMerge(OwnedIndexPush),
-    #[cfg(any(test, doctest))]
     Flush(std::sync::mpsc::Sender<()>),
+    #[cfg(test)]
+    TestDelay {
+        duration: Duration,
+        active: Arc<AtomicUsize>,
+        max_active: Arc<AtomicUsize>,
+        completed: Arc<AtomicUsize>,
+    },
 }
 
 /// Owned inputs for [`RemoteSync::push_entry_artifacts`], queued so the push
@@ -181,7 +233,31 @@ pub(crate) struct OwnedEntryArtifacts {
     pub(crate) paths: Arc<SharedCachePaths>,
     pub(crate) outputs_hash: [u8; 32],
     pub(crate) input_key: [u8; 32],
-    pub(crate) has_outputs: bool,
+    pub(crate) presence: ArtifactPresence,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ArtifactPresence {
+    pub(crate) outputs: bool,
+    pub(crate) entry_meta: bool,
+}
+
+impl ArtifactPresence {
+    #[cfg(test)]
+    const fn all() -> Self {
+        Self {
+            outputs: true,
+            entry_meta: true,
+        }
+    }
+
+    #[cfg(test)]
+    const fn metadata_only() -> Self {
+        Self {
+            outputs: false,
+            entry_meta: true,
+        }
+    }
 }
 
 /// Borrowed inputs for [`RemoteSync::push_entry_artifacts`].
@@ -195,7 +271,28 @@ pub(crate) struct EntryArtifacts<'a> {
     pub(crate) paths: &'a SharedCachePaths,
     pub(crate) outputs_hash: &'a [u8; 32],
     pub(crate) input_key: &'a [u8; 32],
-    pub(crate) has_outputs: bool,
+    pub(crate) presence: ArtifactPresence,
+}
+
+struct RemoteFileDownload<'a> {
+    src_fs: &'a str,
+    src_remote: &'a str,
+    local_path: &'a Path,
+    timeout: Duration,
+}
+
+struct RemoteBytesUpload<'a> {
+    bytes: &'a [u8],
+    dst_fs: &'a str,
+    dst_remote: &'a str,
+    timeout: Duration,
+}
+
+struct RemoteFileUpload<'a> {
+    local_path: &'a Path,
+    dst_fs: &'a str,
+    dst_remote: &'a str,
+    timeout: Duration,
 }
 
 /// Owned inputs for [`RemoteSync::push_index_merge`], queued so the push can
@@ -212,35 +309,81 @@ pub(crate) struct OwnedIndexPush {
 
 impl RemoteSync {
     #[must_use]
+    #[cfg(any(test, doctest))]
     pub(crate) fn new(
         rclone: Arc<RcloneRcd>,
         remote_base_fs: impl Into<String>,
         timeout_disable_threshold: usize,
     ) -> Self {
-        let state = Arc::new(RemoteState::new(timeout_disable_threshold));
+        Self::new_with_stats(
+            rclone,
+            remote_base_fs,
+            timeout_disable_threshold,
+            Arc::new(SharedCacheStats::default()),
+        )
+    }
+
+    fn new_with_stats(
+        rclone: Arc<RcloneRcd>,
+        remote_base_fs: impl Into<String>,
+        timeout_disable_threshold: usize,
+        stats: Arc<SharedCacheStats>,
+    ) -> Self {
+        let concurrency = rclone.concurrency_limit();
+        let sync_timeout = rclone.default_timeout();
+        let capacity = std::env::var("LUCHTA_SHARED_CACHE_PUSH_QUEUE_CAPACITY")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .map(|value| value.max(1))
+            .unwrap_or(DEFAULT_PUSH_QUEUE_CAPACITY);
+        let (tx, rx) = mpsc::channel();
+        let push_runtime = Arc::new(PushRuntime {
+            receiver: Mutex::new(rx),
+            capacity,
+            depth: AtomicUsize::new(0),
+            next_job_id: AtomicUsize::new(0),
+            progress: Mutex::new(PushProgress::default()),
+            progress_ready: Condvar::new(),
+            cancelled: AtomicBool::new(false),
+            drop_warned: AtomicBool::new(false),
+            flush_timeout_warned: AtomicBool::new(false),
+            deadline: Mutex::new(None),
+            stats: Arc::clone(&stats),
+        });
+        let state = Arc::new(RemoteState::new(
+            timeout_disable_threshold,
+            concurrency,
+            stats,
+        ));
         let mut remote = Self {
             rclone,
             remote_base_fs: remote_base_fs.into(),
             state,
             push_queue: Arc::new(PushQueue {
-                tx: Mutex::new(None),
-                worker: Mutex::new(None),
+                tx: Mutex::new(Some(tx)),
+                workers: Mutex::new(Vec::new()),
             }),
+            push_runtime,
+            sync_timeout,
             owns_shared_state: true,
         };
-        remote.start_push_queue();
+        remote.start_push_workers(concurrency);
         remote
     }
 
-    pub(crate) fn from_config(config: RemoteConfig) -> Result<Self, rclone::RcloneError> {
+    pub(crate) fn from_config(
+        config: RemoteConfig,
+        stats: Arc<SharedCacheStats>,
+    ) -> Result<Self, rclone::RcloneError> {
         let rclone = Arc::new(RcloneRcd::with_concurrency_limit(
             config.sync_timeout,
             config.rclone_concurrency,
         )?);
-        Ok(Self::new(
+        Ok(Self::new_with_stats(
             rclone,
             config.fs_base,
             config.timeout_disable_threshold,
+            stats,
         ))
     }
 
@@ -283,7 +426,10 @@ impl RemoteSync {
 
     /// Shut the rclone daemon down at run end (best-effort).
     pub(crate) fn shutdown(&self) {
-        let _ = self.rclone.shutdown(self.rclone.default_timeout());
+        let timeout = self.sync_timeout.min(Duration::from_secs(1));
+        if self.rclone.shutdown(timeout).is_err() {
+            let _ = self.rclone.force_shutdown();
+        }
     }
 
     /// Test-only: whether the run-wide remote-disable flag has been tripped.
@@ -312,6 +458,32 @@ impl RemoteSync {
             self.remote_base_fs.trim_end_matches('/')
         )
     }
+
+    /// Admit one logical remote operation, hold the permit through the full
+    /// rclone job, and recheck disable/cancellation after waiting.
+    fn remote_operation<T>(
+        &self,
+        operation: impl FnOnce(Duration) -> Result<T, rclone::RcloneError>,
+    ) -> Option<(Result<T, rclone::RcloneError>, Duration)> {
+        let _permit = self.state.limiter.acquire();
+        if self.is_disabled() || self.push_runtime.cancelled.load(Ordering::Acquire) {
+            return None;
+        }
+        let timeout = match *self
+            .push_runtime
+            .deadline
+            .lock()
+            .expect("push deadline poisoned")
+        {
+            Some(deadline) => deadline.saturating_duration_since(Instant::now()),
+            None => self.rclone.default_timeout(),
+        };
+        if timeout.is_zero() {
+            return None;
+        }
+        let started = Instant::now();
+        Some((operation(timeout), started.elapsed()))
+    }
 }
 
 /// Turns an rclone error into a short, human-readable reason string, used by
@@ -335,13 +507,7 @@ fn remote_disable_reason(err: &rclone::RcloneError) -> String {
 }
 
 impl RemoteSync {
-    fn start_push_queue(&mut self) {
-        let capacity = std::env::var("LUCHTA_SHARED_CACHE_PUSH_QUEUE_CAPACITY")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .map(|value| value.max(1))
-            .unwrap_or(DEFAULT_PUSH_QUEUE_CAPACITY);
-        let (tx, rx) = mpsc::sync_channel(capacity);
+    fn start_push_workers(&mut self, concurrency: usize) {
         // The worker gets its own inert `PushQueue` rather than sharing this
         // one. Sharing it means the worker holds the sender too, so the
         // channel stays open even after the owner is gone, the thread blocks
@@ -350,108 +516,285 @@ impl RemoteSync {
         // (#283). `Drop` closing the queue is the primary fix; this keeps the
         // worker from being able to hold it open in the first place. The
         // worker only ever needs the push methods, never the queue.
-        let worker_remote = Self {
-            rclone: Arc::clone(&self.rclone),
-            remote_base_fs: self.remote_base_fs.clone(),
-            state: Arc::clone(&self.state),
-            push_queue: Arc::new(PushQueue {
-                tx: Mutex::new(None),
-                worker: Mutex::new(None),
-            }),
-            owns_shared_state: false,
-        };
-        let worker = std::thread::spawn(move || {
-            for msg in rx {
-                match msg {
-                    PushMsg::EntryArtifacts(push) => worker_remote.push_entry_artifacts_owned(push),
-                    PushMsg::IndexMerge(push) => worker_remote.push_index_merge_owned(push),
-                    #[cfg(any(test, doctest))]
-                    PushMsg::Flush(ack) => {
-                        let _ = ack.send(());
-                    }
-                }
-            }
-        });
-        *self
+        let mut workers = self
             .push_queue
-            .tx
+            .workers
             .lock()
-            .expect("push queue tx mutex poisoned") = Some(tx);
-        *self
-            .push_queue
-            .worker
-            .lock()
-            .expect("push queue worker mutex poisoned") = Some(worker);
+            .expect("push queue workers mutex poisoned");
+        for _ in 0..concurrency.max(1) {
+            let worker_remote = Self {
+                rclone: Arc::clone(&self.rclone),
+                remote_base_fs: self.remote_base_fs.clone(),
+                state: Arc::clone(&self.state),
+                push_queue: Arc::new(PushQueue {
+                    tx: Mutex::new(None),
+                    workers: Mutex::new(Vec::new()),
+                }),
+                push_runtime: Arc::clone(&self.push_runtime),
+                sync_timeout: self.sync_timeout,
+                owns_shared_state: false,
+            };
+            workers.push(std::thread::spawn(move || worker_remote.run_push_worker()));
+        }
     }
 
     pub(crate) fn enqueue_entry_artifacts(&self, push: OwnedEntryArtifacts) {
-        let Some(tx) = self
-            .push_queue
-            .tx
-            .lock()
-            .expect("push queue tx mutex poisoned")
-            .as_ref()
-            .cloned()
-        else {
-            self.push_entry_artifacts_owned(push);
-            return;
-        };
-        if tx.send(PushMsg::EntryArtifacts(push)).is_err() {
-            eprintln!("debug: remote push queue closed before enqueue completed");
-        }
+        self.enqueue_push(PushMsg::EntryArtifacts(push));
     }
 
     pub(crate) fn enqueue_index_push(&self, push: OwnedIndexPush) {
-        let Some(tx) = self
-            .push_queue
-            .tx
-            .lock()
-            .expect("push queue tx mutex poisoned")
-            .as_ref()
-            .cloned()
-        else {
-            self.push_index_merge_owned(push);
-            return;
-        };
-        if tx.send(PushMsg::IndexMerge(push)).is_err() {
-            eprintln!("debug: remote push queue closed before enqueue completed");
-        }
+        self.enqueue_push(PushMsg::IndexMerge(push));
     }
 
-    #[cfg(any(test, doctest))]
     pub(crate) fn drain_push_queue(&self) {
-        let Some(tx) = self
-            .push_queue
-            .tx
+        let deadline = Instant::now() + self.sync_timeout;
+        *self
+            .push_runtime
+            .deadline
             .lock()
-            .expect("push queue tx mutex poisoned")
-            .as_ref()
-            .cloned()
-        else {
-            return;
-        };
+            .expect("push deadline poisoned") = Some(deadline);
         let (ack_tx, ack_rx) = mpsc::channel();
-        if tx.send(PushMsg::Flush(ack_tx)).is_err() {
+        let mut ack_tx = Some(ack_tx);
+        loop {
+            let sender = ack_tx.take().expect("flush sender missing");
+            if self.enqueue_push(PushMsg::Flush(sender.clone())) {
+                break;
+            }
+            ack_tx = Some(sender);
+            if Instant::now() >= deadline || self.push_runtime.cancelled.load(Ordering::Acquire) {
+                self.cancel_timed_out_pushes();
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if ack_rx.recv_timeout(remaining).is_err() {
+            self.cancel_timed_out_pushes();
             return;
         }
-        let _ = ack_rx.recv();
+        *self
+            .push_runtime
+            .deadline
+            .lock()
+            .expect("push deadline poisoned") = None;
     }
 
     pub(crate) fn flush_push_queue(&self) {
+        self.finish_push_queue(false);
+    }
+
+    pub(crate) fn discard_push_queue(&self) {
+        self.finish_push_queue(true);
+    }
+
+    fn enqueue_push(&self, message: PushMsg) -> bool {
+        if self.push_runtime.cancelled.load(Ordering::Acquire) {
+            return false;
+        }
+        // The sender guard also serializes producer admission: keep the depth
+        // check and increment inside it so the queue cap cannot be overshot by
+        // concurrent enqueuers while workers independently decrement depth.
+        let mut tx = self
+            .push_queue
+            .tx
+            .lock()
+            .expect("push queue tx mutex poisoned");
+        let Some(sender) = tx.as_ref() else {
+            return false;
+        };
+        let depth = self.push_runtime.depth.load(Ordering::Acquire);
+        if depth >= self.push_runtime.capacity {
+            self.push_runtime
+                .stats
+                .queue_drops
+                .fetch_add(1, Ordering::AcqRel);
+            if !self.push_runtime.drop_warned.swap(true, Ordering::AcqRel) {
+                eprintln!(
+                    "warn: shared cache artifact upload queue saturated; dropping optional remote cache work"
+                );
+            }
+            return false;
+        }
+        let id = self.push_runtime.next_job_id.fetch_add(1, Ordering::AcqRel) + 1;
+        self.push_runtime.depth.fetch_add(1, Ordering::AcqRel);
+        self.push_runtime.stats.observe_queue_depth(depth + 1);
+        if sender.send(PushJob { id, message }).is_err() {
+            self.push_runtime.depth.fetch_sub(1, Ordering::AcqRel);
+            self.push_runtime.stats.observe_queue_depth(depth);
+            *tx = None;
+            return false;
+        }
+        true
+    }
+
+    fn run_push_worker(&self) {
+        loop {
+            let job = self
+                .push_runtime
+                .receiver
+                .lock()
+                .expect("push queue receiver poisoned")
+                .recv();
+            let Ok(job) = job else { break };
+            let depth = self
+                .push_runtime
+                .depth
+                .fetch_sub(1, Ordering::AcqRel)
+                .saturating_sub(1);
+            self.push_runtime.stats.observe_queue_depth(depth);
+            if !self.push_runtime.cancelled.load(Ordering::Acquire)
+                && self.wait_for_previous_jobs(job.id.saturating_sub(1), &job.message)
+            {
+                match job.message {
+                    PushMsg::EntryArtifacts(push) => self.push_entry_artifacts_owned(push),
+                    PushMsg::IndexMerge(push) => self.push_index_merge_owned(push),
+                    PushMsg::Flush(ack) => {
+                        let _ = ack.send(());
+                    }
+                    #[cfg(test)]
+                    PushMsg::TestDelay {
+                        duration,
+                        active,
+                        max_active,
+                        completed,
+                    } => {
+                        let current = active.fetch_add(1, Ordering::AcqRel) + 1;
+                        max_active.fetch_max(current, Ordering::AcqRel);
+                        std::thread::sleep(duration);
+                        active.fetch_sub(1, Ordering::AcqRel);
+                        completed.fetch_add(1, Ordering::AcqRel);
+                    }
+                }
+            }
+            self.mark_job_complete(job.id);
+        }
+    }
+
+    fn wait_for_previous_jobs(&self, previous: usize, message: &PushMsg) -> bool {
+        let may_run_concurrently = match message {
+            PushMsg::EntryArtifacts(_) => true,
+            #[cfg(test)]
+            PushMsg::TestDelay { .. } => true,
+            _ => false,
+        };
+        if may_run_concurrently {
+            return true;
+        }
+        let mut progress = self
+            .push_runtime
+            .progress
+            .lock()
+            .expect("push progress poisoned");
+        while progress.completed_through < previous
+            && !self.push_runtime.cancelled.load(Ordering::Acquire)
+        {
+            progress = self
+                .push_runtime
+                .progress_ready
+                .wait(progress)
+                .expect("push progress poisoned");
+        }
+        !self.push_runtime.cancelled.load(Ordering::Acquire)
+    }
+
+    fn mark_job_complete(&self, id: usize) {
+        let mut progress = self
+            .push_runtime
+            .progress
+            .lock()
+            .expect("push progress poisoned");
+        progress.completed_out_of_order.insert(id);
+        loop {
+            let next = progress.completed_through + 1;
+            if !progress.completed_out_of_order.remove(&next) {
+                break;
+            }
+            progress.completed_through += 1;
+        }
+        self.push_runtime.progress_ready.notify_all();
+    }
+
+    fn finish_push_queue(&self, discard: bool) {
+        let deadline = self.close_push_queue(discard);
+        let workers = self.take_push_workers();
+        Self::wait_for_push_workers(&workers, deadline);
+        self.stop_unfinished_push_workers(&workers, discard);
+        Self::join_finished_push_workers(workers);
+    }
+
+    fn close_push_queue(&self, discard: bool) -> Instant {
+        if discard {
+            self.push_runtime.cancelled.store(true, Ordering::Release);
+        } else {
+            *self
+                .push_runtime
+                .deadline
+                .lock()
+                .expect("push deadline poisoned") = Some(Instant::now() + self.sync_timeout);
+        }
         self.push_queue
             .tx
             .lock()
             .expect("push queue tx mutex poisoned")
             .take();
-        if let Some(worker) = self
-            .push_queue
-            .worker
-            .lock()
-            .expect("push queue worker mutex poisoned")
-            .take()
-        {
-            let _ = worker.join();
+        self.push_runtime.progress_ready.notify_all();
+        Instant::now()
+            + if discard {
+                Duration::ZERO
+            } else {
+                self.sync_timeout
+            }
+    }
+
+    fn take_push_workers(&self) -> Vec<JoinHandle<()>> {
+        std::mem::take(
+            &mut *self
+                .push_queue
+                .workers
+                .lock()
+                .expect("push queue workers mutex poisoned"),
+        )
+    }
+
+    fn wait_for_push_workers(workers: &[JoinHandle<()>], deadline: Instant) {
+        while workers.iter().any(|worker| !worker.is_finished()) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    fn stop_unfinished_push_workers(&self, workers: &[JoinHandle<()>], discard: bool) {
+        if workers.iter().all(JoinHandle::is_finished) {
+            return;
+        }
+        if discard {
+            let _ = self.rclone.force_shutdown();
+        } else {
+            self.cancel_timed_out_pushes();
+        }
+    }
+
+    fn join_finished_push_workers(workers: Vec<JoinHandle<()>>) {
+        for worker in workers {
+            if worker.is_finished() {
+                let _ = worker.join();
+            }
+        }
+    }
+
+    fn cancel_timed_out_pushes(&self) {
+        self.push_runtime.cancelled.store(true, Ordering::Release);
+        self.push_runtime.progress_ready.notify_all();
+        let reason = "final flush exceeded shared-cache sync timeout";
+        self.state.stats.set_disable_reason(reason);
+        if !self
+            .push_runtime
+            .flush_timeout_warned
+            .swap(true, Ordering::AcqRel)
+        {
+            eprintln!("warn: shared cache final flush exceeded sync timeout; discarding queued remote work");
+        }
+        self.state.record_timeout(reason);
+        let _ = self.rclone.force_shutdown();
     }
 
     fn push_entry_artifacts_owned(&self, push: OwnedEntryArtifacts) {
@@ -459,7 +802,7 @@ impl RemoteSync {
             paths: &push.paths,
             outputs_hash: &push.outputs_hash,
             input_key: &push.input_key,
-            has_outputs: push.has_outputs,
+            presence: push.presence,
         });
     }
 
@@ -478,14 +821,39 @@ impl RemoteSync {
             return;
         }
         let local_fs = format!(":local:{}", local_dir.display());
-        if let Err(err) = self
-            .rclone
-            .copy_dir(&remote_fs, &local_fs, self.rclone.default_timeout())
-        {
+        let Some((result, elapsed)) =
+            self.remote_operation(|timeout| self.rclone.copy_dir(&remote_fs, &local_fs, timeout))
+        else {
+            return;
+        };
+        self.state
+            .stats
+            .snapshot_syncs
+            .fetch_add(1, Ordering::AcqRel);
+        self.state
+            .stats
+            .download_latency_ms
+            .fetch_add(elapsed.as_millis() as u64, Ordering::AcqRel);
+        if let Err(err) = result {
             self.record_remote_error(&err);
-            eprintln!("debug: remote snapshot copy failed for bucket={commit_key}: {err}");
+            if !matches!(err, rclone::RcloneError::HttpStatus { status: 404, .. })
+                && !is_missing_local_source_copy_error(&err)
+            {
+                eprintln!(
+                    "warn: shared cache snapshot download failed for bucket={commit_key}: {err}"
+                );
+            }
         } else {
             self.record_remote_success();
+            let bytes = directory_file_bytes(&local_dir);
+            self.state
+                .stats
+                .snapshot_bytes
+                .fetch_add(bytes, Ordering::AcqRel);
+            self.state
+                .stats
+                .download_bytes
+                .fetch_add(bytes, Ordering::AcqRel);
         }
     }
 
@@ -502,9 +870,40 @@ impl RemoteSync {
             return Ok(());
         }
         let file_name = format!("{}.bin", hex_hash(*input_key));
-        self.copy_remote_file_down(&self.entries_fs(), &file_name, &local_path)
-            .inspect(|_| self.record_remote_success())
-            .inspect_err(|err| self.record_remote_error(err))
+        self.state
+            .stats
+            .fallback_meta_gets
+            .fetch_add(1, Ordering::AcqRel);
+        let Some((result, elapsed)) = self.remote_operation(|timeout| {
+            self.copy_remote_file_down(RemoteFileDownload {
+                src_fs: &self.entries_fs(),
+                src_remote: &file_name,
+                local_path: &local_path,
+                timeout,
+            })
+        }) else {
+            return Ok(());
+        };
+        self.state
+            .stats
+            .download_latency_ms
+            .fetch_add(elapsed.as_millis() as u64, Ordering::AcqRel);
+        match result {
+            Ok(()) => {
+                self.record_remote_success();
+                self.state.stats.download_bytes.fetch_add(
+                    fs::metadata(&local_path)
+                        .map(|meta| meta.len())
+                        .unwrap_or(0),
+                    Ordering::AcqRel,
+                );
+                Ok(())
+            }
+            Err(err) => {
+                self.record_remote_error(&err);
+                Err(err)
+            }
+        }
     }
 
     pub(crate) fn pull_blob(
@@ -520,17 +919,49 @@ impl RemoteSync {
         if local_path.exists() {
             return Ok(());
         }
-        self.copy_remote_file_down(&self.blobs_fs(), &file_name, &local_path)
-            .inspect(|_| self.record_remote_success())
-            .inspect_err(|err| self.record_remote_error(err))
+        self.state.stats.blob_gets.fetch_add(1, Ordering::AcqRel);
+        let Some((result, elapsed)) = self.remote_operation(|timeout| {
+            self.copy_remote_file_down(RemoteFileDownload {
+                src_fs: &self.blobs_fs(),
+                src_remote: &file_name,
+                local_path: &local_path,
+                timeout,
+            })
+        }) else {
+            return Ok(());
+        };
+        self.state
+            .stats
+            .download_latency_ms
+            .fetch_add(elapsed.as_millis() as u64, Ordering::AcqRel);
+        match result {
+            Ok(()) => {
+                self.record_remote_success();
+                self.state.stats.download_bytes.fetch_add(
+                    fs::metadata(&local_path)
+                        .map(|meta| meta.len())
+                        .unwrap_or(0),
+                    Ordering::AcqRel,
+                );
+                Ok(())
+            }
+            Err(err) => {
+                self.record_remote_error(&err);
+                Err(err)
+            }
+        }
     }
 
     fn copy_remote_file_down(
         &self,
-        src_fs: &str,
-        src_remote: &str,
-        local_path: &Path,
+        download: RemoteFileDownload<'_>,
     ) -> Result<(), rclone::RcloneError> {
+        let RemoteFileDownload {
+            src_fs,
+            src_remote,
+            local_path,
+            timeout,
+        } = download;
         let parent = local_path.parent().ok_or_else(|| {
             rclone::RcloneError::Io(io::Error::other("local cache target missing parent"))
         })?;
@@ -555,7 +986,7 @@ impl RemoteSync {
                 dst_fs: &dst_fs,
                 dst_remote,
             },
-            self.rclone.default_timeout(),
+            timeout,
         )?;
         std::fs::rename(&temp_path, local_path).or_else(|err| {
             if err.kind() == io::ErrorKind::AlreadyExists {
@@ -567,8 +998,8 @@ impl RemoteSync {
         Ok(())
     }
 
-    /// Pushes the content-addressed blob (when `has_outputs`) and the
-    /// `entries/<input_key>.bin` object.
+    /// Pushes the content-addressed blob (when `has_outputs`) and the fallback
+    /// `entries/<input_key>.bin` object (when metadata was too large to inline).
     ///
     /// Independent of [`push_index_merge`](Self::push_index_merge): both the
     /// blob and the entry meta are useful to a restore on another machine
@@ -579,10 +1010,12 @@ impl RemoteSync {
             return;
         }
 
-        if artifacts.has_outputs {
+        if artifacts.presence.outputs {
             self.push_blob_if_missing(artifacts.paths, artifacts.outputs_hash);
         }
-        self.push_entry_meta_if_missing(artifacts.paths, artifacts.input_key);
+        if artifacts.presence.entry_meta {
+            self.push_entry_meta_if_missing(artifacts.paths, artifacts.input_key);
+        }
     }
 
     /// Pushes the merged index shard (when the merge produced one) and then
@@ -620,10 +1053,12 @@ impl RemoteSync {
     fn push_blob_if_missing(&self, paths: &SharedCachePaths, outputs_hash: &[u8; 32]) {
         let remote_fs = self.blobs_fs();
         let blob_name = format!("{}.tar.zst", hex_hash(*outputs_hash));
-        match self
-            .rclone
-            .stat(&remote_fs, &blob_name, self.rclone.default_timeout())
-        {
+        let Some((preflight, _)) =
+            self.remote_operation(|timeout| self.rclone.stat(&remote_fs, &blob_name, timeout))
+        else {
+            return;
+        };
+        match preflight {
             Ok(Some(_)) => {
                 self.record_remote_success();
                 return;
@@ -633,15 +1068,29 @@ impl RemoteSync {
             }
             Err(err) => {
                 self.record_remote_error(&err);
-                eprintln!("warn: shared cache remote blob stat failed for {blob_name}: {err}");
+                eprintln!("warn: shared cache upload preflight failed for blob={blob_name}: {err}");
                 return;
             }
         }
 
         let local_path = blob_path(paths, outputs_hash);
-        if let Err(err) = self.copy_local_file_up(&local_path, &remote_fs, &blob_name) {
+        let bytes = fs::metadata(&local_path)
+            .map(|meta| meta.len())
+            .unwrap_or(0);
+        let Some((result, elapsed)) = self.remote_operation(|timeout| {
+            self.copy_local_file_up(RemoteFileUpload {
+                local_path: &local_path,
+                dst_fs: &remote_fs,
+                dst_remote: &blob_name,
+                timeout,
+            })
+        }) else {
+            return;
+        };
+        self.record_upload_stats(bytes, elapsed, result.is_ok());
+        if let Err(err) = result {
             self.record_remote_error(&err);
-            eprintln!("warn: shared cache remote blob upload failed for {blob_name}: {err}");
+            eprintln!("warn: shared cache artifact upload failed for blob={blob_name}: {err}");
         } else {
             self.record_remote_success();
         }
@@ -650,10 +1099,12 @@ impl RemoteSync {
     fn push_entry_meta_if_missing(&self, paths: &SharedCachePaths, input_key: &[u8; 32]) {
         let remote_fs = self.entries_fs();
         let file_name = format!("{}.bin", hex_hash(*input_key));
-        match self
-            .rclone
-            .stat(&remote_fs, &file_name, self.rclone.default_timeout())
-        {
+        let Some((preflight, _)) =
+            self.remote_operation(|timeout| self.rclone.stat(&remote_fs, &file_name, timeout))
+        else {
+            return;
+        };
+        match preflight {
             Ok(Some(_)) => {
                 self.record_remote_success();
                 return;
@@ -664,16 +1115,30 @@ impl RemoteSync {
             Err(err) => {
                 self.record_remote_error(&err);
                 eprintln!(
-                    "warn: shared cache remote entry meta stat failed for {file_name}: {err}"
+                    "warn: shared cache upload preflight failed for entry={file_name}: {err}"
                 );
                 return;
             }
         }
 
         let local_path = entry_meta_path(paths, input_key);
-        if let Err(err) = self.copy_local_file_up(&local_path, &remote_fs, &file_name) {
+        let bytes = fs::metadata(&local_path)
+            .map(|meta| meta.len())
+            .unwrap_or(0);
+        let Some((result, elapsed)) = self.remote_operation(|timeout| {
+            self.copy_local_file_up(RemoteFileUpload {
+                local_path: &local_path,
+                dst_fs: &remote_fs,
+                dst_remote: &file_name,
+                timeout,
+            })
+        }) else {
+            return;
+        };
+        self.record_upload_stats(bytes, elapsed, result.is_ok());
+        if let Err(err) = result {
             self.record_remote_error(&err);
-            eprintln!("warn: shared cache remote entry meta upload failed for {file_name}: {err}");
+            eprintln!("warn: shared cache artifact upload failed for entry={file_name}: {err}");
         } else {
             self.record_remote_success();
         }
@@ -682,10 +1147,21 @@ impl RemoteSync {
     fn push_snapshot_upload(&self, commit_key: &str, upload: &SnapshotUpload) -> bool {
         let remote_fs = self.snapshots_fs(commit_key);
         let shard_name = format!("{}.{SNAPSHOT_FILE_EXTENSION}", upload.shard_id);
-        if let Err(err) = self.copy_bytes_up(&upload.shard_bytes, &remote_fs, &shard_name) {
+        let Some((result, elapsed)) = self.remote_operation(|timeout| {
+            self.copy_bytes_up(RemoteBytesUpload {
+                bytes: &upload.shard_bytes,
+                dst_fs: &remote_fs,
+                dst_remote: &shard_name,
+                timeout,
+            })
+        }) else {
+            return false;
+        };
+        self.record_upload_stats(upload.shard_bytes.len() as u64, elapsed, result.is_ok());
+        if let Err(err) = result {
             self.record_remote_error(&err);
             eprintln!(
-                "warn: shared cache remote snapshot upload failed for bucket={commit_key} file={shard_name}: {err}"
+                "warn: shared cache final flush failed for bucket={commit_key} file={shard_name}: {err}"
             );
             return false;
         }
@@ -700,10 +1176,12 @@ impl RemoteSync {
         }
         let remote_fs = self.snapshots_fs(commit_key);
         let remote_name = format!("{shard_id}.{extension}");
-        if let Err(err) =
-            self.rclone
-                .deletefile(&remote_fs, &remote_name, self.rclone.default_timeout())
-        {
+        let Some((result, _)) = self
+            .remote_operation(|timeout| self.rclone.deletefile(&remote_fs, &remote_name, timeout))
+        else {
+            return;
+        };
+        if let Err(err) = result {
             if matches!(err, rclone::RcloneError::HttpStatus { status: 404, .. }) {
                 self.record_remote_success();
                 return;
@@ -717,29 +1195,25 @@ impl RemoteSync {
         }
     }
 
-    fn copy_bytes_up(
-        &self,
-        bytes: &[u8],
-        dst_fs: &str,
-        dst_remote: &str,
-    ) -> Result<(), rclone::RcloneError> {
+    fn copy_bytes_up(&self, upload: RemoteBytesUpload<'_>) -> Result<(), rclone::RcloneError> {
         self.rclone.upload_bytes(
             rclone::UploadFile {
-                fs: dst_fs,
+                fs: upload.dst_fs,
                 remote_dir: "",
-                file_name: dst_remote,
-                bytes,
+                file_name: upload.dst_remote,
+                bytes: upload.bytes,
             },
-            self.rclone.default_timeout(),
+            upload.timeout,
         )
     }
 
-    fn copy_local_file_up(
-        &self,
-        local_path: &Path,
-        dst_fs: &str,
-        dst_remote: &str,
-    ) -> Result<(), rclone::RcloneError> {
+    fn copy_local_file_up(&self, upload: RemoteFileUpload<'_>) -> Result<(), rclone::RcloneError> {
+        let RemoteFileUpload {
+            local_path,
+            dst_fs,
+            dst_remote,
+            timeout,
+        } = upload;
         let parent = local_path.parent().ok_or_else(|| {
             rclone::RcloneError::Io(io::Error::other("local cache source missing parent"))
         })?;
@@ -757,8 +1231,22 @@ impl RemoteSync {
                 dst_fs,
                 dst_remote,
             },
-            self.rclone.default_timeout(),
+            timeout,
         )
+    }
+
+    fn record_upload_stats(&self, bytes: u64, elapsed: Duration, succeeded: bool) {
+        self.state.stats.uploads.fetch_add(1, Ordering::AcqRel);
+        self.state
+            .stats
+            .upload_latency_ms
+            .fetch_add(elapsed.as_millis() as u64, Ordering::AcqRel);
+        if succeeded {
+            self.state
+                .stats
+                .upload_bytes
+                .fetch_add(bytes, Ordering::AcqRel);
+        }
     }
 }
 
@@ -768,9 +1256,10 @@ mod tests {
     use crate::shared::snapshot::snapshot_bincode_config;
     use crate::shared::tests::{create_commit, sample_record, setup_git_repo};
     use crate::shared::{
-        derive_input_key, input_key_hex, MergeResult, OpenExtras, SharedCache, Snapshot,
-        SnapshotEntry, StoreOutcome, SNAPSHOT_SCHEMA_VERSION,
+        derive_input_key, input_key_hex, MergeResult, OpenExtras, SharedCache,
+        SharedCacheStoreRequest, Snapshot, SnapshotEntry, StoreOutcome, SNAPSHOT_SCHEMA_VERSION,
     };
+    use crate::store::ReportInput;
     use std::collections::BTreeMap;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -859,7 +1348,7 @@ mod tests {
         SharedCache::open_with_remote(
             repo_root,
             1_000_000,
-            10,
+            3,
             OpenExtras {
                 cache_dir: Some(cache_dir),
                 remote: Some(RemoteConfig {
@@ -1020,6 +1509,27 @@ mod tests {
         );
     }
 
+    fn remote_snapshot_entry(
+        seed: u8,
+        input_key: [u8; 32],
+        outputs_hash: [u8; 32],
+    ) -> SnapshotEntry {
+        SnapshotEntry {
+            task_id: format!("pkg-{seed}#build"),
+            input_key,
+            outputs_hash,
+            task_spec_hash: [seed; 32],
+            env_hash: [seed.wrapping_add(1); 32],
+            pkg_dep_hash: [seed.wrapping_add(2); 32],
+            duration_ms: 200,
+            output_bytes: 0,
+            cached_at_unix_ms: 1_000_000_000_000,
+            tool_version: None,
+            inline_meta: None,
+            duration_trusted: true,
+        }
+    }
+
     fn seed_snapshot_entry(
         seed_cache: &SharedCache,
         remote_seed: &RemoteSync,
@@ -1036,7 +1546,7 @@ mod tests {
             paths: seed_cache.paths(),
             outputs_hash: &outputs_hash,
             input_key: &input_key,
-            has_outputs: true,
+            presence: ArtifactPresence::all(),
         });
         remote_seed.push_index_merge(shard_key, &merge);
         shard_id
@@ -1075,6 +1585,8 @@ mod tests {
                 output_bytes: 10,
                 cached_at_unix_ms: 1,
                 tool_version: None,
+                inline_meta: None,
+                duration_trusted: true,
             },
         );
         let merge2_id = seed_snapshot_entry(
@@ -1092,6 +1604,8 @@ mod tests {
                 output_bytes: 11,
                 cached_at_unix_ms: 2,
                 tool_version: None,
+                inline_meta: None,
+                duration_trusted: true,
             },
         );
         (seed_cache, merge1_id, merge2_id)
@@ -1151,7 +1665,7 @@ mod tests {
     }
 
     #[test]
-    fn success_resets_timeout_counter() {
+    fn successful_requests_do_not_erase_cumulative_timeout_evidence() {
         let remote = RemoteSync::new(
             Arc::new(RcloneRcd::new(Duration::from_secs(1)).unwrap()),
             ":local:/tmp/nonexistent-remote".to_string(),
@@ -1164,10 +1678,6 @@ mod tests {
         remote.record_remote_error(&timeout);
         remote.record_remote_error(&timeout);
         remote.record_remote_success();
-        remote.record_remote_error(&timeout);
-        remote.record_remote_error(&timeout);
-
-        assert!(!remote.is_disabled_for_test());
         remote.record_remote_error(&timeout);
         assert!(remote.is_disabled_for_test());
     }
@@ -1317,79 +1827,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn push_queue_full_blocks_instead_of_dropping() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::sync::mpsc::channel;
-        use std::thread;
-
-        let (tx, rx) = mpsc::sync_channel::<PushMsg>(1);
-        let (started_tx, started_rx) = channel();
-        let (release_tx, release_rx) = channel();
-        let (processed_tx, processed_rx) = channel();
-        let processed = Arc::new(AtomicUsize::new(0));
-        let processed_in_worker = Arc::clone(&processed);
-        let worker = thread::spawn(move || {
-            for msg in rx {
-                match msg {
-                    PushMsg::EntryArtifacts(_) => {
-                        let count = processed_in_worker.fetch_add(1, Ordering::SeqCst);
-                        started_tx.send(count).unwrap();
-                        release_rx.recv().unwrap();
-                        processed_tx.send(()).unwrap();
-                    }
-                    PushMsg::IndexMerge(_) => {}
-                    PushMsg::Flush(ack) => {
-                        let _ = ack.send(());
-                    }
-                }
-            }
-        });
-
-        let make_push = |n| OwnedEntryArtifacts {
-            paths: Arc::new(SharedCachePaths {
-                root: PathBuf::from(format!("/tmp/luchta-test-{n}")),
-                blobs_dir: PathBuf::from(format!("/tmp/luchta-test-{n}/blobs")),
-                snapshots_dir: PathBuf::from(format!("/tmp/luchta-test-{n}/snapshots")),
-                entries_dir: PathBuf::from(format!("/tmp/luchta-test-{n}/entries")),
-            }),
-            outputs_hash: [n as u8; 32],
-            input_key: [n as u8; 32],
-            has_outputs: true,
-        };
-
-        tx.send(PushMsg::EntryArtifacts(make_push(1))).unwrap();
-        started_rx.recv().unwrap();
-        tx.send(PushMsg::EntryArtifacts(make_push(2))).unwrap();
-
-        let (send_result_tx, send_result_rx) = channel();
-        let send_third = {
-            let tx = tx.clone();
-            thread::spawn(move || {
-                let sent = tx.send(PushMsg::EntryArtifacts(make_push(3))).is_ok();
-                send_result_tx.send(sent).unwrap();
-            })
-        };
-
-        assert!(processed_rx
-            .recv_timeout(Duration::from_millis(50))
-            .is_err());
-        release_tx.send(()).unwrap();
-        processed_rx.recv().unwrap();
-        started_rx.recv().unwrap();
-        send_third.join().unwrap();
-        assert!(send_result_rx.recv().unwrap());
-
-        release_tx.send(()).unwrap();
-        processed_rx.recv().unwrap();
-        started_rx.recv().unwrap();
-        release_tx.send(()).unwrap();
-        processed_rx.recv().unwrap();
-
-        drop(tx);
-        worker.join().unwrap();
-        assert_eq!(processed.load(Ordering::SeqCst), 3);
-    }
     fn seed_guard_blob(local_cache: &TempDir, outputs_hash: [u8; 32], body: &[u8]) {
         let local_blob_dir = local_cache.path().join("blobs");
         fs::create_dir_all(&local_blob_dir).unwrap();
@@ -1449,6 +1886,8 @@ mod tests {
                 output_bytes: 12,
                 cached_at_unix_ms: 3,
                 tool_version: None,
+                inline_meta: None,
+                duration_trusted: true,
             },
         );
         let upload = merge3.new_snapshot_upload.as_mut().unwrap();
@@ -1475,7 +1914,7 @@ mod tests {
             paths: cache.paths(),
             outputs_hash: &[23; 32],
             input_key: &input_key,
-            has_outputs: true,
+            presence: ArtifactPresence::all(),
         });
         harness.remote.push_index_merge(&shard_key, &merge3);
         // The failed upload must not have disabled the remote permanently in a
@@ -1534,6 +1973,8 @@ mod tests {
                     output_bytes: 10,
                     cached_at_unix_ms: 1,
                     tool_version: None,
+                    inline_meta: None,
+                    duration_trusted: true,
                 },
             ))
             .collect::<BTreeMap<_, _>>(),
@@ -1759,7 +2200,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_store_uploads_entry_meta_and_second_machine_restores_no_output_task() {
+    fn remote_store_inlines_meta_and_second_machine_restores_no_output_task() {
         if !should_run_rclone_test() {
             eprintln!("skipping rclone-gated shared-cache entry-meta sync test; rclone not on PATH or LUCHTA_TEST_RCLONE disabled");
             return;
@@ -1790,31 +2231,33 @@ mod tests {
         );
 
         let cache_a = open_cache_with_remote(repo.path(), machine_a_cache.path(), &remote);
+        let reports = vec![ReportInput {
+            filename: "lint.sarif".to_owned(),
+            mime_type: "application/sarif+json".to_owned(),
+            content: r#"{"runs":[]}"#.to_owned(),
+        }];
         cache_a
-            .store(
-                "pkg#lint",
-                &input_key,
-                &empty_hash,
-                &package_dir,
-                &[],
-                &record,
-                b"lint output",
-                b"",
-                &[],
-                repo.path(),
+            .store_with_execution_duration(
+                SharedCacheStoreRequest {
+                    task_id: "pkg#lint",
+                    input_key: &input_key,
+                    outputs_hash: &empty_hash,
+                    package_dir: &package_dir,
+                    rel_output_paths: &[],
+                    record: &record,
+                    stdout: b"lint output",
+                    stderr: b"",
+                    reports: &reports,
+                    repo_root: repo.path(),
+                },
+                200,
             )
             .unwrap();
-        cache_a.flush_push_queue();
 
+        let entries_dir = remote_root.path().join("entries");
         assert!(
-            remote_root
-                .path()
-                .join("entries")
-                .read_dir()
-                .unwrap()
-                .count()
-                > 0,
-            "entry meta should be uploaded immediately, before any index flush"
+            !entries_dir.exists() || entries_dir.read_dir().unwrap().next().is_none(),
+            "small inline metadata must replace the separate entries object"
         );
 
         // The index merge/push is deferred to the end-of-run flush -- machine
@@ -1832,6 +2275,8 @@ mod tests {
             .next()
             .expect("machine B should find the entry");
         assert_eq!(candidate.stdout, b"lint output");
+        assert_eq!(candidate.stderr, b"");
+        assert_eq!(candidate.reports, reports);
     }
 
     #[test]
@@ -2004,7 +2449,7 @@ mod tests {
             paths: seed_cache.paths(),
             outputs_hash: &[0x66; 32],
             input_key: &input_key,
-            has_outputs: true,
+            presence: ArtifactPresence::all(),
         });
         harness.remote.push_index_merge(&shard_key, &merge3);
         assert!(harness.remote.is_disabled_for_test());
@@ -2230,15 +2675,9 @@ mod tests {
             &remote_only_key,
             SnapshotEntry {
                 task_id: "pkg#remote-only".to_string(),
-                input_key,
-                outputs_hash: [0; 32],
-                task_spec_hash: [61; 32],
-                env_hash: [62; 32],
-                pkg_dep_hash: [63; 32],
                 duration_ms: 150,
-                output_bytes: 0,
                 cached_at_unix_ms: 1,
-                tool_version: None,
+                ..remote_snapshot_entry(61, input_key, [0; 32])
             },
         );
 
@@ -2251,7 +2690,7 @@ mod tests {
             paths: &seed_paths,
             outputs_hash: &[0; 32],
             input_key: &input_key,
-            has_outputs: false,
+            presence: ArtifactPresence::metadata_only(),
         });
         remote_seed.push_index_merge(&remote_only_key, &merge);
 
@@ -2325,6 +2764,8 @@ mod tests {
             output_bytes: 0,
             cached_at_unix_ms: 1_000_000_000_000,
             tool_version: None,
+            inline_meta: None,
+            duration_trusted: true,
         };
 
         // `refresh_entry` only records the entry and touches its local
@@ -2422,15 +2863,7 @@ mod tests {
 
             let entry = SnapshotEntry {
                 task_id: format!("pkg-{seed}#refresh"),
-                input_key,
-                outputs_hash,
-                task_spec_hash: [seed; 32],
-                env_hash: [seed.wrapping_add(1); 32],
-                pkg_dep_hash: [seed.wrapping_add(2); 32],
-                duration_ms: 200,
-                output_bytes: 0,
-                cached_at_unix_ms: 1_000_000_000_000,
-                tool_version: None,
+                ..remote_snapshot_entry(seed, input_key, outputs_hash)
             };
             cache.refresh_entry(&input_key, &entry);
         }
@@ -2474,7 +2907,7 @@ mod tests {
     }
 
     #[test]
-    fn store_pushes_artifacts_immediately_but_defers_the_index_push_to_flush() {
+    fn store_pushes_blobs_immediately_but_defers_inline_meta_index_to_flush() {
         if !should_run_rclone_test() {
             eprintln!("skipping rclone-gated store-defers-index-push test; rclone not on PATH or LUCHTA_TEST_RCLONE disabled");
             return;
@@ -2482,12 +2915,12 @@ mod tests {
 
         // The invariant most at risk from batching the index merge out of
         // `store()`: a restore on another machine must be able to find a
-        // store's blob/entry-meta artifacts whether or not this run's index
-        // push has happened. Proven here directly against the remote, with
-        // no `flush_pending_entries` call before the artifact assertions.
-        // Three distinct stores (not one) so the entry-meta count can be an
-        // exact 3, catching silently dropped artifact pushes. The post-flush
-        // shard count is a resting-state invariant only -- it does NOT prove
+        // store's output blobs whether or not this run's index push has
+        // happened. Small entry metadata is inline, so it deliberately has no
+        // remote artifact before the snapshot flush. Proven here directly
+        // against the remote, with no `flush_pending_entries` call before the
+        // artifact assertions. The post-flush shard count is a resting-state
+        // invariant only -- it does NOT prove
         // the merge was batched, because `push_index_merge` deletes each
         // subsumed shard from the remote, so N eager merges also settle at
         // one shard. What catches a reinstated eager push is the pre-flush
@@ -2524,17 +2957,10 @@ mod tests {
             assert_remote_has_blob(harness.remote_root.path(), outputs_hash);
         }
 
-        assert_eq!(
-            harness
-                .remote_root
-                .path()
-                .join("entries")
-                .read_dir()
-                .unwrap()
-                .count(),
-            3,
-            "three distinct stores must produce three entry-meta objects on the remote, \
-             before any index flush"
+        let entries_dir = harness.remote_root.path().join("entries");
+        assert!(
+            !entries_dir.exists() || entries_dir.read_dir().unwrap().next().is_none(),
+            "inline metadata must not produce fallback entry objects"
         );
 
         let write_key = cache.write_bucket_key().expect("write key").to_string();
@@ -2595,7 +3021,7 @@ mod tests {
             paths: Arc::new(cache.paths().clone()),
             outputs_hash,
             input_key,
-            has_outputs: false,
+            presence: ArtifactPresence::metadata_only(),
         });
         harness.remote.drain_push_queue();
 
@@ -2645,6 +3071,10 @@ mod tests {
         let input_key = derive_input_key([61; 32], [62; 32], [63; 32], [64; 32], [65; 32]);
         let outputs_hash = [0x5a; 32];
 
+        let mut oversized_stdout = Vec::with_capacity(32 * 1_024);
+        for value in 0_u64..1_024 {
+            oversized_stdout.extend_from_slice(blake3::hash(&value.to_le_bytes()).as_bytes());
+        }
         let outcome = cache
             .store(
                 "pkg#build",
@@ -2653,7 +3083,7 @@ mod tests {
                 &harness.package_dir,
                 &[PathBuf::from("dist/main.js")],
                 &sample_record(true, 300),
-                b"stdout-store-only",
+                &oversized_stdout,
                 b"stderr-store-only",
                 &[],
                 harness.temp_repo.path(),

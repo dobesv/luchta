@@ -457,7 +457,7 @@ fn shared_cache_hit_restores_reports_into_local_cache_and_logs_file() {
     common::write_task_config_with_shell_worker(
         &temp,
         worker.path(),
-        r#""a#build":{"cache":{},"worker":"shell","inputs":["src.txt"],"outputs":[],"command":"sleep 0.15 && echo running"}"#,
+        r#""a#build":{"cache":{},"worker":"shell","inputs":["src.txt"],"outputs":[],"command":"sleep 0.15 && count=$(cat ../../run-count.txt 2>/dev/null || echo 0); count=$((count+1)); echo $count > ../../run-count.txt; echo running"}"#,
     );
     common::init_git(&temp);
 
@@ -471,6 +471,7 @@ fn shared_cache_hit_restores_reports_into_local_cache_and_logs_file() {
         .env("LUCHTA_SHARED_CACHE_DIR", shared_cache_dir.path())
         .assert()
         .success();
+    temp.child("run-count.txt").assert("1\n");
 
     std::fs::remove_dir_all(temp.child(".luchta/cache").path()).unwrap();
 
@@ -482,17 +483,20 @@ fn shared_cache_hit_restores_reports_into_local_cache_and_logs_file() {
         .arg(temp.path())
         .env("LUCHTA_SHARED_CACHE", "1")
         .env("LUCHTA_SHARED_CACHE_DIR", shared_cache_dir.path())
+        .env("LUCHTA_SHARED_CACHE_STATS", "1")
         .assert()
         .success()
         .get_output()
-        .stdout
         .clone();
-    let second_stdout = String::from_utf8(second).unwrap();
+    let second_stdout = String::from_utf8(second.stdout).unwrap();
+    let second_stderr = String::from_utf8(second.stderr).unwrap();
     assert!(
         second_stdout.contains("📥 1"),
         "stdout was:
 {second_stdout}"
     );
+    temp.child("run-count.txt").assert("1\n");
+    assert!(second_stderr.contains("inline_hits=1 fallback_meta_gets=0 blob_gets=0"));
 
     let cache = luchta_cache::Cache::open(&temp.path().join(".luchta/cache")).unwrap();
     let report = cache

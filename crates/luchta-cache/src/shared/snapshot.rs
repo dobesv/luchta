@@ -5,9 +5,10 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::shared::{atomic_write, SharedCachePaths};
+use crate::shared::{atomic_write, EntryMeta, SharedCachePaths};
 
-pub const SNAPSHOT_SCHEMA_VERSION: u32 = 2;
+pub const SNAPSHOT_SCHEMA_VERSION: u32 = 3;
+const SNAPSHOT_SCHEMA_VERSION_V2: u32 = 2;
 const SNAPSHOT_ZSTD_LEVEL: i32 = 3;
 const ZSTD_FRAME_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 const DEP_OUTPUTS_HASH_DOMAIN: &[u8] = b"luchta:dep-outputs:v1";
@@ -27,6 +28,66 @@ pub struct SnapshotEntry {
     pub output_bytes: u64,
     pub cached_at_unix_ms: u64,
     pub tool_version: Option<String>,
+    /// Complete restore metadata when its compressed entry representation fits
+    /// the shared-cache inline budget. `None` uses `entries/<input_key>.bin`.
+    pub inline_meta: Option<EntryMeta>,
+    /// Whether `duration_ms` measures execution after semaphore admission.
+    /// Schema-v2 durations included queueing time and are converted as untrusted.
+    pub duration_trusted: bool,
+}
+
+/// Exact schema-v2 wire representation. Keep this separate from the current
+/// structs so compatibility does not depend on serde field evolution.
+#[derive(Debug, Serialize, Deserialize)]
+struct SnapshotV2 {
+    schema_version: u32,
+    entries: BTreeMap<String, SnapshotEntryV2>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SnapshotEntryV2 {
+    task_id: String,
+    input_key: [u8; 32],
+    outputs_hash: [u8; 32],
+    task_spec_hash: [u8; 32],
+    env_hash: [u8; 32],
+    pkg_dep_hash: [u8; 32],
+    duration_ms: u64,
+    output_bytes: u64,
+    cached_at_unix_ms: u64,
+    tool_version: Option<String>,
+}
+
+impl From<SnapshotV2> for Snapshot {
+    fn from(snapshot: SnapshotV2) -> Self {
+        debug_assert_eq!(snapshot.schema_version, SNAPSHOT_SCHEMA_VERSION_V2);
+        Self {
+            schema_version: SNAPSHOT_SCHEMA_VERSION,
+            entries: snapshot
+                .entries
+                .into_iter()
+                .map(|(key, entry)| {
+                    (
+                        key,
+                        SnapshotEntry {
+                            task_id: entry.task_id,
+                            input_key: entry.input_key,
+                            outputs_hash: entry.outputs_hash,
+                            task_spec_hash: entry.task_spec_hash,
+                            env_hash: entry.env_hash,
+                            pkg_dep_hash: entry.pkg_dep_hash,
+                            duration_ms: entry.duration_ms,
+                            output_bytes: entry.output_bytes,
+                            cached_at_unix_ms: entry.cached_at_unix_ms,
+                            tool_version: entry.tool_version,
+                            inline_meta: None,
+                            duration_trusted: false,
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -234,34 +295,10 @@ impl SnapshotStore {
         } = self.load_merged_snapshot_from_shards(shard_key, visible_shards.clone());
         let mut consolidated = snapshot.unwrap_or_default();
 
-        let mut changed = false;
-        let mut saw_conflict = false;
-        for entry in entries {
-            let entry_key = input_key_hex(entry.input_key);
-            match consolidated.entries.get(&entry_key) {
-                Some(existing) if existing.outputs_hash == entry.outputs_hash => {
-                    // Already present with the same content: nothing to do
-                    // for this entry.
-                }
-                Some(_existing) => {
-                    // Conflict: same rule as a single-entry merge. Since
-                    // `input_key` folds in a hash of the package's resolved
-                    // input content (`derive_input_key`'s `inputs_hash`), two
-                    // writers landing on the same key have, by construction,
-                    // observed the same source state. A same-key
-                    // `outputs_hash` mismatch here means a non-deterministic
-                    // build (or a task-spec/env collision this key doesn't
-                    // yet distinguish), not two legitimate source states
-                    // racing for one slot. Keeping the first writer is still
-                    // the safe choice for a non-deterministic build.
-                    saw_conflict = true;
-                }
-                None => {
-                    consolidated.entries.insert(entry_key, entry);
-                    changed = true;
-                }
-            }
-        }
+        let MergeChanges {
+            changed,
+            saw_conflict,
+        } = merge_snapshot_entries(&mut consolidated, entries);
 
         if !changed {
             // Preserve the single-entry distinction exactly: a lone
@@ -511,14 +548,66 @@ impl SnapshotShard {
 
 fn merge_shard_entries(merged: &mut Snapshot, shard: Snapshot) {
     for (entry_key, entry) in shard.entries {
-        match merged.entries.get(&entry_key) {
+        match merged.entries.get_mut(&entry_key) {
             None => {
                 merged.entries.insert(entry_key, entry);
             }
-            Some(existing) if existing.outputs_hash == entry.outputs_hash => {}
+            Some(existing) if existing.outputs_hash == entry.outputs_hash => {
+                enrich_same_output_entry(existing, entry);
+            }
             Some(_) => {}
         }
     }
+}
+
+struct MergeChanges {
+    changed: bool,
+    saw_conflict: bool,
+}
+
+fn merge_snapshot_entries(snapshot: &mut Snapshot, entries: Vec<SnapshotEntry>) -> MergeChanges {
+    let mut result = MergeChanges {
+        changed: false,
+        saw_conflict: false,
+    };
+    for entry in entries {
+        let entry_key = input_key_hex(entry.input_key);
+        match snapshot.entries.get_mut(&entry_key) {
+            Some(existing) if existing.outputs_hash == entry.outputs_hash => {
+                result.changed |= enrich_same_output_entry(existing, entry);
+            }
+            // The input key includes resolved source content. A differing
+            // output therefore indicates a nondeterministic build, for which
+            // retaining the first writer is the safe result.
+            Some(_) => result.saw_conflict = true,
+            None => {
+                snapshot.entries.insert(entry_key, entry);
+                result.changed = true;
+            }
+        }
+    }
+    result
+}
+
+/// Same-output schema-v3 data may enrich a schema-v2 observation without
+/// changing first-writer-wins conflict semantics.
+pub(crate) fn enrich_same_output_entry(
+    existing: &mut SnapshotEntry,
+    mut incoming: SnapshotEntry,
+) -> bool {
+    let mut changed = false;
+    if !existing.duration_trusted && incoming.duration_trusted {
+        let existing_inline_meta = existing.inline_meta.take();
+        *existing = incoming;
+        if existing.inline_meta.is_none() {
+            existing.inline_meta = existing_inline_meta;
+        }
+        changed = true;
+    } else if existing.inline_meta.is_none() && incoming.inline_meta.is_some() {
+        existing.inline_meta = incoming.inline_meta.take();
+        changed = true;
+    }
+    changed
 }
 
 fn compress_snapshot_bytes(raw: &[u8]) -> io::Result<Vec<u8>> {
@@ -626,14 +715,23 @@ fn decode_snapshot(
 ) -> Result<Snapshot, bincode::error::DecodeError> {
     let raw = decompress_snapshot_bytes(bytes)
         .map_err(|err| bincode::error::DecodeError::OtherString(err.to_string()))?;
-    let (snapshot, _): (Snapshot, usize) =
+    let (schema_version, _): (u32, usize) =
         bincode::serde::decode_from_slice(&raw, snapshot_bincode_config())?;
-    if snapshot.schema_version != SNAPSHOT_SCHEMA_VERSION {
-        return Err(bincode::error::DecodeError::OtherString(
+    match schema_version {
+        SNAPSHOT_SCHEMA_VERSION_V2 => {
+            let (snapshot, _): (SnapshotV2, usize) =
+                bincode::serde::decode_from_slice(&raw, snapshot_bincode_config())?;
+            Ok(snapshot.into())
+        }
+        SNAPSHOT_SCHEMA_VERSION => {
+            let (snapshot, _): (Snapshot, usize) =
+                bincode::serde::decode_from_slice(&raw, snapshot_bincode_config())?;
+            Ok(snapshot)
+        }
+        _ => Err(bincode::error::DecodeError::OtherString(
             "unsupported snapshot schema version".to_owned(),
-        ));
+        )),
     }
-    Ok(snapshot)
 }
 
 #[cfg(test)]
@@ -650,28 +748,17 @@ mod tests {
     #[test]
     fn derive_input_key_changes_when_any_component_changes() {
         let base = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32], [5; 32]);
-
-        assert_ne!(
-            base,
-            derive_input_key([9; 32], [2; 32], [3; 32], [4; 32], [5; 32])
-        );
-        assert_ne!(
-            base,
-            derive_input_key([1; 32], [9; 32], [3; 32], [4; 32], [5; 32])
-        );
-        assert_ne!(
-            base,
-            derive_input_key([1; 32], [2; 32], [9; 32], [4; 32], [5; 32])
-        );
-        assert_ne!(
-            base,
-            derive_input_key([1; 32], [2; 32], [3; 32], [9; 32], [5; 32])
-        );
-        assert_ne!(
-            base,
+        let changed_components = [
+            derive_input_key([9; 32], [2; 32], [3; 32], [4; 32], [5; 32]),
+            derive_input_key([1; 32], [9; 32], [3; 32], [4; 32], [5; 32]),
+            derive_input_key([1; 32], [2; 32], [9; 32], [4; 32], [5; 32]),
+            derive_input_key([1; 32], [2; 32], [3; 32], [9; 32], [5; 32]),
             derive_input_key([1; 32], [2; 32], [3; 32], [4; 32], [9; 32]),
-            "inputs_hash must be folded into the key"
-        );
+        ];
+
+        for changed in changed_components {
+            assert_ne!(base, changed, "every component must be folded into the key");
+        }
     }
 
     #[test]
@@ -736,6 +823,62 @@ mod tests {
         let encoded = bincode::serde::encode_to_vec(&snapshot, snapshot_bincode_config()).unwrap();
         let decoded = decode_snapshot(&encoded, "commit").unwrap();
         assert_eq!(decoded, snapshot);
+    }
+
+    #[test]
+    fn snapshot_v2_decodes_without_inline_meta_and_with_untrusted_duration() {
+        let current = sample_entry_with_seed(31, [7; 32]);
+        let legacy_entry = SnapshotEntryV2 {
+            task_id: current.task_id.clone(),
+            input_key: current.input_key,
+            outputs_hash: current.outputs_hash,
+            task_spec_hash: current.task_spec_hash,
+            env_hash: current.env_hash,
+            pkg_dep_hash: current.pkg_dep_hash,
+            duration_ms: 9_999,
+            output_bytes: current.output_bytes,
+            cached_at_unix_ms: current.cached_at_unix_ms,
+            tool_version: current.tool_version.clone(),
+        };
+        let legacy = SnapshotV2 {
+            schema_version: SNAPSHOT_SCHEMA_VERSION_V2,
+            entries: BTreeMap::from([(input_key_hex(current.input_key), legacy_entry)]),
+        };
+        let encoded = bincode::serde::encode_to_vec(&legacy, snapshot_bincode_config()).unwrap();
+
+        let decoded = decode_snapshot(&encoded, "legacy-commit").unwrap();
+        let entry = decoded
+            .entries
+            .get(&input_key_hex(current.input_key))
+            .unwrap();
+        assert_eq!(decoded.schema_version, SNAPSHOT_SCHEMA_VERSION);
+        assert_eq!(entry.duration_ms, 9_999);
+        assert!(!entry.duration_trusted);
+        assert!(entry.inline_meta.is_none());
+    }
+
+    #[test]
+    fn same_output_shards_accumulate_inline_meta_and_trusted_duration() {
+        let mut legacy = sample_entry_with_seed(32, [8; 32]);
+        legacy.duration_ms = 50_000;
+        legacy.duration_trusted = false;
+
+        let mut inline_only = legacy.clone();
+        inline_only.inline_meta = Some(sample_inline_meta(inline_only.outputs_hash));
+
+        let mut trusted_only = legacy.clone();
+        trusted_only.duration_ms = 250;
+        trusted_only.duration_trusted = true;
+
+        let key = input_key_hex(legacy.input_key);
+        let mut merged = snapshot_with_entries([legacy]);
+        merge_shard_entries(&mut merged, snapshot_with_entries([inline_only]));
+        merge_shard_entries(&mut merged, snapshot_with_entries([trusted_only]));
+
+        let enriched = merged.entries.get(&key).unwrap();
+        assert!(enriched.inline_meta.is_some());
+        assert!(enriched.duration_trusted);
+        assert_eq!(enriched.duration_ms, 250);
     }
 
     #[test]
@@ -1307,6 +1450,8 @@ mod tests {
             output_bytes: 128,
             cached_at_unix_ms: 1_700_000_000_000,
             tool_version: Some("0.1.0".to_owned()),
+            inline_meta: None,
+            duration_trusted: true,
         };
 
         let mut snapshot = Snapshot::new();
@@ -1337,6 +1482,20 @@ mod tests {
             output_bytes: 1_000 + u64::from(seed),
             cached_at_unix_ms: 1_700_000_000_000 + u64::from(seed),
             tool_version: Some("0.1.0".to_owned()),
+            inline_meta: None,
+            duration_trusted: true,
+        }
+    }
+
+    fn sample_inline_meta(outputs_hash: [u8; 32]) -> EntryMeta {
+        EntryMeta {
+            schema_version: crate::shared::ENTRY_META_SCHEMA_VERSION,
+            outputs_hash,
+            has_outputs: false,
+            record: vec![1, 2, 3],
+            stdout: b"inline stdout".to_vec(),
+            stderr: b"inline stderr".to_vec(),
+            reports: Vec::new(),
         }
     }
 

@@ -14,8 +14,8 @@ use globset::{Glob, GlobSet, GlobSetBuilder};
 use luchta_cache::shared::SharedCache;
 use luchta_cache::{
     combined_outputs_hash, decide, resolve_cache_dir, resolve_inputs_with_semantics,
-    resolve_outputs, Cache, CurrentState, Decision, DecisionResult, FileEntry, ListingCache,
-    RunReason, TaskRunRecord,
+    resolve_outputs, Cache, Decision, DecisionResult, FileEntry, ListingCache, RunReason,
+    TaskRunRecord,
 };
 use luchta_engine::{
     expand_input_patterns, is_root_task, CompletionSignal, ExecutionLogSink, ExecutionRequest,
@@ -630,17 +630,6 @@ struct CacheCurrentStateInput<'a> {
     merged_env: &'a BTreeMap<String, EnvSpec>,
     nonce: Option<&'a str>,
     cache_context: &'a CacheStateContext,
-}
-
-struct SharedCacheSkipInput<'a> {
-    task_id: &'a TaskId,
-    task_def: &'a TaskDefinition,
-    current: &'a CurrentState<'a>,
-    decision: &'a DecisionResult,
-    /// The task's local cache record, if any. Used as the mtime prior when
-    /// resolving inputs up front for the shared-cache key -- see the comment
-    /// in `try_shared_cache_skip`.
-    local_record: Option<&'a TaskRunRecord>,
 }
 
 #[derive(Clone)]
@@ -1414,6 +1403,26 @@ mod tests {
                 std::env::remove_var(self.name);
             }
         }
+    }
+
+    #[test]
+    fn late_interruption_discards_instead_of_draining_remote_work() {
+        let interrupted = AtomicBool::new(false);
+        assert!(!should_abort_remote(false, &interrupted));
+
+        // A detached task can report interruption while finalization drains
+        // the walker, after the cycle's first remote-abort decision.
+        interrupted.store(true, Ordering::SeqCst);
+        let discards = std::cell::Cell::new(0);
+        let finishes = std::cell::Cell::new(0);
+        finish_or_discard_remote_work(
+            should_abort_remote(false, &interrupted),
+            || discards.set(discards.get() + 1),
+            || finishes.set(finishes.get() + 1),
+        );
+
+        assert_eq!(discards.get(), 1);
+        assert_eq!(finishes.get(), 0);
     }
 
     #[tokio::test]
@@ -2480,6 +2489,41 @@ fn compute_cycle_outcome(
     }
 }
 
+fn should_abort_remote(was_cancelled: bool, interrupted: &AtomicBool) -> bool {
+    was_cancelled || interrupted.load(Ordering::SeqCst)
+}
+
+fn finish_or_discard_remote_work(
+    abort_remote: bool,
+    discard: impl FnOnce(),
+    finish: impl FnOnce(),
+) {
+    if abort_remote {
+        discard();
+    } else {
+        finish();
+    }
+}
+
+fn begin_shared_cache_cycle_finish(cache: Option<&Arc<SharedCache>>, abort_remote: bool) {
+    let Some(cache) = cache else { return };
+    if abort_remote {
+        cache.discard_remote_work();
+    }
+    cache.flush_pending_entries();
+}
+
+fn complete_shared_cache_cycle(cache: Option<&Arc<SharedCache>>, abort_remote: bool) {
+    let Some(cache) = cache else { return };
+    cache.flush_pending_entries();
+    finish_or_discard_remote_work(
+        abort_remote,
+        || cache.discard_remote_work(),
+        || cache.finish_remote_cycle(),
+    );
+    cache.report_cycle_stats();
+}
+
 #[allow(clippy::manual_async_fn)]
 /// Executes one cycle of task dispatch.
 ///
@@ -2544,6 +2588,8 @@ pub(crate) fn run_cycle<'a>(
         )
         .await;
 
+        let abort_remote = should_abort_remote(was_cancelled, &interrupted);
+
         // Flush this cycle's pending shared-cache entries in one batched
         // merge and push, rather than one merge and push per store or per
         // cache-hit refresh as tasks completed. See
@@ -2564,9 +2610,7 @@ pub(crate) fn run_cycle<'a>(
         // Kept here as well as there because `finalize_and_report` can
         // return early on a walker panic, and a run's index entries
         // shouldn't depend on the reporting path succeeding.
-        if let Some(shared_cache) = &resources.shared_cache {
-            shared_cache.flush_pending_entries();
-        }
+        begin_shared_cache_cycle_finish(resources.shared_cache.as_ref(), abort_remote);
 
         let cycle_result = finalize_and_report(FinalizeCycle {
             run,
@@ -2592,9 +2636,8 @@ pub(crate) fn run_cycle<'a>(
         // index entry and re-runs next time. Making that airtight means
         // tracking every spawned task and waiting on it, which costs watch
         // mode its responsiveness for a case that only drops one entry.
-        if let Some(shared_cache) = &resources.shared_cache {
-            shared_cache.flush_pending_entries();
-        }
+        let final_abort_remote = should_abort_remote(was_cancelled, &interrupted);
+        complete_shared_cache_cycle(resources.shared_cache.as_ref(), final_abort_remote);
 
         cycle_result
     }
