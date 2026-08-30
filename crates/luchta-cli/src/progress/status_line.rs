@@ -1,11 +1,14 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Duration};
 
 use luchta_engine::TaskProgress;
 use luchta_types::TaskId;
 use owo_colors::{OwoColorize, Stream};
 
 use super::console_output::visible_width;
-use crate::progress_task_list::{render_task_id_list_with_progress, render_task_id_with_progress};
+use crate::progress_task_list::{
+    render_running_task_list, render_task_id_with_status, shared_package_prefix_for_tasks,
+    shared_scope_for_tasks,
+};
 
 const HIDDEN_TASK_MARKER: &str = "…";
 
@@ -25,6 +28,7 @@ pub(super) struct StatusLineInput<'a> {
     pub(super) stream: Stream,
     pub(super) running_tasks: Vec<&'a TaskId>,
     pub(super) task_progress: &'a HashMap<TaskId, TaskProgress>,
+    pub(super) task_elapsed: &'a HashMap<TaskId, Duration>,
     pub(super) failed_segment: Option<&'a str>,
     pub(super) counts: StatusLineCounts,
     pub(super) rss_formatted: &'a str,
@@ -33,8 +37,11 @@ pub(super) struct StatusLineInput<'a> {
 }
 
 pub(super) fn render_status_line(input: StatusLineInput<'_>) -> String {
-    let full_task_list =
-        render_task_id_list_with_progress(input.running_tasks.clone(), input.task_progress);
+    let full_task_list = render_running_task_list(
+        &input.running_tasks,
+        input.task_progress,
+        input.task_elapsed,
+    );
     let parts = StatusLineParts {
         stream: input.stream,
         failed_segment: input.failed_segment,
@@ -54,6 +61,7 @@ pub(super) fn render_status_line(input: StatusLineInput<'_>) -> String {
     let compact_task_list = compact_running_task_list(
         input.running_tasks,
         input.task_progress,
+        input.task_elapsed,
         max_width.saturating_sub(fixed_width),
     );
     parts.render(&compact_task_list)
@@ -73,13 +81,17 @@ impl StatusLineParts<'_> {
         let mut segments = vec![format!("✔ {}", self.counts.completed)
             .if_supports_color(self.stream, |value| value.green())
             .to_string()];
-        self.append_segments(&mut segments, running_task_list);
+        self.append_fixed_segments(&mut segments);
         let mut line = segments.join(" ");
         line.push_str(self.warning_suffix);
+        if self.counts.running > 0 {
+            line.push(' ');
+            line.push_str(&self.running_segment(running_task_list));
+        }
         line
     }
 
-    fn append_segments(&self, segments: &mut Vec<String>, running_task_list: &str) {
+    fn append_fixed_segments(&self, segments: &mut Vec<String>) {
         push_optional_segment(segments, self.counts.skipped > 0, || {
             format!("⏩ {}", self.counts.skipped)
                 .if_supports_color(self.stream, |value| value.cyan())
@@ -94,9 +106,6 @@ impl StatusLineParts<'_> {
             format!("⌛ {}", self.counts.pending)
                 .if_supports_color(self.stream, |value| value.dimmed())
                 .to_string()
-        });
-        push_optional_segment(segments, self.counts.running > 0, || {
-            self.running_segment(running_task_list)
         });
         if let Some(segment) = self.failed_segment {
             segments.push(segment.to_owned());
@@ -121,7 +130,7 @@ impl StatusLineParts<'_> {
         let text = if task_list.is_empty() {
             format!("🏃 {}", self.counts.running)
         } else {
-            format!("🏃 {} ({task_list})", self.counts.running)
+            format!("🏃 {} {task_list}", self.counts.running)
         };
         text.if_supports_color(self.stream, |value| value.bright_black())
             .to_string()
@@ -129,54 +138,58 @@ impl StatusLineParts<'_> {
 }
 
 fn compact_running_task_list(
-    mut tasks: Vec<&TaskId>,
+    tasks: Vec<&TaskId>,
     progress: &HashMap<TaskId, TaskProgress>,
+    elapsed: &HashMap<TaskId, Duration>,
     max_width: usize,
 ) -> String {
-    tasks.sort_by_key(|task| task.to_string());
     let total = tasks.len();
     let mut shown = Vec::new();
-    let mut shown_width = 0;
 
     for task in tasks {
-        let entry = render_task_id_with_progress(task, progress);
-        let separator_width = usize::from(!shown.is_empty()) * 2;
-        let candidate_width = shown_width + separator_width + visible_width(&entry);
-        let hidden_after = total.saturating_sub(shown.len() + 1);
-        let marker_width = if hidden_after > 0 {
-            2 + visible_width(HIDDEN_TASK_MARKER)
-        } else {
-            0
-        };
-        if candidate_width + marker_width <= max_width {
-            shown_width = candidate_width;
-            shown.push(entry);
+        shown.push(task);
+        let candidate = render_compact_entries(&shown, progress, elapsed, total > shown.len());
+        if visible_width(&candidate) > max_width {
+            shown.pop();
         }
     }
 
-    append_hidden_marker(&mut shown, shown_width, total, max_width);
-    shown.join(", ")
+    let compact = render_compact_entries(&shown, progress, elapsed, total > shown.len());
+    if visible_width(&compact) <= max_width {
+        compact
+    } else {
+        String::new()
+    }
 }
 
-fn append_hidden_marker(
-    shown: &mut Vec<String>,
-    shown_width: usize,
-    total: usize,
-    max_width: usize,
-) {
-    let hidden = total.saturating_sub(shown.len());
-    if hidden == 0 {
-        return;
+fn render_compact_entries(
+    tasks: &[&TaskId],
+    progress: &HashMap<TaskId, TaskProgress>,
+    elapsed: &HashMap<TaskId, Duration>,
+    hidden: bool,
+) -> String {
+    let shared_scope = if tasks.iter().any(|task| task.package.is_root()) {
+        None
+    } else {
+        shared_scope_for_tasks(tasks)
+    };
+    let package_prefix = shared_package_prefix_for_tasks(tasks, shared_scope)
+        .filter(|prefix| visible_width(prefix).saturating_mul(tasks.len().saturating_sub(1)) >= 2);
+    let mut entries = tasks
+        .iter()
+        .map(|task| {
+            render_task_id_with_status(task, shared_scope, package_prefix, progress, elapsed)
+        })
+        .collect::<Vec<_>>();
+    if hidden {
+        entries.push(HIDDEN_TASK_MARKER.to_owned());
     }
 
-    let marker_width = visible_width(HIDDEN_TASK_MARKER);
-    let marker_fits = if shown.is_empty() {
-        marker_width <= max_width
+    let contents = entries.join(", ");
+    if let Some(prefix) = package_prefix {
+        format!("{prefix}{{{contents}}}")
     } else {
-        shown_width + 2 + marker_width <= max_width
-    };
-    if marker_fits {
-        shown.push(HIDDEN_TASK_MARKER.to_owned());
+        contents
     }
 }
 
@@ -207,8 +220,92 @@ mod tests {
         ];
         let task_refs = tasks.iter().collect();
 
-        let compact = compact_running_task_list(task_refs, &HashMap::new(), 8);
+        let compact = compact_running_task_list(task_refs, &HashMap::new(), &HashMap::new(), 8);
 
         assert_eq!(compact, "b#x, …");
+    }
+
+    #[test]
+    fn compact_list_omits_scope_shared_by_visible_age_ordered_tasks() {
+        let tasks = [
+            task_id("@formative/react-main", "lint:styles"),
+            task_id("@formative/test-data", "build:browser"),
+            task_id(
+                "@formative/package-name-too-long-for-the-remaining-width",
+                "test",
+            ),
+        ];
+        let elapsed = HashMap::from([
+            (tasks[0].clone(), Duration::from_secs(45)),
+            (tasks[1].clone(), Duration::from_secs(10)),
+            (tasks[2].clone(), Duration::from_secs(6)),
+        ]);
+        let expected = "react-main#lint:styles(⌚ 45s), test-data#build:browser(⌚ 10s), …";
+
+        let compact = compact_running_task_list(
+            tasks.iter().collect(),
+            &HashMap::new(),
+            &elapsed,
+            visible_width(expected),
+        );
+
+        assert_eq!(compact, expected);
+    }
+
+    #[test]
+    fn compact_list_factors_package_prefix_after_omitting_shared_scope() {
+        let tasks = [
+            task_id("@formative/react-components", "lint:styles"),
+            task_id("@formative/react-item-bank-item-generation", "lint:styles"),
+            task_id(
+                "@formative/react-package-name-too-long-for-the-remaining-width",
+                "test",
+            ),
+        ];
+        let elapsed = HashMap::from([
+            (tasks[0].clone(), Duration::from_secs(32)),
+            (tasks[1].clone(), Duration::from_secs(24)),
+            (tasks[2].clone(), Duration::from_secs(6)),
+        ]);
+        let expected = "react-{components#lint:styles(⌚ 32s), item-bank-item-generation#lint:styles(⌚ 24s), …}";
+
+        let compact = compact_running_task_list(
+            tasks.iter().collect(),
+            &HashMap::new(),
+            &elapsed,
+            visible_width(expected),
+        );
+
+        assert_eq!(compact, expected);
+    }
+
+    #[test]
+    fn running_tasks_follow_fixed_status_and_warnings_without_outer_parentheses() {
+        let task = task_id("pkg", "build");
+        let line = render_status_line(StatusLineInput {
+            stream: Stream::Stdout,
+            running_tasks: vec![&task],
+            task_progress: &HashMap::new(),
+            task_elapsed: &HashMap::new(),
+            failed_segment: Some("× 1 failed#test"),
+            counts: StatusLineCounts {
+                completed: 1,
+                skipped: 0,
+                shared_hits: 0,
+                pending: 0,
+                running: 1,
+                elapsed_total: 9,
+                waves_done: 1,
+                total_waves: 2,
+            },
+            rss_formatted: "10 MB",
+            warning_suffix: " ❗ warning",
+            max_width: None,
+        });
+
+        assert_eq!(
+            line,
+            "✔ 1 × 1 failed#test ⌚ 9s 🐏 10 MB 🌊 1 / 2 ❗ warning 🏃 1 pkg#build"
+        );
     }
 }
