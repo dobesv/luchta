@@ -529,7 +529,7 @@ async fn handle_delegate_stdout_read_error(
 
 async fn process_delegate_line(line: String, ctx: &DelegateStdoutCtx) -> Result<(), ProxyError> {
     let response = parse_delegate_response(&line, ctx).await?;
-    if let Err(error) = write_response(&ctx.writer, &response).await {
+    if let Err(error) = write_worker_response(&ctx.writer, &response).await {
         fail_all_waiters(&ctx.waiters, format!("proxy stdout write failed: {error}")).await;
         return Err(error);
     }
@@ -714,7 +714,9 @@ fn default_shared_stderr_writer() -> SharedWriter {
     Arc::new(Mutex::new(Box::new(stderr())))
 }
 
-async fn write_response(
+/// Serialize one worker response as JSONL and flush it atomically with respect
+/// to other writers sharing the same output stream.
+pub async fn write_worker_response(
     writer: &SharedWriter,
     response: &WorkerResponse,
 ) -> Result<(), ProxyError> {

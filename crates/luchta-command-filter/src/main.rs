@@ -3,14 +3,13 @@ use std::process;
 use std::sync::Arc;
 
 use luchta_worker::{
-    split_current_process_argv, version_requested, DelegateHandle, ProxyError, ResolveResult,
-    ResolveTask, WorkerMessage, WorkerResponse,
+    run_concurrent_middleware, split_current_process_argv, version_requested,
+    write_worker_response, DelegateHandle, ProxyError, ResolveResult, ResolveTask, SharedWriter,
+    WorkerMessage, WorkerResponse,
 };
-use tokio::io::{stdin, stdout, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::stdout;
 use tokio::process::Command;
 use tokio::sync::Mutex;
-
-type SharedWriter = Arc<Mutex<Box<dyn AsyncWrite + Unpin + Send>>>;
 
 /// Bound on how long the delegate may take to answer a forwarded `resolve`.
 /// `resolve` runs during graph build and must be fast; a delegate that is alive
@@ -54,7 +53,7 @@ async fn async_main() -> i32 {
 
     // stage_args includes argv[0] (the wrapper binary name); drop it so the
     // predicate is the user-supplied tokens before `--`.
-    let predicate = argv.stage_args.into_iter().skip(1).collect::<Vec<_>>();
+    let predicate = Arc::new(argv.stage_args.into_iter().skip(1).collect::<Vec<_>>());
 
     if predicate.is_empty() {
         eprintln!("missing predicate command; {usage}");
@@ -66,91 +65,27 @@ async fn async_main() -> i32 {
     }
 
     let stdout_writer: SharedWriter = Arc::new(Mutex::new(Box::new(stdout())));
-    let delegate = DelegateHandle::with_writers(
+    let delegate = Arc::new(DelegateHandle::with_writers(
         argv.delegate_command,
         Arc::clone(&stdout_writer),
         Arc::new(Mutex::new(Box::new(tokio::io::stderr()))),
         Some("delegate stderr: ".to_owned()),
-    );
+    ));
 
     let mut exit_code = 0;
-    let mut lines = BufReader::new(stdin()).lines();
-
-    loop {
-        let Some(line) = (match lines.next_line().await {
-            Ok(line) => line,
-            Err(error) => {
-                eprintln!("failed to read worker stdin: {error}");
-                exit_code = 1;
-                break;
-            }
-        }) else {
-            break;
-        };
-
-        let message = match serde_json::from_str::<WorkerMessage>(&line) {
-            Ok(message) => message,
-            Err(error) => {
-                eprintln!("failed to parse worker message: {error}");
-                exit_code = 1;
-                break;
-            }
-        };
-
-        match message {
-            WorkerMessage::ResolveTask(resolve) => {
-                let request_id = resolve.id.clone();
-                match predicate_passes(&predicate, &resolve).await {
-                    Ok(true) => {
-                        if let Err(error) = delegate
-                            .send_with_timeout(
-                                WorkerMessage::ResolveTask(resolve),
-                                RESOLVE_FORWARD_TIMEOUT,
-                            )
-                            .await
-                        {
-                            eprintln!(
-                                "{}",
-                                delegate
-                                    .failure_message(
-                                        "delegate failed before resolve decision",
-                                        error,
-                                    )
-                                    .await
-                            );
-                            exit_code = 1;
-                            break;
-                        }
-                    }
-                    Ok(false) => {
-                        let response =
-                            WorkerResponse::resolved(request_id, ResolveResult::prune(None));
-                        if let Err(error) = write_response(&stdout_writer, &response).await {
-                            eprintln!("failed to write prune response: {error}");
-                            exit_code = 1;
-                            break;
-                        }
-                    }
-                    Err(error) => {
-                        eprintln!(
-                            "failed to run predicate command: predicate={predicate:?}, error={error}"
-                        );
-                        exit_code = 1;
-                        break;
-                    }
-                }
-            }
-            WorkerMessage::Run(request) => {
-                if let Err(error) = delegate.send(WorkerMessage::Run(request)).await {
-                    eprintln!(
-                        "{}",
-                        delegate.failure_message("delegate failed", error).await
-                    );
-                    exit_code = 1;
-                    break;
-                }
-            }
-        }
+    let dispatch_predicate = Arc::clone(&predicate);
+    let dispatch_delegate = Arc::clone(&delegate);
+    let dispatch_writer = Arc::clone(&stdout_writer);
+    if let Err(error) = run_concurrent_middleware(move |message| {
+        let predicate = Arc::clone(&dispatch_predicate);
+        let delegate = Arc::clone(&dispatch_delegate);
+        let stdout_writer = Arc::clone(&dispatch_writer);
+        async move { dispatch_message(predicate, &delegate, &stdout_writer, message).await }
+    })
+    .await
+    {
+        eprintln!("{error}");
+        exit_code = 1;
     }
 
     if let Err(error) = delegate.shutdown().await {
@@ -163,6 +98,48 @@ async fn async_main() -> i32 {
     }
 
     exit_code
+}
+
+async fn dispatch_message(
+    predicate: Arc<Vec<String>>,
+    delegate: &DelegateHandle,
+    stdout_writer: &SharedWriter,
+    message: WorkerMessage,
+) -> Result<(), String> {
+    match message {
+        WorkerMessage::ResolveTask(resolve) => {
+            let request_id = resolve.id.clone();
+            match predicate_passes(&predicate, &resolve).await {
+                Ok(true) => {
+                    if let Err(error) = delegate
+                        .send_with_timeout(
+                            WorkerMessage::ResolveTask(resolve),
+                            RESOLVE_FORWARD_TIMEOUT,
+                        )
+                        .await
+                    {
+                        return Err(delegate
+                            .failure_message("delegate failed before resolve decision", error)
+                            .await);
+                    }
+                    Ok(())
+                }
+                Ok(false) => {
+                    let response = WorkerResponse::resolved(request_id, ResolveResult::prune(None));
+                    write_worker_response(stdout_writer, &response)
+                        .await
+                        .map_err(|error| format!("failed to write prune response: {error}"))
+                }
+                Err(error) => Err(format!(
+                    "failed to run predicate command: predicate={predicate:?}, error={error}"
+                )),
+            }
+        }
+        WorkerMessage::Run(request) => match delegate.send(WorkerMessage::Run(request)).await {
+            Ok(_) => Ok(()),
+            Err(error) => Err(delegate.failure_message("delegate failed", error).await),
+        },
+    }
 }
 
 async fn predicate_passes(predicate: &[String], resolve: &ResolveTask) -> Result<bool, ProxyError> {
@@ -198,18 +175,6 @@ fn resolve_base_dir(resolve: &ResolveTask) -> Result<PathBuf, ProxyError> {
         Some(cwd) => Ok(Path::new(cwd).to_path_buf()),
         None => Ok(std::env::current_dir()?),
     }
-}
-
-async fn write_response(
-    writer: &SharedWriter,
-    response: &WorkerResponse,
-) -> Result<(), ProxyError> {
-    let line = serde_json::to_string(response)?;
-    let mut writer = writer.lock().await;
-    writer.write_all(line.as_bytes()).await?;
-    writer.write_all(b"\n").await?;
-    writer.flush().await?;
-    Ok(())
 }
 
 #[cfg(test)]

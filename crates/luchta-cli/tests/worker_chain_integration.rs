@@ -17,6 +17,9 @@ use std::time::Duration;
 use assert_fs::prelude::*;
 use predicates::prelude::*;
 
+const CONCURRENCY_GATE_MAX_ATTEMPTS: usize = 500;
+const CONCURRENCY_GATE_POLL_SECONDS: f64 = 0.01;
+
 //------------------------------------------------------------------------------
 // Binary helpers (build via escargot)
 //------------------------------------------------------------------------------
@@ -97,6 +100,53 @@ fn write_workspace(temp: &assert_fs::TempDir, packages: &[(&str, &str)]) {
     }
 }
 
+fn full_filter_chain(delegate: &Path) -> String {
+    format!(
+        "{yarn} -- {file_exists} 'babel.config.*' -- {cmd_filter} sh -c 'exit 0' -- {lazy} -- {delegate}",
+        yarn = yarn_filter_bin().display(),
+        file_exists = file_exists_filter_bin().display(),
+        cmd_filter = command_filter_bin().display(),
+        lazy = lazy_worker_bin().display(),
+        delegate = delegate.display(),
+    )
+}
+
+fn write_concurrency_gate_delegate(temp: &assert_fs::TempDir) -> std::path::PathBuf {
+    let started = temp.child("delegate.started");
+    let gate = temp.child("delegate.gate");
+    write_executable(
+        temp,
+        "concurrent-delegate.sh",
+        &format!(
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  case "$line" in
+    *'"type":"run"'*)
+      printf '%s\n' "$id" >> {started}
+      if [ "$(wc -l < {started})" -ge 2 ]; then touch {gate}; fi
+      (
+        attempts=0
+        while [ ! -f {gate} ] && [ "$attempts" -lt {max_attempts} ]; do
+          sleep {poll_seconds}
+          attempts=$((attempts + 1))
+        done
+        if [ -f {gate} ]; then exit_code=0; else exit_code=1; fi
+        printf '{{"type":"done","id":"%s","exitCode":%s}}\n' "$id" "$exit_code"
+      ) &
+      ;;
+  esac
+done
+wait
+"#,
+            started = started.path().display(),
+            gate = gate.path().display(),
+            max_attempts = CONCURRENCY_GATE_MAX_ATTEMPTS,
+            poll_seconds = CONCURRENCY_GATE_POLL_SECONDS,
+        ),
+    )
+}
+
 /// Waits up to `timeout` for `path` to exist, polling every 10ms.
 fn wait_for_file(path: &Path, timeout: Duration) {
     let deadline = std::time::Instant::now() + timeout;
@@ -164,14 +214,7 @@ done
     // file-exists-filter: keep if babel.config.* exists under cwd
     // command-filter: always true (sh -c 'exit 0')
     // lazy-worker: resolve => accept without spawning; run => spawn delegate
-    let chain_command = format!(
-        "{yarn} -- {file_exists} 'babel.config.*' -- {cmd_filter} sh -c 'exit 0' -- {lazy} -- {delegate}",
-        yarn = yarn_filter_bin().display(),
-        file_exists = file_exists_filter_bin().display(),
-        cmd_filter = command_filter_bin().display(),
-        lazy = lazy_worker_bin().display(),
-        delegate = delegate.display(),
-    );
+    let chain_command = full_filter_chain(&delegate);
 
     write_config(
         &temp,
@@ -197,6 +240,53 @@ done
     // - delegate ran successfully (ran marker exists)
     wait_for_file(spawned_marker.path(), Duration::from_secs(5));
     wait_for_file(ran_marker.path(), Duration::from_secs(5));
+
+    temp.close().expect("cleanup temp dir");
+}
+
+#[test]
+fn full_chain_forwards_independent_runs_concurrently() {
+    let temp = assert_fs::TempDir::new().expect("create temp dir");
+    write_workspace(
+        &temp,
+        &[("app", "echo app-built"), ("web", "echo web-built")],
+    );
+    for package in ["app", "web"] {
+        temp.child(format!("packages/{package}/babel.config.js"))
+            .write_str("module.exports = {};")
+            .expect("write babel config");
+    }
+
+    let started = temp.child("delegate.started");
+    let gate = temp.child("delegate.gate");
+    let delegate = write_concurrency_gate_delegate(&temp);
+    let chain_command = full_filter_chain(&delegate);
+    write_config(
+        &temp,
+        &format!(
+            r#"{{"concurrency":{{"maxWeight":2}},"tasks":{{"build":{{"worker":"chain"}}}},"workers":{{"chain":{{"command":"{}"}}}}}}"#,
+            chain_command
+        ),
+    );
+
+    assert_cmd::Command::cargo_bin("luchta")
+        .expect("find binary")
+        .env("NO_COLOR", "1")
+        .arg("run")
+        .arg("build")
+        .arg("--output")
+        .arg("summary")
+        .arg("--workspace-root")
+        .arg(temp.path())
+        .assert()
+        .success();
+
+    let started_ids = fs::read_to_string(started.path()).expect("read started task ids");
+    assert_eq!(started_ids.lines().count(), 2, "started ids: {started_ids}");
+    assert!(
+        gate.path().exists(),
+        "delegate never observed two simultaneous in-flight runs"
+    );
 
     temp.close().expect("cleanup temp dir");
 }
@@ -237,14 +327,7 @@ done
     );
 
     // Chain command (will prune due to missing babel.config.*)
-    let chain_command = format!(
-        "{yarn} -- {file_exists} 'babel.config.*' -- {cmd_filter} sh -c 'exit 0' -- {lazy} -- {delegate}",
-        yarn = yarn_filter_bin().display(),
-        file_exists = file_exists_filter_bin().display(),
-        cmd_filter = command_filter_bin().display(),
-        lazy = lazy_worker_bin().display(),
-        delegate = delegate.display(),
-    );
+    let chain_command = full_filter_chain(&delegate);
 
     write_config(
         &temp,

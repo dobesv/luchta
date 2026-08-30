@@ -1,10 +1,10 @@
 ---
-title: "Task failure fast-stop: first-failure latch, collateral classification, and shared-worker serialization gotcha"
+title: "Task failure fast-stop: first-failure latch, collateral classification, and serial test-worker fixture gotcha"
 date: 2026-06-23
 category: logic-errors
 problem_type: logic_error
 component: luchta-cli/run
-root_cause: "Race conditions in failure handling, collateral vs genuine failure misclassification, and test invalidation due to shared-worker serialization"
+root_cause: "Race conditions in failure handling, collateral vs genuine failure misclassification, and test invalidation due to a serial shell worker fixture"
 resolution_type: code_fix
 severity: high
 tags:
@@ -20,7 +20,7 @@ plan_ref: luchta-run-failure-handling
 
 ## Problem
 
-Implementing `luchta run --continue` and default fast-stop-on-failure behavior exposed three non-obvious concurrency and testing pitfalls: (1) ensuring exactly-once failure-triggered shutdown, (2) distinguishing genuine failures from collateral (fast-stop-killed) tasks, and (3) a shared-worker serialization gotcha that invalidated integration tests.
+Implementing `luchta run --continue` and default fast-stop-on-failure behavior exposed three non-obvious concurrency and testing pitfalls: (1) ensuring exactly-once failure-triggered shutdown, (2) distinguishing genuine failures from collateral (fast-stop-killed) tasks, and (3) a synchronous shell worker fixture that invalidated integration tests.
 
 ## Symptoms
 
@@ -41,7 +41,7 @@ no cached output for app#success  # <- collateral task leaked
 
 ## Investigation Steps
 
-1. **Shared-worker timing mystery**: Test put `fastfail#fail` and `longrun#build` on the same `shell` worker. Shell worker reads stdin line-by-line and blocks per command — tasks on one worker are serialized. Scheduling sent longrun's run message first → `sleep 10` completed before fastfail ran → no in-flight task to kill. Control experiment with two distinct workers (`w1`, `w2`) proved fast-stop works correctly (exits in 0.25s).
+1. **Shared-worker timing mystery**: The test put `fastfail#fail` and `longrun#build` on the same custom shell worker fixture. That fixture read one stdin line and synchronously ran its command before reading again, so it serialized requests. Scheduling sent longrun's run message first → `sleep 10` completed before fastfail ran → no in-flight task to kill. A control experiment with two fixture processes (`w1`, `w2`) proved fast-stop works correctly (exits in 0.25s).
 
 2. **Collateral leak diagnosis**: `logs --failed` enumerated requested tasks and printed "no cached output" for any without a record. Fast-stop-killed siblings didn't persist a FAILED record (correctly suppressed via `interrupted` flag), but still appeared in task selection.
 
@@ -49,9 +49,9 @@ no cached output for app#success  # <- collateral task leaked
 
 ## Root Cause
 
-### 1. Shared-Worker Serialization Gotcha (Test Design Flaw)
+### 1. Serial Test-Worker Fixture (Test Design Flaw)
 
-Workers process `run` messages serially. A shell worker reading stdin line-by-line blocks inside each command. Two "independent" tasks on the same worker never run concurrently. Integration tests asserting concurrent in-flight behavior must use distinct workers per task.
+The custom shell fixture processed `run` messages serially because it blocked inside each command before reading the next JSONL record. That is a property of the fixture, not the worker protocol: workers built on `luchta_worker::run_worker_main` spawn requests concurrently, and middleware wrappers must use `run_concurrent_middleware` to preserve that multiplexing. A test using a synchronous fixture must use distinct fixture processes for concurrent in-flight behavior.
 
 ### 2. Latch Race Condition
 
@@ -126,7 +126,7 @@ sets `interrupted`. So:
 Tests asserting concurrent in-flight behavior must:
 
 ```rust
-// WRONG: both tasks on same worker — serialized, no concurrency
+// WRONG for this synchronous fixture: both tasks serialize in one process
 fastfail#fail -> worker w1
 longrun#build -> worker w1  // runs AFTER fastfail completes
 
@@ -150,25 +150,25 @@ Reusing the existing `interrupted` atomic (also used by Ctrl-C handling) creates
 
 ### Test Fix
 
-Distinct workers mean distinct subprocess PIDs. Each worker reads its own stdin, so commands run truly concurrently. The wall-clock timing assertion (`< 10s` while long task sleeps 30s) proves fast-stop killed the in-flight worker promptly.
+Distinct fixture processes mean distinct subprocess PIDs, bypassing the fixture's synchronous request loop. The wall-clock timing assertion (`< 10s` while long task sleeps 30s) proves fast-stop killed the in-flight worker promptly.
 
 ## Prevention Strategies
 
 ### Test Cases
 
-- **Concurrent in-flight assertion**: require >=2 distinct workers; fail instantly-long-running task starts first; assert wall-clock bound
+- **Concurrent in-flight assertion**: verify the fixture multiplexes requests or use >=2 distinct fixture processes; ensure the long-running task starts before failure; assert a wall-clock bound
 - **Collateral suppression**: assert `logs --failed` output matches only tasks with genuine `exit != 0`
 - **Latch exactly-once**: concurrent calls to `trigger_fast_stop_on_first_failure` — only one returns `true`
 
 ### Best Practices
 
-- **Workers are units of concurrency**: never assume two tasks on one worker run in parallel
+- **Fixture behavior defines test concurrency**: do not infer protocol serialization from a shell fixture that blocks before reading its next JSONL record
 - **Sync flag-flip, async side-effect**: flip atomic synchronously, spawn async work after — prevents TOCTOU races
 - **Reuse existing signals**: `interrupted` atomic for both Ctrl-C and fast-stop; collateral handling stays consistent
 
 ### Code Review Checklist
 
-- [ ] Integration tests for concurrent dispatch use distinct workers per concurrent task?
+- [ ] Does the test worker keep reading protocol input while prior requests run, or does the test use distinct fixture processes?
 - [ ] Failure-latch uses `compare_exchange` for exactly-once semantics?
 - [ ] Collateral/fast-stop behavior tested separately from genuine failure?
 - [ ] Progress accounting subtracts failed tasks from pending?

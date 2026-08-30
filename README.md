@@ -1012,7 +1012,9 @@ Luchta provides a set of composable wrapper workers that can be chained using
 `--` to add laziness or conditional pruning to any worker. Each wrapper spawns
 the next stage in the chain as a child process and forwards the JSONL protocol.
 Composition works from left to right; the rightmost stage is the real worker.
-Pruning is silent.
+Pruning is silent. Wrapper stages preserve worker protocol multiplexing, so
+independent resolve and run requests can remain in flight concurrently through
+the entire chain.
 
 - **luchta-lazy-worker -- <delegate...>**
   Answers `resolve` with `Accept` immediately without starting the delegate.

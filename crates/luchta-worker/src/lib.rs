@@ -1,3 +1,4 @@
+mod middleware;
 pub mod parallel;
 pub mod paths;
 mod progress;
@@ -12,11 +13,12 @@ use std::{collections::HashMap, path::Path};
 use luchta_types::{DependsOn, TaskDefinition};
 use serde::{Deserialize, Serialize};
 
+pub use middleware::{run_concurrent_middleware, MiddlewareError};
 pub use parallel::process_items_in_parallel;
 pub use progress::{ItemProgress, ItemProgressGuard, ParallelProgress, TaskProgress};
 pub use proxy::{
-    split_current_process_argv, split_delegate_argv, DelegateArgvSplit, DelegateHandle, ProxyError,
-    RawDelegate, SharedWriter,
+    split_current_process_argv, split_delegate_argv, write_worker_response, DelegateArgvSplit,
+    DelegateHandle, ProxyError, RawDelegate, SharedWriter,
 };
 pub use runtime::{
     run_worker, run_worker_main, shell_single_quote, InProcessOutcome, JobContext, Worker,
