@@ -35,7 +35,7 @@ use luchta_worker::{
 use tokio::io::stdout;
 use tokio::sync::Mutex;
 
-use response_filter::{ResponseFilter, ResponseFilteringWriter};
+use response_filter::{shared_response_writer, ResponseFilter};
 
 const RESOLVE_FORWARD_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -128,13 +128,13 @@ fn parse_args() -> Result<(Vec<String>, Vec<String>), i32> {
 }
 
 fn build_app(resolve_cmd: Vec<String>, delegate_cmd: Vec<String>) -> App {
-    let stdout_writer: SharedWriter = Arc::new(Mutex::new(Box::new(stdout())));
     let stderr_writer: SharedWriter = Arc::new(Mutex::new(Box::new(tokio::io::stderr())));
     let resolve_sink: SharedWriter = Arc::new(Mutex::new(Box::new(tokio::io::sink())));
     let run_response_filter = ResponseFilter::default();
-    let run_forward_writer: SharedWriter = Arc::new(Mutex::new(Box::new(
-        ResponseFilteringWriter::new(stdout(), run_response_filter.clone()),
-    )));
+    // Delegate and synthetic responses must share this outer lock. The proxy
+    // holds it across each JSON body, newline, and flush, making the complete
+    // JSONL record the serialization boundary for both output paths.
+    let stdout_writer = shared_response_writer(stdout(), run_response_filter.clone());
 
     let resolve_delegate = DelegateHandle::with_writers(
         resolve_cmd,
@@ -144,7 +144,7 @@ fn build_app(resolve_cmd: Vec<String>, delegate_cmd: Vec<String>) -> App {
     );
     let run_delegate = DelegateHandle::with_writers(
         delegate_cmd,
-        run_forward_writer,
+        Arc::clone(&stdout_writer),
         stderr_writer,
         Some("delegate stderr: ".to_owned()),
     );
