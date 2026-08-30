@@ -533,10 +533,17 @@ support (`TERM` is not `dumb`) gets one live status line that refreshes ten time
 per second. Task output, warnings, and diagnostics clear that line before they
 are printed, and progress resumes below them. Long running-task lists adapt to
 the available terminal width, keeping complete task names that fit and
-summarizing the remainder. When stderr is redirected or piped, or `TERM=dumb`,
-Luchta retains append-only status records every five seconds so logs remain
-readable and deterministic. `--output summary` suppresses progress in either
-environment and prints only the final summary.
+summarizing the remainder. Compact lists omit an npm scope shared by their
+visible tasks and factor a shared package prefix at a word boundary when that
+does not increase the width. The unparenthesized running-task list is always the
+final status segment, after elapsed time, memory usage, wave progress, and any
+warnings. When stderr is redirected or piped, or `TERM=dumb`, Luchta retains
+append-only status records every five seconds so logs remain readable and
+deterministic. Running-task groups are ordered by their oldest member, members
+are ordered from oldest to newest, and tasks running longer than five seconds
+include their elapsed time in the same parentheses as any worker progress.
+`--output summary` suppresses progress in either environment and prints only
+the final summary.
 
 #### Failed Task Output
 

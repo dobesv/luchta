@@ -1,6 +1,9 @@
 use super::super::*;
 use super::helpers::*;
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
 
 use luchta_engine::{ExecutionLogSink, TaskProgress};
 
@@ -52,9 +55,13 @@ fn render_progress_numerator_includes_skipped_and_pending_omits_at_zero() {
     );
     assert_progress_line_shape(
         &out,
-        "✔ 2 ⏩ 1 🏃 1 (pkg-c#build) ⌚ ",
+        "✔ 2 ⏩ 1 ⌚ ",
         SegmentLabel::new("🐏", "10 MB"),
         SegmentLabel::new("🌊", "0 / 1"),
+    );
+    assert!(
+        out.ends_with("🌊 0 / 1 🏃 1 pkg-c#build"),
+        "output was: {out}"
     );
     assert!(!out.contains("⌛"));
 }
@@ -99,6 +106,22 @@ fn render_progress_running_segment_uses_grouped_list() {
     for task in wave_of.keys() {
         reporter.task_started(task);
     }
+    let now = Instant::now();
+    let mut running = reporter
+        .running
+        .lock()
+        .expect("progress reporter running mutex poisoned");
+    for (task, age_ms) in [
+        (task_id("a", "lint"), 600),
+        (task_id("b", "lint"), 500),
+        (task_id("c", "lint"), 400),
+        (task_id("d", "test"), 300),
+        (task_id("d", "tsc"), 200),
+        (task_id("e", "babel"), 100),
+    ] {
+        running.insert(task, now - Duration::from_millis(age_ms));
+    }
+    drop(running);
 
     let out = reporter.render_progress(
         "42 MB",
@@ -113,11 +136,61 @@ fn render_progress_running_segment_uses_grouped_list() {
     );
     assert_progress_line_shape(
         &out,
-        "✔ 0 🏃 6 ({a,b,c}#lint, d#{test,tsc}, e#babel) ⌚ ",
+        "✔ 0 ⌚ ",
         SegmentLabel::new("🐏", "42 MB"),
         SegmentLabel::new("🌊", "0 / 1"),
     );
+    assert!(
+        out.ends_with("🌊 0 / 1 🏃 6 {a,b,c}#lint, d#{test,tsc}, e#babel"),
+        "output was: {out}"
+    );
     assert!(!out.contains("running:"));
+}
+
+#[test]
+fn render_progress_orders_running_tasks_by_age_and_times_only_slow_tasks() {
+    let oldest = task_id("b", "build");
+    let middle = task_id("a", "test");
+    let newest = task_id("z", "lint");
+    let reporter = ProgressReporter::new(
+        OutputMode::Default,
+        [&oldest, &middle, &newest]
+            .into_iter()
+            .map(|task| (task.clone(), 0))
+            .collect(),
+        1,
+    );
+    let sink = ExecutionLogSink::new();
+    reporter.task_started_with_progress(&oldest, sink.clone());
+    reporter.task_started(&middle);
+    reporter.task_started(&newest);
+    sink.set_progress(TaskProgress {
+        pending: 2,
+        ..TaskProgress::default()
+    });
+
+    let now = Instant::now();
+    let mut running = reporter
+        .running
+        .lock()
+        .expect("progress reporter running mutex poisoned");
+    running.insert(oldest, now - Duration::from_secs(30));
+    running.insert(middle, now - Duration::from_secs(20));
+    running.insert(newest, now - Duration::from_secs(4));
+    drop(running);
+
+    let out = reporter.render_progress(
+        "10 MB",
+        &[],
+        &pressure_snapshot(None, 0, 0),
+        owo_colors::Stream::Stdout,
+    );
+
+    assert!(
+        out.contains("b#build(⌛ 2 ⌚ 30s), a#test(⌚ 20s), z#lint"),
+        "output was: {out}"
+    );
+    assert!(!out.contains("z#lint("), "output was: {out}");
 }
 
 #[test]
@@ -178,7 +251,7 @@ fn render_progress_uses_latest_worker_snapshot_and_cleans_up_on_completion() {
 }
 
 #[test]
-fn render_progress_failed_segment_uses_grouped_list_and_appears_after_running() {
+fn render_progress_failed_segment_uses_grouped_list_and_appears_before_running() {
     let wave_of = HashMap::from([
         (task_id("a", "lint"), 0),
         (task_id("b", "lint"), 0),
@@ -205,9 +278,10 @@ fn render_progress_failed_segment_uses_grouped_list_and_appears_after_running() 
         owo_colors::Stream::Stdout,
     );
 
-    assert!(out.contains("🏃 1 (c#lint)"), "output was: {out}");
+    assert!(out.contains("🏃 1 c#lint"), "output was: {out}");
     assert!(out.contains("× 2 ({a,b}#lint)"), "output was: {out}");
-    assert!(out.find("🏃").unwrap() < out.find("×").unwrap());
+    assert!(out.find("×").unwrap() < out.find("🏃").unwrap());
+    assert!(out.find("🌊").unwrap() < out.find("🏃").unwrap());
 }
 #[test]
 fn render_progress_counts_completed_waves_from_done_skipped_and_failed() {
@@ -238,9 +312,13 @@ fn render_progress_counts_completed_waves_from_done_skipped_and_failed() {
     );
     assert_progress_line_shape(
         &out,
-        "✔ 3 ⏩ 1 ⌛ 1 🏃 1 (pkg-d#build) ⌚ ",
+        "✔ 3 ⏩ 1 ⌛ 1 ⌚ ",
         SegmentLabel::new("🐏", "24 MB"),
         SegmentLabel::new("🌊", "1 / 3"),
+    );
+    assert!(
+        out.ends_with("🌊 1 / 3 🏃 1 pkg-d#build"),
+        "output was: {out}"
     );
     assert!(out.contains("🌊 1 / 3"));
     assert!(!out.contains("W1 "));

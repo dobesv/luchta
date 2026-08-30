@@ -120,7 +120,15 @@ pub(super) fn rss_segment(out: &str) -> String {
 }
 
 pub(super) fn wave_segment(out: &str) -> String {
-    segment_from(out, SegmentLabel::new("🌊", "🌊"))
+    if out.contains('🏃') {
+        segment_between(
+            out,
+            SegmentLabel::new("🌊", "🌊"),
+            SegmentLabel::new("🏃", "🏃"),
+        )
+    } else {
+        segment_from(out, SegmentLabel::new("🌊", "🌊"))
+    }
 }
 
 pub(super) fn segment_between(

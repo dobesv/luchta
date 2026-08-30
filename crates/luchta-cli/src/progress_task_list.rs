@@ -1,29 +1,58 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap},
+    time::Duration,
+};
 
 use luchta_engine::TaskProgress;
 use luchta_types::TaskId;
 
-pub(crate) fn render_task_id_list(all: Vec<&TaskId>) -> String {
-    render_task_id_list_with_progress(all, &HashMap::new())
+const SLOW_TASK_THRESHOLD: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TaskListOrder {
+    Deterministic,
+    OldestFirst,
 }
 
-pub(crate) fn render_task_id_list_with_progress(
-    mut all: Vec<&TaskId>,
-    progress: &HashMap<TaskId, TaskProgress>,
-) -> String {
+struct RenderedTaskGroup {
+    first_position: usize,
+    text: String,
+}
+
+pub(crate) fn render_task_id_list(mut all: Vec<&TaskId>) -> String {
     if all.is_empty() {
         return String::new();
     }
 
     all.sort_by_key(|task_id| task_id.to_string());
-    render_running_task_groups_with_progress(&all, progress)
+    render_task_groups(
+        &all,
+        &HashMap::new(),
+        &HashMap::new(),
+        TaskListOrder::Deterministic,
+    )
 }
 
-pub(crate) fn render_task_id_with_progress(
-    task: &TaskId,
+pub(crate) fn render_running_task_list(
+    shown: &[&TaskId],
     progress: &HashMap<TaskId, TaskProgress>,
+    elapsed: &HashMap<TaskId, Duration>,
 ) -> String {
-    render_single_task(task, None, progress)
+    render_task_groups(shown, progress, elapsed, TaskListOrder::OldestFirst)
+}
+
+pub(crate) fn render_task_id_with_status(
+    task: &TaskId,
+    shared_scope: Option<&str>,
+    package_prefix: Option<&str>,
+    progress: &HashMap<TaskId, TaskProgress>,
+    elapsed: &HashMap<TaskId, Duration>,
+) -> String {
+    let rendered = render_single_task(task, shared_scope, progress, elapsed);
+    package_prefix
+        .and_then(|prefix| rendered.strip_prefix(prefix))
+        .unwrap_or(&rendered)
+        .to_owned()
 }
 
 #[cfg(test)]
@@ -31,23 +60,47 @@ pub(crate) fn render_running_task_groups(shown: &[&TaskId]) -> String {
     render_running_task_groups_with_progress(shown, &HashMap::new())
 }
 
+#[cfg(test)]
 pub(crate) fn render_running_task_groups_with_progress(
     shown: &[&TaskId],
     progress: &HashMap<TaskId, TaskProgress>,
 ) -> String {
+    render_task_groups(
+        shown,
+        progress,
+        &HashMap::new(),
+        TaskListOrder::Deterministic,
+    )
+}
+
+fn render_task_groups(
+    shown: &[&TaskId],
+    progress: &HashMap<TaskId, TaskProgress>,
+    elapsed: &HashMap<TaskId, Duration>,
+    order: TaskListOrder,
+) -> String {
     let shared_scope = shared_scope_for_tasks(shown);
     let (mut rendered, consumed) =
-        group_by_shared_task_name_with_progress(shown, shared_scope, progress);
+        group_by_shared_task_name_with_progress(shown, shared_scope, progress, elapsed, order);
     rendered.extend(group_remaining_by_package_with_progress(
         shown,
         &consumed,
         shared_scope,
         progress,
+        elapsed,
+        order,
     ));
-    rendered.join(", ")
+    if order == TaskListOrder::OldestFirst {
+        rendered.sort_by_key(|group| group.first_position);
+    }
+    rendered
+        .into_iter()
+        .map(|group| group.text)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
-fn shared_scope_for_tasks<'a>(shown: &[&'a TaskId]) -> Option<&'a str> {
+pub(crate) fn shared_scope_for_tasks<'a>(shown: &[&'a TaskId]) -> Option<&'a str> {
     let packages = shown
         .iter()
         .filter(|task| !task.package.is_root())
@@ -56,11 +109,28 @@ fn shared_scope_for_tasks<'a>(shown: &[&'a TaskId]) -> Option<&'a str> {
     common_scope(&packages)
 }
 
+pub(crate) fn shared_package_prefix_for_tasks<'a>(
+    shown: &[&'a TaskId],
+    shared_scope: Option<&str>,
+) -> Option<&'a str> {
+    if shown.len() < 2 || shown.iter().any(|task| task.package.is_root()) {
+        return None;
+    }
+
+    let display_packages = shown
+        .iter()
+        .map(|task| display_package_name(task.package.as_str(), shared_scope))
+        .collect::<Vec<_>>();
+    longest_shared_boundary_prefix(&display_packages)
+}
+
 fn group_by_shared_task_name_with_progress(
     shown: &[&TaskId],
     shared_scope: Option<&str>,
     progress: &HashMap<TaskId, TaskProgress>,
-) -> (Vec<String>, Vec<bool>) {
+    elapsed: &HashMap<TaskId, Duration>,
+    order: TaskListOrder,
+) -> (Vec<RenderedTaskGroup>, Vec<bool>) {
     let mut tasks_by_name: BTreeMap<&str, Vec<(usize, &TaskId)>> = BTreeMap::new();
     for (index, task) in shown.iter().copied().enumerate() {
         tasks_by_name
@@ -77,11 +147,14 @@ fn group_by_shared_task_name_with_progress(
             continue;
         }
 
-        rendered.push(format!(
-            "{}#{}",
-            format_annotated_package_set(&packages, &tasks, shared_scope, progress),
-            task_name
-        ));
+        rendered.push(RenderedTaskGroup {
+            first_position: tasks.iter().map(|(index, _)| *index).min().unwrap_or(0),
+            text: format!(
+                "{}#{}",
+                format_annotated_package_set(&tasks, shared_scope, progress, elapsed, order),
+                task_name
+            ),
+        });
         mark_consumed(&mut consumed, &tasks);
     }
 
@@ -89,36 +162,44 @@ fn group_by_shared_task_name_with_progress(
 }
 
 fn format_annotated_package_set(
-    packages: &BTreeSet<&str>,
     tasks: &[(usize, &TaskId)],
     shared_scope: Option<&str>,
     progress: &HashMap<TaskId, TaskProgress>,
+    elapsed: &HashMap<TaskId, Duration>,
+    order: TaskListOrder,
 ) -> String {
-    let display_packages = packages_for_display(packages, shared_scope);
-    let prefix = display_packages
-        .len()
-        .gt(&1)
-        .then(|| longest_shared_boundary_prefix(&display_packages))
-        .flatten();
     let task_by_package = tasks
         .iter()
         .filter(|(_, task)| !task.package.is_root())
         .map(|(_, task)| (task.package.as_str(), *task))
         .collect::<BTreeMap<_, _>>();
-
-    let members = packages
+    let ordered_tasks = match order {
+        TaskListOrder::Deterministic => task_by_package.values().copied().collect::<Vec<_>>(),
+        TaskListOrder::OldestFirst => tasks
+            .iter()
+            .filter(|(_, task)| !task.package.is_root())
+            .map(|(_, task)| *task)
+            .collect(),
+    };
+    let display_packages = ordered_tasks
         .iter()
-        .copied()
+        .map(|task| display_package_name(task.package.as_str(), shared_scope))
+        .collect::<Vec<_>>();
+    let prefix = display_packages
+        .len()
+        .gt(&1)
+        .then(|| longest_shared_boundary_prefix(&display_packages))
+        .flatten();
+    let members = ordered_tasks
+        .into_iter()
         .zip(display_packages)
-        .map(|(package, display)| {
+        .map(|(task, display)| {
             let display = prefix
                 .and_then(|prefix| display.strip_prefix(prefix))
                 .unwrap_or(display);
-            let annotation = task_by_package
-                .get(package)
-                .and_then(|task| progress.get(*task))
-                .and_then(|snapshot| render_progress_annotation(*snapshot))
-                .unwrap_or_default();
+            let annotation =
+                render_progress_annotation(progress.get(task).copied(), elapsed.get(task).copied())
+                    .unwrap_or_default();
             format!("{display}{annotation}")
         })
         .collect::<Vec<_>>()
@@ -261,8 +342,10 @@ fn group_remaining_by_package_with_progress(
     consumed: &[bool],
     shared_scope: Option<&str>,
     progress: &HashMap<TaskId, TaskProgress>,
-) -> Vec<String> {
-    let mut tasks_by_package: BTreeMap<&str, Vec<&TaskId>> = BTreeMap::new();
+    elapsed: &HashMap<TaskId, Duration>,
+    order: TaskListOrder,
+) -> Vec<RenderedTaskGroup> {
+    let mut tasks_by_package: BTreeMap<&str, Vec<(usize, &TaskId)>> = BTreeMap::new();
     for (index, task) in shown.iter().copied().enumerate() {
         if consumed[index] {
             continue;
@@ -270,12 +353,21 @@ fn group_remaining_by_package_with_progress(
         tasks_by_package
             .entry(task.package.as_str())
             .or_default()
-            .push(task);
+            .push((index, task));
     }
 
     tasks_by_package
         .into_values()
-        .map(|tasks| render_package_group_with_progress(tasks, shared_scope, progress))
+        .map(|indexed_tasks| RenderedTaskGroup {
+            first_position: indexed_tasks.first().map(|(index, _)| *index).unwrap_or(0),
+            text: render_package_group_with_progress(
+                indexed_tasks.into_iter().map(|(_, task)| task).collect(),
+                shared_scope,
+                progress,
+                elapsed,
+                order,
+            ),
+        })
         .collect()
 }
 
@@ -283,19 +375,24 @@ fn render_package_group_with_progress(
     mut tasks: Vec<&TaskId>,
     shared_scope: Option<&str>,
     progress: &HashMap<TaskId, TaskProgress>,
+    elapsed: &HashMap<TaskId, Duration>,
+    order: TaskListOrder,
 ) -> String {
-    tasks.sort_by_key(|task| task.task.to_string());
+    if order == TaskListOrder::Deterministic {
+        tasks.sort_by_key(|task| task.task.to_string());
+    }
     if tasks.len() == 1 {
-        return render_single_task(tasks[0], shared_scope, progress);
+        return render_single_task(tasks[0], shared_scope, progress, elapsed);
     }
 
     let names = tasks
         .iter()
         .map(|task| {
-            let annotation = progress
-                .get(*task)
-                .and_then(|snapshot| render_progress_annotation(*snapshot))
-                .unwrap_or_default();
+            let annotation = render_progress_annotation(
+                progress.get(*task).copied(),
+                elapsed.get(*task).copied(),
+            )
+            .unwrap_or_default();
             format!("{}{annotation}", task.task)
         })
         .collect::<Vec<_>>()
@@ -316,11 +413,11 @@ fn render_single_task(
     task: &TaskId,
     shared_scope: Option<&str>,
     progress: &HashMap<TaskId, TaskProgress>,
+    elapsed: &HashMap<TaskId, Duration>,
 ) -> String {
-    let annotation = progress
-        .get(task)
-        .and_then(|snapshot| render_progress_annotation(*snapshot))
-        .unwrap_or_default();
+    let annotation =
+        render_progress_annotation(progress.get(task).copied(), elapsed.get(task).copied())
+            .unwrap_or_default();
     if task.package.is_root() {
         return format!("{}{annotation}", task);
     }
@@ -329,19 +426,27 @@ fn render_single_task(
     format!("{package}#{}{annotation}", task.task)
 }
 
-fn render_progress_annotation(progress: TaskProgress) -> Option<String> {
+fn render_progress_annotation(
+    progress: Option<TaskProgress>,
+    elapsed: Option<Duration>,
+) -> Option<String> {
     let mut counters = Vec::new();
-    if progress.completed > 0 {
-        counters.push(format!("✔ {}", progress.completed));
+    if let Some(progress) = progress {
+        if progress.completed > 0 {
+            counters.push(format!("✔ {}", progress.completed));
+        }
+        if progress.skipped > 0 {
+            counters.push(format!("⏩ {}", progress.skipped));
+        }
+        if progress.pending > 0 {
+            counters.push(format!("⌛ {}", progress.pending));
+        }
+        if progress.running > 0 {
+            counters.push(format!("🏃 {}", progress.running));
+        }
     }
-    if progress.skipped > 0 {
-        counters.push(format!("⏩ {}", progress.skipped));
-    }
-    if progress.pending > 0 {
-        counters.push(format!("⌛ {}", progress.pending));
-    }
-    if progress.running > 0 {
-        counters.push(format!("🏃 {}", progress.running));
+    if let Some(elapsed) = elapsed.filter(|elapsed| *elapsed > SLOW_TASK_THRESHOLD) {
+        counters.push(format!("⌚ {}s", elapsed.as_secs()));
     }
     (!counters.is_empty()).then(|| format!("({})", counters.join(" ")))
 }
@@ -354,13 +459,17 @@ fn display_package_name<'a>(package: &'a str, shared_scope: Option<&str>) -> &'a
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeSet, HashMap};
+    use std::{
+        collections::{BTreeSet, HashMap},
+        time::Duration,
+    };
 
     use luchta_engine::TaskProgress;
     use luchta_types::TaskId;
 
     use super::{
         format_package_set, render_running_task_groups, render_running_task_groups_with_progress,
+        render_running_task_list,
     };
 
     #[test]
@@ -507,6 +616,55 @@ mod tests {
         assert_eq!(
             render_running_task_groups_with_progress(&shown, &progress),
             "{a(✔ 1),z(⌛ 1)}#build"
+        );
+    }
+
+    #[test]
+    fn slow_task_elapsed_time_uses_progress_parentheses_and_strict_threshold() {
+        let task = task_id("pkg", "build");
+        let shown = vec![&task];
+        let progress = HashMap::from([(
+            task.clone(),
+            TaskProgress {
+                completed: 5,
+                pending: 2,
+                ..TaskProgress::default()
+            },
+        )]);
+
+        assert_eq!(
+            render_running_task_list(
+                &shown,
+                &progress,
+                &HashMap::from([(task.clone(), Duration::from_secs(5))]),
+            ),
+            "pkg#build(✔ 5 ⌛ 2)"
+        );
+        assert_eq!(
+            render_running_task_list(
+                &shown,
+                &progress,
+                &HashMap::from([(task.clone(), Duration::from_secs(6))]),
+            ),
+            "pkg#build(✔ 5 ⌛ 2 ⌚ 6s)"
+        );
+    }
+
+    #[test]
+    fn age_order_places_groups_by_oldest_member_and_members_oldest_first() {
+        let oldest_build = task_id("z", "build");
+        let middle_lint = task_id("m", "lint");
+        let newest_build = task_id("a", "build");
+        let shown = vec![&oldest_build, &middle_lint, &newest_build];
+        let elapsed = HashMap::from([
+            (oldest_build.clone(), Duration::from_secs(12)),
+            (middle_lint.clone(), Duration::from_secs(10)),
+            (newest_build.clone(), Duration::from_secs(8)),
+        ]);
+
+        assert_eq!(
+            render_running_task_list(&shown, &HashMap::new(), &elapsed),
+            "{z(⌚ 12s),a(⌚ 8s)}#build, m#lint(⌚ 10s)"
         );
     }
 

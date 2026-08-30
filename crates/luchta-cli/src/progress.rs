@@ -214,16 +214,29 @@ impl ProgressReporter {
     }
 
     pub(crate) fn render_progress_for_width(&self, context: ProgressRenderContext<'_>) -> String {
-        let (counts, running_tasks) = {
+        let (counts, mut running_tasks) = {
             let running = self
                 .running
                 .lock()
                 .expect("progress reporter running mutex poisoned");
             (
                 self.progress_counts(&running),
-                running.keys().cloned().collect::<Vec<_>>(),
+                running
+                    .iter()
+                    .map(|(task, started_at)| (task.clone(), *started_at))
+                    .collect::<Vec<_>>(),
             )
         };
+        running_tasks.sort_by(|(left_task, left_started), (right_task, right_started)| {
+            left_started
+                .cmp(right_started)
+                .then_with(|| left_task.to_string().cmp(&right_task.to_string()))
+        });
+        let now = Instant::now();
+        let task_elapsed = running_tasks
+            .iter()
+            .map(|(task, started_at)| (task.clone(), now.saturating_duration_since(*started_at)))
+            .collect();
         let task_progress = self.worker_progress();
         let segment_counts = StatusLineCounts {
             completed: counts.completed,
@@ -237,11 +250,12 @@ impl ProgressReporter {
         };
         let failed_segment = self.failed_segment(context.stream);
         let warning_suffix = pressure_suffix(context.warnings, context.pressure, context.stream);
-        let running_task_refs = running_tasks.iter().collect();
+        let running_task_refs = running_tasks.iter().map(|(task, _)| task).collect();
         render_status_line(StatusLineInput {
             stream: context.stream,
             running_tasks: running_task_refs,
             task_progress: &task_progress,
+            task_elapsed: &task_elapsed,
             failed_segment: failed_segment.as_deref(),
             counts: segment_counts,
             rss_formatted: context.rss_formatted,
