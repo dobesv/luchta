@@ -163,12 +163,9 @@ fn format_non_default_fields(task_def: &TaskDefinition) -> Vec<(String, String)>
             format_depends_on(&task_def.depends_on),
         ));
     }
-    if !task_def.inputs.is_empty() {
-        fields.push(("inputs".to_string(), format_string_list(&task_def.inputs)));
-    }
-    if !task_def.outputs.is_empty() {
-        fields.push(("outputs".to_string(), format_string_list(&task_def.outputs)));
-    }
+    push_nonempty_string_list(&mut fields, "inputs", &task_def.inputs);
+    push_nonempty_string_list(&mut fields, "outputs", &task_def.outputs);
+    push_nonempty_string_list(&mut fields, "cacheFiles", &task_def.cache_files);
     if task_def.dependencies != ["**/*"] {
         fields.push((
             "dependencies".to_string(),
@@ -183,6 +180,12 @@ fn format_non_default_fields(task_def: &TaskDefinition) -> Vec<(String, String)>
     }
 
     fields
+}
+
+fn push_nonempty_string_list(fields: &mut Vec<(String, String)>, name: &str, values: &[String]) {
+    if !values.is_empty() {
+        fields.push((name.to_owned(), format_string_list(values)));
+    }
 }
 
 fn format_depends_on(depends_on: &[DependsOn]) -> String {
@@ -287,6 +290,7 @@ mod tests {
             }),
             inputs: vec!["src/**/*".to_string()],
             outputs: vec!["dist/**/*".to_string()],
+            cache_files: vec![".eslintcache".to_string()],
             dependencies: vec!["left-pad".to_string(), "react".to_string()],
             env,
         };
@@ -301,6 +305,7 @@ mod tests {
                 ("depends_on".to_string(), "[lint, pkg#build]".to_string()),
                 ("inputs".to_string(), "[src/**/*]".to_string()),
                 ("outputs".to_string(), "[dist/**/*]".to_string()),
+                ("cacheFiles".to_string(), "[.eslintcache]".to_string()),
                 ("dependencies".to_string(), "[left-pad, react]".to_string(),),
                 (
                     "env".to_string(),

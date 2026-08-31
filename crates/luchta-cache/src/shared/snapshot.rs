@@ -5,10 +5,17 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+mod cache_files;
+use cache_files::merge_cache_file_observations;
+pub use cache_files::{
+    derive_cache_file_scope, select_cache_file_observation, CacheFileObservation,
+};
+
 use crate::shared::{atomic_write, EntryMeta, SharedCachePaths};
 
-pub const SNAPSHOT_SCHEMA_VERSION: u32 = 3;
+pub const SNAPSHOT_SCHEMA_VERSION: u32 = 4;
 const SNAPSHOT_SCHEMA_VERSION_V2: u32 = 2;
+const SNAPSHOT_SCHEMA_VERSION_V3: u32 = 3;
 const SNAPSHOT_ZSTD_LEVEL: i32 = 3;
 const ZSTD_FRAME_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 const DEP_OUTPUTS_HASH_DOMAIN: &[u8] = b"luchta:dep-outputs:v1";
@@ -86,6 +93,27 @@ impl From<SnapshotV2> for Snapshot {
                     )
                 })
                 .collect(),
+            cache_files: BTreeMap::new(),
+        }
+    }
+}
+
+/// Exact schema-v3 wire representation. Future clients must keep decoding
+/// this separately so adding cache-file observations never reinterprets old
+/// bytes or drops existing output-cache entries.
+#[derive(Debug, Serialize, Deserialize)]
+struct SnapshotV3 {
+    schema_version: u32,
+    entries: BTreeMap<String, SnapshotEntry>,
+}
+
+impl From<SnapshotV3> for Snapshot {
+    fn from(snapshot: SnapshotV3) -> Self {
+        debug_assert_eq!(snapshot.schema_version, SNAPSHOT_SCHEMA_VERSION_V3);
+        Self {
+            schema_version: SNAPSHOT_SCHEMA_VERSION,
+            entries: snapshot.entries,
+            cache_files: BTreeMap::new(),
         }
     }
 }
@@ -94,6 +122,7 @@ impl From<SnapshotV2> for Snapshot {
 pub struct Snapshot {
     pub schema_version: u32,
     pub entries: BTreeMap<String, SnapshotEntry>,
+    pub cache_files: BTreeMap<String, Vec<CacheFileObservation>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -175,6 +204,7 @@ impl Snapshot {
         Self {
             schema_version: SNAPSHOT_SCHEMA_VERSION,
             entries: BTreeMap::new(),
+            cache_files: BTreeMap::new(),
         }
     }
 }
@@ -275,7 +305,16 @@ impl SnapshotStore {
         shard_key: &str,
         entries: Vec<SnapshotEntry>,
     ) -> MergeEntryOutcome {
-        if entries.is_empty() {
+        self.merge_updates_with_outcome(shard_key, entries, Vec::new())
+    }
+
+    pub fn merge_updates_with_outcome(
+        &self,
+        shard_key: &str,
+        entries: Vec<SnapshotEntry>,
+        cache_file_observations: Vec<CacheFileObservation>,
+    ) -> MergeEntryOutcome {
+        if entries.is_empty() && cache_file_observations.is_empty() {
             return MergeEntryOutcome::from_result(MergeResult::IdempotentNoop);
         }
 
@@ -298,7 +337,7 @@ impl SnapshotStore {
         let MergeChanges {
             changed,
             saw_conflict,
-        } = merge_snapshot_entries(&mut consolidated, entries);
+        } = merge_snapshot_updates(&mut consolidated, entries, cache_file_observations);
 
         if !changed {
             // Preserve the single-entry distinction exactly: a lone
@@ -558,6 +597,7 @@ fn merge_shard_entries(merged: &mut Snapshot, shard: Snapshot) {
             Some(_) => {}
         }
     }
+    merge_cache_file_observations(merged, shard.cache_files.into_values().flatten().collect());
 }
 
 struct MergeChanges {
@@ -565,7 +605,11 @@ struct MergeChanges {
     saw_conflict: bool,
 }
 
-fn merge_snapshot_entries(snapshot: &mut Snapshot, entries: Vec<SnapshotEntry>) -> MergeChanges {
+fn merge_snapshot_updates(
+    snapshot: &mut Snapshot,
+    entries: Vec<SnapshotEntry>,
+    cache_file_observations: Vec<CacheFileObservation>,
+) -> MergeChanges {
     let mut result = MergeChanges {
         changed: false,
         saw_conflict: false,
@@ -586,10 +630,11 @@ fn merge_snapshot_entries(snapshot: &mut Snapshot, entries: Vec<SnapshotEntry>) 
             }
         }
     }
+    result.changed |= merge_cache_file_observations(snapshot, cache_file_observations);
     result
 }
 
-/// Same-output schema-v3 data may enrich a schema-v2 observation without
+/// Same-output schema-v3/v4 data may enrich a schema-v2 observation without
 /// changing first-writer-wins conflict semantics.
 pub(crate) fn enrich_same_output_entry(
     existing: &mut SnapshotEntry,
@@ -728,6 +773,11 @@ fn decode_snapshot(
                 bincode::serde::decode_from_slice(&raw, snapshot_bincode_config())?;
             Ok(snapshot)
         }
+        SNAPSHOT_SCHEMA_VERSION_V3 => {
+            let (snapshot, _): (SnapshotV3, usize) =
+                bincode::serde::decode_from_slice(&raw, snapshot_bincode_config())?;
+            Ok(snapshot.into())
+        }
         _ => Err(bincode::error::DecodeError::OtherString(
             "unsupported snapshot schema version".to_owned(),
         )),
@@ -855,6 +905,25 @@ mod tests {
         assert_eq!(entry.duration_ms, 9_999);
         assert!(!entry.duration_trusted);
         assert!(entry.inline_meta.is_none());
+    }
+
+    #[test]
+    fn snapshot_v3_decodes_with_output_entries_and_no_cache_file_observations() {
+        let entry = sample_entry_with_seed(7, [8; 32]);
+        let fixture = SnapshotV3 {
+            schema_version: SNAPSHOT_SCHEMA_VERSION_V3,
+            entries: BTreeMap::from([(input_key_hex(entry.input_key), entry.clone())]),
+        };
+        let raw = bincode::serde::encode_to_vec(&fixture, snapshot_bincode_config()).unwrap();
+
+        let decoded = decode_snapshot(&raw, "legacy-v3").unwrap();
+
+        assert_eq!(
+            decoded.entries.get(&input_key_hex(entry.input_key)),
+            Some(&entry)
+        );
+        assert!(decoded.cache_files.is_empty());
+        assert_eq!(decoded.schema_version, SNAPSHOT_SCHEMA_VERSION);
     }
 
     #[test]

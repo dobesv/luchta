@@ -1,10 +1,12 @@
 pub(crate) mod atomicio;
 pub mod blob;
+mod cache_files;
 mod cycle;
 mod discovery;
 pub mod entry_meta;
 pub mod gc;
 pub mod paths;
+mod pending;
 mod prepared;
 #[cfg(unix)]
 pub mod rclone;
@@ -21,6 +23,11 @@ pub use blob::{
     write_outputs_blob, BlobReadResult, BlobReadResultWithMeta, BlobWriteResult, MetaFiles,
     StagedRestore,
 };
+pub use cache_files::{
+    cache_file_blob_path, stage_cache_file_blob, write_cache_file_blob, CacheFileBlobSource,
+    CacheFileReadResult, CacheFileRestoreRequest, CacheFileRestoreTarget, CacheFileStoreRequest,
+    PreparedCacheFiles,
+};
 pub use discovery::{
     bucket_key, bucket_keys_for, write_bucket_key, DEFAULT_SHARED_CACHE_DAY_WINDOW,
     SHARED_CACHE_SHARD_COUNT,
@@ -33,8 +40,9 @@ use entry_meta::{entry_meta_resident_bytes, INLINE_ENTRY_META_MAX_RESIDENT_BYTES
 pub use gc::{maybe_run_gc, run_gc, GcStats, DEFAULT_GC_RETENTION, DEFAULT_GC_THROTTLE};
 pub use paths::{
     open_shared_paths, resolve_shared_cache_dir, SharedCachePaths, BLOBS_DIR_NAME,
-    ENTRIES_DIR_NAME, SHARED_CACHE_DIR_ENV, SNAPSHOTS_DIR_NAME,
+    CACHE_FILES_DIR_NAME, ENTRIES_DIR_NAME, SHARED_CACHE_DIR_ENV, SNAPSHOTS_DIR_NAME,
 };
+use pending::PendingState;
 pub use prepared::PreparedRestore;
 #[cfg(unix)]
 pub use rclone::RcloneRcd;
@@ -48,8 +56,9 @@ pub(crate) use remote::RemoteSync;
 pub use remote::DEFAULT_TIMEOUT_DISABLE_THRESHOLD;
 pub use scope::{classify_outputs, OutputScope, ScopeError};
 pub use snapshot::{
-    combined_dep_outputs_hash, derive_input_key, input_key_hex, MergeEntryOutcome, MergeResult,
-    Snapshot, SnapshotEntry, SnapshotStore, SnapshotUpload, SNAPSHOT_SCHEMA_VERSION,
+    combined_dep_outputs_hash, derive_cache_file_scope, derive_input_key, input_key_hex,
+    select_cache_file_observation, CacheFileObservation, MergeEntryOutcome, MergeResult, Snapshot,
+    SnapshotEntry, SnapshotStore, SnapshotUpload, SNAPSHOT_SCHEMA_VERSION,
 };
 use std::collections::HashMap;
 #[cfg(unix)]
@@ -209,17 +218,19 @@ pub enum StoreOutcome {
 }
 
 /// Merged index from all candidate snapshots, built lazily on first access.
-/// First writer wins for differing output hashes. Same-output schema-v3 data
-/// can enrich a legacy observation with inline metadata and trusted timing.
+/// First writer wins for differing output hashes. Same-output schema-v3/v4
+/// data can enrich a legacy observation with inline metadata and trusted timing.
 #[derive(Debug, Clone)]
 pub struct MergedIndex {
     entries: HashMap<String, SnapshotEntry>,
+    cache_files: HashMap<String, Vec<CacheFileObservation>>,
 }
 
 impl MergedIndex {
     fn new() -> Self {
         Self {
             entries: HashMap::new(),
+            cache_files: HashMap::new(),
         }
     }
 
@@ -317,37 +328,6 @@ pub struct SharedCache {
     /// stores' worth of index entries is far cheaper than the per-store
     /// remote traffic this batching removes.
     pending: Mutex<PendingState>,
-}
-
-/// The run's pending index state, behind one lock.
-///
-/// These two were separate `Mutex`es. The coupling between them —  a
-/// representative only ever exists alongside the entries it was recorded
-/// with — was maintained by convention, and a path that cleared one without
-/// the other would leave a stale representative for a later flush to push a
-/// catch-up for. One lock makes the pair inseparable, and lets
-/// `refresh_entry` record both in a single acquisition.
-#[derive(Debug, Default)]
-struct PendingState {
-    /// Keyed by `input_key` so repeat writes of the same key collapse.
-    entries: HashMap<[u8; 32], SnapshotEntry>,
-    /// The first refreshed entry recorded this run, if any — used by
-    /// `flush_pending_entries` for a best-effort blob/entry-meta catch-up
-    /// push. `None` for a run that only stores: see `SharedCache::pending`'s
-    /// doc comment for why stores need no catch-up.
-    ///
-    /// One entry, not N. This is a token push for a single representative,
-    /// not general coverage of the run's refreshed artifacts: if a run
-    /// refreshes 40 entries, 39 of them still get no artifact push, and if
-    /// their blobs really are missing from this remote the next reader
-    /// degrades to a cache miss and re-stores them. A missing blob is a miss,
-    /// never an error, which is why one representative is enough and pushing
-    /// all N would be the per-hit remote traffic this batching removes.
-    /// Which refreshed entry ends up "first" doesn't matter, since the
-    /// snapshot-shard push itself is driven by the merge outcome, not by
-    /// this entry.
-    #[cfg(unix)]
-    catchup_representative: Option<SnapshotEntry>,
 }
 
 pub(crate) fn blob_path(paths: &SharedCachePaths, outputs_hash: &[u8; 32]) -> PathBuf {
@@ -890,6 +870,17 @@ impl SharedCache {
         for (input_key_hex, entry) in snapshot.entries {
             merged.insert_entry(input_key_hex, entry);
         }
+        for (scope_hex, observations) in snapshot.cache_files {
+            merged
+                .cache_files
+                .entry(scope_hex.clone())
+                .or_default()
+                .extend(
+                    observations
+                        .into_iter()
+                        .filter(|observation| input_key_hex(observation.scope_hash) == scope_hex),
+                );
+        }
     }
 
     /// Compatibility store for callers without a monotonic executor duration.
@@ -1190,8 +1181,7 @@ impl SharedCache {
         self.pending
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .entries
-            .insert(entry.input_key, entry);
+            .record_entry(entry);
     }
 
     /// `record_pending_entry` for the cache-hit path, which additionally
@@ -1203,11 +1193,7 @@ impl SharedCache {
             .pending
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        #[cfg(unix)]
-        if pending.catchup_representative.is_none() {
-            pending.catchup_representative = Some(entry.clone());
-        }
-        pending.entries.insert(entry.input_key, entry);
+        pending.record_refresh(entry);
     }
 
     /// Records an entry on a shared-cache hit for a later batched merge, and
@@ -1313,96 +1299,7 @@ impl SharedCache {
     /// Best-effort and infallible, same as `refresh_entry`: called after all
     /// tasks complete, so nothing downstream depends on it succeeding.
     pub fn flush_pending_entries(&self) {
-        // Resolve the write key BEFORE draining: draining first and then
-        // bailing on a `None` key would discard the whole run's entries with
-        // nowhere for them to have gone. Unreachable today (a cache with no
-        // write key records nothing to flush), but the drain is destructive,
-        // so it happens only once the flush can actually proceed.
-        let Some(write_key) = self.write_bucket_key.as_deref() else {
-            return;
-        };
-
-        let entries: Vec<SnapshotEntry> = {
-            let mut pending = self
-                .pending
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if pending.entries.is_empty() {
-                // A representative is only ever recorded alongside an entry,
-                // so there should be nothing here. Clear it anyway rather
-                // than trust that: a representative outliving its entries
-                // would have a later flush push a catch-up for an entry this
-                // run never merged.
-                #[cfg(unix)]
-                {
-                    pending.catchup_representative = None;
-                }
-                return;
-            }
-            std::mem::take(&mut pending.entries).into_values().collect()
-        };
-
-        let entry_count = entries.len();
-
-        let merge = self
-            .snapshot_store
-            .merge_entries_with_outcome(write_key, entries);
-        match merge.result {
-            MergeResult::SkippedLockUnavailable => {
-                // One batched merge means one lock failure now costs the
-                // whole run's index entries, not one entry's — worth a
-                // `warn:`, unlike the per-entry version this replaced.
-                eprintln!(
-                    "warn: shared cache could not lock its index shard; dropped {entry_count} index \
-                     entries for this run, so those tasks will be rebuilt next time"
-                );
-            }
-            MergeResult::Inserted
-            | MergeResult::IdempotentNoop
-            | MergeResult::ConflictKeptExisting => {
-                #[cfg(unix)]
-                {
-                    // Taken here rather than before the merge so a lock
-                    // failure doesn't consume it: the index entries are gone
-                    // either way, but the catch-up push is independent of
-                    // them and there's no reason to lose both.
-                    //
-                    // Only refreshes nominate a representative (see
-                    // `PendingState::catchup_representative`): a store-only
-                    // flush must not manufacture a catch-up push for an
-                    // arbitrary entry, since `finish_store` already pushed
-                    // that entry's own artifacts immediately -- that's
-                    // exactly the remote traffic this batching removes.
-                    let representative = self
-                        .pending
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .catchup_representative
-                        .take();
-                    if let Some(representative) = representative {
-                        let has_outputs = representative
-                            .inline_meta
-                            .as_ref()
-                            .map(|meta| meta.has_outputs)
-                            .or_else(|| {
-                                read_entry_meta(&self.paths, &representative.input_key)
-                                    .map(|meta| meta.has_outputs)
-                            })
-                            .unwrap_or(false);
-                        self.enqueue_entry_artifacts(remote::OwnedEntryArtifacts {
-                            paths: Arc::clone(&self.paths),
-                            outputs_hash: representative.outputs_hash,
-                            input_key: representative.input_key,
-                            presence: remote::ArtifactPresence {
-                                outputs: has_outputs,
-                                entry_meta: representative.inline_meta.is_none(),
-                            },
-                        });
-                    }
-                    self.enqueue_index_push(write_key, merge);
-                }
-            }
-        }
+        pending::flush(self);
     }
 }
 
@@ -1498,6 +1395,369 @@ mod tests {
             cache_nonce: None,
             run_reason: None,
         }
+    }
+
+    #[test]
+    fn cache_file_state_round_trips_and_newer_tombstone_suppresses_it() {
+        let temp_repo = TempDir::new().unwrap();
+        setup_git_repo(temp_repo.path());
+        create_commit(temp_repo.path());
+        let cache_dir = TempDir::new().unwrap();
+        let package_dir = temp_repo.path().join("pkg");
+        fs::create_dir_all(package_dir.join("cache")).unwrap();
+        fs::write(package_dir.join("cache/a.bin"), b"a").unwrap();
+        fs::write(package_dir.join("cache/b.bin"), b"b").unwrap();
+        let patterns = vec!["cache/**".to_owned()];
+        let entries = crate::resolve_outputs(&package_dir, &patterns).unwrap();
+        let relative_paths = entries
+            .iter()
+            .map(|entry| PathBuf::from(&entry.path))
+            .collect::<Vec<_>>();
+        let state_hash = crate::combined_cache_files_hash(&entries);
+        let scope_hash = derive_cache_file_scope("pkg#lint", [1; 32], [4; 32], [5; 32]);
+        let upstream_hash = [7; 32];
+        let cache = open_test_cache(temp_repo.path(), cache_dir.path(), 3);
+        let record = sample_record(true, 200);
+
+        assert_eq!(
+            cache
+                .store_cache_files_with_execution_duration(
+                    CacheFileStoreRequest {
+                        scope_hash,
+                        upstream_outputs_hash: upstream_hash,
+                        package_dir: &package_dir,
+                        relative_paths: &relative_paths,
+                        state_hash: Some(state_hash),
+                        state_bytes: 2,
+                        record: &record,
+                        repo_root: temp_repo.path(),
+                    },
+                    200,
+                )
+                .unwrap(),
+            StoreOutcome::Stored
+        );
+        cache.flush_pending_entries();
+        fs::remove_dir_all(package_dir.join("cache")).unwrap();
+
+        let reader = open_test_cache(temp_repo.path(), cache_dir.path(), 3);
+        let staged = reader
+            .prepare_cache_files(CacheFileRestoreRequest {
+                scope_hash: &scope_hash,
+                upstream_outputs_hash: upstream_hash,
+                package_dir: &package_dir,
+                patterns: &patterns,
+            })
+            .expect("state should stage");
+        staged.commit().unwrap();
+        assert_eq!(fs::read(package_dir.join("cache/a.bin")).unwrap(), b"a");
+        assert_eq!(fs::read(package_dir.join("cache/b.bin")).unwrap(), b"b");
+
+        assert_newer_tombstone_suppresses_state(CacheFileTombstoneTest {
+            cache: &cache,
+            repo: temp_repo.path(),
+            cache_dir: cache_dir.path(),
+            package_dir: &package_dir,
+            patterns: &patterns,
+            scope_hash,
+            upstream_hash,
+        });
+    }
+
+    struct CacheFileTombstoneTest<'a> {
+        cache: &'a SharedCache,
+        repo: &'a Path,
+        cache_dir: &'a Path,
+        package_dir: &'a Path,
+        patterns: &'a [String],
+        scope_hash: [u8; 32],
+        upstream_hash: [u8; 32],
+    }
+
+    fn assert_newer_tombstone_suppresses_state(input: CacheFileTombstoneTest<'_>) {
+        fs::remove_dir_all(input.package_dir.join("cache")).unwrap();
+        let mut tombstone_record = sample_record(true, 201);
+        tombstone_record.end_unix_ms += 1;
+        input
+            .cache
+            .store_cache_files_with_execution_duration(
+                CacheFileStoreRequest {
+                    scope_hash: input.scope_hash,
+                    upstream_outputs_hash: input.upstream_hash,
+                    package_dir: input.package_dir,
+                    relative_paths: &[],
+                    state_hash: None,
+                    state_bytes: 0,
+                    record: &tombstone_record,
+                    repo_root: input.repo,
+                },
+                201,
+            )
+            .unwrap();
+        input.cache.flush_pending_entries();
+
+        let tombstone_reader = open_test_cache(input.repo, input.cache_dir, 3);
+        assert!(tombstone_reader
+            .prepare_cache_files(CacheFileRestoreRequest {
+                scope_hash: &input.scope_hash,
+                upstream_outputs_hash: input.upstream_hash,
+                package_dir: input.package_dir,
+                patterns: input.patterns,
+            })
+            .is_none());
+    }
+
+    #[test]
+    fn missing_selected_cache_file_blob_does_not_cascade_to_an_older_candidate() {
+        let temp_repo = TempDir::new().unwrap();
+        setup_git_repo(temp_repo.path());
+        create_commit(temp_repo.path());
+        let cache_dir = TempDir::new().unwrap();
+        let package_dir = temp_repo.path().join("pkg");
+        fs::create_dir_all(&package_dir).unwrap();
+        let patterns = vec!["cache.bin".to_owned()];
+        let scope_hash = [1; 32];
+        let current_upstream_hash = [2; 32];
+        let cache = open_test_cache(temp_repo.path(), cache_dir.path(), 3);
+
+        fs::write(package_dir.join("cache.bin"), b"newer mismatch").unwrap();
+        let mismatch_entries = crate::resolve_outputs(&package_dir, &patterns).unwrap();
+        let mismatch_hash = crate::combined_cache_files_hash(&mismatch_entries);
+        let mut mismatch_record = sample_record(true, 200);
+        mismatch_record.end_unix_ms += 100;
+        cache
+            .store_cache_files_with_execution_duration(
+                CacheFileStoreRequest {
+                    scope_hash,
+                    upstream_outputs_hash: [9; 32],
+                    package_dir: &package_dir,
+                    relative_paths: &[PathBuf::from("cache.bin")],
+                    state_hash: Some(mismatch_hash),
+                    state_bytes: b"newer mismatch".len() as u64,
+                    record: &mismatch_record,
+                    repo_root: temp_repo.path(),
+                },
+                200,
+            )
+            .unwrap();
+
+        fs::write(package_dir.join("cache.bin"), b"older match").unwrap();
+        let matching_entries = crate::resolve_outputs(&package_dir, &patterns).unwrap();
+        let matching_hash = crate::combined_cache_files_hash(&matching_entries);
+        cache
+            .store_cache_files_with_execution_duration(
+                CacheFileStoreRequest {
+                    scope_hash,
+                    upstream_outputs_hash: current_upstream_hash,
+                    package_dir: &package_dir,
+                    relative_paths: &[PathBuf::from("cache.bin")],
+                    state_hash: Some(matching_hash),
+                    state_bytes: b"older match".len() as u64,
+                    record: &sample_record(true, 200),
+                    repo_root: temp_repo.path(),
+                },
+                200,
+            )
+            .unwrap();
+        cache.flush_pending_entries();
+
+        fs::remove_file(cache_file_blob_path(cache.paths(), &matching_hash)).unwrap();
+        fs::remove_file(package_dir.join("cache.bin")).unwrap();
+        assert!(cache_file_blob_path(cache.paths(), &mismatch_hash).is_file());
+
+        let reader = open_test_cache(temp_repo.path(), cache_dir.path(), 3);
+        assert!(reader
+            .prepare_cache_files(CacheFileRestoreRequest {
+                scope_hash: &scope_hash,
+                upstream_outputs_hash: current_upstream_hash,
+                package_dir: &package_dir,
+                patterns: &patterns,
+            })
+            .is_none());
+        assert!(!package_dir.join("cache.bin").exists());
+    }
+
+    #[test]
+    fn cache_file_storage_rejects_failed_fast_and_oversized_runs() {
+        let temp_repo = TempDir::new().unwrap();
+        setup_git_repo(temp_repo.path());
+        create_commit(temp_repo.path());
+        let cache_dir = TempDir::new().unwrap();
+        let package_dir = temp_repo.path().join("pkg");
+        fs::create_dir_all(&package_dir).unwrap();
+        fs::write(package_dir.join("cache.bin"), b"12345").unwrap();
+        let cache = open_test_cache(temp_repo.path(), cache_dir.path(), 3);
+        let relative_paths = vec![PathBuf::from("cache.bin")];
+        let scope_hash = [1; 32];
+
+        assert_cache_file_store_outcome(
+            &cache,
+            CacheFileStoreRequest {
+                scope_hash,
+                upstream_outputs_hash: [2; 32],
+                package_dir: &package_dir,
+                relative_paths: &relative_paths,
+                state_hash: Some([3; 32]),
+                state_bytes: 5,
+                record: &sample_record(false, 200),
+                repo_root: temp_repo.path(),
+            },
+            200,
+            StoreOutcome::SkippedNotSucceeded,
+        );
+        assert_cache_file_store_outcome(
+            &cache,
+            CacheFileStoreRequest {
+                scope_hash,
+                upstream_outputs_hash: [2; 32],
+                package_dir: &package_dir,
+                relative_paths: &relative_paths,
+                state_hash: Some([3; 32]),
+                state_bytes: 5,
+                record: &sample_record(true, 1),
+                repo_root: temp_repo.path(),
+            },
+            1,
+            StoreOutcome::SkippedTooFast { duration_ms: 1 },
+        );
+
+        // The explicit state byte count is checked independently from output
+        // metadata and archive compression.
+        assert_cache_file_store_outcome(
+            &cache,
+            CacheFileStoreRequest {
+                scope_hash,
+                upstream_outputs_hash: [2; 32],
+                package_dir: &package_dir,
+                relative_paths: &relative_paths,
+                state_hash: Some([3; 32]),
+                state_bytes: 1_000_000_001,
+                record: &sample_record(true, 200),
+                repo_root: temp_repo.path(),
+            },
+            200,
+            StoreOutcome::SkippedTooLarge {
+                bytes: 1_000_000_001,
+            },
+        );
+    }
+
+    fn assert_cache_file_store_outcome(
+        cache: &SharedCache,
+        request: CacheFileStoreRequest<'_>,
+        duration_ms: u64,
+        expected: StoreOutcome,
+    ) {
+        assert_eq!(
+            cache
+                .store_cache_files_with_execution_duration(request, duration_ms)
+                .unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn normal_outputs_remain_eligible_when_cache_file_state_is_oversized() {
+        let temp_repo = TempDir::new().unwrap();
+        setup_git_repo(temp_repo.path());
+        create_commit(temp_repo.path());
+        let cache_dir = TempDir::new().unwrap();
+        let package_dir = temp_repo.path().join("pkg");
+        fs::create_dir_all(&package_dir).unwrap();
+        fs::write(package_dir.join("output.bin"), b"ok").unwrap();
+        let cache = open_test_cache(temp_repo.path(), cache_dir.path(), 3);
+
+        let output_outcome = cache
+            .store(
+                "pkg#build",
+                &[8; 32],
+                &[9; 32],
+                &package_dir,
+                &[PathBuf::from("output.bin")],
+                &sample_record(true, 200),
+                b"",
+                b"",
+                &[],
+                temp_repo.path(),
+            )
+            .unwrap();
+        assert_eq!(output_outcome, StoreOutcome::Stored);
+        let cache_file_outcome = cache
+            .store_cache_files_with_execution_duration(
+                CacheFileStoreRequest {
+                    scope_hash: [1; 32],
+                    upstream_outputs_hash: [2; 32],
+                    package_dir: &package_dir,
+                    relative_paths: &[PathBuf::from("cache.bin")],
+                    state_hash: Some([3; 32]),
+                    state_bytes: 1_000_000_001,
+                    record: &sample_record(true, 200),
+                    repo_root: temp_repo.path(),
+                },
+                200,
+            )
+            .unwrap();
+        assert!(matches!(
+            cache_file_outcome,
+            StoreOutcome::SkippedTooLarge { .. }
+        ));
+    }
+
+    #[test]
+    fn cache_file_state_remains_eligible_when_normal_outputs_are_oversized() {
+        let temp_repo = TempDir::new().unwrap();
+        setup_git_repo(temp_repo.path());
+        create_commit(temp_repo.path());
+        let package_dir = temp_repo.path().join("pkg");
+        fs::create_dir_all(&package_dir).unwrap();
+
+        let small_cache_dir = TempDir::new().unwrap();
+        let small_cache = SharedCache::open_with_cache_dir(
+            temp_repo.path(),
+            100,
+            3,
+            Some(small_cache_dir.path()),
+        )
+        .unwrap();
+        fs::write(package_dir.join("output.bin"), b"12345").unwrap();
+        assert!(matches!(
+            small_cache
+                .store(
+                    "pkg#build",
+                    &[10; 32],
+                    &[11; 32],
+                    &package_dir,
+                    &[PathBuf::from("output.bin")],
+                    &sample_record(true, 200),
+                    b"",
+                    b"",
+                    &[],
+                    temp_repo.path(),
+                )
+                .unwrap(),
+            StoreOutcome::SkippedTooLarge { bytes } if bytes > 100
+        ));
+        fs::write(package_dir.join("cache.bin"), b"x").unwrap();
+        let cache_entries =
+            crate::resolve_outputs(&package_dir, &["cache.bin".to_owned()]).unwrap();
+        assert_eq!(
+            small_cache
+                .store_cache_files_with_execution_duration(
+                    CacheFileStoreRequest {
+                        scope_hash: [12; 32],
+                        upstream_outputs_hash: [13; 32],
+                        package_dir: &package_dir,
+                        relative_paths: &[PathBuf::from("cache.bin")],
+                        state_hash: Some(crate::combined_cache_files_hash(&cache_entries)),
+                        state_bytes: 1,
+                        record: &sample_record(true, 200),
+                        repo_root: temp_repo.path(),
+                    },
+                    200,
+                )
+                .unwrap(),
+            StoreOutcome::Stored
+        );
     }
 
     #[test]

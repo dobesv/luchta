@@ -21,6 +21,9 @@ pub const SHARED_CACHE_DIR_ENV: &str = "LUCHTA_SHARED_CACHE_DIR";
 /// Subdirectory name for blob storage.
 pub const BLOBS_DIR_NAME: &str = "blobs";
 
+/// Subdirectory name for advisory cache-file state blobs.
+pub const CACHE_FILES_DIR_NAME: &str = "cache-files";
+
 /// Subdirectory name for snapshot storage.
 pub const SNAPSHOTS_DIR_NAME: &str = "snapshots";
 
@@ -37,6 +40,8 @@ pub struct SharedCachePaths {
     pub root: PathBuf,
     /// Directory for storing blobs (content-addressed).
     pub blobs_dir: PathBuf,
+    /// Directory for content-addressed advisory cache-file state blobs.
+    pub cache_files_dir: PathBuf,
     /// Directory for storing snapshots.
     pub snapshots_dir: PathBuf,
     /// Directory for storing per-entry meta objects (keyed by input_key).
@@ -109,18 +114,21 @@ pub fn resolve_shared_cache_dir() -> PathBuf {
 /// filesystem issues.
 pub fn open_shared_paths(root: &Path) -> io::Result<SharedCachePaths> {
     let blobs_dir = root.join(BLOBS_DIR_NAME);
+    let cache_files_dir = root.join(CACHE_FILES_DIR_NAME);
     let snapshots_dir = root.join(SNAPSHOTS_DIR_NAME);
     let entries_dir = root.join(ENTRIES_DIR_NAME);
 
     // Create all directories (mkdir -p)
     fs::create_dir_all(root)?;
     fs::create_dir_all(&blobs_dir)?;
+    fs::create_dir_all(&cache_files_dir)?;
     fs::create_dir_all(&snapshots_dir)?;
     fs::create_dir_all(&entries_dir)?;
 
     Ok(SharedCachePaths {
         root: root.to_path_buf(),
         blobs_dir,
+        cache_files_dir,
         snapshots_dir,
         entries_dir,
     })
@@ -174,12 +182,14 @@ mod tests {
         // Verify paths
         assert_eq!(paths.root, root);
         assert_eq!(paths.blobs_dir, root.join(BLOBS_DIR_NAME));
+        assert_eq!(paths.cache_files_dir, root.join(CACHE_FILES_DIR_NAME));
         assert_eq!(paths.snapshots_dir, root.join(SNAPSHOTS_DIR_NAME));
         assert_eq!(paths.entries_dir, root.join(ENTRIES_DIR_NAME));
 
         // Verify directories were created
         assert!(root.exists());
         assert!(paths.blobs_dir.exists());
+        assert!(paths.cache_files_dir.exists());
         assert!(paths.snapshots_dir.exists());
         assert!(paths.entries_dir.exists());
     }
@@ -196,6 +206,7 @@ mod tests {
         // Should be equivalent
         assert_eq!(paths1.root, paths2.root);
         assert_eq!(paths1.blobs_dir, paths2.blobs_dir);
+        assert_eq!(paths1.cache_files_dir, paths2.cache_files_dir);
         assert_eq!(paths1.snapshots_dir, paths2.snapshots_dir);
     }
 }

@@ -16,6 +16,7 @@ use crate::{CacheError, FileEntry, Result};
 
 const COMBINED_OUTPUTS_HASH_DOMAIN: &[u8] = b"luchta-cache:combined-outputs:v1";
 const COMBINED_INPUTS_HASH_DOMAIN: &[u8] = b"luchta-cache:combined-inputs:v1";
+const COMBINED_CACHE_FILES_HASH_DOMAIN: &[u8] = b"luchta-cache:combined-cache-files:v1";
 
 /// Run-scoped memo of directory listings, shared across every task in a single
 /// `luchta run` so each package directory is walked once rather than once per
@@ -226,6 +227,44 @@ pub fn resolve_inputs_with_options(
 
 pub fn resolve_inputs_with_semantics(requests: &[ResolveRequest]) -> Result<Vec<FileEntry>> {
     resolve_inputs_with_semantics_and_options(requests, ResolveOptions::default())
+}
+
+/// Tests whether an absolute path would be selected by a set of already
+/// expanded input requests, including their global exclusions.
+///
+/// Unlike normal resolution this does not require the path to exist. Shared
+/// cache-file restoration uses it while files are still staged, so an absent
+/// input/output glob cannot become overlapping only after the restore commits.
+pub fn path_matches_resolve_requests(path: &Path, requests: &[ResolveRequest]) -> Result<bool> {
+    let exclusions = Exclusions::compile(
+        requests
+            .iter()
+            .filter(|request| request.negated)
+            .map(|request| request.pattern.as_str()),
+    )?;
+
+    for request in requests.iter().filter(|request| !request.negated) {
+        let Ok(relative_path) = path.strip_prefix(&request.base_dir) else {
+            continue;
+        };
+        if exclusions.excludes(relative_path) {
+            continue;
+        }
+        let matches = match request.semantics {
+            InputSemantics::Literal => {
+                relative_path == Path::new(&luchta_glob::unescape_literal(&request.pattern))
+            }
+            InputSemantics::Wildcard => luchta_glob::build_path_glob(&request.pattern)
+                .map_err(CacheError::InvalidGlob)?
+                .compile_matcher()
+                .is_match(relative_path),
+        };
+        if matches {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
 }
 
 /// Resolve pre-classified input [`ResolveRequest`]s, honoring [`ResolveOptions`].
@@ -619,6 +658,15 @@ pub fn combined_outputs_hash(entries: &[FileEntry]) -> [u8; 32] {
 #[must_use]
 pub fn combined_inputs_hash(entries: &[FileEntry]) -> [u8; 32] {
     combined_entries_hash(COMBINED_INPUTS_HASH_DOMAIN, entries)
+}
+
+/// Content address for one advisory cache-file state.
+///
+/// This deliberately uses a distinct domain from normal outputs: identical
+/// paths and bytes in the two roles must not alias storage identities.
+#[must_use]
+pub fn combined_cache_files_hash(entries: &[FileEntry]) -> [u8; 32] {
+    combined_entries_hash(COMBINED_CACHE_FILES_HASH_DOMAIN, entries)
 }
 
 fn resolve_with(
@@ -1046,13 +1094,13 @@ mod tests {
 
     use super::{
         cached_worktree_root, combined_inputs_hash, combined_outputs_hash, dedupe_and_sort_entries,
-        file_entry_from_path, prefix_union, prior_entries_by_path, qualified_base_dir_prefix,
-        resolve_file_entries, resolve_inputs, resolve_inputs_with_options,
-        resolve_inputs_with_semantics, resolve_literal_request, resolve_outputs,
-        resolve_outputs_with_options, resolve_wildcard_with_candidates, resolve_with,
-        resolve_with_candidates, strip_suffix_components, walk_output_candidates, CandidateLister,
-        Exclusions, FileReader, FilesystemLister, ListingCache, ResolveOptions, ResolveRequest,
-        ResolvedBase, StdFs,
+        file_entry_from_path, path_matches_resolve_requests, prefix_union, prior_entries_by_path,
+        qualified_base_dir_prefix, resolve_file_entries, resolve_inputs,
+        resolve_inputs_with_options, resolve_inputs_with_semantics, resolve_literal_request,
+        resolve_outputs, resolve_outputs_with_options, resolve_wildcard_with_candidates,
+        resolve_with, resolve_with_candidates, strip_suffix_components, walk_output_candidates,
+        CandidateLister, Exclusions, FileReader, FilesystemLister, ListingCache, ResolveOptions,
+        ResolveRequest, ResolvedBase, StdFs,
     };
     use crate::FileEntry;
     use crate::Result;
@@ -2109,6 +2157,32 @@ mod tests {
         assert_eq!(classify_pattern("src/main.ts"), InputSemantics::Literal);
         for pattern in ["src/*.ts", "src/?.ts", "src/[ab].ts", "src/{a,b}.ts"] {
             assert_eq!(classify_pattern(pattern), InputSemantics::Wildcard);
+        }
+    }
+
+    #[test]
+    fn path_matching_requests_handles_absent_paths_bases_and_exclusions() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let package = root.join("packages/app");
+        let requests = vec![
+            ResolveRequest::new(package.clone(), "cache/**/*.bin"),
+            ResolveRequest::new(package.clone(), "!cache/tmp/**"),
+            ResolveRequest::new(root.clone(), "root.txt"),
+        ];
+
+        for (path, expected) in [
+            (package.join("cache/state.bin"), true),
+            (package.join("cache/tmp/state.bin"), false),
+            (root.join("root.txt"), true),
+            (root.join("unrelated.txt"), false),
+        ] {
+            assert_eq!(
+                path_matches_resolve_requests(&path, &requests).unwrap(),
+                expected,
+                "unexpected match result for {}",
+                path.display()
+            );
         }
     }
 

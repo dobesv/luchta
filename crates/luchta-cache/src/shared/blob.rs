@@ -240,49 +240,40 @@ pub fn write_outputs_blob(
         blake3::Hash::from(*outputs_hash).to_hex()
     ));
 
+    write_file_blob(&blob_path, package_dir, rel_output_paths, size_cap_bytes)
+}
+
+pub(crate) fn write_file_blob(
+    blob_path: &Path,
+    package_dir: &Path,
+    relative_paths: &[PathBuf],
+    size_cap_bytes: u64,
+) -> io::Result<BlobWriteResult> {
     if blob_path.exists() {
         return Ok(BlobWriteResult::AlreadyExists);
     }
 
-    let mut existing_files = Vec::new();
-    let mut total_bytes = 0_u64;
-
-    for rel_path in rel_output_paths {
-        let absolute_path = package_dir.join(rel_path);
-        let metadata = match fs::metadata(&absolute_path) {
-            Ok(metadata) => metadata,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
-            Err(err) => return Err(err),
+    let existing_files =
+        match collect_blob_source_files(package_dir, relative_paths, size_cap_bytes)? {
+            Ok(files) => files,
+            Err(bytes) => return Ok(BlobWriteResult::SkippedTooLarge { bytes }),
         };
-
-        if !metadata.is_file() {
-            continue;
-        }
-
-        total_bytes = total_bytes.saturating_add(metadata.len());
-        if total_bytes > size_cap_bytes {
-            return Ok(BlobWriteResult::SkippedTooLarge { bytes: total_bytes });
-        }
-
-        existing_files.push((rel_path.clone(), absolute_path, metadata));
-    }
-
     if existing_files.is_empty() {
         return Ok(BlobWriteResult::NoOutputs);
     }
 
-    streaming_atomic_write(&blob_path, |file| {
+    streaming_atomic_write(blob_path, |file| {
         let writer = BufWriter::new(file);
         let encoder = zstd::Encoder::new(writer, ZSTD_LEVEL)?;
         let mut tar = Builder::new(encoder);
 
-        for (rel_path, absolute_path, metadata) in &existing_files {
-            let mut input = File::open(absolute_path)?;
+        for source in &existing_files {
+            let mut input = File::open(&source.absolute_path)?;
             let mut header = tar::Header::new_gnu();
-            header.set_size(metadata.len());
-            header.set_mode(tar_entry_mode(metadata));
+            header.set_size(source.metadata.len());
+            header.set_mode(tar_entry_mode(&source.metadata));
             header.set_cksum();
-            tar.append_data(&mut header, rel_path, &mut input)?;
+            tar.append_data(&mut header, &source.relative_path, &mut input)?;
         }
 
         tar.finish()?;
@@ -294,6 +285,42 @@ pub fn write_outputs_blob(
     .map_err(io::Error::other)?;
 
     Ok(BlobWriteResult::Written)
+}
+
+struct BlobSourceFile {
+    relative_path: PathBuf,
+    absolute_path: PathBuf,
+    metadata: Metadata,
+}
+
+fn collect_blob_source_files(
+    package_dir: &Path,
+    relative_paths: &[PathBuf],
+    size_cap_bytes: u64,
+) -> io::Result<Result<Vec<BlobSourceFile>, u64>> {
+    let mut files = Vec::new();
+    let mut total_bytes = 0_u64;
+    for relative_path in relative_paths {
+        let absolute_path = package_dir.join(relative_path);
+        let metadata = match fs::metadata(&absolute_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        total_bytes = total_bytes.saturating_add(metadata.len());
+        if total_bytes > size_cap_bytes {
+            return Ok(Err(total_bytes));
+        }
+        files.push(BlobSourceFile {
+            relative_path: relative_path.clone(),
+            absolute_path,
+            metadata,
+        });
+    }
+    Ok(Ok(files))
 }
 
 fn tar_entry_mode(metadata: &Metadata) -> u32 {
@@ -895,7 +922,22 @@ pub fn restore_blob_with_meta(
     package_dir: &Path,
 ) -> io::Result<BlobReadResultWithMeta<StagedRestore>> {
     let blob_path = blob_path(paths, outputs_hash);
-    let compressed = match File::open(&blob_path) {
+    restore_file_blob_staged(&blob_path, package_dir)
+}
+
+pub(crate) fn restore_file_blob_staged(
+    blob_path: &Path,
+    package_dir: &Path,
+) -> io::Result<BlobReadResultWithMeta<StagedRestore>> {
+    restore_file_blob_staged_with_size_cap(blob_path, package_dir, None)
+}
+
+pub(crate) fn restore_file_blob_staged_with_size_cap(
+    blob_path: &Path,
+    package_dir: &Path,
+    size_cap_bytes: Option<u64>,
+) -> io::Result<BlobReadResultWithMeta<StagedRestore>> {
+    let compressed = match File::open(blob_path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             return Ok(BlobReadResultWithMeta::Missing)
@@ -907,7 +949,12 @@ pub fn restore_blob_with_meta(
         .prefix("blob-restore-meta-")
         .tempdir_in(package_dir)?;
 
-    match extract_blob_with_meta_to_staging(compressed, package_dir, staging_dir.path()) {
+    match extract_blob_with_meta_to_staging(
+        compressed,
+        package_dir,
+        staging_dir.path(),
+        size_cap_bytes,
+    ) {
         Ok(meta) => Ok(BlobReadResultWithMeta::Restored(StagedRestore {
             meta,
             staging_dir,
@@ -978,6 +1025,54 @@ impl StagedRestore {
     pub fn discard(self) -> io::Result<()> {
         self.staging_dir.close()
     }
+
+    pub(crate) fn relative_file_paths(&self) -> io::Result<Vec<PathBuf>> {
+        let mut paths = walkdir::WalkDir::new(self.staging_dir.path())
+            .min_depth(1)
+            .into_iter()
+            .filter_map(|entry| match entry {
+                Ok(entry) if entry.file_type().is_file() => Some(Ok(entry)),
+                Ok(_) => None,
+                Err(error) => Some(Err(io::Error::other(error))),
+            })
+            .map(|entry| {
+                let entry = entry?;
+                entry
+                    .path()
+                    .strip_prefix(self.staging_dir.path())
+                    .map(Path::to_path_buf)
+                    .map_err(io::Error::other)
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        paths.sort_unstable();
+        Ok(paths)
+    }
+
+    pub(crate) fn cache_files_hash(&self) -> io::Result<[u8; 32]> {
+        let entries = self
+            .relative_file_paths()?
+            .into_iter()
+            .map(|path| {
+                let absolute = self.staging_dir.path().join(&path);
+                let metadata = fs::metadata(&absolute)?;
+                Ok(crate::FileEntry {
+                    path: path.to_string_lossy().replace('\\', "/"),
+                    size: metadata.len(),
+                    mtime_ns: 0,
+                    hash: crate::blake3_file(&absolute)
+                        .map_err(|error| io::Error::other(error.to_string()))?,
+                    absent: false,
+                })
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        Ok(crate::combined_cache_files_hash(&entries))
+    }
+
+    pub(crate) fn contains_package_relative_path(&self, path: &Path) -> bool {
+        self.package_dir
+            .join(path)
+            .starts_with(self.staging_dir.path())
+    }
 }
 
 /// Generic BlobReadResult that can carry a payload.
@@ -994,64 +1089,92 @@ impl Default for BlobReadResultWithMeta {
     }
 }
 
+#[derive(Default)]
+struct ExtractedMetaFiles {
+    stdout: Option<Vec<u8>>,
+    stderr: Option<Vec<u8>>,
+    record: Option<Vec<u8>>,
+    reports: Vec<ReportInput>,
+}
+
+impl ExtractedMetaFiles {
+    fn capture<R: Read>(
+        &mut self,
+        entry: &mut tar::Entry<'_, R>,
+        entry_path: &Path,
+    ) -> Result<bool, RestoreError> {
+        let path = entry_path.to_string_lossy();
+        if !path.starts_with(&format!("{META_DIR_NAME}/")) {
+            return Ok(false);
+        }
+
+        let mut contents = Vec::new();
+        entry
+            .read_to_end(&mut contents)
+            .map_err(|_| RestoreError::Corrupt)?;
+        if path.starts_with(&format!("{META_DIR_NAME}/reports/")) {
+            self.capture_report(entry_path, contents)?;
+            return Ok(true);
+        }
+
+        let file_name = entry_path
+            .file_name()
+            .ok_or(RestoreError::Corrupt)?
+            .to_string_lossy();
+        match file_name.as_ref() {
+            META_STDOUT_FILE_NAME => self.stdout = Some(contents),
+            META_STDERR_FILE_NAME => self.stderr = Some(contents),
+            META_RECORD_FILE_NAME => self.record = Some(contents),
+            _ => {}
+        }
+        Ok(true)
+    }
+
+    fn capture_report(&mut self, entry_path: &Path, contents: Vec<u8>) -> Result<(), RestoreError> {
+        let file_name = entry_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or(RestoreError::Corrupt)?;
+        if !crate::store::is_valid_report_filename(file_name) {
+            return Err(RestoreError::Corrupt);
+        }
+        self.reports.push(ReportInput {
+            filename: file_name.to_owned(),
+            mime_type: String::new(),
+            content: String::from_utf8_lossy(&contents).into_owned(),
+        });
+        Ok(())
+    }
+
+    fn into_meta_files(self) -> MetaFiles {
+        MetaFiles {
+            stdout: self.stdout.unwrap_or_default(),
+            stderr: self.stderr.unwrap_or_default(),
+            record: self.record.unwrap_or_default(),
+            reports: self.reports,
+        }
+    }
+}
+
 fn extract_blob_with_meta_to_staging(
     compressed: File,
     package_dir: &Path,
     staging_dir: &Path,
+    size_cap_bytes: Option<u64>,
 ) -> Result<MetaFiles, RestoreError> {
     let decoder = zstd::Decoder::new(compressed).map_err(|_| RestoreError::Corrupt)?;
     let mut archive = Archive::new(decoder);
     let entries = archive.entries().map_err(|_| RestoreError::Corrupt)?;
 
-    let mut meta_stdout = None;
-    let mut meta_stderr = None;
-    let mut meta_record = None;
-    let mut meta_reports = Vec::new();
+    let mut meta = ExtractedMetaFiles::default();
+    let mut output_bytes = 0_u64;
 
     for entry in entries {
         let mut entry = entry.map_err(|_| RestoreError::Corrupt)?;
         let entry_path = entry.path().map_err(|_| RestoreError::Corrupt)?;
         let entry_path = entry_path.into_owned();
 
-        // Check for meta files
-        let path_str = entry_path.to_string_lossy();
-        let meta_prefix = format!("{}/", META_DIR_NAME);
-
-        if path_str.starts_with(&meta_prefix) {
-            // Extract meta file contents into memory
-            let mut contents = Vec::new();
-            entry
-                .read_to_end(&mut contents)
-                .map_err(|_| RestoreError::Corrupt)?;
-
-            let report_prefix = format!("{}/reports/", META_DIR_NAME);
-            if path_str.starts_with(&report_prefix) {
-                let file_name = entry_path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .ok_or(RestoreError::Corrupt)?;
-                if !crate::store::is_valid_report_filename(file_name) {
-                    return Err(RestoreError::Corrupt);
-                }
-                meta_reports.push(ReportInput {
-                    filename: file_name.to_string(),
-                    mime_type: String::new(),
-                    content: String::from_utf8_lossy(&contents).into_owned(),
-                });
-                continue;
-            }
-
-            let file_name = entry_path
-                .file_name()
-                .ok_or(RestoreError::Corrupt)?
-                .to_string_lossy();
-
-            match file_name.as_ref() {
-                META_STDOUT_FILE_NAME => meta_stdout = Some(contents),
-                META_STDERR_FILE_NAME => meta_stderr = Some(contents),
-                META_RECORD_FILE_NAME => meta_record = Some(contents),
-                _ => {} // Unknown meta file, ignore
-            }
+        if meta.capture(&mut entry, &entry_path)? {
             continue;
         }
 
@@ -1067,6 +1190,9 @@ fn extract_blob_with_meta_to_staging(
         if !entry.header().entry_type().is_file() {
             return Err(RestoreError::Corrupt);
         }
+
+        let entry_size = entry.header().size().map_err(|_| RestoreError::Corrupt)?;
+        add_extracted_output_bytes(&mut output_bytes, entry_size, size_cap_bytes)?;
 
         if let Some(parent) = target_path.parent() {
             fs::create_dir_all(parent)?;
@@ -1085,12 +1211,19 @@ fn extract_blob_with_meta_to_staging(
     // Outputs-only blobs (the current format, see write_outputs_blob) carry no
     // .luchta-meta at all — that is not corruption, just an entry whose record,
     // stdout, and stderr live in entries/<input_key> instead.
-    Ok(MetaFiles {
-        stdout: meta_stdout.unwrap_or_default(),
-        stderr: meta_stderr.unwrap_or_default(),
-        record: meta_record.unwrap_or_default(),
-        reports: meta_reports,
-    })
+    Ok(meta.into_meta_files())
+}
+
+fn add_extracted_output_bytes(
+    total_bytes: &mut u64,
+    entry_bytes: u64,
+    size_cap_bytes: Option<u64>,
+) -> Result<(), RestoreError> {
+    *total_bytes = total_bytes.saturating_add(entry_bytes);
+    if size_cap_bytes.is_some_and(|cap| *total_bytes > cap) {
+        return Err(RestoreError::Corrupt);
+    }
+    Ok(())
 }
 
 struct MoveOutputsError {

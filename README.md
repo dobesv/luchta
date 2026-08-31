@@ -409,7 +409,7 @@ Notes:
 
 ### Glob Syntax
 
-Luchta has two families of glob. **Path globs** match files: `inputs`, `outputs`, the `workspaces` globs in the root `package.json`, watch patterns, and `luchta-file-exists-filter`. **Name globs** match package and task names: `-p`, task arguments, and the `dependencies` filter. They share a grammar, but differ in how `*` treats `/` and in whether `!` negates. Path globs are described first; see [Name globs](#name-globs-are-different) for the differences.
+Luchta has two families of glob. **Path globs** match files: `inputs`, `outputs`, `cacheFiles`, the `workspaces` globs in the root `package.json`, watch patterns, and `luchta-file-exists-filter`. **Name globs** match package and task names: `-p`, task arguments, and the `dependencies` filter. They share a grammar, but differ in how `*` treats `/` and in whether `!` negates. Path globs are described first; see [Name globs](#name-globs-are-different) for the differences.
 
 Path globs are compiled by [`globset`](https://docs.rs/globset) with `literal_separator` enabled, matching what `.gitignore`, Turborepo, and lage all do. Patterns are matched against paths relative to a base directory (the package directory, or the repo root for `#`-prefixed patterns), always written with `/` separators.
 
@@ -1080,12 +1080,26 @@ build: {
   cache: {},
   inputs: ["src/**/*.ts", "package.json"],
   outputs: ["dist/**"],
+  cacheFiles: [".eslintcache"],
   env: {
     NODE_ENV: { value: "production" },
     CI_JOB_ID: { input: false }
   }
 }
 ```
+
+`cacheFiles` declares disposable, performance-only warm state such as ESLint
+or Babel caches. It requires `cache: {}` and accepts package-relative
+output-style globs and exclusions. Cache files must not overlap inputs or
+outputs and cannot cross a package boundary.
+
+Cache files never make a task up to date: they are absent from input, output,
+and dependency-output hashes. After local and exact shared-output misses,
+Luchta restores at most one recent cache-file state before running the task.
+Any matching local cache file wins and suppresses the whole shared restore.
+After a successful input-stable run, cache files are captured independently
+from normal outputs; an empty result records a tombstone so older warm state is
+not resurrected. `--no-cache` disables both restoration and publication.
 
 
 
@@ -1110,25 +1124,27 @@ Use `luchta logs --show-cache-nonce` to view the resolved nonce string persisted
 
 ### Shared Build Cache
 
-The shared build cache is a cross-worktree, cross-clone cache that restores task **outputs** and logs from prior builds. While the standard [Build Cache](#build-cache) is local to a single workspace, the shared cache allows developers and CI to reuse results across different checkouts of the same repository.
+The shared build cache is a cross-worktree, cross-clone cache that restores task **outputs** and logs from prior builds. It can also provide advisory `cacheFiles` to tasks that still need to run. While the standard [Build Cache](#build-cache) is local to a single workspace, the shared cache allows developers and CI to reuse results across different checkouts of the same repository.
 
 #### Concept
 - **Computed Keys, Not Discovered:** Shard keys are `<YYYYMMDD>-<shard>`, derived from the UTC wall clock and a fixed shard count — never listed or walked. The previous design indexed by git commit hash, discovered by walking first-parent ancestry from `HEAD`. That never matched across pull requests, because CI builds run on feature branches and ephemeral merge commits that no other build shares (GitHub #277).
 - **Input-Keyed Entries:** The cache key (`input_key`) folds in the task spec, environment, package-dependency versions, upstream task outputs, and the resolved content of the task's own inputs. Two branches that change a task's source differently land in distinct entries instead of racing for one shared slot — both stay cached and reusable, and reverting one back to the other's state is a hit, not a miss.
 - **Content-Addressed Blobs:** Build outputs are compressed and stored in a deduped blob store, addressed by `outputs_hash`.
 - **Read Window:** On cache lookup, Luchta concurrently fetches every shard from the last `LUCHTA_SHARED_CACHE_DAYS` UTC days (default 3) directly — `day_window * 6` key fetches, no object-store listing involved. Task restore preparation also runs concurrently. Only the chosen entry's fallback metadata and output blob are fetched; historical candidates are not downloaded eagerly.
-- **Inline Restore Metadata:** Schema-v3 snapshots embed complete entry metadata when its compressed encoding is at most 16 KiB. This includes the run record, output-presence bit, stdout, stderr, and reports. Small no-output tasks therefore restore with no per-entry remote request and store without a separate metadata upload. Larger records use `entries/<input_key>.bin` as a fallback.
+- **Inline Restore Metadata:** Schema-v4 snapshots embed complete output-entry metadata when its compressed encoding is at most 16 KiB and add bounded cache-file observations. Schema-v3 and schema-v2 shards remain readable. Small no-output tasks restore with no per-entry remote request; larger records use `entries/<input_key>.bin` as a fallback.
+- **Advisory Cache Files:** Cache-file candidates use a coarse task scope that excludes resolved input contents and upstream outputs. A candidate with matching upstream outputs wins even over a newer mismatch; otherwise newest wins. Only that one immutable blob is fetched, and a missing or corrupt blob runs cold without cascading remote requests.
 - **Refresh on Hit:** A cache hit re-inserts its entry into today's shard, and, with remote sync on, re-pushes that shard, so a hot entry keeps getting a fresh day stamp instead of aging out of the read window on a fixed schedule. The re-insert and the push both happen in the end-of-run flush described next, not at hit time. Legacy schema-v2 entries remain readable through fallback metadata but are not refreshed because their recorded duration includes queueing time; they naturally age out.
 - **Fail-Open Batched Writes:** Output blobs and oversized metadata are admitted to a nonblocking background worker pool. The index shard is gated behind every accepted artifact job that precedes it, then written once at the end of the cycle for all stores and refreshes. A saturated queue drops optional remote work rather than delaying task completion; a missing or partial remote artifact remains a safe cache miss. Normal draining has one total timeout budget. Interrupt and watch cancellation discard queued work immediately and force-stop rclone.
 - **Remote Synchronization:** Opt-in synchronization with S3 or other object stores via `rclone`.
 
 #### Layout
-By default, the cache is stored at `~/.cache/luchta` (on Linux/macOS), under three prefixes:
+By default, the cache is stored at `~/.cache/luchta` (on Linux/macOS), under four prefixes:
 - `blobs/<outputs_hash>.tar.zst` — Content-addressed compressed output archives.
-- `snapshots/<YYYYMMDD>-<shard>/<shard_id>.bincode` — Schema-v3 metadata index shards, one directory per UTC day and shard number (`00`-`05`), holding append-only content-addressed files. Shards are zstd-compressed at rest; `<shard_id>` is the BLAKE3 hash of the uncompressed bincode bytes. Schema-v2 shards remain readable, and shards from future schemas are preserved rather than consolidated or deleted.
+- `cache-files/<state_hash>.tar.zst` — Content-addressed advisory cache-file archives.
+- `snapshots/<YYYYMMDD>-<shard>/<shard_id>.bincode` — Schema-v4 metadata index shards, one directory per UTC day and shard number (`00`-`05`), holding append-only content-addressed files. Shards are zstd-compressed at rest; `<shard_id>` is the BLAKE3 hash of the uncompressed bincode bytes. Schema-v2/v3 shards remain readable, and shards from future schemas are preserved rather than consolidated or deleted.
 - `entries/<input_key>.bin` — Fallback metadata objects only for entries whose compressed metadata exceeds 16 KiB, plus legacy schema-v2 entries. The key is the hex encoding of `input_key`, itself a BLAKE3 hash of the task spec, environment, package-dependency versions, upstream task outputs, and resolved task inputs.
 
-The date baked into each `snapshots/` directory name makes lifecycle rules straightforward to write: target `snapshots/<date>-*` prefixes for a given cutoff directly, no need to inspect individual object ages. `blobs/` and `entries/` have no date in their keys, so expire those by object age instead — matching `LUCHTA_SHARED_CACHE_GC_DAYS` keeps remote retention roughly in step with local GC.
+The date baked into each `snapshots/` directory name makes lifecycle rules straightforward to write: target `snapshots/<date>-*` prefixes for a given cutoff directly, no need to inspect individual object ages. `blobs/`, `cache-files/`, and `entries/` have no date in their keys, so expire those by object age instead — matching `LUCHTA_SHARED_CACHE_GC_DAYS` keeps remote retention roughly in step with local GC.
 
 **Shard count is fixed, not configurable.** Six shards per day (`SHARED_CACHE_SHARD_COUNT`) is a wire-compatibility constant: the read set is exactly `day_window * 6` keys, computed independently on every machine. A machine writing with a higher shard count would put entries in shard numbers a machine reading with a lower count never asks for, and that loss is silent — no error, just a quieter cache. Decreasing the shard count fleet-wide is safe (the old, now-unreachable high-numbered shards just age out via GC); increasing it is not, unless every machine changes at once. That asymmetry is why it isn't exposed as an env var.
 
@@ -1148,7 +1164,7 @@ The shared cache is **OPT-IN** and is configured exclusively via environment var
 - `LUCHTA_SHARED_CACHE_DIR` — Override the cache root directory.
 - `LUCHTA_SHARED_CACHE_SYNC_TIMEOUT` — Maximum seconds for each normal remote operation and the total end-of-cycle upload drain. Default: `30`.
 - `LUCHTA_SHARED_CACHE_GC_DAYS` — Retention period for local cache entries. Default: `14`.
-- `LUCHTA_SHARED_CACHE_MAX_OUTPUT_MB` — Maximum size for a single task's output to be cached. Default: `250`.
+- `LUCHTA_SHARED_CACHE_MAX_OUTPUT_MB` — Maximum size for a single task's normal output archive or advisory cache-file state; the two limits are applied independently. Default: `250`.
 - `LUCHTA_SHARED_CACHE_DAYS` — Number of UTC days of shard history to read. Default: `3`. Deprecated alias `LUCHTA_SHARED_CACHE_HISTORY` (which counted commits, not days) is still read for one release; setting it prints a deprecation warning, and if both are set, `LUCHTA_SHARED_CACHE_DAYS` wins.
 
 Invalid numeric values will trigger a warning and fall back to their defaults.
@@ -1161,7 +1177,7 @@ Invalid numeric values will trigger a warning and fall back to their defaults.
 - `LUCHTA_SHARED_CACHE_RCLONE_CHECKERS` — rclone rcd `--checkers` setting. Default: `8`.
 - `LUCHTA_SHARED_CACHE_RCLONE_JOB_EXPIRE_DURATION` — rclone rcd `--rc-job-expire-duration`; must exceed execution timeout so finished jobs are not reaped before polling completes. Default: `10m`.
 - `LUCHTA_SHARED_CACHE_PUSH_QUEUE_CAPACITY` — Bounded background push queue depth. When full, producers continue immediately and optional remote cache work is dropped with one warning. Default: `256`.
-- `LUCHTA_SHARED_CACHE_MIN_DURATION_MS` — Tasks whose measured execution is faster than this are not stored; semaphore wait and cache-decision time are excluded. Trusted schema-v3 entries below the reader's threshold are also skipped. Default: `100`.
+- `LUCHTA_SHARED_CACHE_MIN_DURATION_MS` — Tasks whose measured execution is faster than this are not stored; semaphore wait and cache-decision time are excluded. Trusted schema-v3/v4 entries below the reader's threshold are also skipped. Default: `100`.
 - `LUCHTA_SHARED_CACHE_STATS` — Set to `1` to print one concise aggregate diagnostics line at the end of each run or watch cycle. It includes snapshot, inline/fallback restore, blob, byte/latency, queue, upload, and disable-reason counters. Disabled by default.
 
 #### Remote Synchronization (S3/rclone)
@@ -1174,7 +1190,7 @@ This fails safe: when the daemon won't start, Luchta records the error, disables
 1. **Setup:** Run `rclone config` to create and name a remote (e.g., `my-s3`).
 2. **Enable:** Set `LUCHTA_SHARED_CACHE=rclone:<remote-name>:<bucket>/<prefix>`.
    - Example: `rclone:my-s3:my-bucket/luchta-cache`.
-   - Luchta appends `blobs/`, `snapshots/`, and `entries/` beneath this base,
+   - Luchta appends `blobs/`, `cache-files/`, `snapshots/`, and `entries/` beneath this base,
      so a dedicated bucket or prefix is recommended.
    - For S3 (and other bucket-based backends) you **must** include the bucket
      name — pointing at the bare remote root (`rclone:my-s3`) is not a valid
@@ -1184,8 +1200,8 @@ This fails safe: when the daemon won't start, Luchta records the error, disables
 **Resilience & Performance:**
 - **Build Safety:** Remote cache problems never fail a build. Health failures disable remote access immediately; isolated timeouts fail open and count toward the configured cumulative threshold. Warnings identify the failed phase, such as snapshot download, metadata fallback, blob restore, upload preflight, artifact upload, or final flush.
 - **No CAS Required:** Snapshots are stored as append-only content-addressed shards, eliminating the need for complex "Compare-and-Swap" operations on the remote store.
-- **Garbage Collection:** Remote GC is not managed by Luchta. Use S3 bucket lifecycle rules or similar object store features to expire old objects under all three prefixes — `blobs/`, `snapshots/`, *and* fallback-only `entries/`. Leaving `entries/` out of those rules lets oversized and legacy metadata grow without bound.
-  Set the `entries/` cutoff generously relative to the day window (`LUCHTA_SHARED_CACHE_DAYS`), or use last-access-based expiry if your object store supports it. A hit refreshes the v3 index shard, not a fallback object's timestamp. If fallback metadata expires while its index remains discoverable, the lookup safely misses and the task re-stores it.
+- **Garbage Collection:** Remote GC is not managed by Luchta. Use S3 bucket lifecycle rules or similar object store features to expire old objects under all four prefixes — `blobs/`, `cache-files/`, `snapshots/`, *and* fallback-only `entries/`. Leaving any immutable-object prefix out lets it grow without bound.
+  Set the `entries/` cutoff generously relative to the day window (`LUCHTA_SHARED_CACHE_DAYS`), or use last-access-based expiry if your object store supports it. A hit refreshes the current index shard, not a fallback object's timestamp. If fallback metadata expires while its index remains discoverable, the lookup safely misses and the task re-stores it.
 
 #### Cacheability
 A task is eligible for the shared cache if all the following are true:
@@ -1196,8 +1212,14 @@ A task is eligible for the shared cache if all the following are true:
 
 The working tree's git status plays no part in eligibility: uncommitted changes are simply reflected in the resolved input hash that makes up part of `input_key`, so a dirty and a clean build of the same task land in distinct, independently cacheable entries rather than one being excluded.
 
+Advisory cache files apply the same success, minimum-duration, package-boundary,
+and size checks independently. Normal output storage can succeed when cache
+files exceed the limit, and cache-file storage can succeed when normal outputs
+exceed it. An eligible empty cache-file set stores a tombstone rather than an
+archive.
+
 #### Maintenance
-Luchta automatically performs throttled garbage collection of old local cache entries, snapshot shards, and blobs (those older than `LUCHTA_SHARED_CACHE_GC_DAYS`). The cache is read-tolerant; if a blob or entry is missing due to GC or other reasons, it is treated as a cache miss.
+Luchta automatically performs throttled garbage collection of old local cache entries, snapshot shards, output blobs, and cache-file blobs (those older than `LUCHTA_SHARED_CACHE_GC_DAYS`). The cache is read-tolerant; if a blob or entry is missing due to GC or other reasons, it is treated as a cache miss.
 
 #### Stats
 Shared cache hits are shown in the build summary: `📥 <n>`. Set `LUCHTA_SHARED_CACHE_STATS=1` for the optional per-cycle diagnostics line; normal and summary output are unchanged otherwise.
