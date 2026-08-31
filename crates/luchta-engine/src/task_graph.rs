@@ -123,6 +123,15 @@ pub enum TaskValidationReason {
     UnknownWorker {
         worker: String,
     },
+    CacheFilesRequireCache,
+    InvalidCacheFilePattern {
+        pattern: String,
+    },
+    CacheFileOverlap {
+        cache_file: String,
+        role: &'static str,
+        pattern: String,
+    },
 }
 
 impl std::fmt::Display for TaskValidationReason {
@@ -138,6 +147,21 @@ impl std::fmt::Display for TaskValidationReason {
             Self::UnknownWorker { worker } => {
                 write!(f, "references unknown worker '{worker}'")
             }
+            Self::CacheFilesRequireCache => {
+                write!(f, "declares cacheFiles but does not enable cache")
+            }
+            Self::InvalidCacheFilePattern { pattern } => write!(
+                f,
+                "cacheFiles pattern '{pattern}' must stay inside the task package"
+            ),
+            Self::CacheFileOverlap {
+                cache_file,
+                role,
+                pattern,
+            } => write!(
+                f,
+                "cacheFiles pattern '{cache_file}' overlaps declared {role} pattern '{pattern}'"
+            ),
         }
     }
 }
@@ -405,6 +429,8 @@ impl TaskGraph {
                 _ => {}
             }
 
+            validate_cache_file_definition(task_id, definition, &mut diagnostics);
+
             for dependency in &definition.depends_on {
                 if let Some(reason) = dependency_context.dead_dependency_reason(task_id, dependency)
                 {
@@ -629,6 +655,177 @@ impl TaskGraph {
     fn validate_acyclic(&self) -> Result<(), EngineError> {
         self.topological_order().map(|_| ())
     }
+}
+
+fn validate_cache_file_definition(
+    task_id: &TaskId,
+    definition: &TaskDefinition,
+    diagnostics: &mut Vec<TaskValidationDiagnostic>,
+) {
+    if definition.cache_files.is_empty() {
+        return;
+    }
+    if !definition.cache_enabled() {
+        push_task_diagnostic(
+            diagnostics,
+            task_id,
+            TaskValidationReason::CacheFilesRequireCache,
+        );
+    }
+
+    for cache_file in definition
+        .cache_files
+        .iter()
+        .filter(|pattern| !cache_file_pattern_stays_in_package(pattern))
+    {
+        push_task_diagnostic(
+            diagnostics,
+            task_id,
+            TaskValidationReason::InvalidCacheFilePattern {
+                pattern: cache_file.clone(),
+            },
+        );
+    }
+
+    for (role, patterns) in [
+        ("input", definition.inputs.as_slice()),
+        ("output", definition.outputs.as_slice()),
+    ] {
+        validate_cache_file_role_overlaps(
+            CacheFileRoleValidation {
+                task_id,
+                definition,
+                role,
+                role_patterns: patterns,
+            },
+            diagnostics,
+        );
+    }
+}
+
+fn push_task_diagnostic(
+    diagnostics: &mut Vec<TaskValidationDiagnostic>,
+    task_id: &TaskId,
+    reason: TaskValidationReason,
+) {
+    diagnostics.push(TaskValidationDiagnostic {
+        task_id: task_id.clone(),
+        reason,
+    });
+}
+
+fn cache_file_pattern_stays_in_package(pattern: &str) -> bool {
+    let (_, body) = luchta_glob::split_negation(pattern);
+    pattern_stays_in_package(body)
+}
+
+struct CacheFileRoleValidation<'a> {
+    task_id: &'a TaskId,
+    definition: &'a TaskDefinition,
+    role: &'static str,
+    role_patterns: &'a [String],
+}
+
+fn validate_cache_file_role_overlaps(
+    validation: CacheFileRoleValidation<'_>,
+    diagnostics: &mut Vec<TaskValidationDiagnostic>,
+) {
+    let cache_files = validation
+        .definition
+        .cache_files
+        .iter()
+        .filter(|pattern| !luchta_glob::is_negated(pattern));
+    let role_patterns_to_check = validation
+        .role_patterns
+        .iter()
+        .filter(|pattern| !luchta_glob::is_negated(pattern));
+
+    for (cache_file, pattern) in cache_files
+        .flat_map(|cache_file| {
+            role_patterns_to_check
+                .clone()
+                .map(move |pattern| (cache_file, pattern))
+        })
+        .filter(|(cache_file, pattern)| {
+            patterns_obviously_overlap(cache_file, pattern)
+                && !literal_overlap_is_excluded(
+                    cache_file,
+                    &validation.definition.cache_files,
+                    pattern,
+                    validation.role_patterns,
+                )
+        })
+    {
+        push_task_diagnostic(
+            diagnostics,
+            validation.task_id,
+            TaskValidationReason::CacheFileOverlap {
+                cache_file: cache_file.clone(),
+                role: validation.role,
+                pattern: pattern.clone(),
+            },
+        );
+    }
+}
+
+fn pattern_stays_in_package(pattern: &str) -> bool {
+    let path = std::path::Path::new(pattern);
+    !path.is_absolute()
+        && !path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+}
+
+fn patterns_obviously_overlap(left: &str, right: &str) -> bool {
+    let (_, left) = luchta_glob::split_negation(left);
+    let (_, right) = luchta_glob::split_negation(right);
+    if left == right {
+        return true;
+    }
+
+    literal_matches_pattern(left, right) || literal_matches_pattern(right, left)
+}
+
+fn literal_matches_pattern(literal: &str, pattern: &str) -> bool {
+    if luchta_types::classify_pattern(literal) != luchta_types::InputSemantics::Literal {
+        return false;
+    }
+    luchta_glob::build_path_glob(pattern).is_ok_and(|glob| {
+        glob.compile_matcher()
+            .is_match(luchta_glob::unescape_literal(literal))
+    })
+}
+
+fn literal_overlap_is_excluded(
+    cache_file: &str,
+    cache_file_patterns: &[String],
+    role_pattern: &str,
+    role_patterns: &[String],
+) -> bool {
+    let cache_file_is_literal =
+        luchta_types::classify_pattern(cache_file) == luchta_types::InputSemantics::Literal;
+    let role_is_literal =
+        luchta_types::classify_pattern(role_pattern) == luchta_types::InputSemantics::Literal;
+
+    (cache_file_is_literal && literal_is_excluded(cache_file, role_patterns))
+        || (role_is_literal && literal_is_excluded(role_pattern, cache_file_patterns))
+}
+
+fn literal_is_excluded(literal: &str, patterns: &[String]) -> bool {
+    let literal = luchta_glob::unescape_literal(literal);
+    patterns
+        .iter()
+        .filter(|pattern| luchta_glob::is_negated(pattern))
+        .any(|pattern| {
+            let (_, body) = luchta_glob::split_negation(pattern);
+            luchta_glob::build_path_glob(body)
+                .is_ok_and(|glob| glob.compile_matcher().is_match(&literal))
+        })
 }
 
 impl ResolvedPipeline {
@@ -1164,7 +1361,7 @@ mod tests {
     use tempfile::tempdir;
 
     use luchta_types::{
-        DependsOn, PackageName, TaskDefinition, TaskId, TaskName, WorkerDefinition,
+        CacheConfig, DependsOn, PackageName, TaskDefinition, TaskId, TaskName, WorkerDefinition,
     };
     use luchta_workspace::{PackageGraph, PackageNode};
 
@@ -2065,6 +2262,87 @@ mod tests {
             (Some(source), Some(target)) => task_graph.as_graph().contains_edge(source, target),
             _ => false,
         }
+    }
+
+    #[test]
+    fn cache_files_require_cache_and_package_local_paths() {
+        let diagnostics = cache_file_validation_diagnostics(TaskDefinition {
+            cache_files: vec!["../outside.cache".to_owned()],
+            ..TaskDefinition::default()
+        });
+
+        assert!(diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.reason == TaskValidationReason::CacheFilesRequireCache));
+        assert!(diagnostics.iter().any(|diagnostic| matches!(
+            &diagnostic.reason,
+            TaskValidationReason::InvalidCacheFilePattern { pattern }
+                if pattern == "../outside.cache"
+        )));
+    }
+
+    #[test]
+    fn cache_files_reject_obvious_input_and_output_overlap() {
+        let diagnostics = cache_file_validation_diagnostics(TaskDefinition {
+            cache: Some(CacheConfig::default()),
+            inputs: vec!["src/**".to_owned()],
+            outputs: vec!["reports/lint.json".to_owned()],
+            cache_files: vec![
+                "src/.eslintcache".to_owned(),
+                "reports/lint.json".to_owned(),
+            ],
+            ..TaskDefinition::default()
+        });
+        let mut roles = diagnostics
+            .iter()
+            .filter_map(|diagnostic| match &diagnostic.reason {
+                TaskValidationReason::CacheFileOverlap { role, .. } => Some(*role),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        roles.sort_unstable();
+
+        assert_eq!(roles, ["input", "output"]);
+    }
+
+    #[test]
+    fn cache_files_accept_disjoint_paths_and_excluded_literal_overlap() {
+        let package_graph = package_graph_single("@repo/app");
+        let valid = HashMap::from([(
+            TaskName::from("lint"),
+            TaskDefinition {
+                cache: Some(CacheConfig::default()),
+                inputs: vec!["src/**".to_owned()],
+                outputs: vec!["reports/**".to_owned()],
+                cache_files: vec![".eslintcache".to_owned()],
+                ..TaskDefinition::default()
+            },
+        )]);
+        TaskGraph::validate_tasks(&package_graph, &valid, &HashMap::new())
+            .expect("disjoint package-local cache files should validate");
+
+        let excluded_overlap = HashMap::from([(
+            TaskName::from("lint"),
+            TaskDefinition {
+                cache: Some(CacheConfig::default()),
+                inputs: vec!["cache/input.bin".to_owned()],
+                cache_files: vec!["cache/**".to_owned(), "!cache/input.bin".to_owned()],
+                ..TaskDefinition::default()
+            },
+        )]);
+        TaskGraph::validate_tasks(&package_graph, &excluded_overlap, &HashMap::new())
+            .expect("cacheFiles exclusions should remove obvious literal overlaps");
+    }
+
+    fn cache_file_validation_diagnostics(
+        definition: TaskDefinition,
+    ) -> Vec<TaskValidationDiagnostic> {
+        let package_graph = package_graph_single("@repo/app");
+        let pipeline = HashMap::from([(TaskName::from("lint"), definition)]);
+        let DependencyValidationError::InvalidTasks { diagnostics } =
+            TaskGraph::validate_tasks(&package_graph, &pipeline, &HashMap::new())
+                .expect_err("cache file definition should be invalid");
+        diagnostics
     }
 
     fn build_single_dep_graph(depends_on: DependsOn) -> TaskGraph {

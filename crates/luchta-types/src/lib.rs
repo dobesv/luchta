@@ -227,6 +227,13 @@ pub struct TaskDefinition {
     /// Output paths or globs produced by task for cache restore.
     #[serde(default)]
     pub outputs: Vec<String>,
+    /// Disposable, performance-only files used to warm a task execution.
+    ///
+    /// Cache files use package-relative output-style globs. They are restored
+    /// only from the shared cache and never participate in skip decisions,
+    /// output hashes, or downstream invalidation.
+    #[serde(default, rename = "cacheFiles", alias = "cache_files")]
+    pub cache_files: Vec<String>,
     /// Package-dependency filter selecting which dependencies' resolved
     /// versions (and their full transitive closures) feed this task's
     /// dependency cache hash. Reuses the same pattern grammar as `inputs`
@@ -255,6 +262,7 @@ impl TaskDefinition {
             cache: None,
             inputs: Vec::new(),
             outputs: Vec::new(),
+            cache_files: Vec::new(),
             dependencies: default_dependencies(),
             env: BTreeMap::new(),
         }
@@ -307,6 +315,7 @@ impl Default for TaskDefinition {
             cache: None,
             inputs: Vec::new(),
             outputs: Vec::new(),
+            cache_files: Vec::new(),
             dependencies: default_dependencies(),
             env: BTreeMap::new(),
         }
@@ -932,6 +941,28 @@ mod tests {
         let task: TaskDefinition =
             serde_json::from_str(r#"{}"#).expect("deserialize task without dependencies");
         assert_eq!(task.dependencies, vec!["**/*".to_string()]);
+    }
+
+    #[test]
+    fn task_definition_deserializes_cache_files_in_camel_and_snake_case() {
+        let camel: TaskDefinition = serde_json::from_str(
+            r#"{"cache":{},"cacheFiles":[".eslintcache","cache/**","!cache/tmp/**"]}"#,
+        )
+        .unwrap();
+        let snake: TaskDefinition =
+            serde_json::from_str(r#"{"cache":{},"cache_files":[".eslintcache"]}"#).unwrap();
+
+        assert_eq!(
+            camel.cache_files,
+            [".eslintcache", "cache/**", "!cache/tmp/**"]
+        );
+        assert_eq!(snake.cache_files, [".eslintcache"]);
+        let serialized = serde_json::to_value(&camel).unwrap();
+        assert_eq!(
+            serialized.get("cacheFiles").unwrap(),
+            &serde_json::json!([".eslintcache", "cache/**", "!cache/tmp/**"])
+        );
+        assert!(serialized.get("cache_files").is_none());
     }
 
     #[test]

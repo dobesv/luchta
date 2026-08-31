@@ -4,9 +4,14 @@
 //! rclone rcd sidecar — and its run-wide disable-and-warn state. Kept separate
 //! from `mod.rs` so the local cache and the remote sync concerns stay cohesive.
 
+mod blobs;
+#[cfg(test)]
+mod cache_file_tests;
 mod limiter;
 #[cfg(test)]
 mod queue_tests;
+
+pub(crate) use blobs::OwnedCacheFileBlob;
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -27,7 +32,7 @@ use std::time::{Duration, Instant};
 use super::snapshot::{SnapshotUpload, SNAPSHOT_FILE_EXTENSION, SNAPSHOT_MERGED_EXTENSION};
 use super::stats::{directory_file_bytes, SharedCacheStats};
 use super::{
-    blob_path, entry_meta_path, hex_hash, rclone, MergeEntryOutcome, RcloneRcd, SharedCachePaths,
+    entry_meta_path, hex_hash, rclone, MergeEntryOutcome, RcloneRcd, SharedCachePaths,
     SnapshotStore, BLOBS_DIR_NAME, ENTRIES_DIR_NAME, SNAPSHOTS_DIR_NAME,
 };
 use limiter::RemoteOperationLimiter;
@@ -210,6 +215,7 @@ impl Drop for RemoteSync {
 #[derive(Debug)]
 enum PushMsg {
     EntryArtifacts(OwnedEntryArtifacts),
+    CacheFileBlob(OwnedCacheFileBlob),
     IndexMerge(OwnedIndexPush),
     Flush(std::sync::mpsc::Sender<()>),
     #[cfg(test)]
@@ -647,6 +653,9 @@ impl RemoteSync {
             {
                 match job.message {
                     PushMsg::EntryArtifacts(push) => self.push_entry_artifacts_owned(push),
+                    PushMsg::CacheFileBlob(push) => {
+                        self.push_cache_file_blob_if_missing(&push.paths, &push.state_hash)
+                    }
                     PushMsg::IndexMerge(push) => self.push_index_merge_owned(push),
                     PushMsg::Flush(ack) => {
                         let _ = ack.send(());
@@ -672,7 +681,7 @@ impl RemoteSync {
 
     fn wait_for_previous_jobs(&self, previous: usize, message: &PushMsg) -> bool {
         let may_run_concurrently = match message {
-            PushMsg::EntryArtifacts(_) => true,
+            PushMsg::EntryArtifacts(_) | PushMsg::CacheFileBlob(_) => true,
             #[cfg(test)]
             PushMsg::TestDelay { .. } => true,
             _ => false,
@@ -906,52 +915,6 @@ impl RemoteSync {
         }
     }
 
-    pub(crate) fn pull_blob(
-        &self,
-        paths: &SharedCachePaths,
-        outputs_hash: &[u8; 32],
-    ) -> Result<(), rclone::RcloneError> {
-        if self.is_disabled() {
-            return Ok(());
-        }
-        let file_name = format!("{}.tar.zst", hex_hash(*outputs_hash));
-        let local_path = paths.blobs_dir.join(&file_name);
-        if local_path.exists() {
-            return Ok(());
-        }
-        self.state.stats.blob_gets.fetch_add(1, Ordering::AcqRel);
-        let Some((result, elapsed)) = self.remote_operation(|timeout| {
-            self.copy_remote_file_down(RemoteFileDownload {
-                src_fs: &self.blobs_fs(),
-                src_remote: &file_name,
-                local_path: &local_path,
-                timeout,
-            })
-        }) else {
-            return Ok(());
-        };
-        self.state
-            .stats
-            .download_latency_ms
-            .fetch_add(elapsed.as_millis() as u64, Ordering::AcqRel);
-        match result {
-            Ok(()) => {
-                self.record_remote_success();
-                self.state.stats.download_bytes.fetch_add(
-                    fs::metadata(&local_path)
-                        .map(|meta| meta.len())
-                        .unwrap_or(0),
-                    Ordering::AcqRel,
-                );
-                Ok(())
-            }
-            Err(err) => {
-                self.record_remote_error(&err);
-                Err(err)
-            }
-        }
-    }
-
     fn copy_remote_file_down(
         &self,
         download: RemoteFileDownload<'_>,
@@ -1047,52 +1010,6 @@ impl RemoteSync {
             }
             self.delete_remote_snapshot_file(shard_key, shard_id, SNAPSHOT_FILE_EXTENSION);
             self.delete_remote_snapshot_file(shard_key, shard_id, SNAPSHOT_MERGED_EXTENSION);
-        }
-    }
-
-    fn push_blob_if_missing(&self, paths: &SharedCachePaths, outputs_hash: &[u8; 32]) {
-        let remote_fs = self.blobs_fs();
-        let blob_name = format!("{}.tar.zst", hex_hash(*outputs_hash));
-        let Some((preflight, _)) =
-            self.remote_operation(|timeout| self.rclone.stat(&remote_fs, &blob_name, timeout))
-        else {
-            return;
-        };
-        match preflight {
-            Ok(Some(_)) => {
-                self.record_remote_success();
-                return;
-            }
-            Ok(None) => {
-                self.record_remote_success();
-            }
-            Err(err) => {
-                self.record_remote_error(&err);
-                eprintln!("warn: shared cache upload preflight failed for blob={blob_name}: {err}");
-                return;
-            }
-        }
-
-        let local_path = blob_path(paths, outputs_hash);
-        let bytes = fs::metadata(&local_path)
-            .map(|meta| meta.len())
-            .unwrap_or(0);
-        let Some((result, elapsed)) = self.remote_operation(|timeout| {
-            self.copy_local_file_up(RemoteFileUpload {
-                local_path: &local_path,
-                dst_fs: &remote_fs,
-                dst_remote: &blob_name,
-                timeout,
-            })
-        }) else {
-            return;
-        };
-        self.record_upload_stats(bytes, elapsed, result.is_ok());
-        if let Err(err) = result {
-            self.record_remote_error(&err);
-            eprintln!("warn: shared cache artifact upload failed for blob={blob_name}: {err}");
-        } else {
-            self.record_remote_success();
         }
     }
 
@@ -1978,6 +1895,7 @@ mod tests {
                 },
             ))
             .collect::<BTreeMap<_, _>>(),
+            cache_files: BTreeMap::new(),
         };
         let remote_commit_dir = cache_dir.path().join("remote/snapshots").join(&commit);
         fs::create_dir_all(&remote_commit_dir).unwrap();

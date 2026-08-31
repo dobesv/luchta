@@ -35,8 +35,21 @@ pub fn task_spec_hash(task_def: &TaskDefinition, nonce: Option<&str>) -> [u8; 32
     };
     let bytes = bincode::serde::encode_to_vec(spec, bincode_config())
         .expect("task spec canonical bincode serialization should succeed");
+    if task_def.cache_files.is_empty() {
+        // Preserve every pre-cacheFiles task hash. Adding an empty field to the
+        // bincode struct would otherwise invalidate the whole existing cache.
+        return *blake3::hash(&bytes).as_bytes();
+    }
 
-    *blake3::hash(&bytes).as_bytes()
+    let cache_files = bincode::serde::encode_to_vec(&task_def.cache_files, bincode_config())
+        .expect("cache file declaration canonical bincode serialization should succeed");
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"luchta-cache:task-spec-cache-files:v1");
+    hasher.update(&(bytes.len() as u64).to_le_bytes());
+    hasher.update(&bytes);
+    hasher.update(&(cache_files.len() as u64).to_le_bytes());
+    hasher.update(&cache_files);
+    *hasher.finalize().as_bytes()
 }
 
 #[must_use]
@@ -111,7 +124,8 @@ enum ResolvedEnvValue {
 
 #[cfg(test)]
 mod tests {
-    use super::{blake3_file, env_hash, pkg_dep_hash, task_spec_hash};
+    use super::{blake3_file, env_hash, pkg_dep_hash, task_spec_hash, TaskSpecHashInput};
+    use crate::serialization::bincode_config;
     use std::{collections::BTreeMap, fs};
 
     use luchta_types::{
@@ -239,6 +253,44 @@ mod tests {
         task.outputs.push("coverage/**".to_owned());
 
         assert_ne!(baseline, task_spec_hash(&task, None));
+    }
+
+    #[test]
+    fn empty_cache_files_preserve_the_legacy_task_hash() {
+        let task = sample_task_definition();
+        assert!(task.cache_files.is_empty());
+        assert_eq!(
+            task_spec_hash(&task, None),
+            *blake3::hash(
+                &bincode::serde::encode_to_vec(
+                    TaskSpecHashInput {
+                        command: task.command.as_deref(),
+                        worker: task.worker.as_deref(),
+                        weight: task.weight,
+                        depends_on: &task.depends_on,
+                        cache_enabled: task.cache_enabled(),
+                        inputs: &task.inputs,
+                        outputs: &task.outputs,
+                        nonce: None,
+                    },
+                    bincode_config(),
+                )
+                .unwrap()
+            )
+            .as_bytes()
+        );
+    }
+
+    #[test]
+    fn task_spec_hash_changes_when_cache_file_declaration_changes() {
+        let mut task = sample_task_definition();
+        let baseline = task_spec_hash(&task, None);
+        task.cache_files = vec![".eslintcache".to_owned()];
+        let eslint = task_spec_hash(&task, None);
+        task.cache_files = vec![".babel-cache/**".to_owned()];
+
+        assert_ne!(baseline, eslint);
+        assert_ne!(eslint, task_spec_hash(&task, None));
     }
 
     #[test]
@@ -597,6 +649,7 @@ mod tests {
             cache: Some(CacheConfig::default()),
             inputs: vec!["src/**/*.ts".to_owned(), "package.json".to_owned()],
             outputs: vec!["dist/**".to_owned()],
+            cache_files: Vec::new(),
             dependencies: vec!["**/*".to_string()],
             env,
         }

@@ -24,6 +24,8 @@ pub(crate) struct SharedCacheStats {
     pub(crate) inline_hits: AtomicU64,
     pub(crate) fallback_meta_gets: AtomicU64,
     pub(crate) blob_gets: AtomicU64,
+    pub(crate) cache_file_blob_gets: AtomicU64,
+    pub(crate) cache_file_blob_uploads: AtomicU64,
     pub(crate) download_bytes: AtomicU64,
     pub(crate) download_latency_ms: AtomicU64,
     pub(crate) queue_depth: AtomicUsize,
@@ -61,14 +63,15 @@ impl SharedCacheStats {
             .unwrap_or_else(|| "none".to_owned());
         format!(
             "shared cache stats: snapshot_syncs={} snapshot_bytes={} inline_hits={} \
-             fallback_meta_gets={} blob_gets={} download_bytes={} download_ms={} \
+             fallback_meta_gets={} blob_gets={} cache_file_blob_gets={} download_bytes={} download_ms={} \
              queue_depth={} queue_max={} queue_drops={} uploads={} upload_bytes={} \
-             upload_ms={} disabled={}",
+             cache_file_blob_uploads={} upload_ms={} disabled={}",
             self.snapshot_syncs.swap(0, Ordering::AcqRel),
             self.snapshot_bytes.swap(0, Ordering::AcqRel),
             self.inline_hits.swap(0, Ordering::AcqRel),
             self.fallback_meta_gets.swap(0, Ordering::AcqRel),
             self.blob_gets.swap(0, Ordering::AcqRel),
+            self.cache_file_blob_gets.swap(0, Ordering::AcqRel),
             self.download_bytes.swap(0, Ordering::AcqRel),
             self.download_latency_ms.swap(0, Ordering::AcqRel),
             current_depth,
@@ -76,6 +79,7 @@ impl SharedCacheStats {
             self.queue_drops.swap(0, Ordering::AcqRel),
             self.uploads.swap(0, Ordering::AcqRel),
             self.upload_bytes.swap(0, Ordering::AcqRel),
+            self.cache_file_blob_uploads.swap(0, Ordering::AcqRel),
             self.upload_latency_ms.swap(0, Ordering::AcqRel),
             disable_reason,
         )

@@ -23,6 +23,7 @@ const ENTRY_META_SUFFIX: &str = ".bin";
 pub struct GcStats {
     pub snapshots_deleted: u64,
     pub blobs_deleted: u64,
+    pub cache_file_blobs_deleted: u64,
     pub entries_deleted: usize,
     pub bytes_freed: u64,
 }
@@ -34,9 +35,33 @@ pub fn run_gc(paths: &SharedCachePaths, retention: Duration) -> GcStats {
 
     gc_snapshot_dir(paths, retention, now, &mut stats);
     gc_blob_dir(paths, retention, now, &mut stats);
+    gc_cache_file_blob_dir(paths, retention, now, &mut stats);
     gc_entries_dir(paths, retention, now, &mut stats);
 
     stats
+}
+
+fn gc_cache_file_blob_dir(
+    paths: &SharedCachePaths,
+    retention: Duration,
+    now: SystemTime,
+    stats: &mut GcStats,
+) {
+    let entries = match fs::read_dir(&paths.cache_files_dir) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !has_file_name_suffix(&path, BLOB_SUFFIX) || !is_older_than(&path, retention, now) {
+            continue;
+        }
+        let bytes = file_len(&path);
+        if remove_file_if_exists(&path) {
+            stats.cache_file_blobs_deleted += 1;
+            stats.bytes_freed = stats.bytes_freed.saturating_add(bytes);
+        }
+    }
 }
 
 pub fn maybe_run_gc(
@@ -413,26 +438,34 @@ mod tests {
 
         let old_snapshot = write_snapshot(&paths, "old-commit", [9; 32]);
         let old_blob = write_blob_fixture(&paths, &package_dir, [8; 32]);
+        let old_cache_file_blob = paths.cache_files_dir.join("old.tar.zst");
+        fs::write(&old_cache_file_blob, b"old cache-file blob").unwrap();
 
         let recent_snapshot = paths.snapshots_dir.join("recent-commit.bincode");
         fs::write(&recent_snapshot, b"recent").unwrap();
         let recent_blob = paths.blobs_dir.join("recent.tar.zst");
         fs::write(&recent_blob, b"recent blob").unwrap();
+        let recent_cache_file_blob = paths.cache_files_dir.join("recent.tar.zst");
+        fs::write(&recent_cache_file_blob, b"recent cache-file blob").unwrap();
 
         let stale = SystemTime::now() - Duration::from_secs(3 * 24 * 60 * 60);
         set_mtime(&old_snapshot, stale);
         set_mtime(&old_blob, stale);
+        set_mtime(&old_cache_file_blob, stale);
 
         let stats = run_gc(&paths, Duration::from_secs(24 * 60 * 60));
 
         assert_eq!(stats.snapshots_deleted, 1);
         assert_eq!(stats.blobs_deleted, 1);
+        assert_eq!(stats.cache_file_blobs_deleted, 1);
         assert!(stats.bytes_freed > 0);
         assert!(!old_snapshot.exists());
         assert!(!old_snapshot.parent().unwrap().exists());
         assert!(!old_blob.exists());
+        assert!(!old_cache_file_blob.exists());
         assert!(recent_snapshot.exists());
         assert!(recent_blob.exists());
+        assert!(recent_cache_file_blob.exists());
     }
 
     #[test]

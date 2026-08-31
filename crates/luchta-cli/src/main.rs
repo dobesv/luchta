@@ -324,6 +324,26 @@ fn task_validation_diagnostic_report(diagnostic: TaskValidationDiagnostic) -> mi
             diagnostic.task_id,
             worker
         ),
+        TaskValidationReason::CacheFilesRequireCache => miette::miette!(
+            "task '{}' declares cacheFiles but does not enable cache; add cache: {{}}",
+            diagnostic.task_id
+        ),
+        TaskValidationReason::InvalidCacheFilePattern { pattern } => miette::miette!(
+            "task '{}' cacheFiles pattern '{}' must be package-relative and may not traverse a parent directory",
+            diagnostic.task_id,
+            pattern
+        ),
+        TaskValidationReason::CacheFileOverlap {
+            cache_file,
+            role,
+            pattern,
+        } => miette::miette!(
+            "task '{}' cacheFiles pattern '{}' overlaps declared {} pattern '{}'",
+            diagnostic.task_id,
+            cache_file,
+            role,
+            pattern
+        ),
     }
 }
 

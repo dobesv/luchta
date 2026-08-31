@@ -1,5 +1,5 @@
 use super::*;
-use luchta_cache::CurrentState;
+use luchta_cache::{path_matches_resolve_requests, CurrentState, ResolveRequest};
 
 struct SharedCacheSkipInput<'a> {
     task_def: &'a TaskDefinition,
@@ -14,10 +14,27 @@ pub(in crate::run) struct PreparedSharedCacheHit {
     restore: luchta_cache::shared::PreparedRestore,
 }
 
+pub(in crate::run) struct PreparedAdvisoryCacheFiles {
+    package_path: PathBuf,
+    patterns: Vec<String>,
+    restore: luchta_cache::shared::PreparedCacheFiles,
+}
+
+struct StagedCacheFileValidation<'a> {
+    ctx: &'a DecisionContext,
+    task_id: &'a TaskId,
+    package_path: &'a Path,
+    task_def: &'a TaskDefinition,
+    current: &'a CurrentState<'a>,
+    local_record: Option<&'a TaskRunRecord>,
+    restore: &'a luchta_cache::shared::PreparedCacheFiles,
+}
+
 pub(in crate::run) struct PreparedCacheDecision {
     pub(in crate::run) decision: Decision,
     pub(in crate::run) cache_write: Option<CacheWriteContext>,
     pub(in crate::run) shared_hit: Option<PreparedSharedCacheHit>,
+    pub(in crate::run) cache_files: Option<PreparedAdvisoryCacheFiles>,
 }
 
 impl PreparedCacheDecision {
@@ -26,6 +43,7 @@ impl PreparedCacheDecision {
             decision: Decision::Run,
             cache_write: None,
             shared_hit: None,
+            cache_files: None,
         }
     }
 }
@@ -35,9 +53,14 @@ fn prepare_cache_decision_context(
     ctx: &DecisionContext,
     no_cache: bool,
     cache_ctx: &mut CacheWriteContext,
-) -> Option<PreparedSharedCacheHit> {
+) -> (
+    Option<PreparedSharedCacheHit>,
+    Option<PreparedAdvisoryCacheFiles>,
+) {
     let task_def = cache_ctx.task_def.clone();
-    let cache_context = cache_read_state_context(task_id, ctx, cache_ctx)?;
+    let Some(cache_context) = cache_read_state_context(task_id, ctx, cache_ctx) else {
+        return (None, None);
+    };
     let cache_nonce = cache_ctx.cache_nonce.clone();
     let merged_env = match ctx.task_envs.get(task_id) {
         Some(env) => env,
@@ -67,7 +90,21 @@ fn prepare_cache_decision_context(
     if no_cache {
         cache_ctx.decision = cache_run_decision();
     }
-    shared_hit
+    let cache_files = if shared_hit.is_none() && matches!(decision.action, Decision::Run) {
+        maybe_prepare_advisory_cache_files(
+            ctx,
+            no_cache,
+            task_id,
+            &task_def,
+            &cache_ctx.package_path,
+            &current,
+            &cache_context.dep_outputs,
+            local_record.as_ref(),
+        )
+    } else {
+        None
+    };
+    (shared_hit, cache_files)
 }
 
 fn cache_read_state_context(
@@ -125,12 +162,146 @@ pub(super) fn prepare_cache_decision(
     };
     cache_ctx.cache_nonce = nonce;
 
-    let shared_hit = prepare_cache_decision_context(task_id, ctx, false, &mut cache_ctx);
+    let (shared_hit, cache_files) =
+        prepare_cache_decision_context(task_id, ctx, false, &mut cache_ctx);
     let decision = cache_ctx.decision.action;
     PreparedCacheDecision {
         decision,
         cache_write: matches!(decision, Decision::Run).then_some(cache_ctx),
         shared_hit,
+        cache_files,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn maybe_prepare_advisory_cache_files(
+    ctx: &DecisionContext,
+    no_cache: bool,
+    task_id: &TaskId,
+    task_def: &TaskDefinition,
+    package_path: &Path,
+    current: &CurrentState<'_>,
+    dep_outputs: &BTreeMap<String, [u8; 32]>,
+    local_record: Option<&TaskRunRecord>,
+) -> Option<PreparedAdvisoryCacheFiles> {
+    if no_cache || task_def.cache_files.is_empty() {
+        return None;
+    }
+    let shared_cache = ctx.shared_cache.as_ref()?;
+
+    // Local state is authoritative as one coherent set: one matching file is
+    // enough to suppress all shared restoration.
+    let local_cache_files = resolve_outputs(package_path, &task_def.cache_files).ok()?;
+    if local_cache_files.iter().any(|entry| !entry.absent) {
+        return None;
+    }
+
+    let scope = derive_cache_file_scope(
+        &task_id.to_string(),
+        current.task_spec_hash,
+        current.env_hash,
+        current.pkg_dep_hash,
+    );
+    let restore =
+        shared_cache.prepare_cache_files(luchta_cache::shared::CacheFileRestoreRequest {
+            scope_hash: &scope,
+            upstream_outputs_hash: combined_dep_outputs_hash(dep_outputs),
+            package_dir: package_path,
+            patterns: &task_def.cache_files,
+        })?;
+
+    if !staged_cache_files_are_disjoint(StagedCacheFileValidation {
+        ctx,
+        task_id,
+        package_path,
+        task_def,
+        current,
+        local_record,
+        restore: &restore,
+    }) {
+        let _ = restore.discard();
+        ctx.reporter.output().stderr_line(&format!(
+            "warning: shared cache-file restore for task '{task_id}' overlaps resolved inputs or outputs; running cold"
+        ));
+        return None;
+    }
+
+    Some(PreparedAdvisoryCacheFiles {
+        package_path: package_path.to_path_buf(),
+        patterns: task_def.cache_files.clone(),
+        restore,
+    })
+}
+
+fn staged_cache_files_are_disjoint(validation: StagedCacheFileValidation<'_>) -> bool {
+    let input_requests = match expand_input_patterns(
+        &validation.task_def.inputs,
+        &validation.task_id.package,
+        &validation.ctx.package_graph,
+        &validation.ctx.workspace_root,
+    ) {
+        Ok(requests) => requests,
+        Err(_) => return false,
+    };
+    let output_requests = validation
+        .task_def
+        .outputs
+        .iter()
+        .map(|pattern| ResolveRequest::new(validation.package_path.to_path_buf(), pattern))
+        .collect::<Vec<_>>();
+    let prior_inputs = validation
+        .local_record
+        .map_or(&[][..], |record| record.inputs.as_slice());
+    let inputs = match validation
+        .current
+        .resolver
+        .resolve_inputs(validation.current.declared_input_patterns, prior_inputs)
+    {
+        Ok(inputs) => inputs,
+        Err(_) => return false,
+    };
+    let outputs = match resolve_outputs(validation.package_path, &validation.task_def.outputs) {
+        Ok(outputs) => outputs,
+        Err(_) => return false,
+    };
+    let occupied = inputs
+        .iter()
+        .map(|entry| validation.ctx.workspace_root.join(&entry.path))
+        .chain(
+            outputs
+                .iter()
+                .map(|entry| validation.package_path.join(&entry.path)),
+        )
+        .collect::<HashSet<_>>();
+    validation.restore.relative_paths().iter().all(|path| {
+        let absolute = validation.package_path.join(path);
+        !occupied.contains(&absolute)
+            && path_matches_resolve_requests(&absolute, &input_requests)
+                .is_ok_and(|matched| !matched)
+            && path_matches_resolve_requests(&absolute, &output_requests)
+                .is_ok_and(|matched| !matched)
+    })
+}
+
+pub(super) fn finalize_advisory_cache_files(
+    task_id: &TaskId,
+    prepared: PreparedAdvisoryCacheFiles,
+    ctx: &DispatchContext<'_>,
+) {
+    // Recheck local precedence at the commit boundary. A concurrent process or
+    // an upstream task may have produced local warm state after preparation.
+    if resolve_outputs(&prepared.package_path, &prepared.patterns).is_ok_and(|entries| {
+        entries
+            .iter()
+            .any(|entry| !entry.absent && !prepared.restore.is_staged_path(Path::new(&entry.path)))
+    }) {
+        let _ = prepared.restore.discard();
+        return;
+    }
+    if let Err(error) = prepared.restore.commit() {
+        ctx.reporter.output().stderr_line(&format!(
+            "warning: shared cache-file restore commit failed for task '{task_id}': {error}; running cold"
+        ));
     }
 }
 

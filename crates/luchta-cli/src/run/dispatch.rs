@@ -10,17 +10,22 @@ use super::*;
 
 mod shared_cache;
 
-use shared_cache::{finalize_shared_cache_hit, prepare_cache_decision, PreparedCacheDecision};
+use shared_cache::{
+    finalize_advisory_cache_files, finalize_shared_cache_hit, prepare_cache_decision,
+    PreparedCacheDecision,
+};
 use std::time::Instant;
 
 use crate::cache_ctx::gather_pkg_dep_pairs_filtered;
 
 use luchta_cache::shared::{
-    combined_dep_outputs_hash, derive_input_key, SharedCacheStoreRequest, StoreOutcome,
+    combined_dep_outputs_hash, derive_cache_file_scope, derive_input_key, SharedCacheStoreRequest,
+    StoreOutcome,
 };
 use luchta_cache::{
-    combined_inputs_hash, decide_shared_restore, task_cache_key, CurrentState, FileEntry,
-    ReportInput, RunArtifacts, RunReason, SCHEMA_VERSION_V5,
+    combined_cache_files_hash, combined_inputs_hash, decide_shared_restore, resolve_outputs,
+    task_cache_key, CurrentState, FileEntry, ReportInput, RunArtifacts, RunReason,
+    SCHEMA_VERSION_V5,
 };
 use luchta_types::EnvSpec;
 use luchta_worker::BUILTIN_PASSTHROUGH_ENV;
@@ -367,6 +372,9 @@ pub(super) fn dispatch_decision_result(
                     handle_cache_skip(&task_id, Decision::SharedHit, done_tx, ctx);
                     return Ok(None);
                 }
+            }
+            if let Some(cache_files) = prepared.cache_files {
+                finalize_advisory_cache_files(&task_id, cache_files, ctx);
             }
         }
     }
@@ -914,6 +922,7 @@ async fn write_run_record(
     let env_hash = cache_ctx.env_hash;
     let pkg_dep_hash = cache_ctx.pkg_dep_hash;
     let dep_outputs = cache_ctx.dep_outputs.clone();
+    let cache_file_patterns = cache_ctx.task_def.cache_files.clone();
     let outputs_hash = record.outputs_hash;
     let record_for_local = (*record).clone();
     let record_for_shared = record_for_local.clone();
@@ -941,6 +950,7 @@ async fn write_run_record(
         // Path-escape at this point is FATAL and propagates as expansion error.
         if shared_store_enabled {
             if let Some(shared) = shared_cache {
+                let mut fatal_error = None;
                 // `record_for_shared.inputs` are the stable, already-resolved
                 // inputs captured before the task ran (see
                 // `build_successful_run_record`'s doc comment) — no re-resolve
@@ -993,17 +1003,36 @@ async fn write_run_record(
                     Err(e) => {
                         if e.kind() == std::io::ErrorKind::InvalidData {
                             // Path-escape is a security hard-fail.
-                            return Some(format!(
+                            fatal_error = Some(format!(
                                 "shared cache store failed for task '{}': {}",
                                 task_id_str, e
                             ));
-                        }
-
-                        output.stderr_line(&format!(
+                        } else {
+                            output.stderr_line(&format!(
                             "warning: shared cache store failed for task '{}': {}; continuing with local cache",
                             task_id_str, e
-                        ));
+                            ));
+                        }
                     }
+                }
+
+                publish_advisory_cache_files(AdvisoryCacheFileStore {
+                    shared: &shared,
+                    patterns: &cache_file_patterns,
+                    task_id: &task_id_str,
+                    task_spec_hash,
+                    env_hash,
+                    pkg_dep_hash,
+                    dep_outputs: &dep_outputs,
+                    package_dir: &package_dir,
+                    repo_root: &repo_root,
+                    record: &record_for_shared,
+                    execution_duration_ms,
+                    output: &output,
+                });
+
+                if fatal_error.is_some() {
+                    return fatal_error;
                 }
             }
         }
@@ -1020,6 +1049,104 @@ async fn write_run_record(
         )),
     }
     WriteRecordResult::Ok
+}
+
+struct AdvisoryCacheFileStore<'a> {
+    shared: &'a SharedCache,
+    patterns: &'a [String],
+    task_id: &'a str,
+    task_spec_hash: [u8; 32],
+    env_hash: [u8; 32],
+    pkg_dep_hash: [u8; 32],
+    dep_outputs: &'a BTreeMap<String, [u8; 32]>,
+    package_dir: &'a Path,
+    repo_root: &'a Path,
+    record: &'a TaskRunRecord,
+    execution_duration_ms: u64,
+    output: &'a ProgressOutput,
+}
+
+fn publish_advisory_cache_files(input: AdvisoryCacheFileStore<'_>) {
+    if !input.record.succeeded || input.patterns.is_empty() {
+        return;
+    }
+    let entries = match resolve_outputs(input.package_dir, input.patterns) {
+        Ok(entries) => entries,
+        Err(error) => {
+            input.output.stderr_line(&format!(
+                "warning: failed to resolve cacheFiles for task '{}': {}; advisory state was not published",
+                input.task_id, error
+            ));
+            return;
+        }
+    };
+    let present = entries
+        .into_iter()
+        .filter(|entry| !entry.absent)
+        .collect::<Vec<_>>();
+    if !cache_file_entries_are_disjoint(input.package_dir, input.repo_root, &present, input.record)
+    {
+        input.output.stderr_line(&format!(
+            "warning: cacheFiles for task '{}' overlap resolved inputs or outputs; advisory state was not published",
+            input.task_id
+        ));
+        return;
+    }
+
+    let relative_paths = present
+        .iter()
+        .map(|entry| PathBuf::from(&entry.path))
+        .collect::<Vec<_>>();
+    let state_hash = (!present.is_empty()).then(|| combined_cache_files_hash(&present));
+    let state_bytes = present
+        .iter()
+        .fold(0_u64, |total, entry| total.saturating_add(entry.size));
+    let scope_hash = derive_cache_file_scope(
+        input.task_id,
+        input.task_spec_hash,
+        input.env_hash,
+        input.pkg_dep_hash,
+    );
+    if let Err(error) = input.shared.store_cache_files_with_execution_duration(
+        luchta_cache::shared::CacheFileStoreRequest {
+            scope_hash,
+            upstream_outputs_hash: combined_dep_outputs_hash(input.dep_outputs),
+            package_dir: input.package_dir,
+            relative_paths: &relative_paths,
+            state_hash,
+            state_bytes,
+            record: input.record,
+            repo_root: input.repo_root,
+        },
+        input.execution_duration_ms,
+    ) {
+        input.output.stderr_line(&format!(
+            "warning: shared cache-file store failed for task '{}': {}; continuing without advisory state",
+            input.task_id, error
+        ));
+    }
+}
+
+fn cache_file_entries_are_disjoint(
+    package_dir: &Path,
+    repo_root: &Path,
+    cache_files: &[FileEntry],
+    record: &TaskRunRecord,
+) -> bool {
+    let occupied = record
+        .inputs
+        .iter()
+        .map(|entry| repo_root.join(&entry.path))
+        .chain(
+            record
+                .outputs
+                .iter()
+                .map(|entry| package_dir.join(&entry.path)),
+        )
+        .collect::<HashSet<_>>();
+    cache_files
+        .iter()
+        .all(|entry| !occupied.contains(&package_dir.join(&entry.path)))
 }
 
 fn trigger_fast_stop_on_first_failure(
@@ -2321,6 +2448,7 @@ mod tests {
                     decision: Decision::Skip,
                     cache_write: None,
                     shared_hit: None,
+                    cache_files: None,
                 })),
             },
         };

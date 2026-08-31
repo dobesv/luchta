@@ -29,6 +29,7 @@ fn saturated_push_queue_drops_without_blocking() {
         paths: Arc::new(SharedCachePaths {
             root: PathBuf::from("/tmp/luchta-saturated-test"),
             blobs_dir: PathBuf::from("/tmp/luchta-saturated-test/blobs"),
+            cache_files_dir: PathBuf::from("/tmp/luchta-saturated-test/cache-files"),
             snapshots_dir: PathBuf::from("/tmp/luchta-saturated-test/snapshots"),
             entries_dir: PathBuf::from("/tmp/luchta-saturated-test/entries"),
         }),
