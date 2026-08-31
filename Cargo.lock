@@ -2780,7 +2780,7 @@ dependencies = [
 
 [[package]]
 name = "luchta-ast-grep-worker"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "assert_cmd",
  "assert_fs",
@@ -2802,7 +2802,7 @@ dependencies = [
 
 [[package]]
 name = "luchta-bash-worker"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "assert_cmd",
  "luchta-engine",
@@ -2813,7 +2813,7 @@ dependencies = [
 
 [[package]]
 name = "luchta-cache"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "bincode",
  "blake3",
@@ -2841,7 +2841,7 @@ dependencies = [
 
 [[package]]
 name = "luchta-cli"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "arc-swap",
  "assert_cmd",
@@ -2885,7 +2885,7 @@ dependencies = [
 
 [[package]]
 name = "luchta-command-filter"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "assert_cmd",
  "luchta-worker",
@@ -2896,7 +2896,7 @@ dependencies = [
 
 [[package]]
 name = "luchta-engine"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "futures",
  "libc",
@@ -2917,7 +2917,7 @@ dependencies = [
 
 [[package]]
 name = "luchta-extra-resolve-worker"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "assert_cmd",
  "luchta-worker",
@@ -2928,7 +2928,7 @@ dependencies = [
 
 [[package]]
 name = "luchta-file-exists-filter"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "assert_cmd",
  "globset",
@@ -2942,14 +2942,14 @@ dependencies = [
 
 [[package]]
 name = "luchta-glob"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "globset",
 ]
 
 [[package]]
 name = "luchta-lazy-worker"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "assert_cmd",
  "luchta-worker",
@@ -2960,7 +2960,7 @@ dependencies = [
 
 [[package]]
 name = "luchta-lockfiles"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "serde",
  "serde_norway",
@@ -2970,7 +2970,7 @@ dependencies = [
 
 [[package]]
 name = "luchta-oxc-transform-worker"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "assert_fs",
  "luchta-worker",
@@ -2989,7 +2989,7 @@ dependencies = [
 
 [[package]]
 name = "luchta-oxfmt-worker"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "assert_fs",
  "ignore",
@@ -3008,7 +3008,7 @@ dependencies = [
 
 [[package]]
 name = "luchta-oxlint-worker"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "assert_cmd",
  "assert_fs",
@@ -3033,7 +3033,7 @@ dependencies = [
 
 [[package]]
 name = "luchta-swc-transform-worker"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "assert_fs",
  "luchta-worker",
@@ -3046,11 +3046,11 @@ dependencies = [
 
 [[package]]
 name = "luchta-test-support"
-version = "0.2.6"
+version = "0.2.7"
 
 [[package]]
 name = "luchta-types"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "serde",
  "serde_json",
@@ -3059,7 +3059,7 @@ dependencies = [
 
 [[package]]
 name = "luchta-worker"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "libc",
  "luchta-types",
@@ -3071,7 +3071,7 @@ dependencies = [
 
 [[package]]
 name = "luchta-worker-watcher"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "assert_cmd",
  "globset",
@@ -3088,7 +3088,7 @@ dependencies = [
 
 [[package]]
 name = "luchta-workspace"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "globset",
  "luchta-glob",
@@ -3103,7 +3103,7 @@ dependencies = [
 
 [[package]]
 name = "luchta-yarn-filter"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "assert_cmd",
  "luchta-worker",
@@ -3114,7 +3114,7 @@ dependencies = [
 
 [[package]]
 name = "luchta-yarn-worker"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "assert_cmd",
  "luchta-engine",
@@ -7492,7 +7492,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "clap",
  "serde",
