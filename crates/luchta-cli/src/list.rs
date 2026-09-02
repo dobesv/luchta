@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
 use luchta_engine::{PrunedTask, ResolveMode, TaskGraph};
-use luchta_types::{CacheConfig, DependsOn, EnvSpec, TaskDefinition, TaskId};
+use luchta_types::{CacheConfig, DependsOn, EnvSpec, PackageName, TaskDefinition, TaskId};
 use miette::{IntoDiagnostic, Result};
 use serde::Serialize;
 
@@ -32,18 +32,37 @@ pub async fn execute_list(
     tasks: Vec<String>,
     packages: Vec<String>,
     top_level: bool,
+    since: Option<String>,
+    packages_mode: bool,
     json: bool,
 ) -> Result<()> {
     let prepared = prepare_workspace(workspace_root, ResolveMode::Run, None).await?;
     prepared.worker_manager.shutdown().await;
 
+    let since_affected = if let Some(since_ref) = since.as_deref() {
+        let repo_root = crate::since::discover_repo_root(workspace_root)?;
+        Some(crate::since::affected_packages(
+            workspace_root,
+            &repo_root,
+            since_ref,
+            &prepared.package_graph,
+        )?)
+    } else {
+        None
+    };
+
     let selection = TaskSelection {
         requested_tasks: &tasks,
         packages: &packages,
         top_level,
-        since: None,
+        since: since.as_deref(),
     };
-    let selected_ids = select_task_ids(&prepared.task_graph, &selection, &prepared.pruned)?;
+    let selected_ids = select_task_ids(
+        &prepared.task_graph,
+        &selection,
+        &prepared.pruned,
+        since_affected.as_ref(),
+    )?;
 
     let mut sorted_ids: Vec<TaskId> = selected_ids.into_iter().collect();
     sorted_ids.sort_by_key(|id| id.to_string());
@@ -87,9 +106,14 @@ fn select_task_ids(
     task_graph: &TaskGraph,
     selection: &TaskSelection<'_>,
     pruned: &[PrunedTask],
+    since_affected: Option<&HashSet<PackageName>>,
 ) -> Result<HashSet<TaskId>> {
     if selection_uses_default_scope(selection) {
-        return Ok(task_graph.nodes().map(|node| node.id.clone()).collect());
+        return Ok(task_graph
+            .nodes()
+            .filter(|node| passes_since(&node.id, since_affected))
+            .map(|node| node.id.clone())
+            .collect());
     }
 
     if selection_requests_only_top_level(selection) {
@@ -117,6 +141,7 @@ fn select_task_ids(
             .into_iter()
             .filter(|node| !node.id.is_root())
             .filter(|node| matched_package_names.contains(&node.id.package))
+            .filter(|node| passes_since(&node.id, since_affected))
             .map(|node| node.id.clone())
             .collect());
     }
@@ -125,9 +150,13 @@ fn select_task_ids(
         task_graph,
         selection,
         pruned,
-        since_affected: None,
+        since_affected,
         expand_dependencies: false,
     })
+}
+
+fn passes_since(task_id: &TaskId, since_affected: Option<&HashSet<PackageName>>) -> bool {
+    task_id.is_root() || since_affected.is_none_or(|affected| affected.contains(&task_id.package))
 }
 
 fn selection_uses_default_scope(selection: &TaskSelection<'_>) -> bool {

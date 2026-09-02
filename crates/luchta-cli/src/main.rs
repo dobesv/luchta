@@ -259,13 +259,24 @@ async fn dispatch_list(workspace_root: &Path, command: Commands) -> Result<()> {
         tasks,
         packages,
         top_level,
+        since,
+        packages_mode,
         json,
     } = command
     else {
         unreachable!("dispatch_list only accepts the list command");
     };
     let packages = apply_implicit_package(packages, top_level, workspace_root)?;
-    list::execute_list(workspace_root, tasks, packages, top_level, json).await
+    list::execute_list(
+        workspace_root,
+        tasks,
+        packages,
+        top_level,
+        since,
+        packages_mode,
+        json,
+    )
+    .await
 }
 
 async fn dispatch_check(workspace_root: &Path) -> Result<()> {

@@ -244,6 +244,15 @@ pub enum Commands {
         #[arg(short = 'T', long = "top-level")]
         top_level: bool,
 
+        /// Only include tasks affected by changes since the given git ref (plus their dependents).
+        #[arg(long, value_name = "GIT_REF")]
+        since: Option<String>,
+
+        /// List unique packages owning the selected tasks (name + path) instead of tasks.
+        /// Only packages owning at least one selected task appear.
+        #[arg(long = "packages")]
+        packages_mode: bool,
+
         /// Emit machine-readable JSON output.
         #[arg(long = "json")]
         json: bool,
