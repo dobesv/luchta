@@ -265,12 +265,15 @@ mod platform {
 
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
-    /// Sum the resident-set size (bytes) of `root_pid` plus every descendant.
+    /// Sum the resident memory (bytes) of `root_pid` plus every descendant.
     ///
     /// Linux walks `/proc` directly (see the sibling module). Platforms without
     /// `/proc` — macOS and Windows — enumerate the process table via `sysinfo`
     /// and follow parent links instead. Returns `None` when `root_pid` is not a
     /// live process, matching the Linux implementation's contract.
+    ///
+    /// The per-process figure comes from [`process_memory_bytes`], which prefers
+    /// the platform's best accounting over `sysinfo`'s raw resident size.
     pub(super) fn process_tree_rss_bytes_for(root_pid: u32) -> Option<u64> {
         let mut sys = System::new();
         sys.refresh_processes_specifics(
@@ -292,7 +295,7 @@ mod platform {
             }
         }
 
-        let mut total = root_proc.memory();
+        let mut total = process_memory_bytes(root_pid, root_proc.memory());
         let mut visited = HashSet::from([root]);
         let mut queue = VecDeque::from([root]);
         while let Some(pid) = queue.pop_front() {
@@ -304,13 +307,54 @@ mod platform {
                     continue;
                 }
                 if let Some(child_proc) = processes.get(&child) {
-                    total = total.saturating_add(child_proc.memory());
+                    total = total
+                        .saturating_add(process_memory_bytes(child.as_u32(), child_proc.memory()));
                 }
                 queue.push_back(child);
             }
         }
 
         Some(total)
+    }
+
+    /// Bytes to charge `pid` in the tree total, given `sysinfo`'s resident size
+    /// as the fallback.
+    ///
+    /// On macOS that fallback is `pti_resident_size`, which counts every shared
+    /// page — the dyld shared cache, framework text, copy-on-write pages held
+    /// since fork — once per process, so a tree of node/tsc/esbuild workers
+    /// over-reports by gigabytes; it also omits compressed pages entirely.
+    /// `ri_phys_footprint` is the number Activity Monitor shows in its "Memory"
+    /// column: shared clean pages excluded, compressed pages included.
+    #[cfg(target_os = "macos")]
+    fn process_memory_bytes(pid: u32, fallback: u64) -> u64 {
+        phys_footprint_bytes(pid).unwrap_or(fallback)
+    }
+
+    /// Windows' working-set size from `sysinfo` needs no adjustment.
+    #[cfg(not(target_os = "macos"))]
+    fn process_memory_bytes(_pid: u32, fallback: u64) -> u64 {
+        fallback
+    }
+
+    /// Reads `ri_phys_footprint` for `pid`, or `None` when the kernel has no
+    /// answer — the process exited mid-walk, or belongs to another user.
+    #[cfg(target_os = "macos")]
+    fn phys_footprint_bytes(pid: u32) -> Option<u64> {
+        let pid = i32::try_from(pid).ok()?;
+        // SAFETY: `info` is a correctly sized RUSAGE_INFO_V4 buffer, and
+        // `proc_pid_rusage` writes only into it. Reading another process needs
+        // no privilege beyond same-user ownership; failures are reported
+        // through the return code rather than by writing out of bounds.
+        unsafe {
+            let mut info = std::mem::zeroed::<libc::rusage_info_v4>();
+            let status = libc::proc_pid_rusage(
+                pid,
+                libc::RUSAGE_INFO_V4,
+                std::ptr::addr_of_mut!(info).cast(),
+            );
+            (status == 0).then_some(info.ri_phys_footprint)
+        }
     }
 
     #[cfg(test)]
@@ -326,6 +370,21 @@ mod platform {
         #[test]
         fn invalid_root_pid_returns_none() {
             assert_eq!(process_tree_rss_bytes_for(u32::MAX), None);
+        }
+
+        /// A zero fallback means a non-zero answer can only have come from the
+        /// kernel — proving the footprint is read rather than `sysinfo`'s
+        /// shared-page-inflated resident size.
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn per_process_memory_comes_from_the_kernel_not_the_fallback() {
+            assert!(super::process_memory_bytes(std::process::id(), 0) > 0);
+        }
+
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn per_process_memory_falls_back_when_the_kernel_has_no_answer() {
+            assert_eq!(super::process_memory_bytes(u32::MAX, 4_242), 4_242);
         }
     }
 }

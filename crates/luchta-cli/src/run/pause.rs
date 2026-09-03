@@ -31,12 +31,19 @@ pub(super) enum PauseTick {
     Shutdown(ShutdownSignal),
 }
 
-/// The real implementation (ProdPressureEnv) preserves the exact behavior
-/// of original pause loop: 250ms TTL, no timeout escape hatch, intentional
-/// pause-forever comment.
+/// The real implementation (ProdPressureEnv) drives the pause loop from real
+/// time and signals: a 250ms re-check tick, the progress interval, and the
+/// shared shutdown future.
 pub(super) trait PressureEnv {
     /// Check current memory pressure. Updates pressure_state for Task 5 visibility.
     fn check(&mut self) -> MemoryPressure;
+
+    /// Number of tasks currently executing.
+    ///
+    /// The pause loop never holds a task back while this is zero: with nothing
+    /// in flight there is no build work left that could release memory, so
+    /// waiting can only stall forever.
+    fn running_count(&self) -> usize;
 
     /// Await next tick event: re-check timer, progress interval, or shutdown.
     ///
@@ -69,19 +76,37 @@ pub(super) enum PressureClearance {
 /// **Intentional pause-forever behavior**: If pressure never clears, this
 /// function will not return. User must interrupt with Ctrl-C/SIGTERM.
 /// This is BY DESIGN — we do NOT add timeout or auto-resume escape hatch.
+///
+/// macOS is the one exception, via [`DISPATCH_WHEN_IDLE`]: there the loop
+/// never holds the last task back, because with nothing in flight no amount of
+/// waiting can free memory, and macOS pressure originating outside the build
+/// would otherwise deadlock the run until the user hits Ctrl-C.
 pub(super) async fn await_pressure_clearance<E: PressureEnv>(
     env: &mut E,
 ) -> Result<PressureClearance> {
-    if !env.check().paused {
+    await_pressure_clearance_with(env, DISPATCH_WHEN_IDLE).await
+}
+
+/// Whether the pause loop lets a held task through once nothing is in flight.
+///
+/// Enabled on macOS only. Linux and Windows keep the original pause-forever
+/// behavior, where dispatch waits on the byte thresholds alone.
+const DISPATCH_WHEN_IDLE: bool = cfg!(target_os = "macos");
+
+/// [`await_pressure_clearance`] with the idle-dispatch policy made explicit,
+/// so tests can exercise both policies on any host.
+async fn await_pressure_clearance_with<E: PressureEnv>(
+    env: &mut E,
+    dispatch_when_idle: bool,
+) -> Result<PressureClearance> {
+    if may_dispatch(env, dispatch_when_idle) {
         return Ok(PressureClearance::Dispatch);
     }
 
-    // **Intentional pause-forever behavior**: If pressure never clears,
-    // this loop runs forever. No timeout escape hatch.
     loop {
         match env.next_tick().await? {
             PauseTick::ReCheck => {
-                if !env.check().paused {
+                if may_dispatch(env, dispatch_when_idle) {
                     return Ok(PressureClearance::Dispatch);
                 }
             }
@@ -91,6 +116,17 @@ pub(super) async fn await_pressure_clearance<E: PressureEnv>(
             }
         }
     }
+}
+
+/// Whether the held task may be dispatched now.
+///
+/// True when memory pressure has cleared. With `dispatch_when_idle` it is also
+/// true when nothing is in flight: at least one task must then be allowed to
+/// run, or the build can never make the progress that would release memory.
+///
+/// Always samples pressure so the status line keeps updating while paused.
+fn may_dispatch<E: PressureEnv>(env: &mut E, dispatch_when_idle: bool) -> bool {
+    !env.check().paused || (dispatch_when_idle && env.running_count() == 0)
 }
 
 /// The shutdown future type produced by [`shutdown_signal`].
@@ -115,6 +151,10 @@ impl<'a> PressureEnv for ProdPressureEnv<'a> {
         let pressure = self.monitor.check();
         self.pressure_state.update(&pressure);
         pressure
+    }
+
+    fn running_count(&self) -> usize {
+        self.progress_reporter.running_count()
     }
 
     async fn next_tick(&mut self) -> Result<PauseTick> {
@@ -349,15 +389,24 @@ mod tests {
     struct FakePressureEnv {
         check_results: VecDeque<MemoryPressure>,
         tick_events: VecDeque<PauseTick>,
+        /// Scripted `running_count()` answers; the final entry repeats once the
+        /// script is exhausted so tests only script the transitions they care
+        /// about.
+        running_counts: std::sync::Mutex<VecDeque<usize>>,
         render_calls: AtomicUsize,
         check_calls: AtomicUsize,
     }
 
     impl FakePressureEnv {
-        fn new(check_results: Vec<MemoryPressure>, tick_events: Vec<PauseTick>) -> Self {
+        fn with_running_counts(
+            check_results: Vec<MemoryPressure>,
+            tick_events: Vec<PauseTick>,
+            running_counts: Vec<usize>,
+        ) -> Self {
             Self {
                 check_results: check_results.into(),
                 tick_events: tick_events.into(),
+                running_counts: std::sync::Mutex::new(running_counts.into()),
                 render_calls: AtomicUsize::new(0),
                 check_calls: AtomicUsize::new(0),
             }
@@ -390,6 +439,17 @@ mod tests {
         fn render_progress(&self) {
             self.render_calls.fetch_add(1, Ordering::SeqCst);
         }
+
+        fn running_count(&self) -> usize {
+            let mut counts = self.running_counts.lock().expect("running counts poisoned");
+            if counts.len() > 1 {
+                counts.pop_front().expect("non-empty")
+            } else {
+                *counts
+                    .front()
+                    .expect("FakePressureEnv: running_counts is empty")
+            }
+        }
     }
 
     /// Builds a scripted pressure sample. `paused == true` yields a usage-high
@@ -405,6 +465,7 @@ mod tests {
             sample: MemorySample {
                 tree_rss,
                 system_available,
+                kernel_pressure: None,
             },
             reasons,
             paused,
@@ -435,8 +496,21 @@ mod tests {
         check_results: Vec<MemoryPressure>,
         tick_events: Vec<PauseTick>,
     ) -> PauseOutcome {
-        let mut env = FakePressureEnv::new(check_results, tick_events);
-        let clearance = await_pressure_clearance(&mut env)
+        drive_with_policy(check_results, tick_events, vec![1], DISPATCH_WHEN_IDLE).await
+    }
+
+    /// Like [`drive`], but scripts what `running_count()` reports on each call
+    /// and fixes the idle-dispatch policy, so tests can express "the last
+    /// in-flight task finished while paused" under either platform's rule.
+    async fn drive_with_policy(
+        check_results: Vec<MemoryPressure>,
+        tick_events: Vec<PauseTick>,
+        running_counts: Vec<usize>,
+        dispatch_when_idle: bool,
+    ) -> PauseOutcome {
+        let mut env =
+            FakePressureEnv::with_running_counts(check_results, tick_events, running_counts);
+        let clearance = await_pressure_clearance_with(&mut env, dispatch_when_idle)
             .await
             .expect("pause clearance should succeed");
         PauseOutcome {
@@ -510,6 +584,7 @@ mod tests {
             sample: MemorySample {
                 tree_rss: 32 * 1024 * 1024,
                 system_available: u64::MAX,
+                kernel_pressure: None,
             },
             reasons: vec![crate::memory_pressure::PressureReason::UsageHigh],
             paused: true,
@@ -549,6 +624,69 @@ mod tests {
             super::super::progress_interval_duration_from_value(true, Some("250")),
             std::time::Duration::from_millis(250)
         );
+    }
+
+    /// On macOS, pausing with nothing in flight can never resolve: no build
+    /// work is left to release memory, so the loop would wait forever.
+    /// Dispatch instead.
+    #[tokio::test]
+    async fn pause_loop_dispatches_under_pressure_when_nothing_is_in_flight() {
+        let out = drive_with_policy(
+            vec![paused_pressure()],
+            vec![PauseTick::ReCheck, PauseTick::ProgressDue],
+            vec![0],
+            true,
+        )
+        .await;
+
+        assert_eq!(out.clearance, PressureClearance::Dispatch);
+        assert_eq!(out.checks, 1);
+        assert_eq!(out.renders, 0);
+        assert_eq!(out.remaining_ticks, 2);
+    }
+
+    /// Pressure raised by processes outside the build never clears on its own.
+    /// Once the last in-flight task drains, the pause loop must let the held
+    /// task through rather than deadlock the run.
+    #[tokio::test]
+    async fn pause_loop_dispatches_when_last_in_flight_task_drains_during_pause() {
+        let out = drive_with_policy(
+            vec![paused_pressure(), paused_pressure()],
+            vec![PauseTick::ReCheck],
+            vec![1, 0],
+            true,
+        )
+        .await;
+
+        assert_eq!(out.clearance, PressureClearance::Dispatch);
+        assert_eq!(out.checks, 2);
+    }
+
+    /// Off macOS the original contract holds: pressure with nothing in flight
+    /// keeps the task held until pressure clears or the user interrupts.
+    #[tokio::test]
+    async fn pause_loop_keeps_holding_when_idle_dispatch_is_disabled() {
+        let out = drive_with_policy(
+            vec![paused_pressure(), paused_pressure()],
+            vec![
+                PauseTick::ReCheck,
+                PauseTick::Shutdown(ShutdownSignal::CtrlC),
+            ],
+            vec![0],
+            false,
+        )
+        .await;
+
+        assert_eq!(
+            out.clearance,
+            PressureClearance::Shutdown(ShutdownSignal::CtrlC)
+        );
+        assert_eq!(out.checks, 2);
+    }
+
+    #[test]
+    fn idle_dispatch_is_a_macos_only_policy() {
+        assert_eq!(DISPATCH_WHEN_IDLE, cfg!(target_os = "macos"));
     }
 
     #[tokio::test]

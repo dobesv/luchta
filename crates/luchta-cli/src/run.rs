@@ -2370,6 +2370,7 @@ mod tests {
                     sample: crate::memory_pressure::MemorySample {
                         tree_rss: 1_000_000,
                         system_available: 1_000_000,
+                        kernel_pressure: None,
                     },
                     reasons: vec![PressureReason::UsageHigh],
                     paused: true,
@@ -2379,6 +2380,7 @@ mod tests {
                     sample: crate::memory_pressure::MemorySample {
                         tree_rss: 0,
                         system_available: u64::MAX,
+                        kernel_pressure: None,
                     },
                     reasons: vec![],
                     paused: false,

@@ -8,6 +8,7 @@ fn render_progress_warnings_usage_only() {
     let sample = MemorySample {
         tree_rss: 32 * 1024 * 1024,
         system_available: 99 * 1024 * 1024,
+        kernel_pressure: None,
     };
     let threshold = 30 * 1024 * 1024;
     let out = reporter.render_progress(
@@ -28,6 +29,7 @@ fn render_progress_warnings_free_only() {
     let sample = MemorySample {
         tree_rss: 32 * 1024 * 1024,
         system_available: 8 * 1024 * 1024,
+        kernel_pressure: None,
     };
     let threshold = 16 * 1024 * 1024;
     let out = reporter.render_progress(
@@ -52,6 +54,7 @@ fn render_progress_warnings_both() {
     let sample = MemorySample {
         tree_rss: 32 * 1024 * 1024,
         system_available: 8 * 1024 * 1024,
+        kernel_pressure: None,
     };
     let out = reporter.render_progress(
         "10 MB",

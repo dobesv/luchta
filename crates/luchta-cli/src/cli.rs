@@ -73,6 +73,11 @@ pub enum Commands {
         /// "512MiB", "500MB", or bare bytes. Flag overrides
         /// `LUCHTA_MEM_FREE_THRESHOLD`; otherwise defaults to 1/16 of total
         /// system memory. In-flight tasks continue until completion.
+        ///
+        /// On macOS an elevated kernel memory-pressure level pauses dispatch on
+        /// its own, whatever this threshold says, and dispatch is never paused
+        /// while no task is running, since nothing would be left to release
+        /// memory. Other platforms pause on the thresholds alone.
         #[arg(long, value_name = "BYTES_OR_PERCENT")]
         mem_free_threshold: Option<String>,
 
@@ -127,6 +132,11 @@ pub enum Commands {
         /// "512MiB", "500MB", or bare bytes. Flag overrides
         /// `LUCHTA_MEM_FREE_THRESHOLD`; otherwise defaults to 1/16 of total
         /// system memory. In-flight tasks continue until completion.
+        ///
+        /// On macOS an elevated kernel memory-pressure level pauses dispatch on
+        /// its own, whatever this threshold says, and dispatch is never paused
+        /// while no task is running, since nothing would be left to release
+        /// memory. Other platforms pause on the thresholds alone.
         #[arg(long, value_name = "BYTES_OR_PERCENT")]
         mem_free_threshold: Option<String>,
 

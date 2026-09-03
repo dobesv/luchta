@@ -190,6 +190,7 @@ fn render_progress_emits_ansi_when_color_forced() {
     let sample = MemorySample {
         tree_rss: 32 * 1024 * 1024,
         system_available: 99 * 1024 * 1024,
+        kernel_pressure: None,
     };
     let out = owo_colors::with_override(true, || {
         reporter.render_progress(

@@ -18,6 +18,7 @@ mod reports;
 mod rss;
 mod run;
 mod since;
+mod sys_memory;
 mod watch;
 mod why;
 

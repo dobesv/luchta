@@ -16,6 +16,7 @@ use crate::{
     cli::OutputMode,
     memory_pressure::{PressureReason, PressureSnapshot},
     progress_task_list::render_task_id_list,
+    sys_memory::KernelPressure,
 };
 
 mod console_output;
@@ -461,6 +462,19 @@ fn pressure_suffix(
                 let threshold = crate::rss::format_rss(Some(pressure.free_threshold));
                 suffix.push_str(
                     &format!(" ❗ system free memory low ({measured} / {threshold})")
+                        .if_supports_color(stream, |t| t.red())
+                        .to_string(),
+                );
+            }
+            PressureReason::KernelPressureHigh => {
+                // Byte counters are not the source here — say whose verdict it
+                // is, so the pause is not mistaken for a threshold breach.
+                let level = match sample.and_then(|sample| sample.kernel_pressure) {
+                    Some(KernelPressure::Critical) => "critical",
+                    _ => "warn",
+                };
+                suffix.push_str(
+                    &format!(" ❗ kernel reports memory pressure ({level})")
                         .if_supports_color(stream, |t| t.red())
                         .to_string(),
                 );

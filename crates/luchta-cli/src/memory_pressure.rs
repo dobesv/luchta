@@ -3,6 +3,8 @@ use std::time::{Duration, Instant};
 use sysinfo::{Pid, System};
 use thiserror::Error;
 
+use crate::sys_memory::{self, KernelPressure};
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ThresholdSpec {
     Percent(f64),
@@ -35,12 +37,17 @@ impl ThresholdSpec {
 pub(crate) struct MemorySample {
     pub(crate) tree_rss: u64,
     pub(crate) system_available: u64,
+    /// The kernel's own pressure verdict, where the platform publishes one.
+    pub(crate) kernel_pressure: Option<KernelPressure>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PressureReason {
     UsageHigh,
     FreeLow,
+    /// The kernel is asking processes to shrink, whatever the byte counters
+    /// say. Only platforms that publish a pressure level can raise this.
+    KernelPressureHigh,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -207,14 +214,7 @@ impl MemoryMonitor {
             }
         };
 
-        let mut reasons = Vec::new();
-        if sample.tree_rss > self.usage_threshold {
-            reasons.push(PressureReason::UsageHigh);
-        }
-        if sample.system_available < self.free_threshold {
-            reasons.push(PressureReason::FreeLow);
-        }
-
+        let reasons = pressure_reasons(sample, self.usage_threshold, self.free_threshold);
         let paused = !reasons.is_empty();
         MemoryPressure {
             sample,
@@ -229,7 +229,8 @@ impl MemoryMonitor {
 
         MemorySample {
             tree_rss: crate::rss::process_tree_rss_bytes_for(self.root_pid.as_u32()).unwrap_or(0),
-            system_available: self.sys.available_memory(),
+            system_available: sys_memory::available_bytes(&self.sys),
+            kernel_pressure: sys_memory::kernel_pressure(),
         }
     }
 
@@ -253,6 +254,32 @@ impl MemoryMonitor {
     ) {
         self.test_override = override_fn;
     }
+}
+
+/// Classifies a sample against the configured thresholds.
+///
+/// An elevated kernel verdict pauses on its own: where the OS publishes one it
+/// is the authority on scarcity, and it catches the shortages that byte
+/// counters miss.
+fn pressure_reasons(
+    sample: MemorySample,
+    usage_threshold: u64,
+    free_threshold: u64,
+) -> Vec<PressureReason> {
+    let mut reasons = Vec::new();
+    if sample.tree_rss > usage_threshold {
+        reasons.push(PressureReason::UsageHigh);
+    }
+    if sample.system_available < free_threshold {
+        reasons.push(PressureReason::FreeLow);
+    }
+    if sample
+        .kernel_pressure
+        .is_some_and(KernelPressure::is_elevated)
+    {
+        reasons.push(PressureReason::KernelPressureHigh);
+    }
+    reasons
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -348,9 +375,57 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        parse_threshold, MemoryMonitor, PressureReason, ThresholdParseError, ThresholdSpec,
+        parse_threshold, pressure_reasons, MemoryMonitor, MemorySample, PressureReason,
+        ThresholdParseError, ThresholdSpec,
     };
+    use crate::sys_memory::KernelPressure;
     use sysinfo::Pid;
+
+    /// A sample that trips neither byte threshold, carrying `kernel`.
+    fn roomy_sample(kernel: Option<KernelPressure>) -> MemorySample {
+        MemorySample {
+            tree_rss: 1,
+            system_available: u64::MAX,
+            kernel_pressure: kernel,
+        }
+    }
+
+    /// macOS keeps free memory near zero by design and compresses under load,
+    /// so byte counters alone can look fine while the kernel is already asking
+    /// processes to shrink. The kernel verdict must pause on its own.
+    #[test]
+    fn elevated_kernel_pressure_pauses_despite_satisfied_thresholds() {
+        assert_eq!(
+            pressure_reasons(roomy_sample(Some(KernelPressure::Warn)), u64::MAX, 0),
+            vec![PressureReason::KernelPressureHigh]
+        );
+        assert_eq!(
+            pressure_reasons(roomy_sample(Some(KernelPressure::Critical)), u64::MAX, 0),
+            vec![PressureReason::KernelPressureHigh]
+        );
+    }
+
+    #[test]
+    fn normal_or_absent_kernel_pressure_does_not_pause() {
+        assert!(
+            pressure_reasons(roomy_sample(Some(KernelPressure::Normal)), u64::MAX, 0).is_empty()
+        );
+        assert!(pressure_reasons(roomy_sample(None), u64::MAX, 0).is_empty());
+    }
+
+    #[test]
+    fn byte_thresholds_still_raise_their_own_reasons() {
+        let sample = MemorySample {
+            tree_rss: 100,
+            system_available: 10,
+            kernel_pressure: Some(KernelPressure::Normal),
+        };
+
+        assert_eq!(
+            pressure_reasons(sample, 50, 20),
+            vec![PressureReason::UsageHigh, PressureReason::FreeLow]
+        );
+    }
 
     #[test]
     fn parses_percent_threshold() {

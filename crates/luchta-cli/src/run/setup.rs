@@ -760,6 +760,7 @@ mod tests {
         let sample = MemorySample {
             tree_rss: 123,
             system_available: 456,
+            kernel_pressure: None,
         };
         let rss = select_summary_rss(Some(sample), || panic!("fallback should not run"));
         assert_eq!(rss, Some(123));
