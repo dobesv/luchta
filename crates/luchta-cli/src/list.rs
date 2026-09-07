@@ -2,12 +2,28 @@
 //!
 //! Prints configured task definitions for matched tasks, omitting default-valued
 //! fields in human output and optionally emitting full JSON records.
+//!
+//! ## `--since` filter semantics
+//!
+//! The affected-set filter from `--since` intersects with non-root task selection
+//! in ALL branches of `select_task_ids`:
+//!
+//! 1. Default scope (no filters): filters all nodes through `passes_since`
+//! 2. `-T` only: root tasks bypass `--since` (matches `run.rs:package_matches`)
+//! 3. `-p` globs only: filters matched package names through `passes_since`
+//! 4. General case: validates against full graph (`since_affected: None`), then
+//!    post-filters returned ids through `passes_since`
+//!
+//! Branch 4's post-filter pattern is necessary to avoid misreporting existing
+//! literal tasks as "not found" when the affected set excludes all their matches.
+//! See `docs/solutions/logic-errors/literal-task-since-filter-validation-order-2026-09-07.md`.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
 use luchta_engine::{PrunedTask, ResolveMode, TaskGraph};
-use luchta_types::{CacheConfig, DependsOn, EnvSpec, TaskDefinition, TaskId};
+use luchta_types::{CacheConfig, DependsOn, EnvSpec, PackageName, TaskDefinition, TaskId};
+use luchta_workspace::PackageGraph;
 use miette::{IntoDiagnostic, Result};
 use serde::Serialize;
 
@@ -26,27 +42,67 @@ pub(crate) struct ListedTask {
     pub definition: TaskDefinition,
 }
 
+#[derive(Debug, Serialize)]
+struct PackageListing {
+    package: String,
+    path: String,
+}
+
 /// Execute `luchta list`.
 pub async fn execute_list(
     workspace_root: &Path,
     tasks: Vec<String>,
     packages: Vec<String>,
     top_level: bool,
+    since: Option<String>,
+    packages_mode: bool,
     json: bool,
 ) -> Result<()> {
     let prepared = prepare_workspace(workspace_root, ResolveMode::Run, None).await?;
     prepared.worker_manager.shutdown().await;
 
+    let since_affected = if let Some(since_ref) = since.as_deref() {
+        let repo_root = crate::since::discover_repo_root(workspace_root)?;
+        Some(crate::since::affected_packages(
+            workspace_root,
+            &repo_root,
+            since_ref,
+            &prepared.package_graph,
+        )?)
+    } else {
+        None
+    };
+
     let selection = TaskSelection {
         requested_tasks: &tasks,
         packages: &packages,
         top_level,
-        since: None,
+        since: since.as_deref(),
     };
-    let selected_ids = select_task_ids(&prepared.task_graph, &selection, &prepared.pruned)?;
+    let selected_ids = select_task_ids(
+        &prepared.task_graph,
+        &selection,
+        &prepared.pruned,
+        since_affected.as_ref(),
+    )?;
 
     let mut sorted_ids: Vec<TaskId> = selected_ids.into_iter().collect();
     sorted_ids.sort_by_key(|id| id.to_string());
+
+    if packages_mode {
+        let packages = collapse_to_packages(&sorted_ids, &prepared.package_graph, workspace_root)?;
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&packages).into_diagnostic()?
+            );
+        } else {
+            for package in packages {
+                println!("{}", package.package);
+            }
+        }
+        return Ok(());
+    }
 
     if json {
         let listed: Vec<ListedTask> = sorted_ids
@@ -83,13 +139,56 @@ pub async fn execute_list(
     Ok(())
 }
 
+fn collapse_to_packages(
+    selected: &[TaskId],
+    package_graph: &PackageGraph,
+    workspace_root: &Path,
+) -> Result<Vec<PackageListing>> {
+    let mut package_names = HashSet::new();
+    for task_id in selected {
+        let package_name = if task_id.is_root() {
+            package_graph.root_package().ok_or_else(|| {
+                miette::miette!("root task selected, but workspace has no root package")
+            })?
+        } else {
+            &task_id.package
+        };
+        package_names.insert(package_name.clone());
+    }
+
+    let mut packages = Vec::with_capacity(package_names.len());
+    for package_name in package_names {
+        let package = package_graph.node(&package_name).into_diagnostic()?;
+        let relative_path = package
+            .path
+            .strip_prefix(workspace_root)
+            .into_diagnostic()?;
+        let path = if relative_path.as_os_str().is_empty() {
+            ".".to_string()
+        } else {
+            relative_path.to_string_lossy().into_owned()
+        };
+        packages.push(PackageListing {
+            package: package_name.to_string(),
+            path,
+        });
+    }
+    packages.sort_by(|left, right| left.package.cmp(&right.package));
+    Ok(packages)
+}
+
 fn select_task_ids(
     task_graph: &TaskGraph,
     selection: &TaskSelection<'_>,
     pruned: &[PrunedTask],
+    since_affected: Option<&HashSet<PackageName>>,
 ) -> Result<HashSet<TaskId>> {
     if selection_uses_default_scope(selection) {
-        return Ok(task_graph.nodes().map(|node| node.id.clone()).collect());
+        return Ok(task_graph
+            .nodes()
+            .filter(|node| passes_since(&node.id, since_affected))
+            .map(|node| node.id.clone())
+            .collect());
     }
 
     if selection_requests_only_top_level(selection) {
@@ -117,17 +216,26 @@ fn select_task_ids(
             .into_iter()
             .filter(|node| !node.id.is_root())
             .filter(|node| matched_package_names.contains(&node.id.package))
+            .filter(|node| passes_since(&node.id, since_affected))
             .map(|node| node.id.clone())
             .collect());
     }
 
-    collect_requested_subgraph(CollectSubgraphRequest {
+    let selected = collect_requested_subgraph(CollectSubgraphRequest {
         task_graph,
         selection,
         pruned,
         since_affected: None,
         expand_dependencies: false,
-    })
+    })?;
+    Ok(selected
+        .into_iter()
+        .filter(|task_id| passes_since(task_id, since_affected))
+        .collect())
+}
+
+fn passes_since(task_id: &TaskId, since_affected: Option<&HashSet<PackageName>>) -> bool {
+    task_id.is_root() || since_affected.is_none_or(|affected| affected.contains(&task_id.package))
 }
 
 fn selection_uses_default_scope(selection: &TaskSelection<'_>) -> bool {

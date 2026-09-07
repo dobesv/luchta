@@ -46,6 +46,15 @@ produced a wrong-but-green implementation before being caught.
 
 ## Key Learnings (the compounding value)
 
+### 0. Literal-task + since: validate existence before filtering
+
+When wiring `--since` into a code path that validates literal task names, pass
+`since_affected: None` to `collect_requested_subgraph` (existence check against the
+full graph), then apply `passes_since` as a post-filter. Passing the filter into
+the subgraph routine makes an existing literal task outside the affected set
+appear "not found". This quirk still exists in `run.rs` but is fixed for `list`
+(see `literal-task-since-filter-validation-order-2026-09-07.md`).
+
 ### 1. gix 0.73 change-detection API (verified working)
 
 Tree diff `ref..HEAD`:
