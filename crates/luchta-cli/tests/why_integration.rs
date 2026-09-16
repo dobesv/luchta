@@ -325,3 +325,50 @@ fn why_shows_invalid_for_unknown_worker() {
         "expected invalid worker message in output: {stdout}"
     );
 }
+
+#[test]
+fn why_shows_prior_state_for_a_command_less_meta_task() {
+    let temp = assert_fs::TempDir::new().unwrap();
+    common::setup_meta_task_dependency_workspace(&temp);
+    common::run_luchta(&temp, "test").success();
+
+    let stdout = run_why(&temp, &["-p", "app", "build:js"]);
+
+    assert!(
+        stdout.contains("up to date (local cache hit)"),
+        "expected the meta task to report a prior run: {stdout}"
+    );
+    assert!(
+        !stdout.contains("not recorded"),
+        "expected the meta task to have a record: {stdout}"
+    );
+}
+
+#[test]
+fn why_names_the_changed_task_behind_each_meta_task() {
+    let temp = assert_fs::TempDir::new().unwrap();
+    common::setup_meta_task_dependency_workspace(&temp);
+    common::run_luchta(&temp, "test").success();
+
+    // Rebuild only `lib`, so `app`'s meta tasks keep the records they wrote
+    // against the previous `lib` output.
+    temp.child("packages/lib/src.txt")
+        .write_str("lib-two\n")
+        .unwrap();
+    common::run_luchta(&temp, "build:node").success();
+
+    // Walking down the chain names the next task at every step, ending at the
+    // task that actually rebuilt.
+    let steps = [
+        ("app", "test", "lib#build:js-recursive"),
+        ("lib", "build:js-recursive", "lib#build:js"),
+        ("lib", "build:js", "lib#build:node"),
+    ];
+    for (package, task, expected) in steps {
+        let stdout = run_why(&temp, &["-p", package, task]);
+        assert!(
+            stdout.contains(&format!("dependency output changed: {expected}")),
+            "expected {package}#{task} to name {expected}: {stdout}"
+        );
+    }
+}

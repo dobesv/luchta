@@ -466,6 +466,31 @@ fn cache_uncached_detected_dependency_output_change_reruns_downstream_then_skips
 }
 
 #[test]
+fn cache_dependency_output_change_through_meta_tasks_reruns_downstream() {
+    let temp = assert_fs::TempDir::new().unwrap();
+    common::setup_meta_task_dependency_workspace(&temp);
+
+    run_luchta(&temp, "test").success();
+    temp.child("packages/lib/counter.txt").assert("1\n");
+    temp.child("packages/app/counter.txt").assert("1\n");
+
+    run_luchta(&temp, "test").success();
+    temp.child("packages/lib/counter.txt").assert("2\n");
+    temp.child("packages/app/counter.txt").assert("1\n");
+
+    temp.child("packages/lib/src.txt")
+        .write_str("lib-two\n")
+        .unwrap();
+    run_luchta(&temp, "test").success();
+    temp.child("packages/lib/counter.txt").assert("3\n");
+    temp.child("packages/app/counter.txt").assert("2\n");
+
+    run_luchta(&temp, "test").success();
+    temp.child("packages/lib/counter.txt").assert("4\n");
+    temp.child("packages/app/counter.txt").assert("2\n");
+}
+
+#[test]
 fn cache_corrupt_lockfile_forces_run_and_skips_cache_write() {
     let temp = assert_fs::TempDir::new().unwrap();
     setup_lockfile_workspace(&temp, YARN1_LOCK_LEFT_PAD_1_0_0);

@@ -1061,6 +1061,12 @@ workers: {
 ### Build Cache
 Luchta build cache is **opt-in** per task via `cache: {}`. Cached task skips only when prior run succeeded and all cache inputs still match: task spec, significant env, package dependency versions from `yarn.lock`, dependency-task output hashes, declared or worker-detected inputs, and outputs.
 
+- **Ordering tasks (#336):** a task with no worker and no command never runs, so
+  it has no outputs to hash. It contributes a hash derived from the output
+  hashes of its own `dependsOn`, recursively, so an upstream output change
+  invalidates dependents through any depth of such tasks. `luchta why` on one
+  reports the dependency state it was last resolved against, so a chain of them
+  can be walked down to the task that actually rebuilt.
 - **Transitive Lockfile Detection (#89):** Cache hashing and watch-mode invalidation both track the **full transitive closure** of external package dependencies from `yarn.lock`. Any transitive dependency's resolved-version change now busts the cache, even when the direct specifier is unchanged. Lockfile cycles are handled silently. `gather_pkg_dep_pairs` serves as the single source of truth for both cache and watch.
 - Default cache dir: `<workspace>/.luchta/cache`
 - Override: `LUCHTA_CACHE_DIR=/abs/path`

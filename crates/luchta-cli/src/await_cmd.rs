@@ -1,13 +1,14 @@
 //! Passive task-readiness polling.
 
 use std::{
+    cell::Cell,
     collections::{BTreeMap, HashMap, HashSet},
     path::Path,
     sync::Arc,
     time::Duration,
 };
 
-use luchta_cache::{decide, resolve_cache_dir, Cache, Decision, ListingCache, TaskRunRecord};
+use luchta_cache::{decide, resolve_cache_dir, Cache, Decision, ListingCache};
 use luchta_engine::ResolveMode;
 use luchta_types::TaskId;
 use luchta_workspace::PackageGraph;
@@ -16,6 +17,7 @@ use miette::{Context, IntoDiagnostic, Result};
 use crate::{
     build_lock,
     cache_ctx::{load_lockfile_state, LockfileState},
+    dep_outputs::resolve_dependency_outputs,
     live_cache_state::{build_live_task_state, LiveCacheContext},
     run::{
         analyze_tasks, collect_requested_subgraph, prepare_workspace, CollectSubgraphRequest,
@@ -249,28 +251,24 @@ fn non_cacheable_task_is_ready(task_id: &TaskId, context: &AwaitContext) -> bool
         .is_some_and(|dependency_outputs| prior.dep_outputs == dependency_outputs)
 }
 
+/// Dependency output hashes for a non-cacheable task, or `None` when any task
+/// the walk reaches has no successful record yet — an unfinished upstream means
+/// the dependent is not ready, whatever the hashes happen to be.
 fn current_successful_dependency_outputs(
     task_id: &TaskId,
     context: &AwaitContext,
 ) -> Option<BTreeMap<String, [u8; 32]>> {
-    context
-        .prepared
-        .task_graph
-        .dependencies_of(task_id)
-        .into_iter()
-        .filter(|dependency| {
-            context
-                .prepared
-                .task_graph
-                .task_definition(&dependency.id)
-                .is_some_and(luchta_types::TaskDefinition::counts_in_progress)
-        })
-        .try_fold(BTreeMap::new(), |mut outputs, dependency| {
-            let record: TaskRunRecord = context.cache.read(&dependency.id.to_string())?;
-            if !record.succeeded {
-                return None;
+    let unfinished = Cell::new(false);
+    let outputs =
+        resolve_dependency_outputs(task_id, &context.prepared.task_graph, &|dependency_id| {
+            match context.cache.read(&dependency_id.to_string()) {
+                Some(record) if record.succeeded => Some(record.outputs_hash),
+                _ => {
+                    unfinished.set(true);
+                    None
+                }
             }
-            outputs.insert(dependency.id.to_string(), record.outputs_hash);
-            Some(outputs)
-        })
+        });
+
+    (!unfinished.get()).then_some(outputs)
 }

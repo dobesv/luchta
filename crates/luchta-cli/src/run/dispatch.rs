@@ -8,8 +8,10 @@
 
 use super::*;
 
+mod connector;
 mod shared_cache;
 
+use connector::record_connector_state;
 use shared_cache::{
     finalize_advisory_cache_files, finalize_shared_cache_hit, prepare_cache_decision,
     PreparedCacheDecision,
@@ -17,6 +19,7 @@ use shared_cache::{
 use std::time::Instant;
 
 use crate::cache_ctx::gather_pkg_dep_pairs_filtered;
+use crate::dep_outputs::resolve_dependency_outputs;
 
 use luchta_cache::shared::{
     combined_dep_outputs_hash, derive_cache_file_scope, derive_input_key, SharedCacheStoreRequest,
@@ -187,7 +190,7 @@ pub(super) fn dispatch_ready_task_async(
     }
 
     let Some(request) = ctx.commands.get(&task_id).cloned() else {
-        mark_ordering_connector(ctx.reporter, &task_id, done_tx);
+        mark_ordering_connector(&task_id, done_tx, ctx);
         return None;
     };
 
@@ -273,13 +276,10 @@ fn fail_invalid_task(
     let _ = done_tx.send(false);
 }
 
-fn mark_ordering_connector(
-    reporter: &ProgressReporter,
-    task_id: &TaskId,
-    done_tx: CompletionSignal,
-) {
+fn mark_ordering_connector(task_id: &TaskId, done_tx: CompletionSignal, ctx: &DispatchContext<'_>) {
+    record_connector_state(task_id, ctx);
     // No worker/no command ordering node — uncounted connector, not runnable work.
-    reporter.task_finished_uncounted(task_id);
+    ctx.reporter.task_finished_uncounted(task_id);
     let _ = done_tx.send(true);
 }
 
@@ -1589,11 +1589,9 @@ fn dependency_output_hashes(
     output_hashes: &Arc<Mutex<HashMap<TaskId, [u8; 32]>>>,
 ) -> BTreeMap<String, [u8; 32]> {
     let map = output_hashes.lock().expect("output_hashes poisoned");
-    task_graph
-        .dependencies_of(task_id)
-        .into_iter()
-        .filter_map(|d| map.get(&d.id).copied().map(|h| (d.id.to_string(), h)))
-        .collect()
+    resolve_dependency_outputs(task_id, task_graph, &|dependency_id| {
+        map.get(dependency_id).copied()
+    })
 }
 
 fn record_output_hash(

@@ -16,6 +16,7 @@ use crate::{
         build_current_state, gather_pkg_dep_pairs_filtered, LockfileState, PackageDirResolver,
     },
     cache_nonce::resolve_cache_nonce,
+    dep_outputs::resolve_dependency_outputs,
     run::PreparedWorkspace,
 };
 
@@ -124,28 +125,19 @@ pub(crate) fn build_live_task_state(
     }))
 }
 
-/// Read successful dependency output hashes using execution's counted-task
-/// semantics. Ordering-only connectors can retain stale records from older
-/// configurations, but those records never contribute to a live task state.
+/// Read dependency output hashes from prior run records, mirroring execution's
+/// [`resolve_dependency_outputs`] rules so `why`/`await` agree with `run`.
+///
+/// Ordering-only connectors have no record of their own; they resolve to a
+/// digest over the records of the counted tasks they reach.
 pub(crate) fn dependency_outputs_from_cache(
     task_id: &TaskId,
     task_graph: &luchta_engine::TaskGraph,
     cache: &Cache,
 ) -> BTreeMap<String, [u8; 32]> {
-    task_graph
-        .dependencies_of(task_id)
-        .into_iter()
-        .filter(|dependency| {
-            task_graph
-                .task_definition(&dependency.id)
-                .is_some_and(TaskDefinition::counts_in_progress)
-        })
-        .filter_map(|dependency| {
-            let dependency_id = dependency.id.to_string();
-            let record = cache.read(&dependency_id)?;
-            Some((dependency_id, record.outputs_hash))
-        })
-        .collect()
+    resolve_dependency_outputs(task_id, task_graph, &|dependency_id| {
+        Some(cache.read(&dependency_id.to_string())?.outputs_hash)
+    })
 }
 
 struct PackageContext<'a> {
