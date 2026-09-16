@@ -265,3 +265,23 @@ fn task_failed_moves_task_from_running_to_failed_once() {
         "failed task state mismatch for {task}"
     );
 }
+
+#[test]
+fn plain_output_mode_never_uses_live_status_even_on_a_capable_terminal() {
+    assert!(
+        !live_status_enabled(OutputMode::Plain, true),
+        "plain mode must stay append-only so line-buffered readers see each update"
+    );
+    assert!(
+        !live_status_enabled(OutputMode::Summary, true),
+        "summary mode prints no periodic progress at all"
+    );
+    assert!(
+        live_status_enabled(OutputMode::Default, true),
+        "default mode keeps the in-place status line on a capable terminal"
+    );
+    assert!(
+        !live_status_enabled(OutputMode::Default, false),
+        "default mode falls back to append-only when the terminal cannot redraw"
+    );
+}
