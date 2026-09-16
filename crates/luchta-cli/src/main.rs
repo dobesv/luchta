@@ -33,6 +33,7 @@ use luchta_engine::{
 use miette::IntoDiagnostic;
 use miette::{Report, Result};
 
+use crate::memory_pressure::Sensitivity;
 use crate::outcome::TasksFailed;
 use crate::run::setup::no_cache_env;
 
@@ -378,16 +379,11 @@ struct RunArgs {
     top_level: bool,
     dry_run: bool,
     output: Option<OutputMode>,
+    mem_pressure: Option<Sensitivity>,
     continue_on_failure: bool,
     no_cache: bool,
-    thresholds: ThresholdInputs,
     max_weight_cli: Option<String>,
     since: Option<String>,
-}
-
-struct ThresholdInputs {
-    usage_cli: Option<String>,
-    free_cli: Option<String>,
 }
 
 fn command_run_args(command: Commands) -> RunArgs {
@@ -398,9 +394,8 @@ fn command_run_args(command: Commands) -> RunArgs {
             top_level,
             dry_run,
             output,
-            mem_usage_threshold,
+            mem_pressure,
             max_weight,
-            mem_free_threshold,
             since,
             continue_on_failure,
             no_cache,
@@ -410,12 +405,9 @@ fn command_run_args(command: Commands) -> RunArgs {
             top_level,
             dry_run,
             output,
+            mem_pressure,
             continue_on_failure,
             no_cache,
-            thresholds: ThresholdInputs {
-                usage_cli: mem_usage_threshold,
-                free_cli: mem_free_threshold,
-            },
             max_weight_cli: max_weight,
             since,
         },
@@ -431,6 +423,10 @@ fn command_run_args(command: Commands) -> RunArgs {
 async fn run_command(workspace_root: &Path, command: Commands) -> Result<()> {
     let mut args = command_run_args(command);
     let output = resolve_output_mode(args.output, output_mode_env().as_deref())?;
+    let memory_pressure = resolve_mem_pressure(
+        args.mem_pressure,
+        std::env::var(MEM_PRESSURE_ENV).ok().as_deref(),
+    )?;
     args.no_cache = args.no_cache || no_cache_env();
     args.packages = apply_implicit_package(args.packages, args.top_level, workspace_root)?;
     if args.tasks.is_empty() {
@@ -443,7 +439,6 @@ async fn run_command(workspace_root: &Path, command: Commands) -> Result<()> {
         top_level: args.top_level,
         since: args.since.as_deref(),
     };
-    let memory_pressure = resolve_memory_pressure_config(args.thresholds)?;
     let max_weight_override = resolve_max_weight_override(
         args.max_weight_cli.as_deref(),
         "LUCHTA_MAX_WEIGHT",
@@ -472,9 +467,8 @@ async fn watch_command(workspace_root: &Path, command: Commands) -> Result<()> {
         packages,
         top_level,
         output,
-        mem_usage_threshold,
+        mem_pressure,
         max_weight,
-        mem_free_threshold,
         continue_on_failure,
         no_cache,
         debounce,
@@ -491,10 +485,10 @@ async fn watch_command(workspace_root: &Path, command: Commands) -> Result<()> {
 
     let no_cache = no_cache || no_cache_env();
     let output = resolve_output_mode(output, output_mode_env().as_deref())?;
-    let memory_pressure = resolve_memory_pressure_config(ThresholdInputs {
-        usage_cli: mem_usage_threshold,
-        free_cli: mem_free_threshold,
-    })?;
+    let memory_pressure = resolve_mem_pressure(
+        mem_pressure,
+        std::env::var(MEM_PRESSURE_ENV).ok().as_deref(),
+    )?;
     let max_weight_override =
         resolve_max_weight_override(max_weight.as_deref(), "LUCHTA_MAX_WEIGHT", "max-weight")?;
 
@@ -528,69 +522,6 @@ async fn watch_command(workspace_root: &Path, command: Commands) -> Result<()> {
     .await
 }
 
-fn resolve_memory_pressure_config(
-    thresholds: ThresholdInputs,
-) -> Result<run::MemoryPressureConfig> {
-    Ok(run::MemoryPressureConfig {
-        usage: resolve_threshold_spec(
-            thresholds.usage_cli.as_deref(),
-            "LUCHTA_MEM_USAGE_THRESHOLD",
-            "mem-usage-threshold",
-        )?,
-        free: resolve_threshold_spec(
-            thresholds.free_cli.as_deref(),
-            "LUCHTA_MEM_FREE_THRESHOLD",
-            "mem-free-threshold",
-        )?,
-    })
-}
-/// Precedence: CLI flag > env var. Returns `None` if neither is set.
-/// Returns an error if the value is invalid.
-fn resolve_threshold_spec(
-    cli_value: Option<&str>,
-    env_var: &str,
-    flag_name: &str,
-) -> Result<Option<crate::memory_pressure::ThresholdSpec>, miette::Report> {
-    use crate::memory_pressure::{parse_threshold, ThresholdParseError};
-
-    let raw = cli_value
-        .map(|s| s.to_string())
-        .or_else(|| std::env::var(env_var).ok().filter(|s| !s.is_empty()));
-
-    match raw {
-        None => Ok(None),
-        Some(value) => parse_threshold(&value).map(Some).map_err(|e| match e {
-            ThresholdParseError::Empty => {
-                let source = if cli_value.is_some() {
-                    format!("--{flag_name}")
-                } else {
-                    env_var.to_string()
-                };
-                miette::miette!("threshold value for {source} cannot be empty")
-            }
-            ThresholdParseError::InvalidNumber => {
-                miette::miette!(
-                    "Invalid --{} value '{}': must be a non-negative number or percentage",
-                    flag_name,
-                    value
-                )
-            }
-            ThresholdParseError::UnknownUnit { unit } => {
-                miette::miette!(
-                    "Invalid --{} value '{}': unknown unit '{}'. \
-                             Use: % (percent), B, K/KiB/KB, M/MiB/MB, G/GiB/GB",
-                    flag_name,
-                    value,
-                    unit
-                )
-            }
-            ThresholdParseError::Overflow => {
-                miette::miette!("Invalid --{} value '{}': value too large", flag_name, value)
-            }
-        }),
-    }
-}
-
 /// Environment variable selecting the progress output mode.
 const OUTPUT_MODE_ENV: &str = "LUCHTA_OUTPUT";
 
@@ -621,6 +552,33 @@ fn resolve_output_mode(
             .collect::<Vec<_>>()
             .join(", ");
         miette::miette!("Invalid {OUTPUT_MODE_ENV} value '{raw}': expected one of {known}")
+    })
+}
+
+/// Environment variable selecting the memory-pressure sensitivity.
+const MEM_PRESSURE_ENV: &str = "LUCHTA_MEM_PRESSURE";
+
+/// Precedence: flag > env var > default (`normal`).
+fn resolve_mem_pressure(
+    cli_value: Option<Sensitivity>,
+    env_value: Option<&str>,
+) -> Result<Sensitivity, miette::Report> {
+    if let Some(sensitivity) = cli_value {
+        return Ok(sensitivity);
+    }
+
+    let Some(raw) = env_value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(Sensitivity::default());
+    };
+
+    Sensitivity::from_str(raw, true).map_err(|_| {
+        let known = Sensitivity::value_variants()
+            .iter()
+            .filter_map(|variant| variant.to_possible_value())
+            .map(|value| value.get_name().to_owned())
+            .collect::<Vec<_>>()
+            .join(", ");
+        miette::miette!("Invalid {MEM_PRESSURE_ENV} value '{raw}': expected one of {known}")
     })
 }
 
@@ -709,6 +667,29 @@ mod tests {
     }
 
     #[test]
+    fn mem_pressure_precedence_prefers_flag_then_env_then_default() {
+        use crate::memory_pressure::Sensitivity;
+
+        assert_eq!(
+            resolve_mem_pressure(Some(Sensitivity::Off), Some("high")).expect("flag wins"),
+            Sensitivity::Off
+        );
+        assert_eq!(
+            resolve_mem_pressure(None, Some("high")).expect("env used"),
+            Sensitivity::High
+        );
+        assert_eq!(
+            resolve_mem_pressure(None, Some("  ")).expect("blank env ignored"),
+            Sensitivity::Normal
+        );
+        assert_eq!(
+            resolve_mem_pressure(None, None).expect("default"),
+            Sensitivity::Normal
+        );
+        assert!(resolve_mem_pressure(None, Some("nope")).is_err());
+    }
+
+    #[test]
     fn watch_command_parses_plain_output_mode() {
         let cli = Cli::try_parse_from(["luchta", "watch", "build", "--output", "plain"])
             .expect("parse watch with plain output");
@@ -782,9 +763,8 @@ mod tests {
                 top_level: false,
                 dry_run: true,
                 output: None,
-                mem_usage_threshold: None,
+                mem_pressure: None,
                 max_weight: None,
-                mem_free_threshold: None,
                 since: None,
                 continue_on_failure: false,
                 no_cache: false,

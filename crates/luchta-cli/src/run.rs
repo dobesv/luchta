@@ -54,7 +54,6 @@ use input_stability::{
 use pause::dispatch_loop;
 
 pub(crate) mod setup;
-pub use setup::MemoryPressureConfig;
 use setup::{
     build_execution_resources, build_memory_pressure, report_run_outcome, BuildResourcesInputs,
     ExecutionResources,
@@ -325,7 +324,7 @@ pub(crate) struct RunCycleParams<'a> {
     pub output: OutputMode,
     pub continue_on_failure: bool,
     pub no_cache: bool,
-    pub memory_pressure: MemoryPressureConfig,
+    pub memory_pressure: crate::memory_pressure::Sensitivity,
 }
 
 pub struct RunTasksRequest<'a> {
@@ -334,7 +333,7 @@ pub struct RunTasksRequest<'a> {
     pub output: OutputMode,
     pub continue_on_failure: bool,
     pub no_cache: bool,
-    pub memory_pressure: MemoryPressureConfig,
+    pub memory_pressure: crate::memory_pressure::Sensitivity,
     pub max_weight_override: Option<u32>,
 }
 
@@ -2450,64 +2449,6 @@ mod tests {
         );
     }
 
-    /// Integration test for memory-pressure pause behavior.
-    ///
-    /// Verifies that:
-    /// - When paused, the monitor returns paused=true
-    /// - Check() is called multiple times during the pause loop
-    ///
-    /// When the override clears, the task is dispatched.
-    #[test]
-    fn memory_pressure_test_override_allows_forced_pause() {
-        use crate::memory_pressure::{MemoryMonitor, MemoryPressure, PressureReason};
-        use std::sync::atomic::{AtomicU32, Ordering};
-        use std::sync::Arc;
-
-        // Create a monitor with test override that returns paused twice.
-        let mut monitor = MemoryMonitor::for_current_process(u64::MAX, 0);
-        let pause_count = Arc::new(AtomicU32::new(0));
-        let pause_count_clone = Arc::clone(&pause_count);
-
-        monitor.set_test_override(Some(Arc::new(move || {
-            let count = pause_count_clone.fetch_add(1, Ordering::SeqCst);
-            if count < 2 {
-                MemoryPressure {
-                    sample: crate::memory_pressure::MemorySample {
-                        tree_rss: 1_000_000,
-                        system_available: 1_000_000,
-                    },
-                    reasons: vec![PressureReason::UsageHigh],
-                    paused: true,
-                }
-            } else {
-                MemoryPressure {
-                    sample: crate::memory_pressure::MemorySample {
-                        tree_rss: 0,
-                        system_available: u64::MAX,
-                    },
-                    reasons: vec![],
-                    paused: false,
-                }
-            }
-        })));
-
-        // First check returns paused.
-        let pressure = monitor.check();
-        assert!(pressure.paused);
-        assert!(pressure.reasons.contains(&PressureReason::UsageHigh));
-
-        // Second check returns paused.
-        let pressure = monitor.check();
-        assert!(pressure.paused);
-
-        // Third check clears.
-        let pressure = monitor.check();
-        assert!(!pressure.paused);
-
-        // Verify call count.
-        assert_eq!(pause_count.load(Ordering::SeqCst), 3);
-    }
-
     #[test]
     fn resolve_workspace_root_returns_explicit_path_without_walk() {
         let explicit = PathBuf::from("/tmp/explicit-workspace-root");
@@ -2726,7 +2667,6 @@ pub(crate) fn run_cycle<'a>(
             run_result,
             any_failed: &any_failed,
             reporter: &reporter,
-            pressure_state: &pressure_state,
         })
         .await;
 
@@ -2918,7 +2858,6 @@ struct FinalizeCycle<'a> {
     run_result: Result<()>,
     any_failed: &'a Arc<AtomicBool>,
     reporter: &'a Arc<ProgressReporter>,
-    pressure_state: &'a Arc<crate::memory_pressure::PressureState>,
 }
 
 /// Finalizes a cycle: kills workers immediately on interrupt (so the walker can
@@ -2933,7 +2872,6 @@ async fn finalize_and_report(inputs: FinalizeCycle<'_>) -> Result<(CycleOutcome,
         run_result,
         any_failed,
         reporter,
-        pressure_state,
     } = inputs;
 
     let was_interrupted = interrupted.load(Ordering::SeqCst);
@@ -2961,7 +2899,6 @@ async fn finalize_and_report(inputs: FinalizeCycle<'_>) -> Result<(CycleOutcome,
         run_result,
         any_failed,
         reporter,
-        pressure_state,
         outcome == CycleOutcome::Cancelled,
     ) {
         if !any_failed.load(Ordering::SeqCst) {

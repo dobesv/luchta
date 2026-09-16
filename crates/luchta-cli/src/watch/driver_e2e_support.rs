@@ -491,10 +491,7 @@ impl E2eHarness {
                         output: OutputMode::Default,
                         continue_on_failure: false,
                         no_cache: false,
-                        memory_pressure: crate::run::MemoryPressureConfig {
-                            usage: None,
-                            free: None,
-                        },
+                        memory_pressure: crate::memory_pressure::Sensitivity::Normal,
                         show_changed_files: false,
                     },
                 },

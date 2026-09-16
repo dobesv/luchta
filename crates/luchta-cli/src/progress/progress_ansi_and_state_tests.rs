@@ -61,18 +61,15 @@ fn live_progress_compacts_running_tasks_and_preserves_fixed_status() {
     }
 
     let (line, wide_line) = owo_colors::with_override(true, || {
-        let pressure = pressure_snapshot(None, 0, 0);
         let line = reporter.render_progress_for_width(ProgressRenderContext {
             rss_formatted: "10 MB",
-            warnings: &[],
-            pressure: &pressure,
+            pressure: None,
             stream: owo_colors::Stream::Stderr,
             max_width: Some(70),
         });
         let wide_line = reporter.render_progress_for_width(ProgressRenderContext {
             rss_formatted: "10 MB",
-            warnings: &[],
-            pressure: &pressure,
+            pressure: None,
             stream: owo_colors::Stream::Stderr,
             max_width: Some(500),
         });
@@ -111,12 +108,7 @@ fn render_progress_emits_no_ansi_when_color_unsupported() {
     reporter.task_ran(&task);
 
     let out = owo_colors::with_override(false, || {
-        reporter.render_progress(
-            "10 MB",
-            &[],
-            &pressure_snapshot(None, 0, 0),
-            owo_colors::Stream::Stdout,
-        )
+        reporter.render_progress("10 MB", None, owo_colors::Stream::Stdout)
     });
 
     assert!(
@@ -149,12 +141,7 @@ fn render_progress_colors_running_tasks_bright_black() {
     reporter.task_started(&task);
 
     let out = owo_colors::with_override(true, || {
-        reporter.render_progress(
-            "10 MB",
-            &[],
-            &pressure_snapshot(None, 0, 0),
-            owo_colors::Stream::Stdout,
-        )
+        reporter.render_progress("10 MB", None, owo_colors::Stream::Stdout)
     });
 
     // The running segment is present and colored bright black (ANSI 90),
@@ -187,15 +174,10 @@ fn render_progress_emits_ansi_when_color_forced() {
     reporter.task_ran(&task);
     reporter.task_shared_cache_hit(&shared);
 
-    let sample = MemorySample {
-        tree_rss: 32 * 1024 * 1024,
-        system_available: 99 * 1024 * 1024,
-    };
     let out = owo_colors::with_override(true, || {
         reporter.render_progress(
             "10 MB",
-            &[crate::memory_pressure::PressureReason::UsageHigh],
-            &pressure_snapshot(Some(sample), 30 * 1024 * 1024, 0),
+            Some(crate::memory_pressure::PressureDetail::Stalled(23.0)),
             owo_colors::Stream::Stdout,
         )
     });
@@ -211,7 +193,7 @@ fn render_progress_emits_ansi_when_color_forced() {
     );
     assert!(out.contains("📥 1"), "shared-cache segment present: {out}");
     assert!(
-        out.contains("❗ mem usage high ("),
+        out.contains("❗ memory pressure (stalled 23%)"),
         "pressure warning segment present: {out}"
     );
 }

@@ -29,34 +29,20 @@ use super::{
 };
 use crate::progress::ProgressReporter;
 
-/// Resolved memory-pressure thresholds passed to the dispatch loop.
+/// Builds the memory monitor and the shared pressure state.
 ///
-/// `None` for either field means "use the default" (50% of total system memory
-/// for usage, 1/16 of total for free), resolved by the `MemoryMonitor`.
-#[derive(Clone)]
-pub struct MemoryPressureConfig {
-    pub usage: Option<crate::memory_pressure::ThresholdSpec>,
-    pub free: Option<crate::memory_pressure::ThresholdSpec>,
-}
-
-/// Builds the memory monitor and the shared pressure state from the resolved
-/// threshold config. The monitor drives pause decisions; the `PressureState` is
-/// shared so the status line can render the current warning suffix.
+/// The monitor drives pause decisions; the `PressureState` is shared so the
+/// status line can render the current warning suffix.
 pub(crate) fn build_memory_pressure(
-    config: MemoryPressureConfig,
+    sensitivity: crate::memory_pressure::Sensitivity,
 ) -> (
     crate::memory_pressure::MemoryMonitor,
     Arc<crate::memory_pressure::PressureState>,
 ) {
-    let monitor = crate::memory_pressure::MemoryMonitor::with_specs_for_current_process(
-        config.usage,
-        config.free,
-    );
-    let pressure_state = Arc::new(crate::memory_pressure::PressureState::new(
-        monitor.usage_threshold,
-        monitor.free_threshold,
-    ));
-    (monitor, pressure_state)
+    (
+        crate::memory_pressure::MemoryMonitor::new(sensitivity),
+        Arc::new(crate::memory_pressure::PressureState::new()),
+    )
 }
 
 /// Resolves dispatch loop result into final outcome: propagate genuine setup or
@@ -66,18 +52,13 @@ pub(super) fn report_run_outcome(
     run_result: Result<()>,
     any_failed: &AtomicBool,
     reporter: &ProgressReporter,
-    pressure_state: &crate::memory_pressure::PressureState,
     was_cancelled: bool,
 ) -> Result<()> {
     reporter.output().clear_progress();
     run_result?;
 
-    let rss = select_summary_rss(
-        pressure_state.snapshot().sample,
-        crate::rss::process_tree_rss_bytes,
-    );
     reporter.output().stdout_line(&reporter.render_summary(
-        &crate::rss::format_rss(rss),
+        &crate::rss::format_rss(reporter.tree_rss()),
         was_cancelled,
         owo_colors::Stream::Stdout,
     ));
@@ -87,13 +68,6 @@ pub(super) fn report_run_outcome(
     }
 
     Ok(())
-}
-
-fn select_summary_rss(
-    sample: Option<crate::memory_pressure::MemorySample>,
-    fallback: impl FnOnce() -> Option<u64>,
-) -> Option<u64> {
-    sample.map(|sample| sample.tree_rss).or_else(fallback)
 }
 
 /// Inputs for [`build_execution_resources`].
@@ -444,7 +418,6 @@ pub(crate) fn build_execution_resources(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory_pressure::MemorySample;
     use luchta_cache::shared::SHARED_CACHE_SHARD_COUNT;
     use luchta_test_support::require_nextest;
     use std::sync::Mutex;
@@ -753,22 +726,6 @@ mod tests {
             18,
             "default read set must be 18 computed bucket keys"
         );
-    }
-
-    #[test]
-    fn select_summary_rss_prefers_snapshot_sample_over_fallback() {
-        let sample = MemorySample {
-            tree_rss: 123,
-            system_available: 456,
-        };
-        let rss = select_summary_rss(Some(sample), || panic!("fallback should not run"));
-        assert_eq!(rss, Some(123));
-    }
-
-    #[test]
-    fn select_summary_rss_falls_back_when_snapshot_missing() {
-        let rss = select_summary_rss(None, || Some(789));
-        assert_eq!(rss, Some(789));
     }
 
     // ---------------------------------------------------------------------------

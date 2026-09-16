@@ -38,7 +38,7 @@ use super::session::WatchSession;
 use super::watcher::{WatchBatch, WatcherHandle};
 use crate::build_lock;
 use crate::cli::OutputMode;
-use crate::run::{CycleOutcome, MemoryPressureConfig, RunCycleParams, TaskSelection};
+use crate::run::{CycleOutcome, RunCycleParams, TaskSelection};
 
 /// Maximum number of changed file paths to list under `--show-changed-files`
 /// before collapsing the remainder into a count.
@@ -187,7 +187,7 @@ pub struct WatchRunConfig {
     pub output: OutputMode,
     pub continue_on_failure: bool,
     pub no_cache: bool,
-    pub memory_pressure: MemoryPressureConfig,
+    pub memory_pressure: crate::memory_pressure::Sensitivity,
     /// When true, list the changed files that triggered each rebuild.
     pub show_changed_files: bool,
 }
@@ -633,7 +633,7 @@ fn cycle_request<'a>(
         output: config.output,
         continue_on_failure: config.continue_on_failure,
         no_cache: config.no_cache,
-        memory_pressure: config.memory_pressure.clone(),
+        memory_pressure: config.memory_pressure,
     }
 }
 
@@ -688,7 +688,7 @@ struct CycleRequest<'a> {
     output: OutputMode,
     continue_on_failure: bool,
     no_cache: bool,
-    memory_pressure: MemoryPressureConfig,
+    memory_pressure: crate::memory_pressure::Sensitivity,
 }
 
 async fn run_cycle_with_status<F, G>(
@@ -715,7 +715,7 @@ where
             output: request.output,
             continue_on_failure: request.continue_on_failure,
             no_cache: request.no_cache,
-            memory_pressure: request.memory_pressure.clone(),
+            memory_pressure: request.memory_pressure,
         },
         cancel.clone(),
     );

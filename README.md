@@ -596,23 +596,36 @@ Failed tasks are displayed in the status line and final summary as `× <count> (
 
 #### Memory-pressure backpressure
 
-`luchta run` can pause dispatching **new** tasks when memory pressure is high. In-flight tasks keep running to completion.
+`luchta run` pauses dispatching **new** tasks while the operating system reports
+that memory is under pressure. In-flight tasks keep running to completion.
 
-- `--mem-usage-threshold <BYTES_OR_PERCENT>` / `LUCHTA_MEM_USAGE_THRESHOLD`
-  - Pauses new task dispatch while summed process-tree RSS is greater than threshold.
-  - Accepts percentages like `50%` or absolute values like `4GiB`, `512MiB`, `2GB`, or bare bytes.
-  - Default: `50%` of total system memory.
-- `--mem-free-threshold <BYTES_OR_PERCENT>` / `LUCHTA_MEM_FREE_THRESHOLD`
-  - Pauses new task dispatch while system available memory is less than threshold.
-  - Accepts percentages like `12.5%` or absolute values like `1GiB`, `512MiB`, `500MB`, or bare bytes.
-  - Default: `1/16` of total system memory.
+- `--mem-pressure <off|low|normal|high>` / `LUCHTA_MEM_PRESSURE`
+  - `off` disables backpressure entirely.
+  - `low` pauses only under severe pressure; `high` pauses at the first sign.
+  - Default: `normal`.
 
 Precedence: flag > env var > default.
 
+Luchta asks the OS rather than guessing from its own memory use — a build using
+60% of RAM on an idle machine is fine, while one using 20% on a machine that is
+already swapping is not:
 
-Behavior: luchta pauses dispatching **NEW** tasks while process-tree RSS exceeds `--mem-usage-threshold` **or** system available memory drops below `--mem-free-threshold`. In-flight tasks run to completion. There is no timeout or auto-abort while paused; use Ctrl-C to abort.
+| Platform | Indicator | What each level means |
+| --- | --- | --- |
+| Linux | Pressure Stall Information — the current cgroup's `memory.pressure`, falling back to `/proc/pressure/memory` | `some avg10` above 20% (`low`), 10% (`normal`), 5% (`high`) |
+| macOS | `kern.memorystatus_vm_pressure_level` | critical (`low`), warning (`normal` and `high`) |
+| Windows | `LowMemoryResourceNotification` | signalled — a single bit, so sensitivity has no effect beyond `off` |
 
-Status line: while paused, periodic progress output appends `⚠️ mem usage high` and/or `⚠️ system free memory low`.
+Behavior: there is no timeout or auto-abort while paused; use Ctrl-C to abort,
+or run with `--mem-pressure off` if an unrelated process is holding the machine
+under pressure.
+
+If the indicator cannot be read — a Linux kernel built without `CONFIG_PSI`, or
+one needing the `psi=1` boot parameter — luchta dispatches normally and says
+nothing. Backpressure is simply inactive.
+
+Status line: while paused, periodic progress output appends
+`❗ memory pressure (stalled 23%)`, naming the platform's own reading.
 
 #### Concurrency weight override
 

@@ -1908,17 +1908,7 @@ mod tests {
     }
 
     fn assert_skip_progress_without_failure_marker(reporter: &ProgressReporter) {
-        let progress = reporter.render_progress(
-            "0 MB",
-            &[],
-            &crate::memory_pressure::PressureSnapshot {
-                reasons: Vec::new(),
-                sample: None,
-                usage_threshold: 0,
-                free_threshold: 0,
-            },
-            owo_colors::Stream::Stdout,
-        );
+        let progress = reporter.render_progress("0 MB", None, owo_colors::Stream::Stdout);
         assert!(
             progress.contains("⌛ 1"),
             "skip path should leave task uncounted in pending bucket: {progress}"

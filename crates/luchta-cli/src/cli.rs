@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
+use crate::memory_pressure::Sensitivity;
+
 /// How much progress output `luchta run` prints.
 ///
 /// JSONL and color output are explicit future work and intentionally absent
@@ -68,14 +70,17 @@ pub enum Commands {
         #[arg(long, value_enum)]
         output: Option<OutputMode>,
 
-        /// Pause NEW task dispatch when process-tree RSS exceeds this threshold.
+        /// Pause dispatching NEW tasks while the OS reports memory pressure.
         ///
-        /// Accepts percentages like "50%" or absolute values like "4GiB",
-        /// "512MiB", "2GB", or bare bytes. Flag overrides
-        /// `LUCHTA_MEM_USAGE_THRESHOLD`; otherwise defaults to 50% of total
-        /// system memory. In-flight tasks continue until completion.
-        #[arg(long, value_name = "BYTES_OR_PERCENT")]
-        mem_usage_threshold: Option<String>,
+        /// `off` disables backpressure entirely; `low` pauses only under severe
+        /// pressure, `high` at the first sign. Overrides `LUCHTA_MEM_PRESSURE`;
+        /// otherwise defaults to `normal`. In-flight tasks continue until
+        /// completion.
+        ///
+        /// Sensitivity has no effect on Windows, whose indicator is a single
+        /// low-memory bit; `off` still disables.
+        #[arg(long, value_enum, value_name = "LEVEL")]
+        mem_pressure: Option<Sensitivity>,
 
         /// Override maximum cumulative task weight allowed to run at once.
         ///
@@ -83,15 +88,6 @@ pub enum Commands {
         /// `concurrency.maxWeight`, falling back to available parallelism.
         #[arg(long, value_name = "WEIGHT")]
         max_weight: Option<String>,
-
-        /// Pause NEW task dispatch when system available memory drops below this threshold.
-        ///
-        /// Accepts percentages like "12.5%" or absolute values like "1GiB",
-        /// "512MiB", "500MB", or bare bytes. Flag overrides
-        /// `LUCHTA_MEM_FREE_THRESHOLD`; otherwise defaults to 1/16 of total
-        /// system memory. In-flight tasks continue until completion.
-        #[arg(long, value_name = "BYTES_OR_PERCENT")]
-        mem_free_threshold: Option<String>,
 
         /// Only run tasks for packages changed since this git ref (plus their dependents).
         #[arg(long, value_name = "GIT_REF")]
@@ -124,14 +120,17 @@ pub enum Commands {
         #[arg(long, value_enum)]
         output: Option<OutputMode>,
 
-        /// Pause NEW task dispatch when process-tree RSS exceeds this threshold.
+        /// Pause dispatching NEW tasks while the OS reports memory pressure.
         ///
-        /// Accepts percentages like "50%" or absolute values like "4GiB",
-        /// "512MiB", "2GB", or bare bytes. Flag overrides
-        /// `LUCHTA_MEM_USAGE_THRESHOLD`; otherwise defaults to 50% of total
-        /// system memory. In-flight tasks continue until completion.
-        #[arg(long, value_name = "BYTES_OR_PERCENT")]
-        mem_usage_threshold: Option<String>,
+        /// `off` disables backpressure entirely; `low` pauses only under severe
+        /// pressure, `high` at the first sign. Overrides `LUCHTA_MEM_PRESSURE`;
+        /// otherwise defaults to `normal`. In-flight tasks continue until
+        /// completion.
+        ///
+        /// Sensitivity has no effect on Windows, whose indicator is a single
+        /// low-memory bit; `off` still disables.
+        #[arg(long, value_enum, value_name = "LEVEL")]
+        mem_pressure: Option<Sensitivity>,
 
         /// Override maximum cumulative task weight allowed to run at once.
         ///
@@ -139,15 +138,6 @@ pub enum Commands {
         /// `concurrency.maxWeight`, falling back to available parallelism.
         #[arg(long, value_name = "WEIGHT")]
         max_weight: Option<String>,
-
-        /// Pause NEW task dispatch when system available memory drops below this threshold.
-        ///
-        /// Accepts percentages like "12.5%" or absolute values like "1GiB",
-        /// "512MiB", "500MB", or bare bytes. Flag overrides
-        /// `LUCHTA_MEM_FREE_THRESHOLD`; otherwise defaults to 1/16 of total
-        /// system memory. In-flight tasks continue until completion.
-        #[arg(long, value_name = "BYTES_OR_PERCENT")]
-        mem_free_threshold: Option<String>,
 
         /// Continue running independent tasks after a task fails (only transitive dependents are
         /// skipped); exit non-zero if any task failed.

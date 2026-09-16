@@ -12,17 +12,14 @@ fn render_progress_omits_zero_skipped_and_shows_pending_when_work_remains() {
     let wave_of = HashMap::from([(task_id("pkg-a", "build"), 0)]);
     let reporter = ProgressReporter::new(OutputMode::Default, wave_of, 1);
 
-    let out = reporter.render_progress(
-        "10 MB",
-        &[],
-        &pressure_snapshot(None, 0, 0),
-        owo_colors::Stream::Stdout,
-    );
+    let out = reporter.render_progress("10 MB", None, owo_colors::Stream::Stdout);
     assert_progress_line_shape(
-        &out,
-        "✔ 0 ⌛ 1 ⌚ ",
-        SegmentLabel::new("🐏", "10 MB"),
-        SegmentLabel::new("🌊", "0 / 1"),
+        RenderedLine::new(&out),
+        ExpectedProgressShape {
+            prefix: "✔ 0 ⌛ 1 ⌚ ",
+            rss: SegmentLabel::new("🐏", "10 MB"),
+            wave_progress: SegmentLabel::new("🌊", "0 / 1"),
+        },
     );
     assert!(!out.contains("⏩"));
     assert!(!out.contains("🏃"));
@@ -47,17 +44,14 @@ fn render_progress_numerator_includes_skipped_and_pending_omits_at_zero() {
     reporter.task_skipped_cache_hit(&task_b);
     reporter.task_started(&task_c);
 
-    let out = reporter.render_progress(
-        "10 MB",
-        &[],
-        &pressure_snapshot(None, 0, 0),
-        owo_colors::Stream::Stdout,
-    );
+    let out = reporter.render_progress("10 MB", None, owo_colors::Stream::Stdout);
     assert_progress_line_shape(
-        &out,
-        "✔ 2 ⏩ 1 ⌚ ",
-        SegmentLabel::new("🐏", "10 MB"),
-        SegmentLabel::new("🌊", "0 / 1"),
+        RenderedLine::new(&out),
+        ExpectedProgressShape {
+            prefix: "✔ 2 ⏩ 1 ⌚ ",
+            rss: SegmentLabel::new("🐏", "10 MB"),
+            wave_progress: SegmentLabel::new("🌊", "0 / 1"),
+        },
     );
     assert!(
         out.ends_with("🌊 0 / 1 🏃 1 pkg-c#build"),
@@ -79,12 +73,7 @@ fn render_progress_includes_shared_hits_segment_when_present() {
     reporter.task_ran(&task_a);
     reporter.task_shared_cache_hit(&task_b);
 
-    let out = reporter.render_progress(
-        "10 MB",
-        &[],
-        &pressure_snapshot(None, 0, 0),
-        owo_colors::Stream::Stdout,
-    );
+    let out = reporter.render_progress("10 MB", None, owo_colors::Stream::Stdout);
 
     assert!(
         out.contains("✔ 2 📥 1") && out.contains("🌊 1 / 1") && !out.contains("⏩"),
@@ -123,22 +112,14 @@ fn render_progress_running_segment_uses_grouped_list() {
     }
     drop(running);
 
-    let out = reporter.render_progress(
-        "42 MB",
-        &[],
-        &PressureSnapshot {
-            reasons: Vec::new(),
-            sample: None,
-            usage_threshold: 0,
-            free_threshold: 0,
-        },
-        owo_colors::Stream::Stdout,
-    );
+    let out = reporter.render_progress("42 MB", None, owo_colors::Stream::Stdout);
     assert_progress_line_shape(
-        &out,
-        "✔ 0 ⌚ ",
-        SegmentLabel::new("🐏", "42 MB"),
-        SegmentLabel::new("🌊", "0 / 1"),
+        RenderedLine::new(&out),
+        ExpectedProgressShape {
+            prefix: "✔ 0 ⌚ ",
+            rss: SegmentLabel::new("🐏", "42 MB"),
+            wave_progress: SegmentLabel::new("🌊", "0 / 1"),
+        },
     );
     assert!(
         out.ends_with("🌊 0 / 1 🏃 6 {a,b,c}#lint, d#{test,tsc}, e#babel"),
@@ -179,12 +160,7 @@ fn render_progress_orders_running_tasks_by_age_and_times_only_slow_tasks() {
     running.insert(newest, now - Duration::from_secs(4));
     drop(running);
 
-    let out = reporter.render_progress(
-        "10 MB",
-        &[],
-        &pressure_snapshot(None, 0, 0),
-        owo_colors::Stream::Stdout,
-    );
+    let out = reporter.render_progress("10 MB", None, owo_colors::Stream::Stdout);
 
     assert!(
         out.contains("b#build(⌛ 2 ⌚ 30s), a#test(⌚ 20s), z#lint"),
@@ -212,12 +188,7 @@ fn render_progress_uses_latest_worker_snapshot_and_cleans_up_on_completion() {
         pending: 3,
     });
 
-    let running = reporter.render_progress(
-        "10 MB",
-        &[],
-        &pressure_snapshot(None, 0, 0),
-        owo_colors::Stream::Stdout,
-    );
+    let running = reporter.render_progress("10 MB", None, owo_colors::Stream::Stdout);
     assert!(
         running.contains("pkg#build(✔ 6 ⏩ 2 ⌛ 3 🏃 1)"),
         "output was: {running}"
@@ -225,12 +196,7 @@ fn render_progress_uses_latest_worker_snapshot_and_cleans_up_on_completion() {
     assert!(!running.contains("✔ 1 ⌛ 9"), "output was: {running}");
 
     sink.set_progress(TaskProgress::default());
-    let cleared = reporter.render_progress(
-        "10 MB",
-        &[],
-        &pressure_snapshot(None, 0, 0),
-        owo_colors::Stream::Stdout,
-    );
+    let cleared = reporter.render_progress("10 MB", None, owo_colors::Stream::Stdout);
     assert!(cleared.contains("pkg#build"), "output was: {cleared}");
     assert!(!cleared.contains("pkg#build("), "output was: {cleared}");
 
@@ -241,12 +207,7 @@ fn render_progress_uses_latest_worker_snapshot_and_cleans_up_on_completion() {
 
     reporter.task_ran(&task);
     assert_eq!(sink.progress(), None);
-    let finished = reporter.render_progress(
-        "10 MB",
-        &[],
-        &pressure_snapshot(None, 0, 0),
-        owo_colors::Stream::Stdout,
-    );
+    let finished = reporter.render_progress("10 MB", None, owo_colors::Stream::Stdout);
     assert!(!finished.contains("pkg#build"), "output was: {finished}");
 }
 
@@ -266,17 +227,7 @@ fn render_progress_failed_segment_uses_grouped_list_and_appears_before_running()
     reporter.task_failed(&task_id("a", "lint"));
     reporter.task_failed(&task_id("b", "lint"));
 
-    let out = reporter.render_progress(
-        "42 MB",
-        &[],
-        &PressureSnapshot {
-            reasons: Vec::new(),
-            sample: None,
-            usage_threshold: 0,
-            free_threshold: 0,
-        },
-        owo_colors::Stream::Stdout,
-    );
+    let out = reporter.render_progress("42 MB", None, owo_colors::Stream::Stdout);
 
     assert!(out.contains("🏃 1 c#lint"), "output was: {out}");
     assert!(out.contains("× 2 ({a,b}#lint)"), "output was: {out}");
@@ -299,22 +250,14 @@ fn render_progress_counts_completed_waves_from_done_skipped_and_failed() {
     reporter.task_ran(&task_id("pkg-c", "build"));
     reporter.task_started(&task_id("pkg-d", "build"));
 
-    let out = reporter.render_progress(
-        "24 MB",
-        &[],
-        &PressureSnapshot {
-            reasons: Vec::new(),
-            sample: None,
-            usage_threshold: 0,
-            free_threshold: 0,
-        },
-        owo_colors::Stream::Stdout,
-    );
+    let out = reporter.render_progress("24 MB", None, owo_colors::Stream::Stdout);
     assert_progress_line_shape(
-        &out,
-        "✔ 3 ⏩ 1 ⌛ 1 ⌚ ",
-        SegmentLabel::new("🐏", "24 MB"),
-        SegmentLabel::new("🌊", "1 / 3"),
+        RenderedLine::new(&out),
+        ExpectedProgressShape {
+            prefix: "✔ 3 ⏩ 1 ⌛ 1 ⌚ ",
+            rss: SegmentLabel::new("🐏", "24 MB"),
+            wave_progress: SegmentLabel::new("🌊", "1 / 3"),
+        },
     );
     assert!(
         out.ends_with("🌊 1 / 3 🏃 1 pkg-d#build"),
@@ -367,32 +310,26 @@ fn render_progress_ignores_uncounted_tasks_for_running_done_pending_and_waves() 
     reporter.task_started(&uncounted);
     reporter.task_finished_uncounted(&uncounted);
 
-    let initial = reporter.render_progress(
-        "24 MB",
-        &[],
-        &pressure_snapshot(None, 0, 0),
-        owo_colors::Stream::Stdout,
-    );
+    let initial = reporter.render_progress("24 MB", None, owo_colors::Stream::Stdout);
     assert_progress_line_shape(
-        &initial,
-        "✔ 0 ⌛ 1 ⌚ ",
-        SegmentLabel::new("🐏", "24 MB"),
-        SegmentLabel::new("🌊", "0 / 1"),
+        RenderedLine::new(&initial),
+        ExpectedProgressShape {
+            prefix: "✔ 0 ⌛ 1 ⌚ ",
+            rss: SegmentLabel::new("🐏", "24 MB"),
+            wave_progress: SegmentLabel::new("🌊", "0 / 1"),
+        },
     );
     assert!(!initial.contains("🏃"), "output was: {initial}");
 
     reporter.task_ran(&counted);
-    let finished = reporter.render_progress(
-        "24 MB",
-        &[],
-        &pressure_snapshot(None, 0, 0),
-        owo_colors::Stream::Stdout,
-    );
+    let finished = reporter.render_progress("24 MB", None, owo_colors::Stream::Stdout);
     assert_progress_line_shape(
-        &finished,
-        "✔ 1 ⌚ ",
-        SegmentLabel::new("🐏", "24 MB"),
-        SegmentLabel::new("🌊", "1 / 1"),
+        RenderedLine::new(&finished),
+        ExpectedProgressShape {
+            prefix: "✔ 1 ⌚ ",
+            rss: SegmentLabel::new("🐏", "24 MB"),
+            wave_progress: SegmentLabel::new("🌊", "1 / 1"),
+        },
     );
     assert!(!finished.contains("⌛"), "output was: {finished}");
     assert!(!finished.contains("🏃"), "output was: {finished}");
@@ -408,17 +345,14 @@ fn render_progress_counts_zero_task_waves_as_complete_for_denominator() {
         &[&task_a, &task_b],
     );
 
-    let out = reporter.render_progress(
-        "24 MB",
-        &[],
-        &pressure_snapshot(None, 0, 0),
-        owo_colors::Stream::Stdout,
-    );
+    let out = reporter.render_progress("24 MB", None, owo_colors::Stream::Stdout);
     assert_progress_line_shape(
-        &out,
-        "✔ 2 ⌚ ",
-        SegmentLabel::new("🐏", "24 MB"),
-        SegmentLabel::new("🌊", "3 / 3"),
+        RenderedLine::new(&out),
+        ExpectedProgressShape {
+            prefix: "✔ 2 ⌚ ",
+            rss: SegmentLabel::new("🐏", "24 MB"),
+            wave_progress: SegmentLabel::new("🌊", "3 / 3"),
+        },
     );
 }
 
@@ -433,17 +367,14 @@ fn render_progress_all_uncounted_selection_keeps_zero_counters_and_reaches_wave_
     reporter.task_started(&connector_b);
     reporter.task_finished_uncounted(&connector_b);
 
-    let out = reporter.render_progress(
-        "24 MB",
-        &[],
-        &pressure_snapshot(None, 0, 0),
-        owo_colors::Stream::Stdout,
-    );
+    let out = reporter.render_progress("24 MB", None, owo_colors::Stream::Stdout);
     assert_progress_line_shape(
-        &out,
-        "✔ 0 ⌚ ",
-        SegmentLabel::new("🐏", "24 MB"),
-        SegmentLabel::new("🌊", "2 / 2"),
+        RenderedLine::new(&out),
+        ExpectedProgressShape {
+            prefix: "✔ 0 ⌚ ",
+            rss: SegmentLabel::new("🐏", "24 MB"),
+            wave_progress: SegmentLabel::new("🌊", "2 / 2"),
+        },
     );
     assert!(!out.contains("⌛"), "output was: {out}");
     assert!(!out.contains("🏃"), "output was: {out}");

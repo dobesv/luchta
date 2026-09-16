@@ -13,9 +13,7 @@ use luchta_types::TaskId;
 use owo_colors::{OwoColorize, Stream};
 
 use crate::{
-    cli::OutputMode,
-    memory_pressure::{PressureReason, PressureSnapshot},
-    progress_task_list::render_task_id_list,
+    cli::OutputMode, memory_pressure::PressureDetail, progress_task_list::render_task_id_list,
 };
 
 mod console_output;
@@ -66,12 +64,12 @@ pub struct ProgressReporter {
     pub wave_total: Vec<usize>,
     pub start: Instant,
     output: ProgressOutput,
+    rss: crate::rss::RssCache,
 }
 
 pub(crate) struct ProgressRenderContext<'a> {
     pub(crate) rss_formatted: &'a str,
-    pub(crate) warnings: &'a [PressureReason],
-    pub(crate) pressure: &'a PressureSnapshot,
+    pub(crate) pressure: Option<PressureDetail>,
     pub(crate) stream: Stream,
     pub(crate) max_width: Option<usize>,
 }
@@ -103,6 +101,7 @@ impl ProgressReporter {
             failed: AtomicUsize::new(0),
             shared_hits: AtomicUsize::new(0),
             output: ProgressOutput::detect(mode),
+            rss: crate::rss::RssCache::new(),
         }
     }
 
@@ -196,17 +195,21 @@ impl ProgressReporter {
         running.len()
     }
 
+    /// Summed RSS of the luchta process tree for the `🐏` segment, recomputed
+    /// at most once per cache TTL.
+    pub(crate) fn tree_rss(&self) -> Option<u64> {
+        self.rss.get()
+    }
+
     #[cfg(test)]
     pub fn render_progress(
         &self,
         rss_formatted: &str,
-        warnings: &[PressureReason],
-        pressure: &PressureSnapshot,
+        pressure: Option<PressureDetail>,
         stream: Stream,
     ) -> String {
         self.render_progress_for_width(ProgressRenderContext {
             rss_formatted,
-            warnings,
             pressure,
             stream,
             max_width: None,
@@ -249,7 +252,7 @@ impl ProgressReporter {
             total_waves: self.total_waves,
         };
         let failed_segment = self.failed_segment(context.stream);
-        let warning_suffix = pressure_suffix(context.warnings, context.pressure, context.stream);
+        let warning_suffix = pressure_suffix(context.pressure, context.stream);
         let running_task_refs = running_tasks.iter().map(|(task, _)| task).collect();
         render_status_line(StatusLineInput {
             stream: context.stream,
@@ -438,36 +441,13 @@ struct ProgressCounts {
     waves_done: usize,
 }
 
-fn pressure_suffix(
-    warnings: &[PressureReason],
-    pressure: &PressureSnapshot,
-    stream: Stream,
-) -> String {
-    let mut suffix = String::new();
-    let sample = pressure.sample;
-    for warning in warnings {
-        match warning {
-            PressureReason::UsageHigh => {
-                let measured = crate::rss::format_rss(sample.map(|sample| sample.tree_rss));
-                let threshold = crate::rss::format_rss(Some(pressure.usage_threshold));
-                suffix.push_str(
-                    &format!(" ❗ mem usage high ({measured} / {threshold})")
-                        .if_supports_color(stream, |t| t.red())
-                        .to_string(),
-                );
-            }
-            PressureReason::FreeLow => {
-                let measured = crate::rss::format_rss(sample.map(|sample| sample.system_available));
-                let threshold = crate::rss::format_rss(Some(pressure.free_threshold));
-                suffix.push_str(
-                    &format!(" ❗ system free memory low ({measured} / {threshold})")
-                        .if_supports_color(stream, |t| t.red())
-                        .to_string(),
-                );
-            }
-        }
-    }
-    suffix
+fn pressure_suffix(detail: Option<PressureDetail>, stream: Stream) -> String {
+    let Some(detail) = detail else {
+        return String::new();
+    };
+    format!(" ❗ memory pressure ({detail})")
+        .if_supports_color(stream, |t| t.red())
+        .to_string()
 }
 
 #[cfg(test)]
