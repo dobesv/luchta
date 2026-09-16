@@ -25,7 +25,7 @@ pub(crate) use console_output::ProgressOutput;
 use status_line::{render_status_line, StatusLineCounts, StatusLineInput};
 
 #[cfg(test)]
-use console_output::{truncate_ansi, visible_width, InteractiveStatusState};
+use console_output::{live_status_enabled, truncate_ansi, visible_width, InteractiveStatusState};
 
 /// Outcome of a task as recorded by the progress reporter.
 ///

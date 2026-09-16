@@ -545,6 +545,26 @@ include their elapsed time in the same parentheses as any worker progress.
 `--output summary` suppresses progress in either environment and prints only
 the final summary.
 
+`--output plain` keeps the append-only form even on a terminal that could
+redraw in place. Reach for it when a process supervisor sits between Luchta and
+your terminal. Overmind, Foreman, and Hivemind each run a process in a pty and
+then forward its bytes to a line-buffered reader, so a status line that is
+rewritten with a carriage return and never terminated by a newline is buffered
+instead of shown, and a long build appears to print nothing at all. Setting
+`TERM=dumb` also works, but it reaches every task Luchta spawns and turns off
+color; `--output plain` changes only how Luchta itself renders.
+
+The mode can also be set with the `LUCHTA_OUTPUT` environment variable, which
+accepts the same names as the flag. This is convenient in a `Procfile`, where
+the flag would have to be repeated for every entry:
+
+```
+luchta: LUCHTA_OUTPUT=plain luchta watch build
+```
+
+The flag wins when both are given. An unrecognized value is an error rather
+than a silent fallback.
+
 #### Failed Task Output
 
 When a task fails during `luchta run`, its output is replayed to the console wrapped in a clear header and footer block.
@@ -602,6 +622,21 @@ Status line: while paused, periodic progress output appends `⚠️ mem usage hi
   - Default: `concurrency.maxWeight` from config, or available parallelism.
 
 Precedence: flag > env var > config `concurrency.maxWeight` > default.
+
+#### Progress output mode
+
+- `--output <MODE>` / `LUCHTA_OUTPUT`
+  - Selects how much progress `run` and `watch` print. One of `default`,
+    `plain`, or `summary`.
+  - `default` draws one live status line on a capable terminal and falls back
+    to append-only lines every five seconds when stderr is redirected or
+    `TERM=dumb`.
+  - `plain` forces the append-only form everywhere, for process supervisors
+    that read our output line by line.
+  - `summary` prints only the final summary.
+  - An unrecognized environment value is rejected rather than ignored.
+
+Precedence: flag > env var > default.
 
 #### Cache Nonce override
 

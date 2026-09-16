@@ -31,7 +31,7 @@ impl ProgressOutput {
                 Ok(term) => term != "dumb",
                 Err(_) => true,
             };
-        Self::new(mode == OutputMode::Default && terminal_supports_live_status)
+        Self::new(live_status_enabled(mode, terminal_supports_live_status))
     }
 
     pub(crate) fn new(live: bool) -> Self {
@@ -136,6 +136,16 @@ impl ProgressOutput {
         let mut stderr = std::io::stderr().lock();
         expect_write("stderr", operation(&mut state, &mut stderr));
     }
+}
+
+/// Whether progress should be drawn as one in-place status line.
+///
+/// Only [`OutputMode::Default`] on a terminal that can redraw qualifies.
+/// [`OutputMode::Plain`] opts out deliberately: a supervisor that reads our
+/// output line by line never sees a status line that is rewritten with a
+/// carriage return and never terminated by a newline.
+pub(super) fn live_status_enabled(mode: OutputMode, terminal_supports_live_status: bool) -> bool {
+    mode == OutputMode::Default && terminal_supports_live_status
 }
 
 fn expect_write(destination: &str, result: std::io::Result<()>) {

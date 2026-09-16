@@ -23,7 +23,7 @@ mod why;
 
 use std::path::Path;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use cli::{Cli, Commands, OutputMode};
 use logs::LogsOptions;
 use luchta_engine::{
@@ -377,7 +377,7 @@ struct RunArgs {
     packages: Vec<String>,
     top_level: bool,
     dry_run: bool,
-    output: OutputMode,
+    output: Option<OutputMode>,
     continue_on_failure: bool,
     no_cache: bool,
     thresholds: ThresholdInputs,
@@ -430,6 +430,7 @@ fn command_run_args(command: Commands) -> RunArgs {
 
 async fn run_command(workspace_root: &Path, command: Commands) -> Result<()> {
     let mut args = command_run_args(command);
+    let output = resolve_output_mode(args.output, output_mode_env().as_deref())?;
     args.no_cache = args.no_cache || no_cache_env();
     args.packages = apply_implicit_package(args.packages, args.top_level, workspace_root)?;
     if args.tasks.is_empty() {
@@ -455,7 +456,7 @@ async fn run_command(workspace_root: &Path, command: Commands) -> Result<()> {
         run::run_tasks(run::RunTasksRequest {
             workspace_root,
             selection: &selection,
-            output: args.output,
+            output,
             continue_on_failure: args.continue_on_failure,
             no_cache: args.no_cache,
             memory_pressure,
@@ -489,6 +490,7 @@ async fn watch_command(workspace_root: &Path, command: Commands) -> Result<()> {
     }
 
     let no_cache = no_cache || no_cache_env();
+    let output = resolve_output_mode(output, output_mode_env().as_deref())?;
     let memory_pressure = resolve_memory_pressure_config(ThresholdInputs {
         usage_cli: mem_usage_threshold,
         free_cli: mem_free_threshold,
@@ -589,6 +591,39 @@ fn resolve_threshold_spec(
     }
 }
 
+/// Environment variable selecting the progress output mode.
+const OUTPUT_MODE_ENV: &str = "LUCHTA_OUTPUT";
+
+fn output_mode_env() -> Option<String> {
+    std::env::var(OUTPUT_MODE_ENV).ok()
+}
+
+/// Resolves the effective progress output mode.
+///
+/// The `--output` flag wins; otherwise `LUCHTA_OUTPUT` applies.
+fn resolve_output_mode(
+    cli_value: Option<OutputMode>,
+    env_value: Option<&str>,
+) -> Result<OutputMode, miette::Report> {
+    if let Some(mode) = cli_value {
+        return Ok(mode);
+    }
+
+    let Some(raw) = env_value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(OutputMode::default());
+    };
+
+    OutputMode::from_str(raw, true).map_err(|_| {
+        let known = OutputMode::value_variants()
+            .iter()
+            .filter_map(|variant| variant.to_possible_value())
+            .map(|value| value.get_name().to_owned())
+            .collect::<Vec<_>>()
+            .join(", ");
+        miette::miette!("Invalid {OUTPUT_MODE_ENV} value '{raw}': expected one of {known}")
+    })
+}
+
 fn resolve_max_weight_override(
     cli_value: Option<&str>,
     env_var: &str,
@@ -635,6 +670,53 @@ fn resolve_max_weight_override(
 mod tests {
     use super::*;
     use crate::cli::OutputMode;
+
+    #[test]
+    fn output_flag_overrides_the_environment_variable() {
+        let mode = resolve_output_mode(Some(OutputMode::Summary), Some("plain"))
+            .expect("explicit flag resolves");
+        assert_eq!(mode, OutputMode::Summary);
+    }
+
+    #[test]
+    fn output_environment_variable_applies_when_the_flag_is_absent() {
+        for value in ["plain", "PLAIN", " Plain "] {
+            let mode = resolve_output_mode(None, Some(value)).expect("env value resolves");
+            assert_eq!(mode, OutputMode::Plain, "value: {value:?}");
+        }
+    }
+
+    #[test]
+    fn output_mode_defaults_when_neither_flag_nor_environment_is_set() {
+        assert_eq!(
+            resolve_output_mode(None, None).expect("unset resolves"),
+            OutputMode::Default
+        );
+        assert_eq!(
+            resolve_output_mode(None, Some("   ")).expect("blank env resolves"),
+            OutputMode::Default
+        );
+    }
+
+    #[test]
+    fn unrecognized_output_environment_value_is_rejected() {
+        let error = resolve_output_mode(None, Some("bogus")).expect_err("invalid env value errors");
+        let message = format!("{error}");
+        assert!(
+            message.contains("LUCHTA_OUTPUT") && message.contains("bogus"),
+            "error should name the variable and the bad value: {message}"
+        );
+    }
+
+    #[test]
+    fn watch_command_parses_plain_output_mode() {
+        let cli = Cli::try_parse_from(["luchta", "watch", "build", "--output", "plain"])
+            .expect("parse watch with plain output");
+        let Commands::Watch { output, .. } = cli.command else {
+            panic!("expected watch command");
+        };
+        assert_eq!(output, Some(OutputMode::Plain));
+    }
 
     #[test]
     fn await_command_parses_task_and_selection_flags() {
@@ -699,7 +781,7 @@ mod tests {
                 packages: Vec::new(),
                 top_level: false,
                 dry_run: true,
-                output: OutputMode::Default,
+                output: None,
                 mem_usage_threshold: None,
                 max_weight: None,
                 mem_free_threshold: None,
