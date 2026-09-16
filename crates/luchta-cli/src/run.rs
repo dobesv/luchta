@@ -1297,6 +1297,28 @@ fn report_unmatched_request(
     bail!("task '{}' not found in task graph", requested);
 }
 
+/// A bare request (no `-T`) matched nothing, yet the name exists as a top-level
+/// (`#task`) task and NOT as any package task. The user asked for a top-level
+/// task without selecting the top-level scope. Requiring the name to be absent
+/// as a package task keeps this from firing when a package filter (`-p`) simply
+/// targets a package that lacks a task that lives in other packages.
+fn requests_top_level_task_without_flag(
+    criteria: &SelectionCriteria<'_>,
+    exists_at_root: bool,
+    exists_as_package_task: bool,
+) -> bool {
+    !criteria.top_level && exists_at_root && !exists_as_package_task
+}
+
+/// A `-T` request across all packages (no `-p`) matched nothing, yet the name
+/// exists as a package task. The user passed `-T` for a package task name.
+fn requests_package_task_with_top_level_flag(
+    criteria: &SelectionCriteria<'_>,
+    exists_as_package_task: bool,
+) -> bool {
+    criteria.top_level && criteria.match_all_non_root_packages && exists_as_package_task
+}
+
 /// Detects a literal task request that matched nothing only because it targeted
 /// the wrong scope. Package tasks (`task`) and top-level tasks (`#task`) are
 /// separate namespaces, so a bare request never sees top-level tasks and `-T`
@@ -1308,6 +1330,15 @@ fn report_unmatched_request(
 ///
 /// Returns `None` (falling back to the plain "not found" error) for any other
 /// case, including package-filter mismatches, which have their own messaging.
+///
+/// # `available_nodes` is the full unfiltered graph
+///
+/// `available_nodes` comes from `task_graph.nodes().collect()` — the complete
+/// workspace graph, NOT filtered by `-p`. Scope detection therefore inspects
+/// task existence across ALL packages, not just those matching the package
+/// filter. This matters because a task may exist both at the root and in some
+/// packages; a `-p` filter targeting a package without the task should NOT
+/// trigger the `-T` hint when the task exists as a package task elsewhere.
 fn wrong_scope_hint(
     requested: &str,
     criteria: &SelectionCriteria<'_>,
@@ -1320,13 +1351,13 @@ fn wrong_scope_hint(
         .iter()
         .any(|node| !node.id.is_root() && node.id.task.as_str() == requested);
 
-    if !criteria.top_level && exists_at_root {
+    if requests_top_level_task_without_flag(criteria, exists_at_root, exists_as_package_task) {
         return Some(format!(
             "task '{requested}' is a top-level task; pass -T/--top-level to select it"
         ));
     }
 
-    if criteria.top_level && criteria.match_all_non_root_packages && exists_as_package_task {
+    if requests_package_task_with_top_level_flag(criteria, exists_as_package_task) {
         return Some(format!(
             "task '{requested}' is a package task, not a top-level task; drop -T (or pass -p <package>) to select it"
         ));
@@ -2160,6 +2191,80 @@ mod tests {
         assert!(
             error.to_string().contains("not found in task graph"),
             "expected plain not-found error, got: {error}"
+        );
+    }
+
+    #[test]
+    fn report_unmatched_request_keeps_not_found_for_package_filter_missing_task() {
+        // Regression for #300: `build` exists both at the root (`#build`) and in
+        // `@repo/bar`, but the request filters to `@repo/foo` (which has no
+        // `build`). The request targeted a package with no build task, not the
+        // wrong scope — so the top-level hint must NOT fire. It must fall back to
+        // the plain "not found" error rather than misleadingly advising -T.
+        let nodes = [
+            TaskNode {
+                id: TaskId::new(luchta_types::ROOT_PACKAGE_NAME, "build"),
+                weight: 1,
+            },
+            TaskNode {
+                id: TaskId::new("@repo/bar", "build"),
+                weight: 1,
+            },
+        ];
+        let node_refs: Vec<&TaskNode> = nodes.iter().collect();
+        let empty_globs = build_globset(&[]).expect("build empty globs");
+        // A `-p @repo/foo` filter is active, so packages is non-empty and
+        // `match_all_non_root_packages` is false.
+        let package_globs = build_globset(&["@repo/foo".to_string()]).expect("build package globs");
+        let criteria = SelectionCriteria {
+            task_globs: &empty_globs,
+            package_globs: &package_globs,
+            match_all_non_root_packages: false,
+            top_level: false,
+            since_affected: None,
+        };
+
+        let error = report_unmatched_request("build", &[], &criteria, &node_refs)
+            .expect_err("package filter missing the task must error");
+        let message = error.to_string();
+        assert!(
+            message.contains("not found in task graph"),
+            "expected plain not-found error, got: {message}"
+        );
+        assert!(
+            !message.contains("is a top-level task"),
+            "must not advise -T when the task exists as a package task, got: {message}"
+        );
+    }
+
+    #[test]
+    fn report_unmatched_request_hints_top_level_even_with_package_filter() {
+        // `audit-licenses` exists ONLY at the root and nowhere as a package
+        // task. A `-p @repo/foo` filter is active but no `-T`. Because the name
+        // is not a package task anywhere, the request really did target the
+        // wrong scope, so the -T hint must still fire. This guards the fix from
+        // over-correcting by suppressing the hint whenever `-p` is present.
+        let nodes = [TaskNode {
+            id: TaskId::new(luchta_types::ROOT_PACKAGE_NAME, "audit-licenses"),
+            weight: 1,
+        }];
+        let node_refs: Vec<&TaskNode> = nodes.iter().collect();
+        let empty_globs = build_globset(&[]).expect("build empty globs");
+        let package_globs = build_globset(&["@repo/foo".to_string()]).expect("build package globs");
+        let criteria = SelectionCriteria {
+            task_globs: &empty_globs,
+            package_globs: &package_globs,
+            match_all_non_root_packages: false,
+            top_level: false,
+            since_affected: None,
+        };
+
+        let error = report_unmatched_request("audit-licenses", &[], &criteria, &node_refs)
+            .expect_err("root-only task must error");
+        let message = error.to_string();
+        assert!(
+            message.contains("is a top-level task") && message.contains("-T"),
+            "expected top-level hint even with a package filter, got: {message}"
         );
     }
 

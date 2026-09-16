@@ -48,6 +48,69 @@ fn setup_list_workspace_with_root_task() -> assert_fs::TempDir {
     temp
 }
 
+fn setup_package_listing_workspace() -> assert_fs::TempDir {
+    let temp = assert_fs::TempDir::new().unwrap();
+    common::setup_workspace(&temp);
+
+    temp.child("packages/c").create_dir_all().unwrap();
+    temp.child("packages/c/package.json")
+        .write_str(
+            r#"{
+  "name": "c",
+  "version": "1.0.0",
+  "scripts": { "build": "echo build-c" }
+}"#,
+        )
+        .unwrap();
+    temp.child("packages/d").create_dir_all().unwrap();
+    temp.child("packages/d/package.json")
+        .write_str(
+            r#"{
+  "name": "d",
+  "version": "1.0.0"
+}"#,
+        )
+        .unwrap();
+
+    let worker = common::shell_worker(&temp);
+    common::write_task_config_with_named_worker(
+        &temp,
+        "sh",
+        worker.path(),
+        "\"a#build\":{\"worker\":\"sh\"},\"a#test\":{\"worker\":\"sh\"},\"b#build\":{\"dependsOn\":[\"^build\"],\"worker\":\"sh\"},\"c#build\":{\"worker\":\"sh\"}",
+    );
+    common::git_commit_all(temp.path(), "add list package fixture");
+    temp
+}
+
+fn successful_stdout(output: std::process::Output) -> String {
+    assert!(
+        output.status.success(),
+        "list failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).expect("list stdout should be UTF-8")
+}
+
+fn task_headers(stdout: &str) -> Vec<&str> {
+    stdout
+        .lines()
+        .filter(|line| !line.starts_with("  "))
+        .collect()
+}
+
+fn assert_no_run_noop_message(stdout: &str) {
+    assert!(
+        !stdout.contains("nothing to run"),
+        "unexpected run message: {stdout}"
+    );
+    assert!(
+        !stdout.contains("No packages changed"),
+        "unexpected run message: {stdout}"
+    );
+}
+
 fn run_list(temp: &assert_fs::TempDir, args: &[&str]) -> std::process::Output {
     let mut cmd = Command::cargo_bin("luchta").unwrap();
     cmd.env("NO_COLOR", "1");
@@ -234,4 +297,209 @@ fn list_errors_for_unmatched_package() {
     cmd.assert()
         .failure()
         .stderr(predicate::str::contains("No packages matched"));
+}
+
+#[test]
+fn list_since_filters_tasks_to_changed_package_and_dependents() {
+    let temp = setup_package_listing_workspace();
+    temp.child("packages/a/foo.ts")
+        .write_str("export const changed = true;\n")
+        .unwrap();
+
+    let stdout = successful_stdout(run_list(&temp, &["--since", "HEAD"]));
+
+    assert_eq!(task_headers(&stdout), vec!["a#build", "a#test", "b#build"]);
+    assert!(!stdout.contains("c#build"));
+    temp.close().unwrap();
+}
+
+#[test]
+fn list_packages_text_is_sorted_unique_and_uses_real_package_names() {
+    let temp = setup_package_listing_workspace();
+
+    let stdout = successful_stdout(run_list(&temp, &["--packages"]));
+
+    assert_eq!(stdout.lines().collect::<Vec<_>>(), vec!["a", "b", "c"]);
+    assert!(!stdout.contains("//root"));
+    temp.close().unwrap();
+}
+
+#[test]
+fn list_packages_json_has_sorted_names_and_workspace_relative_paths() {
+    let temp = setup_package_listing_workspace();
+
+    let stdout = successful_stdout(run_list(&temp, &["--packages", "--json"]));
+    let parsed: Value = serde_json::from_str(&stdout).expect("valid package JSON");
+
+    assert_eq!(
+        parsed,
+        serde_json::json!([
+            {"package": "a", "path": "packages/a"},
+            {"package": "b", "path": "packages/b"},
+            {"package": "c", "path": "packages/c"}
+        ])
+    );
+    for listing in parsed.as_array().unwrap() {
+        let path = listing["path"].as_str().unwrap();
+        assert!(
+            !std::path::Path::new(path).is_absolute(),
+            "absolute path: {path}"
+        );
+    }
+    temp.close().unwrap();
+}
+
+#[test]
+fn list_packages_task_filter_includes_only_packages_defining_task() {
+    let temp = setup_package_listing_workspace();
+
+    let stdout = successful_stdout(run_list(&temp, &["--packages", "test"]));
+
+    assert_eq!(stdout.lines().collect::<Vec<_>>(), vec!["a"]);
+    temp.close().unwrap();
+}
+
+#[test]
+fn list_packages_package_glob_includes_only_matching_package() {
+    let temp = setup_package_listing_workspace();
+
+    let stdout = successful_stdout(run_list(&temp, &["--packages", "-p", "a"]));
+
+    assert_eq!(stdout.lines().collect::<Vec<_>>(), vec!["a"]);
+    temp.close().unwrap();
+}
+
+#[test]
+fn list_packages_since_returns_changed_package_and_dependents() {
+    let temp = setup_package_listing_workspace();
+    temp.child("packages/a/foo.ts")
+        .write_str("export const changed = true;\n")
+        .unwrap();
+
+    let stdout = successful_stdout(run_list(&temp, &["--packages", "--since", "HEAD"]));
+
+    assert_eq!(stdout.lines().collect::<Vec<_>>(), vec!["a", "b"]);
+    assert!(!stdout.lines().any(|package| package == "c"));
+    temp.close().unwrap();
+}
+
+#[test]
+fn list_packages_top_level_maps_root_sentinel_to_real_name_and_dot_path() {
+    let temp = setup_list_workspace_with_root_task();
+
+    let text = successful_stdout(run_list(&temp, &["-T", "--packages"]));
+    assert_eq!(text, "root\n");
+    assert!(!text.contains("//root"));
+
+    let json = successful_stdout(run_list(&temp, &["-T", "--packages", "--json"]));
+    assert_eq!(
+        serde_json::from_str::<Value>(&json).expect("valid root package JSON"),
+        serde_json::json!([{"package": "root", "path": "."}])
+    );
+    assert!(!json.contains("//root"));
+    temp.close().unwrap();
+}
+
+#[test]
+fn list_since_empty_affected_set_is_silent_for_task_and_package_modes() {
+    let temp = setup_package_listing_workspace();
+
+    for args in [
+        &["--since", "HEAD"][..],
+        &["--packages", "--since", "HEAD"][..],
+    ] {
+        let stdout = successful_stdout(run_list(&temp, args));
+        assert_eq!(stdout, "");
+        assert_no_run_noop_message(&stdout);
+    }
+
+    for args in [
+        &["--since", "HEAD", "--json"][..],
+        &["--packages", "--since", "HEAD", "--json"][..],
+    ] {
+        let stdout = successful_stdout(run_list(&temp, args));
+        assert_eq!(
+            serde_json::from_str::<Value>(&stdout).expect("valid empty JSON"),
+            serde_json::json!([])
+        );
+        assert_no_run_noop_message(&stdout);
+    }
+
+    temp.close().unwrap();
+}
+
+#[test]
+fn list_packages_excludes_package_without_selected_task() {
+    let temp = setup_package_listing_workspace();
+
+    let stdout = successful_stdout(run_list(&temp, &["--packages", "build"]));
+
+    assert_eq!(stdout.lines().collect::<Vec<_>>(), vec!["a", "b", "c"]);
+    assert!(!stdout.lines().any(|package| package == "d"));
+    temp.close().unwrap();
+}
+
+#[test]
+fn list_literal_task_since_empty_affected_set_returns_empty_output() {
+    let temp = setup_package_listing_workspace();
+
+    let text = successful_stdout(run_list(&temp, &["build", "--since", "HEAD"]));
+    assert_eq!(text, "");
+    assert_no_run_noop_message(&text);
+
+    let json = successful_stdout(run_list(&temp, &["build", "--since", "HEAD", "--json"]));
+    assert_eq!(json, "[]\n");
+    assert_no_run_noop_message(&json);
+
+    temp.close().unwrap();
+}
+
+#[test]
+fn list_packages_literal_task_since_empty_affected_set_returns_empty_output() {
+    let temp = setup_package_listing_workspace();
+
+    let text = successful_stdout(run_list(&temp, &["--packages", "build", "--since", "HEAD"]));
+    assert_eq!(text, "");
+    assert_no_run_noop_message(&text);
+
+    let json = successful_stdout(run_list(
+        &temp,
+        &["--packages", "build", "--since", "HEAD", "--json"],
+    ));
+    assert_eq!(json, "[]\n");
+    assert_no_run_noop_message(&json);
+
+    temp.close().unwrap();
+}
+
+#[test]
+fn list_literal_missing_task_since_preserves_not_found_error() {
+    let temp = setup_package_listing_workspace();
+
+    let output = run_list(&temp, &["nonexistent", "--since", "HEAD"]);
+
+    assert!(!output.status.success());
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), "");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("task 'nonexistent' not found in task graph"),
+        "unexpected error: {stderr}"
+    );
+    temp.close().unwrap();
+}
+
+#[test]
+fn list_literal_task_since_changed_package_keeps_affected_tasks_and_packages() {
+    let temp = setup_package_listing_workspace();
+    temp.child("packages/a/foo.ts")
+        .write_str("export const changed = true;\n")
+        .unwrap();
+
+    let tasks = successful_stdout(run_list(&temp, &["build", "--since", "HEAD"]));
+    assert_eq!(task_headers(&tasks), vec!["a#build", "b#build"]);
+
+    let packages = successful_stdout(run_list(&temp, &["--packages", "build", "--since", "HEAD"]));
+    assert_eq!(packages.lines().collect::<Vec<_>>(), vec!["a", "b"]);
+
+    temp.close().unwrap();
 }
