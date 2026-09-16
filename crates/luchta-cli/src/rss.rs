@@ -36,6 +36,70 @@ fn format_with_unit(bytes: u64, unit_size: u64, unit_label: &str) -> String {
     }
 }
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+/// TTL cache over [`process_tree_rss_bytes`].
+///
+/// Tree RSS is display-only: it feeds the `🐏` status-line and summary segment
+/// and no longer gates dispatch. The cache exists because the live status line
+/// renders every 100ms while walking the process tree costs a pass over every
+/// process on the machine.
+///
+/// `Debug` is required: `ProgressReporter`, which owns one, derives it.
+#[derive(Debug)]
+pub struct RssCache {
+    last: Mutex<Option<(Instant, Option<u64>)>>,
+    ttl: Duration,
+    walks: AtomicU64,
+}
+
+impl RssCache {
+    const DEFAULT_TTL: Duration = Duration::from_millis(250);
+
+    pub fn new() -> Self {
+        Self::with_ttl(Self::DEFAULT_TTL)
+    }
+
+    pub fn with_ttl(ttl: Duration) -> Self {
+        Self {
+            last: Mutex::new(None),
+            ttl,
+            walks: AtomicU64::new(0),
+        }
+    }
+
+    /// Summed RSS of this process and its descendants, recomputed at most once
+    /// per TTL. `None` when the platform cannot report it.
+    pub fn get(&self) -> Option<u64> {
+        let mut last = self.last.lock().expect("rss cache mutex poisoned");
+        let now = Instant::now();
+
+        if let Some((sampled_at, value)) = *last {
+            if now.duration_since(sampled_at) < self.ttl {
+                return value;
+            }
+        }
+
+        self.walks.fetch_add(1, Ordering::Relaxed);
+        let value = process_tree_rss_bytes();
+        *last = Some((now, value));
+        value
+    }
+
+    #[cfg(test)]
+    fn walk_count(&self) -> u64 {
+        self.walks.load(Ordering::Relaxed)
+    }
+}
+
+impl Default for RssCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod platform {
     use std::collections::{HashSet, VecDeque};
@@ -344,5 +408,33 @@ mod tests {
         assert_eq!(format_rss(Some(900 * KIB)), "900 KB");
         assert_eq!(format_rss(Some(MIB + (MIB / 2))), "1.5 MB");
         assert_eq!(format_rss(Some(2 * GIB)), "2 GB");
+    }
+
+    #[test]
+    fn rss_cache_reuses_value_within_ttl() {
+        use super::RssCache;
+
+        let cache = RssCache::new();
+        let first = cache.get();
+        let second = cache.get();
+
+        assert!(first.is_some_and(|bytes| bytes > 0));
+        // Two reads inside the TTL must be byte-identical: the second one must not
+        // have re-walked the process tree.
+        assert_eq!(first, second);
+        assert_eq!(cache.walk_count(), 1);
+    }
+
+    #[test]
+    fn rss_cache_rewalks_after_ttl_expires() {
+        use super::RssCache;
+        use std::time::Duration;
+
+        let cache = RssCache::with_ttl(Duration::from_millis(1));
+        let _ = cache.get();
+        std::thread::sleep(Duration::from_millis(5));
+        let _ = cache.get();
+
+        assert_eq!(cache.walk_count(), 2);
     }
 }

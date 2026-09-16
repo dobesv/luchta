@@ -149,12 +149,11 @@ fn render_status_line(
     }
 
     let pressure = pressure_state.snapshot();
-    let rss = crate::rss::format_rss(pressure.sample.map(|sample| sample.tree_rss));
+    let rss = crate::rss::format_rss(reporter.tree_rss());
     let output = reporter.output();
     let line = reporter.render_progress_for_width(crate::progress::ProgressRenderContext {
         rss_formatted: &rss,
-        warnings: &pressure.reasons,
-        pressure: &pressure,
+        pressure: pressure.detail,
         stream: owo_colors::Stream::Stderr,
         max_width: output.terminal_width(),
     });
@@ -188,7 +187,7 @@ pub(super) async fn dispatch_loop(
         tokio::select! {
             signal_result = signal.as_mut() => {
                 let shutdown = signal_result?;
-                break report_interrupted(ctx, pressure_state, Some(shutdown));
+                break report_interrupted(ctx, Some(shutdown));
             }
             message = receiver.recv() => {
                 let Some((task_node, done_tx)) = message else {
@@ -215,7 +214,7 @@ pub(super) async fn dispatch_loop(
                     )
                     .await?
                     {
-                        return report_interrupted(ctx, pressure_state, Some(shutdown));
+                        return report_interrupted(ctx, Some(shutdown));
                     }
                 }
             }
@@ -234,7 +233,7 @@ pub(super) async fn dispatch_loop(
                 )
                 .await?
                 {
-                    return report_interrupted(ctx, pressure_state, Some(shutdown));
+                    return report_interrupted(ctx, Some(shutdown));
                 }
             }
             _ = progress_interval.tick() => render_status_line(ctx.reporter, pressure_state, false),
@@ -303,18 +302,10 @@ where
         .into_diagnostic()
 }
 
-fn report_interrupted(
-    ctx: &DispatchContext<'_>,
-    pressure_state: &PressureState,
-    shutdown: Option<ShutdownSignal>,
-) -> Result<()> {
+fn report_interrupted(ctx: &DispatchContext<'_>, shutdown: Option<ShutdownSignal>) -> Result<()> {
     ctx.interrupted
         .store(true, std::sync::atomic::Ordering::SeqCst);
-    let pressure = pressure_state.snapshot();
-    let rss = pressure
-        .sample
-        .map(|sample| sample.tree_rss)
-        .or_else(crate::rss::process_tree_rss_bytes);
+    let rss = ctx.reporter.tree_rss();
     let source = shutdown
         .map(|signal| format!(" by {}", signal.name()))
         .unwrap_or_default();
@@ -339,7 +330,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
-    use crate::memory_pressure::{MemoryPressure, MemorySample, PressureReason};
+    use crate::memory_pressure::{MemoryPressure, PressureDetail};
 
     /// Fake implementation of PressureEnv for deterministic testing.
     ///
@@ -392,31 +383,23 @@ mod tests {
         }
     }
 
-    /// Builds a scripted pressure sample. `paused == true` yields a usage-high
-    /// sample; `false` yields a fully-cleared one. Centralises the literal so
-    /// the individual tests stay free of duplicated struct construction.
+    /// Builds a scripted verdict. `paused == true` carries a detail, matching
+    /// the `detail.is_some() == paused` invariant; `false` carries none.
+    /// Centralises the literal so the individual tests stay free of duplicated
+    /// struct construction.
     fn pressure_sample(paused: bool) -> MemoryPressure {
-        let (tree_rss, system_available, reasons) = if paused {
-            (1_000_000, 1_000_000, vec![PressureReason::UsageHigh])
-        } else {
-            (0, u64::MAX, vec![])
-        };
         MemoryPressure {
-            sample: MemorySample {
-                tree_rss,
-                system_available,
-            },
-            reasons,
             paused,
+            detail: paused.then_some(PressureDetail::Stalled(42.0)),
         }
     }
 
-    /// Scripted "paused" pressure sample (usage over threshold).
+    /// Scripted "paused" verdict (the OS reports pressure).
     fn paused_pressure() -> MemoryPressure {
         pressure_sample(true)
     }
 
-    /// Scripted "cleared" pressure sample (no pressure).
+    /// Scripted "cleared" verdict (no pressure).
     fn clear_pressure() -> MemoryPressure {
         pressure_sample(false)
     }
@@ -499,32 +482,26 @@ mod tests {
     }
 
     #[test]
-    fn render_status_line_uses_decision_tree_rss() {
+    fn render_status_line_shows_os_pressure_reason() {
         let reporter = crate::progress::ProgressReporter::new(
             OutputMode::Default,
             std::collections::HashMap::new(),
             0,
         );
-        let pressure_state = PressureState::new(30 * 1024 * 1024, 0);
+        let pressure_state = PressureState::new();
         pressure_state.update(&MemoryPressure {
-            sample: MemorySample {
-                tree_rss: 32 * 1024 * 1024,
-                system_available: u64::MAX,
-            },
-            reasons: vec![crate::memory_pressure::PressureReason::UsageHigh],
             paused: true,
+            detail: Some(crate::memory_pressure::PressureDetail::Stalled(23.0)),
         });
 
-        let pressure = pressure_state.snapshot();
         let line = reporter.render_progress(
-            &crate::rss::format_rss(pressure.sample.map(|sample| sample.tree_rss)),
-            &pressure.reasons,
-            &pressure,
+            "32 MB",
+            pressure_state.snapshot().detail,
             owo_colors::Stream::Stderr,
         );
 
         assert!(line.contains("🐏 32 MB"));
-        assert!(line.contains("mem usage high (32 MB / 30 MB)"));
+        assert!(line.contains("memory pressure (stalled 23%)"));
     }
 
     #[test]
