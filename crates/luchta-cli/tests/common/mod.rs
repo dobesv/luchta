@@ -744,3 +744,45 @@ chalk@^5.0.0:
   resolved "https://registry.yarnpkg.com/chalk/-/chalk-5.0.0.tgz#ae417bf7adye0"
   integrity sha512-chalk0
 "#;
+
+/// Workspace where `app#test` reaches `lib`'s real build outputs only through
+/// command-less "meta" tasks (`build:js`, `build:js-recursive`), mirroring the
+/// shape reported in issue #336.
+pub fn setup_meta_task_dependency_workspace(temp: &assert_fs::TempDir) {
+    write_root_workspace(temp);
+    temp.child("yarn.lock").write_str("").unwrap();
+    let worker = shell_worker(temp);
+    write_task_config_with_shell_worker(
+        temp,
+        worker.path(),
+        r#""build:node":{},"build:js":{"dependsOn":["build:node"]},"build:js-recursive":{"dependsOn":["build:js","^build:js-recursive"]},"lib#build:node":{"worker":"shell","inputs":["src.txt"],"outputs":["out.txt"],"command":"count=$(cat counter.txt 2>/dev/null || echo 0); count=$((count+1)); echo $count > counter.txt; cat src.txt > out.txt"},"app#test":{"cache":{},"dependsOn":["build:js","^build:js-recursive"],"worker":"shell","inputs":["src.txt"],"outputs":["counter.txt"],"command":"count=$(cat counter.txt 2>/dev/null || echo 0); count=$((count+1)); echo $count > counter.txt"}"#,
+    );
+
+    temp.child("packages/lib").create_dir_all().unwrap();
+    temp.child("packages/lib/package.json")
+        .write_str(
+            r#"{
+  "name": "lib"
+}"#,
+        )
+        .unwrap();
+    temp.child("packages/lib/src.txt")
+        .write_str("lib-one\n")
+        .unwrap();
+
+    temp.child("packages/app").create_dir_all().unwrap();
+    temp.child("packages/app/package.json")
+        .write_str(
+            r#"{
+  "name": "app",
+  "dependencies": {
+    "lib": "workspace:*"
+  }
+}"#,
+        )
+        .unwrap();
+    temp.child("packages/app/src.txt")
+        .write_str("app-one\n")
+        .unwrap();
+    init_git(temp);
+}
