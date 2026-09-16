@@ -162,7 +162,7 @@ fn render_status_line(
 }
 
 fn should_render(paused: bool, running_count: usize, mode: OutputMode) -> bool {
-    mode == OutputMode::Default && (paused || running_count > 0)
+    mode != OutputMode::Summary && (paused || running_count > 0)
 }
 
 pub(super) async fn dispatch_loop(
@@ -525,6 +525,21 @@ mod tests {
 
         assert!(line.contains("🐏 32 MB"));
         assert!(line.contains("mem usage high (32 MB / 30 MB)"));
+    }
+
+    #[test]
+    fn should_render_status_line_in_plain_mode_for_pause_or_running_matrix() {
+        assert!(should_render(true, 0, OutputMode::Plain));
+        assert!(should_render(true, 2, OutputMode::Plain));
+        assert!(!should_render(false, 0, OutputMode::Plain));
+        assert!(should_render(false, 2, OutputMode::Plain));
+    }
+
+    #[test]
+    fn should_never_render_status_line_in_summary_mode() {
+        assert!(!should_render(true, 0, OutputMode::Summary));
+        assert!(!should_render(true, 2, OutputMode::Summary));
+        assert!(!should_render(false, 2, OutputMode::Summary));
     }
 
     #[test]

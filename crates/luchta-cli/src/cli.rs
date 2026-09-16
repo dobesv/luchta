@@ -4,14 +4,29 @@ use clap::{Parser, Subcommand};
 
 /// How much progress output `luchta run` prints.
 ///
-/// Only two modes exist in v1. JSONL and color output are explicit future work
-/// and intentionally absent here.
+/// JSONL and color output are explicit future work and intentionally absent
+/// here.
+///
+/// Two places decide what a mode prints, and neither matches on the whole enum,
+/// so a new variant silently inherits a default from each. `live_status_enabled`
+/// admits only [`OutputMode::Default`], so a new variant is append-only.
+/// `should_render` in `run::pause` excludes only [`OutputMode::Summary`], so a
+/// new variant does emit periodic status lines. Revisit both when adding one.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum OutputMode {
     /// Live in-place progress on a capable interactive terminal (`TERM` is not
     /// `dumb`), or append-only progress every 5s otherwise, plus a final summary.
     #[default]
     Default,
+    /// Append-only progress every 5s plus a final summary, even on a terminal
+    /// that could redraw in place.
+    ///
+    /// Use this when a process supervisor sits between Luchta and the terminal.
+    /// Tools like Overmind, Foreman, and Hivemind run each process in a pty and
+    /// then forward its bytes to a line-buffered reader, so an in-place status
+    /// line that never emits a newline is buffered instead of shown. See GitHub
+    /// issue #335.
+    Plain,
     /// Only the final summary line; no periodic progress.
     Summary,
 }
@@ -48,8 +63,10 @@ pub enum Commands {
         dry_run: bool,
 
         /// Control how much progress output is printed.
-        #[arg(long, value_enum, default_value_t = OutputMode::Default)]
-        output: OutputMode,
+        ///
+        /// Overrides `LUCHTA_OUTPUT`; otherwise defaults to `default`.
+        #[arg(long, value_enum)]
+        output: Option<OutputMode>,
 
         /// Pause NEW task dispatch when process-tree RSS exceeds this threshold.
         ///
@@ -102,8 +119,10 @@ pub enum Commands {
         top_level: bool,
 
         /// Control how much progress output is printed.
-        #[arg(long, value_enum, default_value_t = OutputMode::Default)]
-        output: OutputMode,
+        ///
+        /// Overrides `LUCHTA_OUTPUT`; otherwise defaults to `default`.
+        #[arg(long, value_enum)]
+        output: Option<OutputMode>,
 
         /// Pause NEW task dispatch when process-tree RSS exceeds this threshold.
         ///
