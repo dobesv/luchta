@@ -599,25 +599,41 @@ Failed tasks are displayed in the status line and final summary as `× <count> (
 `luchta run` pauses dispatching **new** tasks while the operating system reports
 that memory is under pressure. In-flight tasks keep running to completion.
 
-- `--mem-pressure <off|low|normal|high>` / `LUCHTA_MEM_PRESSURE`
-  - `off` disables backpressure entirely.
-  - `low` pauses only under severe pressure; `high` pauses at the first sign.
-  - Default: `normal`.
+This is a safety net against thrashing, not a memory governor: a paused build
+stalls immediately and visibly on every run that meets the trigger, while
+running low on memory is occasional and usually recoverable. Luchta would
+rather keep dispatching well past the point where a machine feels slow than
+pay that cost early, so the defaults below only pause on sustained, severe
+pressure.
 
-Precedence: flag > env var > default.
+- `--no-mem-pressure` / `LUCHTA_NO_MEM_PRESSURE`
+  - Disables backpressure entirely — the escape hatch for a machine whose
+    pressure signal misbehaves, or a build that must not stall behind an
+    unrelated hog.
+  - Default: backpressure is on.
 
 Luchta asks the OS rather than guessing from its own memory use — a build using
 60% of RAM on an idle machine is fine, while one using 20% on a machine that is
-already swapping is not:
+already swapping is not. Each platform publishes a different kind of signal, so
+each gets its own tuning knob rather than a shared sensitivity ladder:
 
-| Platform | Indicator | What each level means |
-| --- | --- | --- |
-| Linux | Pressure Stall Information — the current cgroup's `memory.pressure`, falling back to `/proc/pressure/memory` | `some avg10` above 20% (`low`), 10% (`normal`), 5% (`high`) |
-| macOS | `kern.memorystatus_vm_pressure_level` | critical (`low`), warning (`normal` and `high`) |
-| Windows | `LowMemoryResourceNotification` | signalled — a single bit, so sensitivity has no effect beyond `off` |
+| Platform | Indicator | Pauses when | Tuning |
+| --- | --- | --- | --- |
+| Linux | Pressure Stall Information — the current cgroup's `memory.pressure`, falling back to `/proc/pressure/memory` | `full avg10` (share of time *every* non-idle task was stalled on reclaim at once — the kernel's definition of thrashing) exceeds the threshold | `LUCHTA_MEM_PSI_THRESHOLD` (percent, default `60`) |
+| macOS | `kern.memorystatus_vm_pressure_level` | level reaches the configured minimum | `LUCHTA_MEM_MACOS_LEVEL` (`warning` or `critical`, case-insensitive; default `critical`) |
+| Windows | `LowMemoryResourceNotification` | signalled — a single bit, nothing to tune | none |
+
+macOS raises *warning* routinely as an advisory to release cached memory, not
+as a sign the machine is struggling, so the default only pauses at `critical`.
+Set `LUCHTA_MEM_MACOS_LEVEL=warning` for the more sensitive behavior if your
+workload wants it.
+
+An unparseable value for either tuning variable is a startup error naming the
+variable and what it accepts, not a silent fallback to the default — the point
+is to fail loudly if you think you tuned something and didn't.
 
 Behavior: there is no timeout or auto-abort while paused; use Ctrl-C to abort,
-or run with `--mem-pressure off` if an unrelated process is holding the machine
+or run with `--no-mem-pressure` if an unrelated process is holding the machine
 under pressure.
 
 If the indicator cannot be read — a Linux kernel built without `CONFIG_PSI`, or

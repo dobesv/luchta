@@ -249,7 +249,7 @@ fn default_watch_cycle_params<'a>(selection: &'a TaskSelection<'a>) -> RunCycleP
         output: OutputMode::Default,
         continue_on_failure: false,
         no_cache: false,
-        memory_pressure: crate::memory_pressure::Sensitivity::Normal,
+        memory_pressure_enabled: true,
     }
 }
 
@@ -312,7 +312,7 @@ async fn watch_session_reuses_worker_manager_across_two_real_cycles() {
                 output: OutputMode::Default,
                 continue_on_failure: false,
                 no_cache: false,
-                memory_pressure: crate::memory_pressure::Sensitivity::Normal,
+                memory_pressure_enabled: true,
             },
             CancellationToken::new(),
         )
@@ -328,7 +328,7 @@ async fn watch_session_reuses_worker_manager_across_two_real_cycles() {
                 output: OutputMode::Default,
                 continue_on_failure: false,
                 no_cache: false,
-                memory_pressure: crate::memory_pressure::Sensitivity::Normal,
+                memory_pressure_enabled: true,
             },
             CancellationToken::new(),
         )

@@ -7,20 +7,24 @@
 //! macOS tests, so every decision about what a level means lives in
 //! `sensitivity.rs`, which is compiled and tested on Linux.
 
-use super::sensitivity::macos_level_trigger;
-use super::{PressureDetail, Sensitivity};
+use super::tuning::macos_min_level;
+use super::PressureDetail;
 
 /// `kern.memorystatus_vm_pressure_level`: 1 normal, 2 warning, 4 critical.
 const PRESSURE_LEVEL_SYSCTL: &[u8] = b"kern.memorystatus_vm_pressure_level\0";
 const LEVEL_CRITICAL: i32 = 4;
+
+/// Environment variable overriding the minimum level at which dispatch
+/// pauses. See `tuning::macos_min_level` for parsing and the default.
+const MACOS_LEVEL_ENV: &str = "LUCHTA_MEM_MACOS_LEVEL";
 
 /// Returns `(should_pause, why)`. `why` is only meaningful when
 /// `should_pause` is `true` — there is no "normal" `PressureDetail` variant,
 /// so a healthy level (1) still produces `Warning` here as an ignored
 /// placeholder value, not a claim that the machine is actually at the
 /// warning level. Callers must gate on the bool before rendering the detail.
-pub(super) fn sample(sensitivity: Sensitivity) -> Option<(bool, PressureDetail)> {
-    let trigger = macos_level_trigger(sensitivity)?;
+pub(super) fn sample() -> Option<(bool, PressureDetail)> {
+    let trigger = macos_min_level(std::env::var(MACOS_LEVEL_ENV).ok().as_deref());
     let level = read_pressure_level()?;
     let detail = if level >= LEVEL_CRITICAL {
         PressureDetail::Critical

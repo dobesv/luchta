@@ -1,8 +1,8 @@
 //! Windows memory pressure from `LowMemoryResourceNotification`.
 //!
 //! The OS signals this object when available physical memory is low. It is a
-//! single bit with no severity, which is why `sensitivity.rs` maps every level
-//! but `off` to the same behavior here.
+//! single bit with no severity, so there is nothing to tune here — unlike
+//! Linux and macOS, Windows has no per-platform tuning env var.
 //!
 //! The two API calls are deliberately the ONLY thing in this file; CI never
 //! executes Windows tests. `QueryMemoryResourceNotification` is used instead
@@ -18,16 +18,12 @@ use windows_sys::Win32::System::Memory::{
     QueryMemoryResourceNotification,
 };
 
-use super::sensitivity::windows_pauses;
-use super::{PressureDetail, Sensitivity};
+use super::PressureDetail;
 
 /// Returns `(should_pause, why)`. `why` is only meaningful when
 /// `should_pause` is `true`; callers must gate on the bool before rendering
 /// the detail.
-pub(super) fn sample(sensitivity: Sensitivity) -> Option<(bool, PressureDetail)> {
-    if !windows_pauses(sensitivity) {
-        return None;
-    }
+pub(super) fn sample() -> Option<(bool, PressureDetail)> {
     let low = read_low_memory()?;
     Some((low, PressureDetail::LowMemory))
 }

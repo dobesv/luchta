@@ -13,9 +13,7 @@
 
 use std::time::{Duration, Instant};
 
-mod sensitivity;
-
-pub use sensitivity::Sensitivity;
+pub(crate) mod tuning;
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -42,8 +40,8 @@ mod windows;
 #[allow(dead_code)]
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub(crate) enum PressureDetail {
-    /// Linux PSI `some avg10`: percent of the last 10s during which some task
-    /// stalled on memory reclaim.
+    /// Linux PSI `full avg10`: percent of the last 10s during which every
+    /// non-idle task stalled on memory reclaim at once (thrashing).
     Stalled(f64),
     /// macOS `kern.memorystatus_vm_pressure_level` below critical. Also the
     /// placeholder a calm macOS reading carries, which is why it means nothing
@@ -91,23 +89,19 @@ impl MemoryPressure {
     }
 }
 
-/// Reads the platform indicator and applies `sensitivity`. `None` means the
-/// indicator is unavailable.
-type SampleFn = fn(Sensitivity) -> Option<MemoryPressure>;
+/// Reads the platform indicator. `None` means the indicator is unavailable.
+type SampleFn = fn() -> Option<MemoryPressure>;
 
 /// The platform backend, or a stub on platforms with no indicator.
-fn platform_sample(sensitivity: Sensitivity) -> Option<MemoryPressure> {
+fn platform_sample() -> Option<MemoryPressure> {
     #[cfg(target_os = "linux")]
-    let reading = linux::sample(sensitivity);
+    let reading = linux::sample();
     #[cfg(target_os = "macos")]
-    let reading = macos::sample(sensitivity);
+    let reading = macos::sample();
     #[cfg(target_os = "windows")]
-    let reading = windows::sample(sensitivity);
+    let reading = windows::sample();
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    let reading = {
-        let _ = sensitivity;
-        None::<(bool, PressureDetail)>
-    };
+    let reading = None::<(bool, PressureDetail)>;
 
     reading.map(|(paused, detail)| platform_reading_to_pressure(paused, detail))
 }
@@ -130,7 +124,7 @@ fn platform_reading_to_pressure(paused: bool, detail: PressureDetail) -> MemoryP
 }
 
 pub(crate) struct MemoryMonitor {
-    sensitivity: Sensitivity,
+    enabled: bool,
     sample_fn: SampleFn,
     cache: Option<(Instant, MemoryPressure)>,
     ttl: Duration,
@@ -142,16 +136,16 @@ impl MemoryMonitor {
     /// so a paused loop samples the OS once per tick rather than once per task.
     const DEFAULT_TTL: Duration = Duration::from_millis(250);
 
-    pub(crate) fn new(sensitivity: Sensitivity) -> Self {
-        Self::with_sample_fn(sensitivity, platform_sample)
+    pub(crate) fn new(enabled: bool) -> Self {
+        Self::with_sample_fn(enabled, platform_sample)
     }
 
     /// Test seam: substitutes the platform backend. A plain function pointer
     /// rather than a `#[cfg(test)]` field, so the production struct carries no
     /// test-only state.
-    pub(crate) fn with_sample_fn(sensitivity: Sensitivity, sample_fn: SampleFn) -> Self {
+    pub(crate) fn with_sample_fn(enabled: bool, sample_fn: SampleFn) -> Self {
         Self {
-            sensitivity,
+            enabled,
             sample_fn,
             cache: None,
             ttl: Self::DEFAULT_TTL,
@@ -164,7 +158,7 @@ impl MemoryMonitor {
     }
 
     fn check_at(&mut self, now: Instant) -> MemoryPressure {
-        if self.sensitivity == Sensitivity::Off {
+        if !self.enabled {
             return MemoryPressure::clear();
         }
 
@@ -175,7 +169,7 @@ impl MemoryMonitor {
         }
 
         self.recompute_count += 1;
-        let pressure = (self.sample_fn)(self.sensitivity).unwrap_or_else(MemoryPressure::clear);
+        let pressure = (self.sample_fn)().unwrap_or_else(MemoryPressure::clear);
         self.cache = Some((now, pressure.clone()));
         pressure
     }
@@ -226,12 +220,11 @@ mod tests {
 
     use super::{
         platform_reading_to_pressure, MemoryMonitor, MemoryPressure, PressureDetail, PressureState,
-        Sensitivity,
     };
 
     static SAMPLE_CALLS: AtomicUsize = AtomicUsize::new(0);
 
-    fn counting_paused_sample(_: Sensitivity) -> Option<MemoryPressure> {
+    fn counting_paused_sample() -> Option<MemoryPressure> {
         SAMPLE_CALLS.fetch_add(1, Ordering::SeqCst);
         Some(MemoryPressure {
             paused: true,
@@ -239,7 +232,7 @@ mod tests {
         })
     }
 
-    fn unavailable_sample(_: Sensitivity) -> Option<MemoryPressure> {
+    fn unavailable_sample() -> Option<MemoryPressure> {
         None
     }
 
@@ -254,13 +247,13 @@ mod tests {
         assert_eq!(PressureDetail::LowMemory.to_string(), "low memory");
     }
 
-    /// `off` must not even consult the OS — that is what makes it a usable
+    /// Disabled must not even consult the OS — that is what makes it a usable
     /// escape hatch on a machine whose pressure signal is broken.
     #[test]
-    fn off_sensitivity_never_samples() {
+    fn disabled_monitor_never_samples() {
         require_nextest();
         SAMPLE_CALLS.store(0, Ordering::SeqCst);
-        let mut monitor = MemoryMonitor::with_sample_fn(Sensitivity::Off, counting_paused_sample);
+        let mut monitor = MemoryMonitor::with_sample_fn(false, counting_paused_sample);
 
         let pressure = monitor.check();
 
@@ -273,7 +266,7 @@ mod tests {
     /// fallback heuristic.
     #[test]
     fn unavailable_indicator_never_pauses() {
-        let mut monitor = MemoryMonitor::with_sample_fn(Sensitivity::Normal, unavailable_sample);
+        let mut monitor = MemoryMonitor::with_sample_fn(true, unavailable_sample);
 
         let pressure = monitor.check();
 
@@ -292,8 +285,7 @@ mod tests {
         second_offset: Duration,
     ) -> (MemoryPressure, MemoryPressure, u64) {
         require_nextest();
-        let mut monitor =
-            MemoryMonitor::with_sample_fn(Sensitivity::Normal, counting_paused_sample);
+        let mut monitor = MemoryMonitor::with_sample_fn(true, counting_paused_sample);
         monitor.set_ttl(ttl);
 
         let start = Instant::now();
@@ -328,7 +320,7 @@ mod tests {
     /// produce a detail, even when they report no pressure.
     #[test]
     fn a_calm_reading_carries_no_detail() {
-        fn calm_but_detailed(_: Sensitivity) -> Option<MemoryPressure> {
+        fn calm_but_detailed() -> Option<MemoryPressure> {
             // Mimics what `platform_sample` receives from a backend on an idle
             // machine: a real reading that does not clear the trigger.
             Some(MemoryPressure {
@@ -347,13 +339,13 @@ mod tests {
 
         // The monitor passes a backend verdict through unchanged; the mapping
         // above is what the real backends go through.
-        let mut monitor = MemoryMonitor::with_sample_fn(Sensitivity::Normal, calm_but_detailed);
+        let mut monitor = MemoryMonitor::with_sample_fn(true, calm_but_detailed);
         assert!(!monitor.check().paused);
     }
 
     #[test]
     fn real_monitor_reports_a_verdict_without_panicking() {
-        let mut monitor = MemoryMonitor::new(Sensitivity::Normal);
+        let mut monitor = MemoryMonitor::new(true);
         let _ = monitor.check();
     }
 
