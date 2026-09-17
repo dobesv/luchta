@@ -324,7 +324,7 @@ pub(crate) struct RunCycleParams<'a> {
     pub output: OutputMode,
     pub continue_on_failure: bool,
     pub no_cache: bool,
-    pub memory_pressure: crate::memory_pressure::Sensitivity,
+    pub memory_pressure_enabled: bool,
 }
 
 pub struct RunTasksRequest<'a> {
@@ -333,7 +333,7 @@ pub struct RunTasksRequest<'a> {
     pub output: OutputMode,
     pub continue_on_failure: bool,
     pub no_cache: bool,
-    pub memory_pressure: crate::memory_pressure::Sensitivity,
+    pub memory_pressure_enabled: bool,
     pub max_weight_override: Option<u32>,
 }
 
@@ -344,7 +344,7 @@ pub async fn run_tasks(request: RunTasksRequest<'_>) -> Result<()> {
         output,
         continue_on_failure,
         no_cache,
-        memory_pressure,
+        memory_pressure_enabled,
         max_weight_override,
     } = request;
 
@@ -370,7 +370,7 @@ pub async fn run_tasks(request: RunTasksRequest<'_>) -> Result<()> {
             output,
             continue_on_failure,
             no_cache,
-            memory_pressure,
+            memory_pressure_enabled,
         },
         cancel_token,
     )
@@ -2595,9 +2595,9 @@ pub(crate) fn run_cycle<'a>(
             output,
             continue_on_failure,
             no_cache,
-            memory_pressure,
+            memory_pressure_enabled,
         } = params;
-        let (mut memory_monitor, pressure_state) = build_memory_pressure(memory_pressure);
+        let (mut memory_monitor, pressure_state) = build_memory_pressure(memory_pressure_enabled);
 
         let Some((tasks_to_run, reporter, resources)) =
             prepare_cycle_resources(run, selection, since_affected, output)?

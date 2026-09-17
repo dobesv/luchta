@@ -187,7 +187,7 @@ pub struct WatchRunConfig {
     pub output: OutputMode,
     pub continue_on_failure: bool,
     pub no_cache: bool,
-    pub memory_pressure: crate::memory_pressure::Sensitivity,
+    pub memory_pressure_enabled: bool,
     /// When true, list the changed files that triggered each rebuild.
     pub show_changed_files: bool,
 }
@@ -633,7 +633,7 @@ fn cycle_request<'a>(
         output: config.output,
         continue_on_failure: config.continue_on_failure,
         no_cache: config.no_cache,
-        memory_pressure: config.memory_pressure,
+        memory_pressure_enabled: config.memory_pressure_enabled,
     }
 }
 
@@ -688,7 +688,7 @@ struct CycleRequest<'a> {
     output: OutputMode,
     continue_on_failure: bool,
     no_cache: bool,
-    memory_pressure: crate::memory_pressure::Sensitivity,
+    memory_pressure_enabled: bool,
 }
 
 async fn run_cycle_with_status<F, G>(
@@ -715,7 +715,7 @@ where
             output: request.output,
             continue_on_failure: request.continue_on_failure,
             no_cache: request.no_cache,
-            memory_pressure: request.memory_pressure,
+            memory_pressure_enabled: request.memory_pressure_enabled,
         },
         cancel.clone(),
     );

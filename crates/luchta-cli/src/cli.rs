@@ -2,8 +2,6 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
-use crate::memory_pressure::Sensitivity;
-
 /// How much progress output `luchta run` prints.
 ///
 /// JSONL and color output are explicit future work and intentionally absent
@@ -70,17 +68,17 @@ pub enum Commands {
         #[arg(long, value_enum)]
         output: Option<OutputMode>,
 
-        /// Pause dispatching NEW tasks while the OS reports memory pressure.
+        /// Disable pausing new task dispatch while the OS reports memory
+        /// pressure.
         ///
-        /// `off` disables backpressure entirely; `low` pauses only under severe
-        /// pressure, `high` at the first sign. Overrides `LUCHTA_MEM_PRESSURE`;
-        /// otherwise defaults to `normal`. In-flight tasks continue until
-        /// completion.
-        ///
-        /// Sensitivity has no effect on Windows, whose indicator is a single
-        /// low-memory bit; `off` still disables.
-        #[arg(long, value_enum, value_name = "LEVEL")]
-        mem_pressure: Option<Sensitivity>,
+        /// By default luchta pauses dispatching NEW tasks while the OS
+        /// reports memory pressure; in-flight tasks continue until
+        /// completion. This flag turns that off entirely, the escape hatch
+        /// for a machine whose pressure signal misbehaves, or a build that
+        /// must not stall behind an unrelated hog. Also settable via
+        /// `LUCHTA_NO_MEM_PRESSURE`.
+        #[arg(long)]
+        no_mem_pressure: bool,
 
         /// Override maximum cumulative task weight allowed to run at once.
         ///
@@ -120,17 +118,17 @@ pub enum Commands {
         #[arg(long, value_enum)]
         output: Option<OutputMode>,
 
-        /// Pause dispatching NEW tasks while the OS reports memory pressure.
+        /// Disable pausing new task dispatch while the OS reports memory
+        /// pressure.
         ///
-        /// `off` disables backpressure entirely; `low` pauses only under severe
-        /// pressure, `high` at the first sign. Overrides `LUCHTA_MEM_PRESSURE`;
-        /// otherwise defaults to `normal`. In-flight tasks continue until
-        /// completion.
-        ///
-        /// Sensitivity has no effect on Windows, whose indicator is a single
-        /// low-memory bit; `off` still disables.
-        #[arg(long, value_enum, value_name = "LEVEL")]
-        mem_pressure: Option<Sensitivity>,
+        /// By default luchta pauses dispatching NEW tasks while the OS
+        /// reports memory pressure; in-flight tasks continue until
+        /// completion. This flag turns that off entirely, the escape hatch
+        /// for a machine whose pressure signal misbehaves, or a build that
+        /// must not stall behind an unrelated hog. Also settable via
+        /// `LUCHTA_NO_MEM_PRESSURE`.
+        #[arg(long)]
+        no_mem_pressure: bool,
 
         /// Override maximum cumulative task weight allowed to run at once.
         ///

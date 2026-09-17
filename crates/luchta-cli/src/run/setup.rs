@@ -34,13 +34,13 @@ use crate::progress::ProgressReporter;
 /// The monitor drives pause decisions; the `PressureState` is shared so the
 /// status line can render the current warning suffix.
 pub(crate) fn build_memory_pressure(
-    sensitivity: crate::memory_pressure::Sensitivity,
+    enabled: bool,
 ) -> (
     crate::memory_pressure::MemoryMonitor,
     Arc<crate::memory_pressure::PressureState>,
 ) {
     (
-        crate::memory_pressure::MemoryMonitor::new(sensitivity),
+        crate::memory_pressure::MemoryMonitor::new(enabled),
         Arc::new(crate::memory_pressure::PressureState::new()),
     )
 }
@@ -141,6 +141,9 @@ const _: () = {
 /// Environment variable to disable all caching (no restore, no shared read/write).
 pub(crate) const NO_CACHE_ENV: &str = "LUCHTA_NO_CACHE";
 
+/// Environment variable to disable memory-pressure backpressure entirely.
+pub(crate) const NO_MEM_PRESSURE_ENV: &str = "LUCHTA_NO_MEM_PRESSURE";
+
 /// Default shared cache size cap in megabytes.
 const DEFAULT_SHARED_CACHE_SIZE_CAP_MB: u64 = 250;
 
@@ -150,6 +153,10 @@ fn parse_truthy_env_value(value: Option<&str>) -> bool {
 
 pub(crate) fn no_cache_env() -> bool {
     parse_truthy_env_value(std::env::var(NO_CACHE_ENV).ok().as_deref())
+}
+
+pub(crate) fn no_mem_pressure_env() -> bool {
+    parse_truthy_env_value(std::env::var(NO_MEM_PRESSURE_ENV).ok().as_deref())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -729,98 +736,165 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // no_cache_env() tests
+    // Truthy boolean env vars: no_cache_env() and no_mem_pressure_env()
+    //
+    // Both are `parse_truthy_env_value` applied to a different env var, so
+    // their unset/truthy/non-truthy behavior is identical by construction.
+    // Table-driven across both rather than duplicated per variable — a third
+    // `LUCHTA_NO_*` switch added later just extends the table.
     // ---------------------------------------------------------------------------
 
+    /// A `LUCHTA_NO_*` boolean env var paired with its accessor.
+    type TruthyEnvCase = (&'static str, fn() -> bool);
+
+    fn truthy_env_cases() -> [TruthyEnvCase; 2] {
+        [
+            (NO_CACHE_ENV, no_cache_env as fn() -> bool),
+            (NO_MEM_PRESSURE_ENV, no_mem_pressure_env as fn() -> bool),
+        ]
+    }
+
     #[test]
-    fn no_cache_env_returns_true_for_truthy_values() {
+    fn truthy_env_vars_return_true_for_truthy_values() {
         require_nextest();
         let _lock = ENV_LOCK.lock().unwrap();
-        let _guard = EnvVarGuard::remove(NO_CACHE_ENV);
-
-        for value in ["1", "true", "on", "TRUE", "On", " 1 ", " TRUE "] {
-            let _guard = EnvVarGuard::set(NO_CACHE_ENV, value);
-            assert!(
-                no_cache_env(),
-                "expected LUCHTA_NO_CACHE={value:?} to return true"
-            );
+        for (env_var, env_fn) in truthy_env_cases() {
+            let _remove_guard = EnvVarGuard::remove(env_var);
+            for value in ["1", "true", "on", "TRUE", "On", " 1 ", " TRUE "] {
+                let _guard = EnvVarGuard::set(env_var, value);
+                assert!(env_fn(), "expected {env_var}={value:?} to return true");
+            }
         }
     }
 
     #[test]
-    fn no_cache_env_returns_false_for_non_truthy_values() {
+    fn truthy_env_vars_return_false_for_non_truthy_values() {
         require_nextest();
         let _lock = ENV_LOCK.lock().unwrap();
-        let _guard = EnvVarGuard::remove(NO_CACHE_ENV);
-
-        for value in ["0", "false", "off", "nope", "", "  "] {
-            let _guard = EnvVarGuard::set(NO_CACHE_ENV, value);
-            assert!(
-                !no_cache_env(),
-                "expected LUCHTA_NO_CACHE={value:?} to return false"
-            );
+        for (env_var, env_fn) in truthy_env_cases() {
+            let _remove_guard = EnvVarGuard::remove(env_var);
+            for value in ["0", "false", "off", "nope", "", "  "] {
+                let _guard = EnvVarGuard::set(env_var, value);
+                assert!(!env_fn(), "expected {env_var}={value:?} to return false");
+            }
         }
     }
 
     #[test]
-    fn no_cache_env_returns_false_when_unset() {
+    fn truthy_env_vars_return_false_when_unset() {
         require_nextest();
         let _lock = ENV_LOCK.lock().unwrap();
-        let _guard = EnvVarGuard::remove(NO_CACHE_ENV);
+        for (env_var, env_fn) in truthy_env_cases() {
+            let _guard = EnvVarGuard::remove(env_var);
+            assert!(!env_fn(), "expected unset {env_var} to return false");
+        }
+    }
 
-        assert!(
-            !no_cache_env(),
-            "expected unset LUCHTA_NO_CACHE to return false"
-        );
+    // ---------------------------------------------------------------------------
+    // Flag-or-env composition: the CLI flag ORs with the env var, computed the
+    // same way in main.rs for both `no_cache` and `no_mem_pressure`. Shared
+    // matrix runner; the two effective-value closures below are what differ —
+    // in particular the `no_mem_pressure` one negates the result, which is the
+    // exact inversion the second test below exists to pin.
+    // ---------------------------------------------------------------------------
+
+    /// Runs `effective(cli_flag)` against each `(cli_flag, env_value, expected,
+    /// why)` case, setting or removing `env_var` before every case.
+    fn assert_flag_or_env_matrix(
+        env_var: &'static str,
+        effective: impl Fn(bool) -> bool,
+        cases: &[(bool, Option<&str>, bool, &str)],
+    ) {
+        require_nextest();
+        let _lock = ENV_LOCK.lock().unwrap();
+        for &(cli_flag, env_value, expected, why) in cases {
+            let _guard = match env_value {
+                Some(value) => EnvVarGuard::set(env_var, value),
+                None => EnvVarGuard::remove(env_var),
+            };
+            assert_eq!(effective(cli_flag), expected, "{why}");
+        }
     }
 
     #[test]
     fn no_cache_flag_or_env_semantics() {
-        require_nextest();
-        // The effective no_cache value is computed in main.rs as:
-        //   effective = cli_flag || no_cache_env()
-        //
-        // This test verifies the OR semantics using a local helper to avoid
-        // clippy warnings about literal constants in boolean expressions.
-
-        // Models the computation in main.rs: effective = CLI flag OR env var
+        // Models the computation in main.rs: effective = CLI flag OR env var.
         fn effective_no_cache(cli_flag: bool) -> bool {
             cli_flag || no_cache_env()
         }
 
-        let _lock = ENV_LOCK.lock().unwrap();
-        let _guard = EnvVarGuard::remove(NO_CACHE_ENV);
-
-        // Case 1: CLI flag=true always yields true regardless of env
-        let _env_guard = EnvVarGuard::set(NO_CACHE_ENV, "0");
-        assert!(
-            effective_no_cache(true),
-            "cli_flag=true should always be true"
+        assert_flag_or_env_matrix(
+            NO_CACHE_ENV,
+            effective_no_cache,
+            &[
+                (true, Some("0"), true, "cli_flag=true should always be true"),
+                (true, Some("1"), true, "cli_flag=true should always be true"),
+                (
+                    false,
+                    Some("1"),
+                    true,
+                    "cli_flag=false, env=true => effective=true",
+                ),
+                (
+                    false,
+                    Some("0"),
+                    false,
+                    "cli_flag=false, env=false => effective=false",
+                ),
+                (
+                    false,
+                    None,
+                    false,
+                    "cli_flag=false, env unset => effective=false",
+                ),
+            ],
         );
+    }
 
-        let _env_guard = EnvVarGuard::set(NO_CACHE_ENV, "1");
-        assert!(
-            effective_no_cache(true),
-            "cli_flag=true should always be true"
-        );
+    /// Pins the flag/env combination against the exact bug the design doc
+    /// warns about: the CLI flag is negative (`--no-mem-pressure`) but the
+    /// field it feeds (`memory_pressure_enabled`) reads positively. Getting
+    /// that inversion backwards would silently disable backpressure by
+    /// default and never turn it off when asked, or vice versa.
+    #[test]
+    fn no_mem_pressure_flag_or_env_inverts_to_enabled_correctly() {
+        // Models the computation in main.rs:
+        //   no_mem_pressure = cli_flag || no_mem_pressure_env()
+        //   memory_pressure_enabled = !no_mem_pressure
+        fn effective_memory_pressure_enabled(cli_flag: bool) -> bool {
+            !(cli_flag || no_mem_pressure_env())
+        }
 
-        // Case 2: CLI flag=false yields the env value
-        let _env_guard = EnvVarGuard::set(NO_CACHE_ENV, "1");
-        assert!(
-            effective_no_cache(false),
-            "cli_flag=false, env=true => effective=true"
-        );
-
-        let _env_guard = EnvVarGuard::set(NO_CACHE_ENV, "0");
-        assert!(
-            !effective_no_cache(false),
-            "cli_flag=false, env=false => effective=false"
-        );
-
-        let _env_guard = EnvVarGuard::remove(NO_CACHE_ENV);
-        assert!(
-            !effective_no_cache(false),
-            "cli_flag=false, env unset => effective=false"
+        assert_flag_or_env_matrix(
+            NO_MEM_PRESSURE_ENV,
+            effective_memory_pressure_enabled,
+            &[
+                (
+                    false,
+                    Some("0"),
+                    true,
+                    "no flag, env=0 => memory_pressure_enabled=true",
+                ),
+                (true, None, false, "--no-mem-pressure always disables"),
+                (
+                    true,
+                    Some("1"),
+                    false,
+                    "--no-mem-pressure always disables, even with env=1",
+                ),
+                (
+                    false,
+                    Some("1"),
+                    false,
+                    "no flag, env=1 => memory_pressure_enabled=false",
+                ),
+                (
+                    false,
+                    None,
+                    true,
+                    "no flag, env unset => memory_pressure_enabled=true",
+                ),
+            ],
         );
     }
 }

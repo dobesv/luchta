@@ -1,5 +1,6 @@
-//! Integration tests for the `--mem-pressure` flag and its `LUCHTA_MEM_PRESSURE`
-//! environment variable, and for the removal of the threshold flags it replaced.
+//! Integration tests for the `--no-mem-pressure` flag and its
+//! `LUCHTA_NO_MEM_PRESSURE` environment variable, and for the removal of the
+//! `--mem-pressure` sensitivity ladder it replaced.
 
 mod common;
 
@@ -31,38 +32,21 @@ fn run_with(args: &[&str], env: &[(&str, &str)]) -> assert_cmd::assert::Assert {
 }
 
 #[test]
-fn every_sensitivity_level_is_accepted() {
-    for level in ["off", "low", "normal", "high"] {
-        run_with(&["--mem-pressure", level], &[])
-            .stderr(predicate::str::contains("mem-pressure").not());
-    }
+fn no_mem_pressure_flag_is_accepted() {
+    run_with(&["--no-mem-pressure"], &[]).stderr(predicate::str::contains("unexpected").not());
 }
 
 #[test]
-fn invalid_sensitivity_is_rejected_by_clap() {
-    run_with(&["--mem-pressure", "bogus"], &[])
+fn no_mem_pressure_env_var_is_honored() {
+    run_with(&[], &[("LUCHTA_NO_MEM_PRESSURE", "1")])
+        .stderr(predicate::str::contains("unexpected").not());
+}
+
+#[test]
+fn removed_mem_pressure_flag_is_rejected() {
+    run_with(&["--mem-pressure", "off"], &[])
         .failure()
-        .stderr(predicate::str::contains("invalid value 'bogus'"));
-}
-
-#[test]
-fn env_var_sensitivity_is_honored() {
-    run_with(&[], &[("LUCHTA_MEM_PRESSURE", "bogus_env")])
-        .failure()
-        .stderr(predicate::str::contains(
-            "Invalid LUCHTA_MEM_PRESSURE value 'bogus_env'",
-        ));
-}
-
-#[test]
-fn flag_overrides_env_var() {
-    // A valid flag must win over an invalid env var — if precedence were
-    // reversed this would fail with the env-var parse error.
-    run_with(
-        &["--mem-pressure", "off"],
-        &[("LUCHTA_MEM_PRESSURE", "bogus")],
-    )
-    .stderr(predicate::str::contains("LUCHTA_MEM_PRESSURE").not());
+        .stderr(predicate::str::contains("unexpected argument"));
 }
 
 #[test]

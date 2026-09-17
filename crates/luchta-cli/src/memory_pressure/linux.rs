@@ -12,19 +12,23 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use super::sensitivity::linux_stall_trigger;
-use super::{PressureDetail, Sensitivity};
+use super::tuning::psi_threshold;
+use super::PressureDetail;
 
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 const HOST_PSI: &str = "/proc/pressure/memory";
 const SELF_CGROUP: &str = "/proc/self/cgroup";
 
-/// Reads the OS pressure indicator and decides whether it clears the trigger
-/// for `sensitivity`. `None` means the indicator is unavailable. Returns
+/// Environment variable overriding the `full avg10` percent above which
+/// dispatch pauses. See `tuning::psi_threshold` for parsing and the default.
+const PSI_THRESHOLD_ENV: &str = "LUCHTA_MEM_PSI_THRESHOLD";
+
+/// Reads the OS pressure indicator and decides whether it clears the
+/// configured threshold. `None` means the indicator is unavailable. Returns
 /// `(should_pause, why)`; `why` is only meaningful when `should_pause` is
 /// `true` — callers must gate on the bool before rendering the detail.
-pub(super) fn sample(sensitivity: Sensitivity) -> Option<(bool, PressureDetail)> {
-    let trigger = linux_stall_trigger(sensitivity)?;
+pub(super) fn sample() -> Option<(bool, PressureDetail)> {
+    let trigger = psi_threshold(std::env::var(PSI_THRESHOLD_ENV).ok().as_deref());
     let stalled = read_full_avg10()?;
     Some((stalled > trigger, PressureDetail::Stalled(stalled)))
 }
@@ -190,11 +194,6 @@ full avg10=0.00 avg60=0.01 avg300=0.01 total=1322657835
     }
 
     #[test]
-    fn sample_is_none_when_sensitivity_is_off() {
-        assert_eq!(sample(Sensitivity::Off), None);
-    }
-
-    #[test]
     fn first_parseable_prefers_cgroup_when_it_parses() {
         let host = "some avg10=99.00 avg60=99.00 avg300=99.00 total=1\n";
         assert_eq!(first_parseable(Some(REAL_PSI), Some(host)), Some(0.0));
@@ -243,7 +242,7 @@ full avg10=0.00 avg60=0.01 avg300=0.01 total=1322657835
             return;
         }
 
-        let reading = sample(Sensitivity::Normal);
+        let reading = sample();
         assert!(
             reading.is_some(),
             "a host with a readable, parseable PSI file must yield a reading"
@@ -265,13 +264,12 @@ full avg10=0.00 avg60=0.01 avg300=0.01 total=1322657835
     /// reading.
     ///
     /// This does not assert the host is calm: a memory-constrained or loaded
-    /// CI machine can legitimately exceed `Sensitivity::Low`'s 90% stall
-    /// trigger, and asserting "always calm" would make the test flaky on
-    /// exactly the hosts most worth testing on. Instead it takes whatever
-    /// verdict the live call returns and checks the invariant holds either
-    /// way — detail present if and only if paused — which is true on a calm
-    /// host and a thrashing one alike, while still exercising the real path
-    /// end to end.
+    /// CI machine can legitimately exceed the default 60% stall trigger, and
+    /// asserting "always calm" would make the test flaky on exactly the hosts
+    /// most worth testing on. Instead it takes whatever verdict the live call
+    /// returns and checks the invariant holds either way — detail present if
+    /// and only if paused — which is true on a calm host and a thrashing one
+    /// alike, while still exercising the real path end to end.
     #[test]
     fn platform_sample_clears_detail_on_a_calm_reading() {
         if read_full_avg10().is_none() {
@@ -279,7 +277,7 @@ full avg10=0.00 avg60=0.01 avg300=0.01 total=1322657835
             return;
         }
 
-        let pressure = super::super::platform_sample(Sensitivity::Low)
+        let pressure = super::super::platform_sample()
             .expect("a host with a readable, parseable PSI file must yield a reading");
 
         assert_eq!(

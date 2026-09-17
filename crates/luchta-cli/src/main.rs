@@ -34,9 +34,8 @@ use luchta_engine::{
 use miette::IntoDiagnostic;
 use miette::{Report, Result};
 
-use crate::memory_pressure::Sensitivity;
 use crate::outcome::TasksFailed;
-use crate::run::setup::no_cache_env;
+use crate::run::setup::{no_cache_env, no_mem_pressure_env};
 
 #[tokio::main]
 async fn main() {
@@ -380,7 +379,7 @@ struct RunArgs {
     top_level: bool,
     dry_run: bool,
     output: Option<OutputMode>,
-    mem_pressure: Option<Sensitivity>,
+    no_mem_pressure: bool,
     continue_on_failure: bool,
     no_cache: bool,
     max_weight_cli: Option<String>,
@@ -395,7 +394,7 @@ fn command_run_args(command: Commands) -> RunArgs {
             top_level,
             dry_run,
             output,
-            mem_pressure,
+            no_mem_pressure,
             max_weight,
             since,
             continue_on_failure,
@@ -406,7 +405,7 @@ fn command_run_args(command: Commands) -> RunArgs {
             top_level,
             dry_run,
             output,
-            mem_pressure,
+            no_mem_pressure,
             continue_on_failure,
             no_cache,
             max_weight_cli: max_weight,
@@ -424,10 +423,8 @@ fn command_run_args(command: Commands) -> RunArgs {
 async fn run_command(workspace_root: &Path, command: Commands) -> Result<()> {
     let mut args = command_run_args(command);
     let output = resolve_output_mode(args.output, output_mode_env().as_deref())?;
-    let memory_pressure = resolve_mem_pressure(
-        args.mem_pressure,
-        std::env::var(MEM_PRESSURE_ENV).ok().as_deref(),
-    )?;
+    validate_mem_pressure_tuning_env()?;
+    let memory_pressure_enabled = !(args.no_mem_pressure || no_mem_pressure_env());
     args.no_cache = args.no_cache || no_cache_env();
     args.packages = apply_implicit_package(args.packages, args.top_level, workspace_root)?;
     if args.tasks.is_empty() {
@@ -455,7 +452,7 @@ async fn run_command(workspace_root: &Path, command: Commands) -> Result<()> {
             output,
             continue_on_failure: args.continue_on_failure,
             no_cache: args.no_cache,
-            memory_pressure,
+            memory_pressure_enabled,
             max_weight_override,
         })
         .await
@@ -468,7 +465,7 @@ async fn watch_command(workspace_root: &Path, command: Commands) -> Result<()> {
         packages,
         top_level,
         output,
-        mem_pressure,
+        no_mem_pressure,
         max_weight,
         continue_on_failure,
         no_cache,
@@ -486,10 +483,8 @@ async fn watch_command(workspace_root: &Path, command: Commands) -> Result<()> {
 
     let no_cache = no_cache || no_cache_env();
     let output = resolve_output_mode(output, output_mode_env().as_deref())?;
-    let memory_pressure = resolve_mem_pressure(
-        mem_pressure,
-        std::env::var(MEM_PRESSURE_ENV).ok().as_deref(),
-    )?;
+    validate_mem_pressure_tuning_env()?;
+    let memory_pressure_enabled = !(no_mem_pressure || no_mem_pressure_env());
     let max_weight_override =
         resolve_max_weight_override(max_weight.as_deref(), "LUCHTA_MAX_WEIGHT", "max-weight")?;
 
@@ -509,7 +504,7 @@ async fn watch_command(workspace_root: &Path, command: Commands) -> Result<()> {
         output,
         continue_on_failure,
         no_cache,
-        memory_pressure,
+        memory_pressure_enabled,
         show_changed_files,
     };
 
@@ -556,31 +551,62 @@ fn resolve_output_mode(
     })
 }
 
-/// Environment variable selecting the memory-pressure sensitivity.
-const MEM_PRESSURE_ENV: &str = "LUCHTA_MEM_PRESSURE";
+/// Environment variable tuning the Linux PSI threshold (percent of `full
+/// avg10`) above which dispatch pauses. See
+/// `memory_pressure::tuning::psi_threshold` for parsing and the default.
+const MEM_PSI_THRESHOLD_ENV: &str = "LUCHTA_MEM_PSI_THRESHOLD";
 
-/// Precedence: flag > env var > default (`normal`).
-fn resolve_mem_pressure(
-    cli_value: Option<Sensitivity>,
-    env_value: Option<&str>,
-) -> Result<Sensitivity, miette::Report> {
-    if let Some(sensitivity) = cli_value {
-        return Ok(sensitivity);
-    }
+/// Environment variable choosing the minimum macOS
+/// `kern.memorystatus_vm_pressure_level` at which dispatch pauses. See
+/// `memory_pressure::tuning::macos_min_level` for parsing and the default.
+const MEM_MACOS_LEVEL_ENV: &str = "LUCHTA_MEM_MACOS_LEVEL";
 
-    let Some(raw) = env_value.map(str::trim).filter(|value| !value.is_empty()) else {
-        return Ok(Sensitivity::default());
+/// Rejects an unparseable platform memory-pressure tuning env var at startup
+/// rather than silently falling back to the default, which would leave a user
+/// believing they had tuned something. An unset or blank value passes through
+/// untouched; the relevant backend applies its own default.
+///
+/// Both variables are validated regardless of the host platform: the parsers
+/// live in `memory_pressure::tuning`, compiled everywhere, so there is no
+/// reason to let a typo through just because it happens to be the "wrong"
+/// platform's variable.
+fn validate_mem_pressure_tuning_env() -> Result<(), miette::Report> {
+    reject_unparseable_env(
+        MEM_PSI_THRESHOLD_ENV,
+        memory_pressure::tuning::parse_psi_threshold,
+        "expected a nonnegative percentage (e.g. 60)",
+    )?;
+    reject_unparseable_env(
+        MEM_MACOS_LEVEL_ENV,
+        memory_pressure::tuning::parse_macos_level,
+        "expected 'warning' or 'critical'",
+    )?;
+    Ok(())
+}
+
+/// Errors if `env_var` is set to a non-blank value that `parse` rejects.
+/// Unset or blank passes through silently — the caller's parser applies its
+/// own default for those cases.
+fn reject_unparseable_env<T>(
+    env_var: &str,
+    parse: impl FnOnce(&str) -> Option<T>,
+    expected: &str,
+) -> Result<(), miette::Report> {
+    let Some(raw) = std::env::var(env_var)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(());
     };
 
-    Sensitivity::from_str(raw, true).map_err(|_| {
-        let known = Sensitivity::value_variants()
-            .iter()
-            .filter_map(|variant| variant.to_possible_value())
-            .map(|value| value.get_name().to_owned())
-            .collect::<Vec<_>>()
-            .join(", ");
-        miette::miette!("Invalid {MEM_PRESSURE_ENV} value '{raw}': expected one of {known}")
-    })
+    if parse(&raw).is_some() {
+        return Ok(());
+    }
+
+    Err(miette::miette!(
+        "Invalid {env_var} value '{raw}': {expected}"
+    ))
 }
 
 fn resolve_max_weight_override(
@@ -629,6 +655,42 @@ fn resolve_max_weight_override(
 mod tests {
     use super::*;
     use crate::cli::OutputMode;
+    use std::sync::Mutex;
+
+    /// Serializes tests that mutate process-wide env vars, so they don't race
+    /// each other within one test binary.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Sets or removes an env var for the duration of a test, restoring its
+    /// prior value on drop.
+    struct EnvVarGuard {
+        name: &'static str,
+        prior: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(name: &'static str, value: &str) -> Self {
+            let prior = std::env::var(name).ok();
+            std::env::set_var(name, value);
+            Self { name, prior }
+        }
+
+        fn remove(name: &'static str) -> Self {
+            let prior = std::env::var(name).ok();
+            std::env::remove_var(name);
+            Self { name, prior }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(ref value) = self.prior {
+                std::env::set_var(self.name, value);
+            } else {
+                std::env::remove_var(self.name);
+            }
+        }
+    }
 
     #[test]
     fn output_flag_overrides_the_environment_variable() {
@@ -668,26 +730,48 @@ mod tests {
     }
 
     #[test]
-    fn mem_pressure_precedence_prefers_flag_then_env_then_default() {
-        use crate::memory_pressure::Sensitivity;
+    fn mem_pressure_tuning_env_validation_accepts_unset_blank_and_valid_values() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _psi_guard = EnvVarGuard::remove(MEM_PSI_THRESHOLD_ENV);
+        let _macos_guard = EnvVarGuard::remove(MEM_MACOS_LEVEL_ENV);
+        assert!(validate_mem_pressure_tuning_env().is_ok());
 
-        assert_eq!(
-            resolve_mem_pressure(Some(Sensitivity::Off), Some("high")).expect("flag wins"),
-            Sensitivity::Off
+        let _psi_guard = EnvVarGuard::set(MEM_PSI_THRESHOLD_ENV, "  ");
+        let _macos_guard = EnvVarGuard::set(MEM_MACOS_LEVEL_ENV, "  ");
+        assert!(validate_mem_pressure_tuning_env().is_ok());
+
+        let _psi_guard = EnvVarGuard::set(MEM_PSI_THRESHOLD_ENV, "30");
+        let _macos_guard = EnvVarGuard::set(MEM_MACOS_LEVEL_ENV, "warning");
+        assert!(validate_mem_pressure_tuning_env().is_ok());
+    }
+
+    /// Sets `env_var` to `bad_value` (the other tuning var left unset) and
+    /// asserts `validate_mem_pressure_tuning_env` rejects it, naming both the
+    /// variable and the bad value. Shared by the PSI-threshold and
+    /// macOS-level cases below, which differ only in which variable is set.
+    fn assert_tuning_env_rejects(env_var: &'static str, bad_value: &str) {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _psi_guard = EnvVarGuard::remove(MEM_PSI_THRESHOLD_ENV);
+        let _macos_guard = EnvVarGuard::remove(MEM_MACOS_LEVEL_ENV);
+        let _bad_guard = EnvVarGuard::set(env_var, bad_value);
+
+        let error =
+            validate_mem_pressure_tuning_env().expect_err("unparseable tuning value must error");
+        let message = format!("{error}");
+        assert!(
+            message.contains(env_var) && message.contains(bad_value),
+            "error should name the variable and the bad value: {message}"
         );
-        assert_eq!(
-            resolve_mem_pressure(None, Some("high")).expect("env used"),
-            Sensitivity::High
-        );
-        assert_eq!(
-            resolve_mem_pressure(None, Some("  ")).expect("blank env ignored"),
-            Sensitivity::Normal
-        );
-        assert_eq!(
-            resolve_mem_pressure(None, None).expect("default"),
-            Sensitivity::Normal
-        );
-        assert!(resolve_mem_pressure(None, Some("nope")).is_err());
+    }
+
+    #[test]
+    fn mem_pressure_tuning_env_validation_rejects_unparseable_psi_threshold() {
+        assert_tuning_env_rejects(MEM_PSI_THRESHOLD_ENV, "bogus");
+    }
+
+    #[test]
+    fn mem_pressure_tuning_env_validation_rejects_unparseable_macos_level() {
+        assert_tuning_env_rejects(MEM_MACOS_LEVEL_ENV, "extreme");
     }
 
     #[test]
@@ -764,7 +848,7 @@ mod tests {
                 top_level: false,
                 dry_run: true,
                 output: None,
-                mem_pressure: None,
+                no_mem_pressure: false,
                 max_weight: None,
                 since: None,
                 continue_on_failure: false,
