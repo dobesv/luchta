@@ -34,17 +34,48 @@ pub enum Sensitivity {
     High,
 }
 
-/// Percent of `some avg10` (Linux PSI) above which dispatch pauses.
+/// Percent of `full avg10` (Linux PSI) above which dispatch pauses.
 ///
-/// `avg10` is the share of the last 10 seconds during which at least one task
-/// stalled waiting on memory reclaim. `None` means never pause.
+/// `avg10` is the share of the last 10 seconds during which every non-idle
+/// task stalled waiting on memory reclaim at the same time — the kernel's own
+/// definition of thrashing. `None` means never pause.
+///
+/// This gate is a last resort against thrashing, not an early-warning memory
+/// governor: luchta would rather run a machine into occasional, recoverable
+/// memory exhaustion than pay the immediate, visible cost of pausing dispatch
+/// on every build. A paused build stalls right now, on every run that meets
+/// the trigger; running low on memory is occasional and usually survivable.
+/// So the thresholds below are set high, deliberately.
+///
+/// Evidence behind the numbers: PSI captured every 5s through an ordinary
+/// build that completed in 28s with no pause peaked at `full avg10 = 6.1%`
+/// (`some avg10` peaked at 7.4% over the same window — `full` tracks `some`
+/// at roughly 0.8x on this workload, not an order of magnitude lower, so
+/// switching metrics alone would not have cleared the noise floor). A build
+/// that previously triggered a spurious pause read `some avg10 = 13%`, which
+/// corresponds to `full avg10 ≈ 11%`. Any trigger near either of those
+/// figures fires on healthy work.
+///
+/// `high`, the most eager setting luchta offers, is 30%: roughly 3 of every
+/// 10 seconds with every non-idle task blocked on memory, which is already a
+/// badly degraded machine. `normal` and `low` back off further from there,
+/// each more of a last resort than the one before. At `low`'s 90%, the OOM
+/// killer will often fire before PSI sustains that level for 10 seconds, so
+/// `low` behaves close to `off` on many systems — that is the intended shape
+/// of the knob, not an oversight.
+///
+/// These numbers come from measurements on one machine (61 GB RAM, heavily
+/// swapped) plus an explicit preference for throughput over caution — a
+/// considered starting point, not a derived constant. Retuning them needs
+/// equivalent evidence — PSI samples through both a healthy build and a
+/// stalling one — not just intuition about what "feels" low.
 #[allow(dead_code)]
 pub(crate) fn linux_stall_trigger(sensitivity: Sensitivity) -> Option<f64> {
     match sensitivity {
         Sensitivity::Off => None,
-        Sensitivity::Low => Some(20.0),
-        Sensitivity::Normal => Some(10.0),
-        Sensitivity::High => Some(5.0),
+        Sensitivity::Low => Some(90.0),
+        Sensitivity::Normal => Some(60.0),
+        Sensitivity::High => Some(30.0),
     }
 }
 
@@ -83,9 +114,9 @@ mod tests {
     #[test]
     fn linux_triggers_tighten_as_sensitivity_rises() {
         assert_eq!(linux_stall_trigger(Sensitivity::Off), None);
-        assert_eq!(linux_stall_trigger(Sensitivity::Low), Some(20.0));
-        assert_eq!(linux_stall_trigger(Sensitivity::Normal), Some(10.0));
-        assert_eq!(linux_stall_trigger(Sensitivity::High), Some(5.0));
+        assert_eq!(linux_stall_trigger(Sensitivity::Low), Some(90.0));
+        assert_eq!(linux_stall_trigger(Sensitivity::Normal), Some(60.0));
+        assert_eq!(linux_stall_trigger(Sensitivity::High), Some(30.0));
     }
 
     /// macOS exposes only three levels (1 normal / 2 warning / 4 critical), so

@@ -25,17 +25,17 @@ const SELF_CGROUP: &str = "/proc/self/cgroup";
 /// `true` — callers must gate on the bool before rendering the detail.
 pub(super) fn sample(sensitivity: Sensitivity) -> Option<(bool, PressureDetail)> {
     let trigger = linux_stall_trigger(sensitivity)?;
-    let stalled = read_some_avg10()?;
+    let stalled = read_full_avg10()?;
     Some((stalled > trigger, PressureDetail::Stalled(stalled)))
 }
 
-/// Reads `some avg10` from the most specific PSI file available.
+/// Reads `full avg10` from the most specific PSI file available.
 ///
 /// The cgroup file and the host file are read independently, and each is
 /// parsed independently: a cgroup file that reads successfully but fails to
 /// parse must fall back to the host file just as a missing cgroup file does.
 /// See `first_parseable`, which encodes that policy.
-fn read_some_avg10() -> Option<f64> {
+fn read_full_avg10() -> Option<f64> {
     let cgroup = cgroup_psi_path().and_then(|path| fs::read_to_string(path).ok());
     let host = fs::read_to_string(HOST_PSI).ok();
     first_parseable(cgroup.as_deref(), host.as_deref())
@@ -43,18 +43,18 @@ fn read_some_avg10() -> Option<f64> {
 
 /// Parses `cgroup`, falling back to `host` when `cgroup` is absent *or* fails
 /// to parse (empty file, truncated write, unexpected format). Pulled out of
-/// `read_some_avg10` so the fallback policy can be tested without touching
+/// `read_full_avg10` so the fallback policy can be tested without touching
 /// the filesystem: readability and parseability of the cgroup source are
 /// independent failure modes, and both must fall back to the host source.
 fn first_parseable(cgroup: Option<&str>, host: Option<&str>) -> Option<f64> {
     cgroup
-        .and_then(parse_psi_some_avg10)
-        .or_else(|| host.and_then(parse_psi_some_avg10))
+        .and_then(parse_psi_full_avg10)
+        .or_else(|| host.and_then(parse_psi_full_avg10))
 }
 
 /// The current cgroup's `memory.pressure`, if this is cgroup v2 and the file
 /// exists. Checking existence here (rather than letting the read fail) keeps
-/// `read_some_avg10`'s file handling simple: a lookup failure and a read
+/// `read_full_avg10`'s file handling simple: a lookup failure and a read
 /// failure both collapse to `None` before `first_parseable` ever sees them.
 ///
 /// The path is built from `/proc/self/cgroup`, which the kernel writes and
@@ -86,7 +86,7 @@ fn cgroup_pressure_path(self_cgroup: &str) -> Option<PathBuf> {
     Some(path)
 }
 
-/// Extracts `avg10` from the `some` line of a PSI file.
+/// Extracts `avg10` from the `full` line of a PSI file.
 ///
 /// Format (two lines, whitespace-separated key=value fields):
 /// ```text
@@ -94,11 +94,18 @@ fn cgroup_pressure_path(self_cgroup: &str) -> Option<PathBuf> {
 /// full avg10=0.00 avg60=0.01 avg300=0.01 total=1322657835
 /// ```
 ///
-/// The `some` line counts time when *any* task stalled; `full` counts only
-/// time when *every* task stalled. `some` is the earlier, more useful signal.
-fn parse_psi_some_avg10(psi: &str) -> Option<f64> {
+/// `some` counts time when *any* task stalled, which includes ordinary
+/// page-cache refaults and direct reclaim during routine I/O-heavy work —
+/// an unremarkable build touching thousands of files can hold `some` above
+/// the default trigger continuously with no actual memory shortage. `full`
+/// counts only time when *every* non-idle task stalled at once, which the
+/// kernel's own PSI documentation (`Documentation/accounting/psi.rst`)
+/// treats as thrashing when sustained. That is the condition backpressure
+/// should react to, so read `full`, not `some` — do not "helpfully" switch
+/// this back.
+fn parse_psi_full_avg10(psi: &str) -> Option<f64> {
     psi.lines()
-        .find_map(|line| line.strip_prefix("some "))?
+        .find_map(|line| line.strip_prefix("full "))?
         .split_whitespace()
         .find_map(|field| field.strip_prefix("avg10="))?
         .parse::<f64>()
@@ -117,37 +124,41 @@ full avg10=0.00 avg60=0.01 avg300=0.01 total=1322657835
 ";
 
     #[test]
-    fn parses_some_avg10_from_real_psi_file() {
-        assert_eq!(parse_psi_some_avg10(REAL_PSI), Some(0.0));
+    fn parses_full_avg10_from_real_psi_file() {
+        assert_eq!(parse_psi_full_avg10(REAL_PSI), Some(0.0));
     }
 
     #[test]
     fn parses_nonzero_stall() {
         let psi = "some avg10=23.40 avg60=8.10 avg300=2.00 total=99\n\
                    full avg10=1.00 avg60=0.50 avg300=0.10 total=9\n";
-        assert_eq!(parse_psi_some_avg10(psi), Some(23.40));
+        assert_eq!(parse_psi_full_avg10(psi), Some(1.00));
     }
 
-    /// The `full` line must never be mistaken for `some` — `full` only counts
-    /// time when EVERY task stalled, so reading it would make luchta far less
-    /// sensitive than configured.
+    /// A `some`-only file (no `full` line — this shouldn't happen in
+    /// practice, since the kernel always writes both, but a truncated or
+    /// hand-crafted file could) must yield `None`, not the `some` value.
+    /// Reading `some` as if it were `full` would be exactly the regression
+    /// this issue fixes: `some` fires on routine page-cache churn during
+    /// ordinary I/O-heavy builds, so treating it as `full` would bring back
+    /// the spurious pauses.
     #[test]
-    fn ignores_full_line_when_some_is_absent() {
-        let psi = "full avg10=50.00 avg60=50.00 avg300=50.00 total=9\n";
-        assert_eq!(parse_psi_some_avg10(psi), None);
+    fn ignores_some_line_when_full_is_absent() {
+        let psi = "some avg10=50.00 avg60=50.00 avg300=50.00 total=9\n";
+        assert_eq!(parse_psi_full_avg10(psi), None);
     }
 
     #[test]
     fn rejects_malformed_input() {
-        assert_eq!(parse_psi_some_avg10(""), None);
+        assert_eq!(parse_psi_full_avg10(""), None);
         assert_eq!(
-            parse_psi_some_avg10("some avg10=notanumber total=1\n"),
+            parse_psi_full_avg10("full avg10=notanumber total=1\n"),
             None
         );
-        assert_eq!(parse_psi_some_avg10("some avg60=1.00 total=1\n"), None);
-        assert_eq!(parse_psi_some_avg10("some"), None);
+        assert_eq!(parse_psi_full_avg10("full avg60=1.00 total=1\n"), None);
+        assert_eq!(parse_psi_full_avg10("full"), None);
         // Truncated mid-write: the field is present but has no value.
-        assert_eq!(parse_psi_some_avg10("some avg10="), None);
+        assert_eq!(parse_psi_full_avg10("full avg10="), None);
     }
 
     #[test]
@@ -191,7 +202,7 @@ full avg10=0.00 avg60=0.01 avg300=0.01 total=1322657835
 
     /// The regression this fixes: a cgroup PSI file that reads successfully
     /// but fails to parse must fall back to the host file, exactly like a
-    /// missing cgroup file does. Before this fix, `read_some_avg10`'s
+    /// missing cgroup file does. Before this fix, `read_full_avg10`'s
     /// `or_else` only covered a failed *read*, so an empty or truncated
     /// cgroup file silently disabled backpressure instead of falling back.
     #[test]
@@ -218,7 +229,7 @@ full avg10=0.00 avg60=0.01 avg300=0.01 total=1322657835
     /// publish PSI — the failure mode where the file is readable but the path
     /// resolution or parsing is broken.
     ///
-    /// Gates on an actual successful read-and-parse (`read_some_avg10`)
+    /// Gates on an actual successful read-and-parse (`read_full_avg10`)
     /// rather than path existence: on a restricted container, or during a
     /// filesystem race, a path can exist yet be unreadable or unparseable,
     /// which would make the gate pass and the assertion below fail
@@ -227,7 +238,7 @@ full avg10=0.00 avg60=0.01 avg300=0.01 total=1322657835
     /// failing.
     #[test]
     fn sample_reads_the_live_psi_file_when_the_host_has_one() {
-        if read_some_avg10().is_none() {
+        if read_full_avg10().is_none() {
             eprintln!("no readable, parseable PSI file on this host; skipping");
             return;
         }
@@ -254,7 +265,7 @@ full avg10=0.00 avg60=0.01 avg300=0.01 total=1322657835
     /// reading.
     ///
     /// This does not assert the host is calm: a memory-constrained or loaded
-    /// CI machine can legitimately exceed `Sensitivity::Low`'s 20% stall
+    /// CI machine can legitimately exceed `Sensitivity::Low`'s 90% stall
     /// trigger, and asserting "always calm" would make the test flaky on
     /// exactly the hosts most worth testing on. Instead it takes whatever
     /// verdict the live call returns and checks the invariant holds either
@@ -263,7 +274,7 @@ full avg10=0.00 avg60=0.01 avg300=0.01 total=1322657835
     /// end to end.
     #[test]
     fn platform_sample_clears_detail_on_a_calm_reading() {
-        if read_some_avg10().is_none() {
+        if read_full_avg10().is_none() {
             eprintln!("no readable, parseable PSI file on this host; skipping");
             return;
         }

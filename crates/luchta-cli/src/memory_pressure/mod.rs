@@ -42,8 +42,8 @@ mod windows;
 #[allow(dead_code)]
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub(crate) enum PressureDetail {
-    /// Linux PSI `some avg10`: percent of the last 10s during which some task
-    /// stalled on memory reclaim.
+    /// Linux PSI `full avg10`: percent of the last 10s during which every
+    /// non-idle task stalled on memory reclaim at once (thrashing).
     Stalled(f64),
     /// macOS `kern.memorystatus_vm_pressure_level` below critical. Also the
     /// placeholder a calm macOS reading carries, which is why it means nothing
