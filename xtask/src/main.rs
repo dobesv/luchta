@@ -89,17 +89,46 @@ fn build_worker_to(repo_root: &Path, target: &str, out_dir: &Path) -> Result<Pat
 
     let patches = patch_paths(repo_root);
     let output_path = out_dir.join(worker_binary_name(go_target.goos));
+    let go_module_dir = vendor_dir.join("tsc");
 
     reset_vendor_worktree(&vendor_dir)?;
-    apply_patches(&vendor_dir, &patches)?;
+    apply_patches_and_build(
+        &vendor_dir,
+        &patches,
+        &go_module_dir,
+        &output_path,
+        go_target,
+    )?;
+    Ok(output_path)
+}
 
-    let go_module_dir = vendor_dir.join("tsc");
-    let build_result = go_build_worker(&go_module_dir, &output_path, go_target);
-    let reset_result = reset_vendor_worktree(&vendor_dir);
+/// Applies every patch and then builds the Go worker, bracketing both steps
+/// in a single reset of `vendor_dir` afterward — success or failure.
+///
+/// Patch application and the build used to be reset separately (the build
+/// alone was wrapped), which meant a failure partway through
+/// `apply_patches` — e.g. `upstream-pnp.patch` applies but `luchta.patch`
+/// then fails — returned early and left the submodule holding the first
+/// patch's changes uncommitted. That dirty worktree then confused the next
+/// `build-worker` run (and anyone poking at `vendor/typescript` by hand).
+/// Putting apply and build in one fallible section with one unconditional
+/// reset after it, mirroring how the build alone used to be handled, closes
+/// that gap: whatever fails, the reset still runs and the submodule ends up
+/// clean.
+fn apply_patches_and_build(
+    vendor_dir: &Path,
+    patches: &[(&'static str, PathBuf)],
+    go_module_dir: &Path,
+    output_path: &Path,
+    go_target: GoTarget,
+) -> Result<(), String> {
+    let build_result = apply_patches(vendor_dir, patches)
+        .and_then(|()| go_build_worker(go_module_dir, output_path, go_target));
+    let reset_result = reset_vendor_worktree(vendor_dir);
 
     build_result?;
     reset_result?;
-    Ok(output_path)
+    Ok(())
 }
 
 /// Resolves `PATCHES_IN_ORDER` to full paths under `repo_root`, paired with
@@ -163,6 +192,31 @@ fn host_target_triple() -> Result<String, String> {
         .ok_or_else(|| "failed to find host triple in rustc -vV output".to_string())
 }
 
+/// Builds a `git` command scoped to `vendor_dir` via `-C`, with the
+/// environment variables that can override `-C` stripped.
+///
+/// Git itself sets `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, and
+/// `GIT_COMMON_DIR` on child processes in ordinary situations (running from
+/// a hook, for instance) — this isn't only a deliberate-misuse concern. Any
+/// of them take precedence over `-C` and can point git at a different
+/// repository, worktree, or index than the one we just named.
+/// `reset_vendor_worktree` runs `checkout .` and `clean -fd`, so under the
+/// wrong worktree that silently deletes files that were never meant to be
+/// touched. Stripping these here makes `-C vendor_dir` authoritative for
+/// every git invocation in this file, without touching any other inherited
+/// environment variable.
+fn git_command(vendor_dir: &Path) -> Command {
+    let mut command = Command::new("git");
+    command
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_COMMON_DIR")
+        .arg("-C")
+        .arg(vendor_dir);
+    command
+}
+
 /// Applies every patch in `patches`, in order, to `vendor_dir`. Stops at the
 /// first one that fails and names it — that diagnostic is what makes patch
 /// staleness obvious, so it must say *which* patch broke, not just that
@@ -176,9 +230,7 @@ fn apply_patches(vendor_dir: &Path, patches: &[(&'static str, PathBuf)]) -> Resu
 
 fn apply_one_patch(vendor_dir: &Path, patch_path: &Path, patch_label: &str) -> Result<(), String> {
     let check_status = run_command(
-        Command::new("git")
-            .arg("-C")
-            .arg(vendor_dir)
+        git_command(vendor_dir)
             .arg("apply")
             .arg("--check")
             .arg(patch_path),
@@ -192,11 +244,7 @@ fn apply_one_patch(vendor_dir: &Path, patch_path: &Path, patch_label: &str) -> R
     }
 
     let apply_status = run_command(
-        Command::new("git")
-            .arg("-C")
-            .arg(vendor_dir)
-            .arg("apply")
-            .arg(patch_path),
+        git_command(vendor_dir).arg("apply").arg(patch_path),
         &format!("failed to run git apply for {patch_label}"),
     )?;
 
@@ -212,11 +260,7 @@ fn apply_one_patch(vendor_dir: &Path, patch_path: &Path, patch_label: &str) -> R
 
 fn reset_vendor_worktree(vendor_dir: &Path) -> Result<(), String> {
     let checkout_status = run_command(
-        Command::new("git")
-            .arg("-C")
-            .arg(vendor_dir)
-            .arg("checkout")
-            .arg("."),
+        git_command(vendor_dir).arg("checkout").arg("."),
         "failed to run git checkout .",
     )?;
 
@@ -228,11 +272,7 @@ fn reset_vendor_worktree(vendor_dir: &Path) -> Result<(), String> {
     }
 
     let clean_status = run_command(
-        Command::new("git")
-            .arg("-C")
-            .arg(vendor_dir)
-            .arg("clean")
-            .arg("-fd"),
+        git_command(vendor_dir).arg("clean").arg("-fd"),
         "failed to run git clean -fd",
     )?;
 
@@ -1054,6 +1094,149 @@ mod tests {
         for target in supported_target_triples() {
             assert!(error.contains(target), "missing {target} in {error}");
         }
+    }
+
+    #[test]
+    fn git_command_strips_repo_location_env_vars() {
+        // GIT_DIR, GIT_WORK_TREE, GIT_INDEX_FILE, and GIT_COMMON_DIR all
+        // override -C when set, and git sets some of these itself on child
+        // processes (e.g. from a hook). get_envs() reports env_remove'd keys
+        // as present with value None, which is how we assert they're
+        // explicitly stripped rather than merely never set.
+        let command = git_command(Path::new("/repo/vendor/typescript"));
+        let envs: HashMap<_, _> = command.get_envs().collect();
+        for var in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_COMMON_DIR",
+        ] {
+            assert_eq!(
+                envs.get(OsStr::new(var)),
+                Some(&None),
+                "{var} should be explicitly removed from the git command's environment"
+            );
+        }
+    }
+
+    /// Runs `git` with `args` in `dir`, panicking with stderr on failure.
+    /// Test-only plumbing for the fixture below, not a path production code
+    /// takes.
+    fn git(dir: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .expect("git spawns");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Builds a throwaway git repo with one committed file plus two
+    /// standalone patches against it. Both patches are diffed against the
+    /// same committed base (so each applies cleanly to a pristine checkout
+    /// on its own), but the second patch's context still assumes the
+    /// original line 2 — so once the first patch has already rewritten it
+    /// on disk, the second no longer applies. That mirrors the real failure
+    /// mode under test: a second patch, anchored to content the first patch
+    /// changes, fails mid-sequence and must not leave the worktree dirty.
+    fn two_patch_fixture(temp: &tempfile::TempDir) -> (PathBuf, PathBuf, PathBuf) {
+        let repo_dir = temp.path().join("repo");
+        std::fs::create_dir(&repo_dir).expect("create repo dir");
+        git(&repo_dir, &["init", "-q", "-b", "main"]);
+        git(&repo_dir, &["config", "user.email", "test@example.com"]);
+        git(&repo_dir, &["config", "user.name", "Test"]);
+
+        let file_path = repo_dir.join("foo.txt");
+        std::fs::write(&file_path, "line1\nline2\nline3\n").expect("write foo.txt");
+        git(&repo_dir, &["add", "foo.txt"]);
+        git(&repo_dir, &["commit", "-q", "-m", "init"]);
+
+        git(&repo_dir, &["checkout", "-q", "-b", "feature-1"]);
+        std::fs::write(&file_path, "line1\nPATCHED-A\nline3\n").expect("write feature-1");
+        git(&repo_dir, &["commit", "-q", "-am", "feature-1"]);
+        let patch1 = temp.path().join("patch1.patch");
+        let diff1 = Command::new("git")
+            .arg("-C")
+            .arg(&repo_dir)
+            .args(["diff", "main", "feature-1", "--", "foo.txt"])
+            .output()
+            .expect("git diff feature-1");
+        std::fs::write(&patch1, &diff1.stdout).expect("write patch1");
+
+        git(&repo_dir, &["checkout", "-q", "main"]);
+        git(&repo_dir, &["checkout", "-q", "-b", "feature-2"]);
+        std::fs::write(&file_path, "line1\nPATCHED-B\nline3\n").expect("write feature-2");
+        git(&repo_dir, &["commit", "-q", "-am", "feature-2"]);
+        let patch2 = temp.path().join("patch2.patch");
+        let diff2 = Command::new("git")
+            .arg("-C")
+            .arg(&repo_dir)
+            .args(["diff", "main", "feature-2", "--", "foo.txt"])
+            .output()
+            .expect("git diff feature-2");
+        std::fs::write(&patch2, &diff2.stdout).expect("write patch2");
+
+        git(&repo_dir, &["checkout", "-q", "main"]);
+
+        (repo_dir, patch1, patch2)
+    }
+
+    #[test]
+    fn apply_patches_and_build_resets_worktree_after_second_patch_fails() {
+        // Regression test for a real failure: apply_patches used to return
+        // early on the second patch's error, and reset_vendor_worktree only
+        // ran around the build step, so the first patch's change was left
+        // uncommitted in the submodule. apply_patches_and_build now brackets
+        // both apply_patches and the build in one fallible section with a
+        // single unconditional reset after it.
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let (repo_dir, patch1, patch2) = two_patch_fixture(&temp);
+        let patches: Vec<(&'static str, PathBuf)> =
+            vec![("patch1.patch", patch1), ("patch2.patch", patch2)];
+
+        // go_module_dir/output_path/go_target are never touched: the second
+        // patch fails inside apply_patches before go_build_worker would run,
+        // which is what lets this test exercise the reset without needing
+        // `go` installed.
+        let result = apply_patches_and_build(
+            &repo_dir,
+            &patches,
+            Path::new("unused-go-module-dir"),
+            Path::new("unused-output-path"),
+            GoTarget {
+                goos: "linux",
+                goarch: "amd64",
+            },
+        );
+
+        let error = result.expect_err("second patch's stale context must fail to apply");
+        assert!(
+            error.contains("patch2.patch"),
+            "error should name the failing patch: {error}"
+        );
+
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&repo_dir)
+            .args(["status", "--porcelain"])
+            .output()
+            .expect("git status");
+        assert!(
+            status.stdout.is_empty(),
+            "vendor worktree must be clean after a failed second patch, got: {}",
+            String::from_utf8_lossy(&status.stdout)
+        );
+
+        let contents = std::fs::read_to_string(repo_dir.join("foo.txt")).expect("read foo.txt");
+        assert_eq!(
+            contents, "line1\nline2\nline3\n",
+            "first patch's change must be reverted by the reset, not left dangling"
+        );
     }
 
     #[test]

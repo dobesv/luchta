@@ -175,7 +175,11 @@ different maintenance stories:
   ```
   The script derives the base commit itself (see below), refuses to run
   against a dirty `vendor/typescript` worktree, and verifies the regenerated
-  patch still applies with zero conflicts before leaving it in place.
+  patch applies with zero conflicts — at the base commit it was just diffed
+  from — before leaving it in place; a failed run leaves the checked-in
+  patch untouched. That check catches a malformed diff, not drift between
+  the base and `vendor/typescript`'s current pin — see below for how those
+  two relate.
 - **`patches/luchta.patch`** — everything that is actually ours: the
   `luchta-tsc-worker` binary and its `internal/luchta/` package, a small
   manifest-caching layer on top of the PnP support (`InitPnpApiCached` and

@@ -27,6 +27,10 @@ readonly SUBMODULE_DIR="${REPO_ROOT}/vendor/typescript"
 readonly PATCH_FILE="${REPO_ROOT}/patches/upstream-pnp.patch"
 readonly TEMP_REF="refresh-upstream-pnp-tmp"
 
+# Set once the diff is generated, below. Declared here so cleanup() can
+# safely reference it (as empty) even if we die before that point.
+temp_patch_file=""
+
 err() {
     printf 'Error: %s\n' "$*" >&2
     exit 1
@@ -55,6 +59,9 @@ sub branch -D "${TEMP_REF}" >/dev/null 2>&1 || true
 cleanup() {
     sub checkout --quiet --detach "${original_head}" >/dev/null 2>&1 || true
     sub branch -D "${TEMP_REF}" >/dev/null 2>&1 || true
+    # No-op once the diff has been moved into place: mv leaves nothing at
+    # this path for rm -f to remove.
+    [ -z "${temp_patch_file}" ] || rm -f "${temp_patch_file}"
 }
 trap cleanup EXIT
 
@@ -69,7 +76,12 @@ sub fetch --depth 200 origin "+refs/pull/${PR_NUMBER}/head:${TEMP_REF}"
 depth=200
 base=""
 while [ -z "${base}" ]; do
-    sub fetch --depth "${depth}" origin main
+    # An explicit refspec is required here: `fetch origin main` only updates
+    # FETCH_HEAD, leaving refs/remotes/origin/main — which merge-base reads
+    # below — stale. That defeats the fresh-base-every-run guarantee this
+    # script exists for: origin/main would keep pointing at whatever it
+    # happened to be the first time this ran in this checkout.
+    sub fetch --depth "${depth}" origin "+refs/heads/main:refs/remotes/origin/main"
     sub fetch --depth "${depth}" origin "+refs/pull/${PR_NUMBER}/head:${TEMP_REF}"
     if base="$(sub merge-base origin/main "${TEMP_REF}" 2>/dev/null)"; then
         break
@@ -83,14 +95,19 @@ while [ -z "${base}" ]; do
 done
 
 echo "Generating diff ${base}..${TEMP_REF}..." >&2
-sub diff "${base}..${TEMP_REF}" > "${PATCH_FILE}"
+# Written to a temp file first, not straight to PATCH_FILE: the checked-in
+# patch must not be touched until the diff below is confirmed to apply. A
+# run that dies partway through validation would otherwise leave a bad patch
+# on disk with no indication anything went wrong.
+temp_patch_file="$(mktemp "${PATCH_FILE}.XXXXXX")"
+sub diff "${base}..${TEMP_REF}" > "${temp_patch_file}"
 
 # Verify the patch applies with zero conflicts at the commit it was diffed
 # from. This requires checking that commit out; we restore original_head
 # afterward via the trap regardless of the outcome below.
 sub checkout --quiet --detach "${base}"
 sub clean -fdq
-if sub apply --check "${PATCH_FILE}"; then
+if sub apply --check "${temp_patch_file}"; then
     apply_result="applies cleanly"
 else
     apply_result="DOES NOT APPLY CLEANLY"
@@ -119,5 +136,13 @@ top of, and that deserves a look before it's committed.
 EOF
 
 if [ "${apply_result}" != "applies cleanly" ]; then
-    err "Generated patch does not apply cleanly at ${base} -- do not trust it. This usually means the base commit above is stale relative to what's already checked out; move the pin (see above) and rerun."
+    # The checkout above put vendor/typescript's worktree at exactly ${base}
+    # before running `apply --check`, so this isn't the base drifting from
+    # what's checked out — they're identical by construction. A failure here
+    # instead points at the diff itself: malformed `git diff` output, or
+    # line-ending mangling somewhere in the fetched history.
+    err "Generated patch does not apply cleanly at ${base} -- do not trust it. This does not mean the base is stale (the check ran with vendor/typescript already at that exact commit); it means the diff output itself is malformed, e.g. bad line endings. Investigate that before rerunning rather than assuming the base needs to move."
 fi
+
+mv "${temp_patch_file}" "${PATCH_FILE}"
+echo "Wrote ${PATCH_FILE}" >&2
