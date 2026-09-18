@@ -244,4 +244,55 @@ mod tests {
         assert_eq!(read_entry_meta(&paths, &[1; 32]).unwrap().stdout, b"task-a");
         assert_eq!(read_entry_meta(&paths, &[2; 32]).unwrap().stdout, b"task-b");
     }
+
+    /// Zstd block type of the first block in a frame: 0 = `Raw_Block`,
+    /// 1 = `RLE_Block`, 2 = `Compressed_Block`, 3 = reserved.
+    ///
+    /// Layout: 4-byte magic, 1-byte frame header descriptor, 1-byte window
+    /// descriptor, then a 3-byte little-endian block header whose bit 0 is
+    /// `last_block` and bits 1-2 are `block_type`.
+    fn first_block_type(frame: &[u8]) -> u8 {
+        let block_header =
+            u32::from(frame[6]) | (u32::from(frame[7]) << 8) | (u32::from(frame[8]) << 16);
+        ((block_header >> 1) & 0b11) as u8
+    }
+
+    #[test]
+    fn decodes_zstd_payload_written_by_previous_version() {
+        // Captured from zstd 0.13 at ENTRY_META_ZSTD_LEVEL. Decoding must keep
+        // working across zstd major bumps or every existing shared-cache entry
+        // becomes unreadable.
+        //
+        // The payload is a short phrase repeated 32 times, deliberately
+        // repetitive so that zstd actually compresses it into a
+        // `Compressed_Block` instead of storing it literally as a
+        // `Raw_Block`. A short, low-entropy fixture would let this test pass
+        // while only exercising frame parsing and a byte copy, never the
+        // Huffman/FSE/sequence decode path where a real cross-version
+        // frame-format break would show up.
+        const LEGACY_FRAME_HEX: &str = "28b52ffd00588d010084026c756368746120656e747279206d6574612\
+            0636f6d7061746962696c6974792066697874757265200100a866fdaa0c";
+
+        let bytes: Vec<u8> = (0..LEGACY_FRAME_HEX.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&LEGACY_FRAME_HEX[i..i + 2], 16).unwrap())
+            .collect();
+
+        const COMPRESSED_BLOCK: u8 = 2;
+        assert_eq!(
+            first_block_type(&bytes),
+            COMPRESSED_BLOCK,
+            "fixture must contain a Compressed_Block, not a Raw_Block or RLE_Block \u{2014} a \
+             short or low-entropy payload here would only exercise frame parsing, silently \
+             losing coverage of the Huffman/FSE decode path"
+        );
+
+        let raw = zstd::decode_all(bytes.as_slice()).expect("legacy frame should decode");
+        assert_eq!(
+            raw,
+            "luchta entry meta compatibility fixture "
+                .repeat(32)
+                .as_bytes()
+        );
+    }
 }

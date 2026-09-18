@@ -7,9 +7,8 @@ use std::path::{Path, PathBuf};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use json_strip_comments::StripComments;
 use oxc_formatter::{
-    ArrowParentheses, AttributePosition, BracketSameLine, BracketSpacing,
-    EmbeddedLanguageFormatting, Expand, JsFormatOptions, QuoteProperties, QuoteStyle, Semicolons,
-    TrailingCommas,
+    ArrowParentheses, AttributePosition, BracketSameLine, BracketSpacing, Expand, JsFormatOptions,
+    QuoteProperties, QuoteStyle, Semicolons, TrailingCommas,
 };
 use oxc_formatter_core::{IndentStyle, IndentWidth, LineEnding, LineWidth};
 use serde::Deserialize;
@@ -68,11 +67,13 @@ struct OxfmtRc {
     single_attribute_per_line: Option<bool>,
     object_wrap: Option<ObjectWrap>,
     html_whitespace_sensitivity: Option<HtmlWhitespaceSensitivity>,
+    // Parsed but not applied; see `apply_markup_options` for why. Keeping the
+    // field is what still type-checks the value and keeps the key recognized.
     embedded_language_formatting: Option<EmbeddedLanguageFormattingOption>,
     // NOTE: `experimentalOperatorPosition` and `experimentalTernaries` are not
-    // supported by this worker's oxc_formatter revision. They are intentionally
-    // NOT fields here: serde ignores them, and they surface as unsupported-key
-    // warnings via `collect_unknown_options` (they are absent from
+    // supported by this worker. They are intentionally NOT fields here: serde
+    // ignores them, and they surface as unsupported-key warnings via
+    // `collect_unknown_options` (they are absent from
     // `KNOWN_TOP_LEVEL_KEYS`). This keeps forward compatibility — a newer or
     // shared `.oxfmtrc` degrades with a warning instead of hard-failing the
     // whole repo's formatting.
@@ -218,7 +219,7 @@ pub fn discover_config(cwd: &Path) -> Result<LoadedConfig, String> {
     let parsed = match path.as_deref() {
         Some(path) => load_config_from_path(path)?,
         None => ParsedConfig {
-            options: JsFormatOptions::new(),
+            options: JsFormatOptions::default(),
             ignore_matcher: None,
             warnings: Vec::new(),
             unsupported_option_notices: Vec::new(),
@@ -244,7 +245,7 @@ fn oxfmtrc_to_options(json: &str) -> Result<JsFormatOptions, String> {
 }
 
 fn options_from_oxfmtrc(config: &OxfmtRc) -> Result<JsFormatOptions, String> {
-    let mut options = JsFormatOptions::new();
+    let mut options = JsFormatOptions::default();
     apply_oxfmtrc_to_options(config, &mut options)?;
 
     // Supported subset only. Unsupported top-level keys are surfaced as warnings
@@ -367,12 +368,15 @@ fn apply_markup_options(config: &OxfmtRc, options: &mut JsFormatOptions) {
             HtmlWhitespaceSensitivity::Ignore
         );
     }
-    if let Some(embedded_language_formatting) = config.embedded_language_formatting {
-        options.embedded_language_formatting = match embedded_language_formatting {
-            EmbeddedLanguageFormattingOption::Auto => EmbeddedLanguageFormatting::Auto,
-            EmbeddedLanguageFormattingOption::Off => EmbeddedLanguageFormatting::Off,
-        };
-    }
+    // `embeddedLanguageFormatting` has no `JsFormatOptions` counterpart any
+    // more: oxc's formatter-session redesign moved the switch out of the
+    // options struct, and upstream oxfmt now honours `"off"` by installing no
+    // embedded dispatcher on the session. This worker installs one
+    // unconditionally, which is exactly what it did before the redesign too —
+    // the old `JsFormatOptions::embedded_language_formatting` field was inert
+    // data that `oxc_formatter` never read. `OxfmtRc` still carries the key so
+    // its value keeps being checked and configs that set it keep loading
+    // unchanged; honouring `"off"` would be a behaviour change, not a port.
 }
 
 fn map_quote_style(single_quote: bool) -> QuoteStyle {
@@ -458,7 +462,7 @@ fn build_override_matchers(
 ) -> Result<Vec<OverrideMatcher>, String> {
     let mut matchers = Vec::new();
     for override_config in overrides {
-        let mut scratch = JsFormatOptions::new();
+        let mut scratch = JsFormatOptions::default();
         apply_oxfmtrc_to_options(&override_config.options, &mut scratch)
             .map_err(|error| format!("invalid override options: {error}"))?;
 
@@ -803,7 +807,7 @@ mod tests {
     /// the fields the worker maps. Encapsulates the comparison so tests do not
     /// carry a large consecutive assertion block.
     fn assert_options_are_defaults(options: &oxc_formatter::JsFormatOptions) {
-        let defaults = oxc_formatter::JsFormatOptions::new();
+        let defaults = oxc_formatter::JsFormatOptions::default();
         // Compare mapped fields as grouped tuples to keep the assertion block
         // small (widths together, style/enum fields together).
         assert_eq!(
@@ -957,10 +961,6 @@ mod tests {
         )
         .expect("parse");
         assert!(options.html_whitespace_sensitivity_ignore);
-        assert_eq!(
-            options.embedded_language_formatting,
-            oxc_formatter::EmbeddedLanguageFormatting::Off
-        );
     }
 
     #[test]

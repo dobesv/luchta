@@ -3,8 +3,12 @@
 use std::{path::Path, sync::Arc};
 
 use oxc_allocator::Allocator;
-use oxc_formatter::{format, ExternalCallbacks, JsFormatOptions, QuoteStyle, TrailingCommas};
-use oxc_formatter_core::{DispatchResult, FormatDispatcher};
+use oxc_formatter::{
+    format_with_session, CssInJsTemplate, JsFormatOptions, QuoteStyle, TrailingCommas,
+};
+use oxc_formatter_core::{
+    DispatchRequest, DispatchResponse, FormatDispatcher, FormatSession, InputKind, SessionServices,
+};
 use oxc_formatter_css::{
     CssFormatOptions, CssVariant, SingleQuote, TrailingCommas as CssTrailingCommas,
 };
@@ -23,43 +27,66 @@ pub fn format_path(
 ) -> Result<FormatResult, String> {
     let allocator = Allocator::default();
     let css_options = css_format_options(options);
-    let dispatcher: FormatDispatcher = Arc::new(move |ctx, language, texts, _parent| {
-        let css_options = match language {
-            "css" | "scss" | "less" => css_options,
-            _ => return Err(format!("unsupported embedded language: {language}")),
-        };
-        let [text] = texts else {
-            return Err(format!(
-                "expected exactly 1 embedded text for {language}, got {}",
-                texts.len()
-            ));
-        };
-        let embedded = oxc_formatter_css::format_to_ir(ctx, text, css_options)
-            .map_err(|error| error.to_string())?;
-        Ok(DispatchResult {
-            docs: vec![embedded.ir],
-            tailwind_classes: embedded.tailwind_classes,
-            meta: None,
-        })
-    });
-    let callbacks = ExternalCallbacks::new().with_dispatcher(Some(dispatcher));
+    let dispatcher: FormatDispatcher = Arc::new(
+        move |session: &FormatSession<'_>, request: DispatchRequest<'_>| {
+            // CSS-in-JS is the only embedded language this worker serves. Any
+            // other request is a deliberate "do not format", and the JS
+            // formatter keeps the template literal exactly as written.
+            //
+            // The pre-session API reached the same outcome for this worker when
+            // the closure answered `Err`, though not by one uniform rule: most
+            // embed sites bailed out on `Err`, while html-in-js instead fell
+            // through to a string-based fallback. That fallback is inert here
+            // only because it starts by calling the string-embedding callback,
+            // which this worker never installed (it set a dispatcher and nothing
+            // else) — so it bailed out in turn.
+            if !matches!(request.language, "css" | "scss" | "less") {
+                return Ok(DispatchResponse::PreserveOriginal);
+            }
+            // `${...}` interpolations reach the child as `` `PLACEHOLDER-N` ``
+            // markers, which parse only in the css-in-js mode. `oxc_formatter`'s
+            // CSS embed sites are the only senders and always tag the request
+            // with `CssInJsTemplate`, so this is the `allow_placeholders = true`
+            // that the pre-session `format_to_ir` hard-coded.
+            let template_placeholders = request
+                .parent_context
+                .is_some_and(|context| context.downcast_ref::<CssInJsTemplate>().is_some());
+            match oxc_formatter_css::format_to_ir(
+                session,
+                request.text,
+                css_options,
+                template_placeholders,
+            ) {
+                Ok(embedded) => Ok(DispatchResponse::Formatted(embedded.into())),
+                // A child that will not parse is preserved, not an error: the
+                // `Err` the old code returned here was swallowed by the embed
+                // site, which left the template verbatim all the same.
+                Err(_) => Ok(DispatchResponse::PreserveOriginal),
+            }
+        },
+    );
+    // Only the IR dispatcher is installed, matching the single
+    // `ExternalCallbacks::with_dispatcher` of the pre-session API: no string
+    // embedder (JSDoc fences stay as-is) and no Tailwind sorter (classes print
+    // in source order).
+    let services = SessionServices {
+        dispatcher: Some(dispatcher),
+        ..SessionServices::default()
+    };
+    // `PhysicalFile`: this worker formats files on disk, so the root owns the
+    // file-level envelope (BOM) exactly as the pre-session entry point did.
+    let session = FormatSession::with_services(&allocator, InputKind::PhysicalFile, services);
     let source_type = SourceType::from_path(path).map_err(|error| {
         format!(
             "failed to determine source type for {}: {error}",
             luchta_worker::paths::repo_relative(path, repo_root)
         )
     })?;
-    let formatted: String = format(
-        &allocator,
-        source,
-        source_type,
-        options.clone(),
-        Some(callbacks),
-    )
-    .map_err(|error| format_diagnostic(path, repo_root, &error.to_string()))?
-    .print()
-    .map_err(|error| format_diagnostic(path, repo_root, &error.to_string()))?
-    .into_code();
+    let formatted: String = format_with_session(&session, source, source_type, options.clone())
+        .map_err(|error| format_diagnostic(path, repo_root, &error.to_string()))?
+        .print()
+        .map_err(|error| format_diagnostic(path, repo_root, &error.to_string()))?
+        .into_code();
 
     Ok(FormatResult {
         changed: formatted.as_bytes() != source.as_bytes(),
@@ -105,7 +132,7 @@ mod tests {
             path,
             Path::new(""),
             "export const value={foo:'bar'}\n",
-            &JsFormatOptions::new(),
+            &JsFormatOptions::default(),
         )
         .expect("format ok");
         assert!(result.changed);
@@ -118,8 +145,8 @@ mod tests {
         let input = "const Button = styled.button`color:red;${({ theme }) => css`display:flex;align-items:center;justify-content:space-between;`};padding:8px;`;\n";
         let expected = "const Button = styled.button`\n  color: red;\n  ${({ theme }) =>\n    css`\n      display: flex;\n      align-items: center;\n      justify-content: space-between;\n    `}; padding: 8px;\n`;\n";
 
-        let result =
-            format_path(path, Path::new(""), input, &JsFormatOptions::new()).expect("format ok");
+        let result = format_path(path, Path::new(""), input, &JsFormatOptions::default())
+            .expect("format ok");
 
         assert_eq!(result.formatted, expected);
     }
@@ -130,8 +157,8 @@ mod tests {
         let input = "const Card = styled.div`${foo+bar+baz?'display:grid;grid-template-columns:1fr auto;':'display:block;'}\nmargin:0 auto;`;\n";
         let expected = "const Card = styled.div`\n  ${foo + bar + baz ? \"display:grid;grid-template-columns:1fr auto;\" : \"display:block;\"}\n  margin: 0 auto;\n`;\n";
 
-        let result =
-            format_path(path, Path::new(""), input, &JsFormatOptions::new()).expect("format ok");
+        let result = format_path(path, Path::new(""), input, &JsFormatOptions::default())
+            .expect("format ok");
 
         assert_eq!(result.formatted, expected);
     }
@@ -142,8 +169,10 @@ mod tests {
         let input = "import z from 'z';\nimport a from 'a';\n\nexport { z, a };\n";
         let expected = "import a from \"a\";\nimport z from \"z\";\n\nexport { z, a };\n";
 
-        let mut options = JsFormatOptions::new();
-        options.sort_imports = Some(SortImportsOptions::default());
+        let options = JsFormatOptions {
+            sort_imports: Some(SortImportsOptions::default()),
+            ..JsFormatOptions::default()
+        };
 
         let result = format_path(path, Path::new(""), input, &options).expect("format ok");
 
@@ -152,8 +181,24 @@ mod tests {
     }
 
     #[test]
+    fn format_path_leaves_unsupported_embedded_languages_untouched() {
+        // The dispatcher serves CSS only. A `gql` tagged template dispatches
+        // the "graphql" language, which this worker declines; the JS formatter
+        // must then leave the template's contents byte-for-byte alone, exactly
+        // as it did when declining meant answering `Err`.
+        let path = Path::new("src/example.ts");
+        let input = "const q=gql`query   Foo{  id }`;\n";
+        let expected = "const q = gql`query   Foo{  id }`;\n";
+
+        let result = format_path(path, Path::new(""), input, &JsFormatOptions::default())
+            .expect("format ok");
+
+        assert_eq!(result.formatted, expected);
+    }
+
+    #[test]
     fn css_options_map_js_options_for_embedded_css() {
-        let css_options = css_format_options(&JsFormatOptions::new());
+        let css_options = css_format_options(&JsFormatOptions::default());
         assert_eq!(css_options.variant, oxc_formatter_css::CssVariant::Scss);
         assert!(!css_options.sort_tailwindcss);
     }
@@ -165,9 +210,11 @@ mod tests {
         let expected =
             "const Box = styled.div`\n\tcolor: red;\n\tbackground: url('x.png');\n\t${foo}\n`;\n";
 
-        let mut options = JsFormatOptions::new();
-        options.indent_style = oxc_formatter_core::IndentStyle::Tab;
-        options.quote_style = oxc_formatter::QuoteStyle::Single;
+        let options = JsFormatOptions {
+            indent_style: oxc_formatter_core::IndentStyle::Tab,
+            quote_style: oxc_formatter::QuoteStyle::Single,
+            ..JsFormatOptions::default()
+        };
 
         let result = format_path(path, Path::new(""), input, &options).expect("format ok");
 
