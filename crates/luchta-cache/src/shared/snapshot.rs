@@ -659,6 +659,12 @@ fn compress_snapshot_bytes(raw: &[u8]) -> io::Result<Vec<u8>> {
     zstd::encode_all(raw, SNAPSHOT_ZSTD_LEVEL)
 }
 
+// Home-grown compatibility logic: bytes without the zstd frame magic are
+// assumed to be a legacy, pre-compression snapshot written before this format
+// existed. No test exercises this branch against a real captured legacy
+// (uncompressed) snapshot; existing tests only assert the magic-byte prefix on
+// freshly zstd-encoded bytes, so a change here that broke old-snapshot
+// decoding would not be caught by the current suite.
 fn decompress_snapshot_bytes(bytes: &[u8]) -> io::Result<Vec<u8>> {
     if bytes.starts_with(&ZSTD_FRAME_MAGIC) {
         zstd::decode_all(bytes)

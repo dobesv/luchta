@@ -167,6 +167,8 @@ git diff --no-color --binary e578159b7ae473127056a65748d7b3a4daa9a93f..9ed9a7d05
 **Important:**
 - The repository uses `core.autocrlf=input`. `.gitattributes` marks `patches/tsgo.patch -text` to ensure CRLF line endings survive checkout. Maintainers MUST preserve this attribute.
 - A scheduled workflow (`patch-drift.yaml`) monitors the patch and opens a maintenance issue if it can no longer be applied.
+- **`git apply` succeeding does not mean the patch is still correct.** The patch threads a `PnpApi()` accessor through ~140 call sites across the host interfaces (`module.ResolutionHost`, `compiler.CompilerHost`, `tsc.System`, etc.). A call site upstream *adds* between rebases produces no conflict — it just compiles with a missing argument and quietly builds a host with no PnP support on that path. Only an incidental change to a constructor's arity has ever caught this in practice. When rebasing onto a new upstream commit, grep for new constructor call sites of `NewCompilerHost` / `NewCachedFSCompilerHost` / `createCompilerHost` (and any interface the patch extends) and check each one passes the PnP argument — don't rely on conflicts alone.
+- The vendored Go test suite does not currently compile at the pinned commit (pre-existing, independent of any particular submodule bump), so `internal/luchta` and the PnP compiler baselines can't be run as an automated gate for a patch rebase. Verify behaviour by hand — `cargo xtask build-worker` plus a manual JSONL smoke test against the built `luchta-tsc-worker` — until someone restores the test build.
 
 ### Verification
 
@@ -955,7 +957,7 @@ Standard worker binaries are resolved via `PATH`. They ship inside each release 
   tasks that don't need Yarn workspace wrapping.
 
 #### oxc Workers
-Luchta bundles three in-process workers built on the oxc toolchain (git-pinned to rev `415fe1e7`). All share the same limitations and upgrade cadence.
+Luchta bundles three in-process workers built on the oxc toolchain (git-pinned to rev `7bf68f70`, tagged `apps_v1.83.0`/`oxlint_v1.83.0`/`oxfmt_v0.68.0`). All share the same limitations and upgrade cadence.
 
 **Shared limitations:**
 - Unix-only as resident workers: the engine only runs these as resident workers on Unix. Binaries ship on all platforms but Windows usage requires spawning per-task.

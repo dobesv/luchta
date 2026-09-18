@@ -570,6 +570,10 @@ impl TaskGraph {
         &self.graph
     }
 
+    /// No test pins the exact order among nodes with no dependency relation to
+    /// each other, so a future `petgraph` bump that changed tie-breaking would
+    /// have no automated tripwire here — see the same note on
+    /// `PackageGraph::topological_order`.
     pub fn topological_order(&self) -> Result<Vec<&TaskNode>, EngineError> {
         let order = toposort(&self.graph, None).map_err(|cycle| EngineError::TaskGraphCycle {
             task: self.graph[cycle.node_id()].id.clone(),

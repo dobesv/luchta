@@ -19,9 +19,9 @@ use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use ignore::WalkBuilder;
 use luchta_workspace::PackageNode;
 use notify::event::{CreateKind, ModifyKind, RemoveKind};
-use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{EventKind, RecommendedWatcher, RecursiveMode};
 use notify_debouncer_full::{
-    new_debouncer, DebounceEventResult, DebouncedEvent, Debouncer, FileIdMap,
+    new_debouncer, DebounceEventResult, DebouncedEvent, Debouncer, RecommendedCache,
 };
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -32,7 +32,7 @@ const DEFAULT_CHANNEL_CAPACITY: usize = 32;
 const DEFAULT_DEBOUNCE_MS: u64 = 150;
 const IGNORED_DIR_NAMES: &[&str] = &["target", "node_modules", ".git", ".luchta"];
 
-type SharedDebouncer = Arc<Mutex<Debouncer<RecommendedWatcher, FileIdMap>>>;
+type SharedDebouncer = Arc<Mutex<Debouncer<RecommendedWatcher, RecommendedCache>>>;
 type SharedWatchedDirs = Arc<Mutex<HashSet<PathBuf>>>;
 
 struct BridgeTaskParams {
@@ -97,7 +97,7 @@ impl WatcherHandle {
             .lock()
             .map_err(|_| WatcherError::WatchStatePoisoned)?;
         let mut watched_dirs = lock_watched_dirs(&self.watched_dirs)?;
-        reconcile_watched_dirs(guard.watcher(), &mut watched_dirs, desired_dirs)
+        reconcile_watched_dirs(&mut guard, &mut watched_dirs, desired_dirs)
     }
 }
 
@@ -169,7 +169,7 @@ pub fn spawn_watcher(
         let mut guard = debouncer
             .lock()
             .map_err(|_| WatcherError::WatchStatePoisoned)?;
-        watch_directories(guard.watcher(), initial_dirs.iter().cloned())?;
+        watch_directories(&mut guard, initial_dirs.iter().cloned())?;
     }
 
     let watched_dirs = Arc::new(Mutex::new(initial_dirs.clone()));
@@ -206,7 +206,7 @@ fn spawn_bridge_task(params: BridgeTaskParams) -> JoinHandle<()> {
             let created_dirs = created_directories(&ignore_filter, events.iter());
             if let (Ok(mut guard), Ok(mut watched_dirs)) = (debouncer.lock(), watched_dirs.lock()) {
                 let new_dirs = pending_watch_dirs(&ignore_filter, &mut watched_dirs, created_dirs);
-                let _ = watch_directories(guard.watcher(), new_dirs.into_iter());
+                let _ = watch_directories(&mut guard, new_dirs.into_iter());
             }
 
             let batch = collect_watch_batch(&ignore_filter, events);
@@ -230,7 +230,7 @@ fn resolve_debounce_ms(debounce_ms: u64) -> u64 {
 }
 
 fn watch_directories(
-    watcher: &mut RecommendedWatcher,
+    watcher: &mut Debouncer<RecommendedWatcher, RecommendedCache>,
     directories: impl Iterator<Item = PathBuf>,
 ) -> Result<(), WatcherError> {
     for path in directories {
@@ -382,7 +382,7 @@ fn lock_watched_dirs(
 }
 
 fn reconcile_watched_dirs(
-    watcher: &mut RecommendedWatcher,
+    watcher: &mut Debouncer<RecommendedWatcher, RecommendedCache>,
     watched_dirs: &mut HashSet<PathBuf>,
     desired_dirs: HashSet<PathBuf>,
 ) -> Result<(), WatcherError> {
@@ -474,7 +474,8 @@ mod tests {
         DEFAULT_DEBOUNCE_MS,
     };
     use notify::event::{CreateKind, ModifyKind};
-    use notify::{Event, EventKind, RecommendedWatcher, Watcher};
+    use notify::{Event, EventKind, RecommendedWatcher};
+    use notify_debouncer_full::{new_debouncer, Debouncer, RecommendedCache};
     use std::collections::HashSet;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -638,9 +639,12 @@ mod tests {
         keep_src: &Path,
         keep_tests: &Path,
         orphan_src: &Path,
-    ) -> (RecommendedWatcher, HashSet<PathBuf>) {
-        let mut watcher =
-            notify::recommended_watcher(|_: Result<Event, notify::Error>| {}).expect("watcher");
+    ) -> (
+        Debouncer<RecommendedWatcher, RecommendedCache>,
+        HashSet<PathBuf>,
+    ) {
+        let mut watcher = new_debouncer(Duration::from_millis(DEFAULT_DEBOUNCE_MS), None, |_| {})
+            .expect("watcher");
         let packages_dir = root.join("packages");
         let keep_package = root.join("packages/keep");
         let orphan_package = root.join("packages/orphan");

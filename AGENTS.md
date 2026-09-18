@@ -55,6 +55,25 @@ If `cargo nextest` is not installed: `cargo install cargo-nextest --locked`
 suite five times — flaky tests that pass once but fail intermittently surface
 here.
 
+**`--stress-count=5` can intermittently time out under full-concurrency
+contention.** The `luchta-worker-watcher` and `luchta-cli` end-to-end tests
+spawn real processes and wait on filesystem events against a roughly 10s
+deadline; nextest runs the whole suite at full CPU-count concurrency, and
+under that load one of these tests can occasionally miss the deadline. The
+failure **presents as a bare timeout**, with no resource-limit or watcher
+error attached, so it reads exactly like a real regression or a broken
+watcher — that is the useful warning here, not a diagnosis of the cause.
+Before concluding a dependency bump broke the watcher, re-run the failing
+test by itself: these tests complete in well under a second in isolation, so
+an instant pass there means the stress failure was contention, not a
+regression. Raising `fs.inotify.max_user_instances` above the common default
+of 128 is worth doing on a dev machine regardless (some watcher code paths do
+open inotify instances), but direct sampling has not shown instance
+exhaustion to be the cause of these particular timeouts — treat it as a
+plausible mitigation, not a confirmed root cause. CI does not run
+`--stress-count` (`.github/workflows/ci.yml` uses plain `cargo nextest run
+--workspace --no-fail-fast`), so this only affects local stress runs.
+
 **`cargo nextest run --workspace` is the canonical test command.** Do not use
 plain `cargo test` — it runs the whole suite in one process with shared
 threads, so tests that mutate process-global state (cwd, real environment

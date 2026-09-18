@@ -229,6 +229,12 @@ impl PackageGraph {
     }
 
     /// Returns build-order topological sequence with dependencies before dependents.
+    ///
+    /// No test pins the exact order among nodes with no dependency relation to
+    /// each other, so a future `petgraph` bump that changed tie-breaking would
+    /// have no automated tripwire here — it would need the same manual diff of
+    /// `toposort` and the graph's neighbour-iteration order against the new
+    /// version that the 0.6->0.8 bump required.
     pub fn topological_order(&self) -> Result<Vec<&PackageNode>, WorkspaceError> {
         let mut order = toposort(&self.graph, None).map_err(|cycle| {
             WorkspaceError::Graph(format!(

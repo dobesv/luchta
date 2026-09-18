@@ -158,7 +158,7 @@ fn collect_committed_changes(
                     changed_paths.insert(bstr_to_path(location));
                 }
             }
-            Ok::<Action, std::convert::Infallible>(Action::Continue)
+            Ok::<Action, std::convert::Infallible>(Action::Continue(()))
         })
         .map_err(|error| SinceError::Diff(error.to_string()))?;
 
@@ -211,6 +211,14 @@ mod tests {
     const PKG_A_JSON: &str = "{\n  \"name\": \"@repo/a\"\n}\n";
     const ROOT_PKG_JSON: &str = "{\n  \"name\": \"root\"\n}\n";
 
+    // NOTE: `untracked.txt` below sits at the repo root, so this test does not
+    // exercise `gix::status::UntrackedFiles::Files` vs. a hypothetical
+    // regression to `Collapsed` the way it looks like it does:
+    // `EmissionMode::CollapseDirectory` only collapses untracked *directories*,
+    // not top-level files, so a `Files` -> `Collapsed` mistake here would still
+    // pass. Only source-level review of `collect_worktree_changes` currently
+    // establishes that untracked files are reported individually; a nested
+    // `untracked/nested/file.txt` case would make this test load-bearing.
     #[test]
     fn unions_committed_staged_unstaged_and_untracked_changes() {
         let repo = TestRepo::new();

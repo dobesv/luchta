@@ -1,4 +1,12 @@
 [workspace]
+# Deliberately "2", not "3". Resolver 3 would cap resolution at the declared
+# `rust-version` floor, which sounds safer but silently inverts the intent of
+# a "bump everything to latest" pass: it would resolve older, MSRV-compliant
+# versions instead of the ones actually requested. The tradeoff this way is
+# that `cargo update` can pull in a crate whose MSRV exceeds the workspace
+# floor (it happened twice bumping deps in 2026-09) — that has to be caught by
+# checking each updated crate's declared MSRV by hand, not by trusting a clean
+# `cargo build` under the current toolchain.
 resolver = "2"
 members = [
     "crates/luchta-types",
@@ -31,8 +39,10 @@ edition = "2021"
 version = "0.2.10"
 license = "MIT"
 authors = ["Luchta Contributors"]
-# oxc main requires Rust >= 1.94.0 at pinned rev 415fe1e7bb423cf05019c5e2c9a5705eebbc5447.
-rust-version = "1.94.0"
+# Rust 1.96.0 required by oxc at pinned rev 7bf68f70c20f5329251f19be95076f6eab4fe396,
+# which is now the binding constraint. The registry crates oxc_sourcemap,
+# oxc_resolver and oxc-browserslist require >= 1.95.0.
+rust-version = "1.96.0"
 repository = "https://example.com/luchta"
 homepage = "https://example.com/luchta"
 description = "Rust monorepo build orchestration tool"
@@ -44,25 +54,25 @@ description = "Rust monorepo build orchestration tool"
 # as the other oxc crates) workspace-wide. Keep this rev in sync whenever the
 # oxc git rev is bumped.
 [patch.crates-io]
-oxc_allocator = { git = "https://github.com/oxc-project/oxc.git", rev = "415fe1e7bb423cf05019c5e2c9a5705eebbc5447", package = "oxc_allocator" }
+oxc_allocator = { git = "https://github.com/oxc-project/oxc.git", rev = "7bf68f70c20f5329251f19be95076f6eab4fe396", package = "oxc_allocator" }
 
 [workspace.dependencies]
-petgraph = "0.6.5"
+petgraph = "0.8.3"
 tokio = { version = "1.38.0", features = ["full"] }
 futures = "0.3.30"
 serde = { version = "1.0.203", features = ["derive"] }
 serde_json = "1.0.117"
 serde_norway = "0.9.42"
-toml = "0.8.14"
-thiserror = "1.0.61"
+toml = "1.1.6"
+thiserror = "2.0.20"
 miette = { version = "7.2.0", features = ["fancy"] }
 clap = { version = "4.5.7", features = ["derive"] }
 globset = "0.4.14"
 walkdir = "2.5.0"
 blake3 = "1.5.1"
-gix = { version = "0.73.0", default-features = false, features = ["dirwalk", "status", "revision", "blob-diff"] }
+gix = { version = "0.87.1", default-features = false, features = ["dirwalk", "status", "revision", "blob-diff", "sha1"] }
 bincode = { version = "2.0.1", features = ["serde"] }
-yarn-lock-parser = "0.11.0"
+yarn-lock-parser = "0.14.0"
 assert_cmd = "2.0.14"
 assert_fs = "1.1.1"
 predicates = "3.1.0"
@@ -71,39 +81,46 @@ libc = "0.2.155"
 windows-sys = "0.61"
 tokio-stream = "0.1"
 tokio-util = { version = "0.7", features = ["codec"] }
-sysinfo = { version = "0.36.1", default-features = false, features = ["system"] }
-zstd = "0.13.2"
+sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
+zstd = "0.14.0"
 tar = "0.4.44"
-dirs = "6.0.0"
+dirs = "7.0.0"
 fd-lock = "4"
 fs2 = "0.4.3"
 ignore = "0.4.27"
-notify = "6"
-notify-debouncer-full = "0.3"
+notify = "8.2"
+notify-debouncer-full = "0.7"
 # Plain `mimalloc` rather than oxlint's `mimalloc-safe`: the latter builds via
 # cmake, which we don't want to require of every build environment.
 mimalloc = "0.1.43"
 
-# oxc toolchain pinned to a single main rev 415fe1e7bb423cf05019c5e2c9a5705eebbc5447
-# (see plan note open-verification-items). Requires Rust >= 1.94.
-oxc_allocator = { git = "https://github.com/oxc-project/oxc.git", rev = "415fe1e7bb423cf05019c5e2c9a5705eebbc5447" }
-oxc_parser = { git = "https://github.com/oxc-project/oxc.git", rev = "415fe1e7bb423cf05019c5e2c9a5705eebbc5447" }
-oxc_semantic = { git = "https://github.com/oxc-project/oxc.git", rev = "415fe1e7bb423cf05019c5e2c9a5705eebbc5447" }
-oxc_linter = { git = "https://github.com/oxc-project/oxc.git", rev = "415fe1e7bb423cf05019c5e2c9a5705eebbc5447" }
-oxc_span = { git = "https://github.com/oxc-project/oxc.git", rev = "415fe1e7bb423cf05019c5e2c9a5705eebbc5447" }
-oxc_diagnostics = { git = "https://github.com/oxc-project/oxc.git", rev = "415fe1e7bb423cf05019c5e2c9a5705eebbc5447" }
-oxc_transformer = { git = "https://github.com/oxc-project/oxc.git", rev = "415fe1e7bb423cf05019c5e2c9a5705eebbc5447" }
-oxc_codegen = { git = "https://github.com/oxc-project/oxc.git", rev = "415fe1e7bb423cf05019c5e2c9a5705eebbc5447" }
+# oxc toolchain pinned to a single main rev 7bf68f70c20f5329251f19be95076f6eab4fe396
+# (tagged apps_v1.83.0 / oxlint_v1.83.0 / oxfmt_v0.68.0). Requires Rust >= 1.96.
+# The git pin is mandatory, not a style choice: oxc_linter, oxc_formatter_core
+# and oxc_formatter_css are not published to crates.io at all, and every
+# published oxc_formatter version on crates.io is yanked. "Just use the
+# released crates" is not an available option for this workspace.
+#
+# `crates/luchta-oxlint-worker/Cargo.toml` also carries its own `oxc_syntax`
+# git pin at this same rev, outside this table — check it too when bumping.
+oxc_allocator = { git = "https://github.com/oxc-project/oxc.git", rev = "7bf68f70c20f5329251f19be95076f6eab4fe396" }
+oxc_parser = { git = "https://github.com/oxc-project/oxc.git", rev = "7bf68f70c20f5329251f19be95076f6eab4fe396" }
+oxc_semantic = { git = "https://github.com/oxc-project/oxc.git", rev = "7bf68f70c20f5329251f19be95076f6eab4fe396" }
+oxc_linter = { git = "https://github.com/oxc-project/oxc.git", rev = "7bf68f70c20f5329251f19be95076f6eab4fe396" }
+oxc_span = { git = "https://github.com/oxc-project/oxc.git", rev = "7bf68f70c20f5329251f19be95076f6eab4fe396" }
+oxc_diagnostics = { git = "https://github.com/oxc-project/oxc.git", rev = "7bf68f70c20f5329251f19be95076f6eab4fe396" }
+oxc_transformer = { git = "https://github.com/oxc-project/oxc.git", rev = "7bf68f70c20f5329251f19be95076f6eab4fe396" }
+oxc_codegen = { git = "https://github.com/oxc-project/oxc.git", rev = "7bf68f70c20f5329251f19be95076f6eab4fe396" }
 oxc_sourcemap = "8.0.2"
-oxc_formatter = { git = "https://github.com/oxc-project/oxc.git", rev = "415fe1e7bb423cf05019c5e2c9a5705eebbc5447" }
-oxc_formatter_core = { git = "https://github.com/oxc-project/oxc.git", rev = "415fe1e7bb423cf05019c5e2c9a5705eebbc5447" }
-oxc_formatter_css = { git = "https://github.com/oxc-project/oxc.git", rev = "415fe1e7bb423cf05019c5e2c9a5705eebbc5447", default-features = false }
+oxc_formatter = { git = "https://github.com/oxc-project/oxc.git", rev = "7bf68f70c20f5329251f19be95076f6eab4fe396" }
+oxc_formatter_core = { git = "https://github.com/oxc-project/oxc.git", rev = "7bf68f70c20f5329251f19be95076f6eab4fe396" }
+oxc_formatter_css = { git = "https://github.com/oxc-project/oxc.git", rev = "7bf68f70c20f5329251f19be95076f6eab4fe396", default-features = false }
 json-strip-comments = "3.1.1"
 serde-sarif = "0.8.0"
 url = "2.5.8"
 
 # swc pinned exact — SWC breaks public API on minor bumps. See plan note a394e139 (probe).
-swc_core = { version = "=74.0.2", features = ["base_module", "common", "ecma_ast", "ecma_parser", "ecma_helpers_inline"] }
+swc_core = { version = "=80.0.0", features = ["base_module", "common", "ecma_ast", "ecma_parser", "ecma_helpers_inline"] }
 
 # Match oxlint's own release settings (fat LTO, one codegen unit) so the
 # bundled oxc crates run at full speed; without this the workers lint

@@ -7,7 +7,6 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use luchta_glob::PathMatcher;
-use notify::Watcher;
 use notify_debouncer_full::{new_debouncer, DebounceEventResult};
 use thiserror::Error;
 
@@ -258,10 +257,7 @@ pub async fn run(
 
     // Watch each root recursively
     for root in roots {
-        if let Err(e) = debouncer
-            .watcher()
-            .watch(&root, notify::RecursiveMode::Recursive)
-        {
+        if let Err(e) = debouncer.watch(&root, notify::RecursiveMode::Recursive) {
             eprintln!("[watch] warning: failed to watch {root:?}: {e}");
         }
     }

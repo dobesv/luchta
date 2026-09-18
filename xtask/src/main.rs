@@ -413,15 +413,56 @@ fn install_host_worker() -> Result<PathBuf, String> {
             built_path.display()
         )
     })?);
-    std::fs::copy(&built_path, &installed_path).map_err(|error| {
-        format!(
-            "failed to copy {} to {}: {error}",
-            built_path.display(),
-            installed_path.display()
-        )
-    })?;
+    copy_atomically(&built_path, &installed_path)?;
 
     Ok(installed_path)
+}
+
+/// Copies `source` to `destination` atomically: the file is copied into a
+/// temporary path in `destination`'s own directory and then renamed over
+/// `destination`. This avoids `ETXTBSY` ("Text file busy") when `destination`
+/// is a binary that is currently running — unlike an in-place copy, a rename
+/// only swaps the directory entry, so a running process keeps executing the
+/// old (now unlinked) inode while the new binary takes its place for the next
+/// invocation. The temporary file lives alongside `destination` rather than
+/// in a system temp directory because `rename` only works within a single
+/// filesystem. `std::fs::copy` preserves the source's permission bits
+/// (including the executable bit), so no explicit `chmod` is needed. The
+/// temporary file is removed if the rename fails.
+fn copy_atomically(source: &Path, destination: &Path) -> Result<(), String> {
+    let parent = destination.parent().ok_or_else(|| {
+        format!(
+            "failed to copy {} to {}: destination has no parent directory",
+            source.display(),
+            destination.display()
+        )
+    })?;
+    let file_name = destination.file_name().ok_or_else(|| {
+        format!(
+            "failed to copy {} to {}: destination has no final component",
+            source.display(),
+            destination.display()
+        )
+    })?;
+    let temp_path = parent.join(format!(".{}.tmp", file_name.to_string_lossy()));
+
+    std::fs::copy(source, &temp_path).map_err(|error| {
+        format!(
+            "failed to copy {} to {}: {error}",
+            source.display(),
+            destination.display()
+        )
+    })?;
+    if let Err(error) = std::fs::rename(&temp_path, destination) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(format!(
+            "failed to copy {} to {}: {error}",
+            source.display(),
+            destination.display()
+        ));
+    }
+
+    Ok(())
 }
 
 fn cargo_install_env() -> HashMap<String, OsString> {
@@ -955,5 +996,73 @@ mod tests {
         for target in supported_target_triples() {
             assert!(error.contains(target), "missing {target} in {error}");
         }
+    }
+
+    #[test]
+    fn copy_atomically_replaces_existing_destination_and_leaves_no_temp_file() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let source = temp.path().join("source-bin");
+        std::fs::write(&source, "new contents").expect("write source");
+        let destination = temp.path().join("dest-bin");
+        std::fs::write(&destination, "old contents").expect("seed destination");
+
+        copy_atomically(&source, &destination).expect("copy");
+
+        assert_eq!(
+            std::fs::read_to_string(&destination).expect("read"),
+            "new contents"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(temp.path())
+            .expect("read dir")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temporary file left behind");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_atomically_preserves_executable_permission_bit() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let source = temp.path().join("source-bin");
+        std::fs::write(&source, "#!/bin/sh\n").expect("write source");
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod source");
+        let destination = temp.path().join("dest-bin");
+
+        copy_atomically(&source, &destination).expect("copy");
+
+        let mode = std::fs::metadata(&destination)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o111, 0o111, "executable bit did not survive copy");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_atomically_replaces_destination_inode_rather_than_writing_in_place() {
+        use std::os::unix::fs::MetadataExt;
+
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let source = temp.path().join("source-bin");
+        std::fs::write(&source, "new contents").expect("write source");
+        let destination = temp.path().join("dest-bin");
+        std::fs::write(&destination, "old contents").expect("seed destination");
+        let original_inode = std::fs::metadata(&destination)
+            .expect("stat destination")
+            .ino();
+
+        copy_atomically(&source, &destination).expect("copy");
+
+        let replaced_inode = std::fs::metadata(&destination)
+            .expect("stat destination")
+            .ino();
+        assert_ne!(
+            original_inode, replaced_inode,
+            "destination must be a new inode: an in-place copy reuses it, which is what fails with ETXTBSY against a running binary"
+        );
     }
 }
