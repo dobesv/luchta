@@ -135,7 +135,7 @@ This discovers every workspace member with a binary target via `cargo
 metadata` and runs `cargo install --path` for each, so it stays correct as
 crates are added. `install` also builds the Go worker for the host and
 places `luchta-tsc-worker` in the cargo bin directory alongside the Rust
-binaries, so it requires Go 1.26+ and an initialized `vendor/tsgo`
+binaries, so it requires Go 1.26+ and an initialized `vendor/typescript`
 submodule (`git submodule update --init`).
 
 #### Building the TypeScript Worker
@@ -155,20 +155,88 @@ The TypeScript worker (`luchta-tsc-worker`) is written in Go and is built using 
 
 #### Patch Maintenance
 
-The worker uses a vendored `vendor/tsgo` (git submodule) pinned to the upstream `microsoft/typescript-go` merge-base `e578159b7ae473127056a65748d7b3a4daa9a93f`. Changes are applied via `patches/tsgo.patch` (the diff against the fork `dobesv/typescript-go` at `9ed9a7d054c8dd0655bce2e4c3248a14da7d8772`).
+The worker uses a vendored `vendor/typescript` (git submodule) tracking
+[`microsoft/TypeScript`](https://github.com/microsoft/TypeScript). The
+previous upstream, `microsoft/typescript-go`, is **archived** — it was the
+staging repo for the TypeScript 7.0 native port, and that port is complete —
+so there is no going back to it.
 
-**Regenerating the Patch:**
-To update the patch from a scratch clone containing both remotes (`upstream=microsoft/typescript-go`, `fork=dobesv/typescript-go`):
+Two patches apply in sequence on top of the pinned commit, and they have
+different maintenance stories:
+
+- **`patches/upstream-pnp.patch`** — Yarn PnP support, lifted mechanically
+  from upstream pull request
+  [microsoft/TypeScript#63919](https://github.com/microsoft/TypeScript/pull/63919).
+  **This file is generated and must never be hand-edited.** If it needs to
+  change, the change belongs either in `patches/luchta.patch` or upstream in
+  the PR itself. Regenerate it with:
+  ```bash
+  scripts/refresh-upstream-pnp-patch.sh
+  ```
+  The script derives the base commit itself (see below), refuses to run
+  against a dirty `vendor/typescript` worktree, and verifies the regenerated
+  patch still applies with zero conflicts before leaving it in place.
+- **`patches/luchta.patch`** — everything that is actually ours: the
+  `luchta-tsc-worker` binary and its `internal/luchta/` package, a small
+  manifest-caching layer on top of the PnP support (`InitPnpApiCached` and
+  friends, since the worker is long-lived and re-parsing `.pnp.cjs` on every
+  compile is waste), and a handful of small upstream-file edits. This one is
+  hand-maintained; edit it directly when Luchta's own code needs to change.
+
+Apply them **in order** — `upstream-pnp.patch` first, then `luchta.patch` —
+exactly as `cargo xtask build-worker` does:
 ```bash
-git diff --no-color --binary e578159b7ae473127056a65748d7b3a4daa9a93f..9ed9a7d054c8dd0655bce2e4c3248a14da7d8772 \
-  -- . ':!node_modules' ':!docs/superpowers/**' ':!testdata/fixtures/pnp/*.cjs' > patches/tsgo.patch
+git -C vendor/typescript apply ../../patches/upstream-pnp.patch
+git -C vendor/typescript apply ../../patches/luchta.patch
 ```
 
+**The base commit is not `main`'s tip.** `vendor/typescript` is pinned to the
+merge-base of `microsoft/TypeScript` `main` and PR #63919 — i.e. the commit
+the PR actually targets, currently `e26b8d24bee09bf66d59941912166c5aa7975d20`.
+At `main`'s tip, applying the PR needs three-way conflict resolution on four
+files that upstream and the PR both touched since that merge-base; those
+resolutions would end up baked into `patches/luchta.patch`, which is exactly
+the coupling this two-patch split exists to avoid. Pinning to the merge-base
+keeps `upstream-pnp.patch` a clean, mechanical diff. This also gives the pin a
+*rule* instead of a judgment call: the base is always whatever #63919
+currently targets, and `scripts/refresh-upstream-pnp-patch.sh` derives it
+fresh each run rather than trusting a hard-coded value. Moving the pin itself
+(after refreshing the patch) is a deliberate step — see the script's output
+for the exact commands — because it can change what `patches/luchta.patch`
+needs to apply on top of.
+
+**Do not expect PR #63919 to merge soon.** It is CI-green but blocked on
+process, not code: it is filed against issue
+[microsoft/TypeScript#63769](https://github.com/microsoft/TypeScript/issues/63769)
+("Yarn PnP", open since March 2025), and the TypeScript team has not accepted
+that issue. If it ever merges, `upstream-pnp.patch` simply disappears and
+`luchta.patch` no longer needs to name it as a prerequisite.
+
 **Important:**
-- The repository uses `core.autocrlf=input`. `.gitattributes` marks `patches/tsgo.patch -text` to ensure CRLF line endings survive checkout. Maintainers MUST preserve this attribute.
-- A scheduled workflow (`patch-drift.yaml`) monitors the patch and opens a maintenance issue if it can no longer be applied.
-- **`git apply` succeeding does not mean the patch is still correct.** The patch threads a `PnpApi()` accessor through ~140 call sites across the host interfaces (`module.ResolutionHost`, `compiler.CompilerHost`, `tsc.System`, etc.). A call site upstream *adds* between rebases produces no conflict — it just compiles with a missing argument and quietly builds a host with no PnP support on that path. Only an incidental change to a constructor's arity has ever caught this in practice. When rebasing onto a new upstream commit, grep for new constructor call sites of `NewCompilerHost` / `NewCachedFSCompilerHost` / `createCompilerHost` (and any interface the patch extends) and check each one passes the PnP argument — don't rely on conflicts alone.
-- The vendored Go test suite does not currently compile at the pinned commit (pre-existing, independent of any particular submodule bump), so `internal/luchta` and the PnP compiler baselines can't be run as an automated gate for a patch rebase. Verify behaviour by hand — `cargo xtask build-worker` plus a manual JSONL smoke test against the built `luchta-tsc-worker` — until someone restores the test build.
+- The repository uses `core.autocrlf=input`. `.gitattributes` marks both
+  `patches/upstream-pnp.patch` and `patches/luchta.patch` `-text` to ensure
+  CRLF line endings survive checkout. Maintainers MUST preserve this
+  attribute on any new patch file — staging one without it silently corrupts
+  the file through CRLF normalisation.
+- A scheduled workflow (`patch-drift.yaml`) applies both patches in sequence
+  and opens a maintenance issue naming whichever one no longer applies.
+- **`git apply` succeeding does not mean a patch is still correct.** The PnP
+  threading passes a `PnpApi()` accessor through the host interfaces
+  (`module.ResolutionHost`, `compiler.CompilerHost`, `tsc.System` and others).
+  A call site upstream *adds* produces no conflict — it simply compiles with a
+  missing argument and quietly builds a host with no PnP support on that path.
+  Only an incidental change to a constructor's arity has ever caught this in
+  practice. That threading now lives in `upstream-pnp.patch` rather than in
+  ours, which is the main reason that file is regenerated and never
+  hand-edited: resolving a conflict there by hand reintroduces exactly this
+  hazard. If you ever must, grep for new call sites of `NewCompilerHost` /
+  `NewCachedFSCompilerHost` / `createCompilerHost` and check each passes the
+  PnP argument — do not rely on conflicts alone.
+- The vendored Go test suite compiles and runs at the pinned commit: 65
+  packages pass. `internal/astnav` fails because its node helper needs
+  `npm ci` inside the submodule, which the worker build does not require.
+  (This is an improvement on the archived typescript-go pins, where the suite
+  did not compile at all and no automated gate was available.)
 
 ### Verification
 
@@ -943,7 +1011,7 @@ Reports are recorded in the task metadata and can be viewed via `luchta logs`.
 
 Standard worker binaries are resolved via `PATH`. They ship inside each release archive alongside the `luchta` binary. Add the extraction directory to your `PATH` so Luchta can locate them.
 
-- **luchta-tsc-worker** is a high-performance TypeScript/tsc worker built from an in-tree vendored and patched [typescript-go](https://github.com/microsoft/typescript-go).
+- **luchta-tsc-worker** is a high-performance TypeScript/tsc worker built from an in-tree vendored and patched [TypeScript](https://github.com/microsoft/TypeScript) (see [Patch Maintenance](#patch-maintenance) above).
 - **luchta-ast-grep-worker** scans source files in-process using the custom rules in `sgconfig.yml`. Inline `ast-grep-ignore` comments have the same next-line, same-line, file-level, and rule-specific suppression semantics as the ast-grep CLI, and suppressed matches are also excluded from `--fix`.
 - **luchta-yarn-worker** runs each task through Yarn so that Yarn-injected
   environment variables (`PATH`, `NODE_OPTIONS`, …) are available. For

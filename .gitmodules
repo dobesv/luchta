@@ -1,4 +1,4 @@
-[submodule "vendor/tsgo"]
-	path = vendor/tsgo
-	url = https://github.com/microsoft/typescript-go
+[submodule "vendor/typescript"]
+	path = vendor/typescript
+	url = https://github.com/microsoft/TypeScript.git
 	shallow = true

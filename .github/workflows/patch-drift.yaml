@@ -15,7 +15,7 @@ env:
 
 jobs:
   check-patch:
-    name: Check patch applies to pinned submodule
+    name: Check patches apply to pinned submodule
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -24,31 +24,47 @@ jobs:
         with:
           submodules: true
 
-      # Only vendor/tsgo is needed to check the patch; do NOT recurse into its
-      # nested `_submodules/TypeScript` submodule (large, unused here).
-      - name: Ensure submodules initialized
+      - name: Ensure submodule initialized
         shell: bash
-        run: git submodule update --init vendor/tsgo
+        run: git submodule update --init vendor/typescript
 
-      - name: Check patch applies
+      # patches/upstream-pnp.patch (PR microsoft/TypeScript#63919, an open PR)
+      # must apply first: patches/luchta.patch's hunks are anchored to blobs
+      # that the upstream patch produces, so checking luchta.patch in
+      # isolation would report false drift. Apply upstream-pnp for real (not
+      # just --check) so luchta.patch is checked against the tree it will
+      # actually land on, then restore the worktree either way.
+      - name: Check patches apply in order
         id: check-patch
         shell: bash
         run: |
           # Run git apply --check and capture output WITHOUT aborting under set -e
           # GitHub Actions runs bash with -e (errexit), so we use if ! to trap failure
-          if ! OUTPUT=$(git -C vendor/tsgo apply --check ../../patches/tsgo.patch 2>&1); then
-            # Patch does NOT apply - capture failure for issue body
+          if ! OUTPUT=$(git -C vendor/typescript apply --check ../../patches/upstream-pnp.patch 2>&1); then
             {
+              echo "failed_patch=patches/upstream-pnp.patch"
               echo "patch_check_output<<EOF"
               echo "$OUTPUT"
               echo "EOF"
               echo "patch_applies=false"
             } >> "$GITHUB_OUTPUT"
           else
-            # Patch applies cleanly
-            echo "patch_check_output=" >> "$GITHUB_OUTPUT"
-            echo "patch_applies=true" >> "$GITHUB_OUTPUT"
+            git -C vendor/typescript apply ../../patches/upstream-pnp.patch
+            if ! OUTPUT=$(git -C vendor/typescript apply --check ../../patches/luchta.patch 2>&1); then
+              {
+                echo "failed_patch=patches/luchta.patch"
+                echo "patch_check_output<<EOF"
+                echo "$OUTPUT"
+                echo "EOF"
+                echo "patch_applies=false"
+              } >> "$GITHUB_OUTPUT"
+            else
+              echo "patch_applies=true" >> "$GITHUB_OUTPUT"
+            fi
           fi
+          # Always leave the submodule worktree clean, regardless of outcome.
+          git -C vendor/typescript checkout .
+          git -C vendor/typescript clean -fd
 
       - name: Create or find maintenance label
         if: steps.check-patch.outputs.patch_applies == 'false'
@@ -62,8 +78,10 @@ jobs:
         id: check-issue
         shell: bash
         run: |
-          # Search for existing open issue with exact title
-          EXISTING=$(gh issue list --search "tsgo patch no longer applies in:title" --state open --json number --jq 'length')
+          # Search per-patch so a standing issue about one patch never
+          # suppresses filing for the other patch drifting later.
+          TITLE="${{ steps.check-patch.outputs.failed_patch }} no longer applies"
+          EXISTING=$(gh issue list --search "\"$TITLE\" in:title" --state open --json number --jq 'length')
           if [ "$EXISTING" -gt 0 ]; then
             echo "issue_exists=true" >> "$GITHUB_OUTPUT"
           else
@@ -76,14 +94,24 @@ jobs:
         run: |
           # Derive the pinned SHA from the recorded submodule pointer so this
           # stays correct across rebases instead of hardcoding a stale value.
-          PINNED_SHA=$(git ls-tree HEAD vendor/tsgo | awk '{print $3}')
+          PINNED_SHA=$(git ls-tree HEAD vendor/typescript | awk '{print $3}')
+          FAILED_PATCH="${{ steps.check-patch.outputs.failed_patch }}"
+
+          if [ "$FAILED_PATCH" = "patches/upstream-pnp.patch" ]; then
+            NEXT_STEP="Regenerate it with \`scripts/refresh-upstream-pnp-patch.sh\`, which refetches microsoft/TypeScript#63919 (still an open, unmerged PR) and derives a fresh base commit. If that script also reports the pin needs to move, follow the instructions it prints -- moving the pin is a human decision, since it can shift what \`patches/luchta.patch\` needs to apply on top of."
+          else
+            NEXT_STEP="Rebase \`patches/luchta.patch\` by hand against the pinned commit with \`patches/upstream-pnp.patch\` applied first (that ordering is structural: \`luchta.patch\`'s hunks are anchored to blobs the upstream patch produces). Do not hand-edit \`patches/upstream-pnp.patch\` to work around this -- it is generated."
+          fi
+
           ISSUE_BODY="## Patch Drift Detected
 
-          The patch \`patches/tsgo.patch\` no longer applies cleanly to the pinned \`vendor/tsgo\` submodule.
+          The patch \`${FAILED_PATCH}\` no longer applies cleanly to the pinned \`vendor/typescript\` submodule.
 
           **Pinned upstream SHA:** \`${PINNED_SHA}\`
+          **Patches applied in order:** \`patches/upstream-pnp.patch\`, then \`patches/luchta.patch\`.
+          **Failed at:** \`${FAILED_PATCH}\`
 
-          The patch needs to be regenerated or rebased against the pinned submodule commit.
+          ${NEXT_STEP}
 
           ### Error Output
 
@@ -96,13 +124,13 @@ jobs:
           This issue was automatically created by the \`patch-drift\` workflow."
 
           gh issue create \
-            --title "tsgo patch no longer applies" \
+            --title "${FAILED_PATCH} no longer applies" \
             --label maintenance \
             --body "$ISSUE_BODY"
 
-      - name: Fail if patch does not apply
+      - name: Fail if a patch does not apply
         if: steps.check-patch.outputs.patch_applies == 'false'
         shell: bash
         run: |
-          echo "::error::Patch drift detected - patches/tsgo.patch does not apply to pinned vendor/tsgo"
+          echo "::error::Patch drift detected - ${{ steps.check-patch.outputs.failed_patch }} does not apply to pinned vendor/typescript"
           exit 1

@@ -65,9 +65,16 @@ fn try_build_worker(args: BuildWorkerArgs) -> Result<(), String> {
     Ok(())
 }
 
+/// Vendored patches applied to `vendor/typescript`, in required order:
+/// `upstream-pnp.patch` first (PR #63919, mechanically regenerated — never
+/// hand-edited), then `luchta.patch` (our own additive packages and small
+/// upstream tweaks) on top of it. `luchta.patch`'s hunks are anchored to blobs
+/// that the upstream patch produces, so it cannot apply first.
+const PATCHES_IN_ORDER: &[&str] = &["patches/upstream-pnp.patch", "patches/luchta.patch"];
+
 fn build_worker_to(repo_root: &Path, target: &str, out_dir: &Path) -> Result<PathBuf, String> {
-    let vendor_dir = repo_root.join("vendor/tsgo");
-    ensure_tsgo_submodule_initialized(&vendor_dir)?;
+    let vendor_dir = repo_root.join("vendor/typescript");
+    ensure_vendor_submodule_initialized(&vendor_dir)?;
 
     let go_target = go_target_for_rust_triple(target)?;
     let current_dir = std::env::current_dir()
@@ -80,18 +87,31 @@ fn build_worker_to(repo_root: &Path, target: &str, out_dir: &Path) -> Result<Pat
         )
     })?;
 
-    let patch_path = repo_root.join("patches/tsgo.patch");
+    let patches = patch_paths(repo_root);
     let output_path = out_dir.join(worker_binary_name(go_target.goos));
 
-    reset_tsgo_worktree(&vendor_dir)?;
-    apply_tsgo_patch(&vendor_dir, &patch_path)?;
+    reset_vendor_worktree(&vendor_dir)?;
+    apply_patches(&vendor_dir, &patches)?;
 
-    let build_result = go_build_worker(&vendor_dir, &output_path, go_target);
-    let reset_result = reset_tsgo_worktree(&vendor_dir);
+    let go_module_dir = vendor_dir.join("tsc");
+    let build_result = go_build_worker(&go_module_dir, &output_path, go_target);
+    let reset_result = reset_vendor_worktree(&vendor_dir);
 
     build_result?;
     reset_result?;
     Ok(output_path)
+}
+
+/// Resolves `PATCHES_IN_ORDER` to full paths under `repo_root`, paired with
+/// their repo-relative display name for diagnostics. Kept separate from
+/// `apply_patches` so the ordering itself — load-bearing, since
+/// `luchta.patch` cannot apply before `upstream-pnp.patch` — is unit
+/// testable without shelling out to git.
+fn patch_paths(repo_root: &Path) -> Vec<(&'static str, PathBuf)> {
+    PATCHES_IN_ORDER
+        .iter()
+        .map(|&relative| (relative, repo_root.join(relative)))
+        .collect()
 }
 
 fn resolve_out_dir(cwd: &Path, out_dir: &Path) -> PathBuf {
@@ -112,11 +132,11 @@ fn repo_root() -> Result<PathBuf, String> {
     })
 }
 
-fn ensure_tsgo_submodule_initialized(vendor_dir: &Path) -> Result<(), String> {
+fn ensure_vendor_submodule_initialized(vendor_dir: &Path) -> Result<(), String> {
     if vendor_dir.join(".git").exists() {
         Ok(())
     } else {
-        Err("vendor/tsgo not initialized — run: git submodule update --init".to_string())
+        Err("vendor/typescript not initialized — run: git submodule update --init".to_string())
     }
 }
 
@@ -143,7 +163,18 @@ fn host_target_triple() -> Result<String, String> {
         .ok_or_else(|| "failed to find host triple in rustc -vV output".to_string())
 }
 
-fn apply_tsgo_patch(vendor_dir: &Path, patch_path: &Path) -> Result<(), String> {
+/// Applies every patch in `patches`, in order, to `vendor_dir`. Stops at the
+/// first one that fails and names it — that diagnostic is what makes patch
+/// staleness obvious, so it must say *which* patch broke, not just that
+/// something did.
+fn apply_patches(vendor_dir: &Path, patches: &[(&'static str, PathBuf)]) -> Result<(), String> {
+    for (relative, patch_path) in patches {
+        apply_one_patch(vendor_dir, patch_path, relative)?;
+    }
+    Ok(())
+}
+
+fn apply_one_patch(vendor_dir: &Path, patch_path: &Path, patch_label: &str) -> Result<(), String> {
     let check_status = run_command(
         Command::new("git")
             .arg("-C")
@@ -151,11 +182,13 @@ fn apply_tsgo_patch(vendor_dir: &Path, patch_path: &Path) -> Result<(), String> 
             .arg("apply")
             .arg("--check")
             .arg(patch_path),
-        "failed to run git apply --check",
+        &format!("failed to run git apply --check for {patch_label}"),
     )?;
 
     if !check_status.success() {
-        return Err("patches/tsgo.patch does not apply to vendor/tsgo — rebase needed".to_string());
+        return Err(format!(
+            "{patch_label} does not apply to vendor/typescript — rebase needed"
+        ));
     }
 
     let apply_status = run_command(
@@ -164,20 +197,20 @@ fn apply_tsgo_patch(vendor_dir: &Path, patch_path: &Path) -> Result<(), String> 
             .arg(vendor_dir)
             .arg("apply")
             .arg(patch_path),
-        "failed to run git apply",
+        &format!("failed to run git apply for {patch_label}"),
     )?;
 
     if apply_status.success() {
         Ok(())
     } else {
         Err(format!(
-            "git apply exited with {}",
+            "git apply exited with {} while applying {patch_label}",
             exit_code_label(apply_status.code())
         ))
     }
 }
 
-fn reset_tsgo_worktree(vendor_dir: &Path) -> Result<(), String> {
+fn reset_vendor_worktree(vendor_dir: &Path) -> Result<(), String> {
     let checkout_status = run_command(
         Command::new("git")
             .arg("-C")
@@ -215,12 +248,12 @@ fn reset_tsgo_worktree(vendor_dir: &Path) -> Result<(), String> {
 
 #[allow(clippy::suspicious_command_arg_space)]
 fn go_build_worker(
-    vendor_dir: &Path,
+    go_module_dir: &Path,
     output_path: &Path,
     go_target: GoTarget,
 ) -> Result<(), String> {
     let status = Command::new("go")
-        .current_dir(vendor_dir)
+        .current_dir(go_module_dir)
         .env("CGO_ENABLED", "0")
         .env("GOOS", go_target.goos)
         .env("GOARCH", go_target.goarch)
@@ -986,6 +1019,31 @@ mod tests {
         assert_eq!(
             cargo_install_bin_dir_from_env(&env),
             Ok(PathBuf::from("/x/cargo-home/bin"))
+        );
+    }
+
+    #[test]
+    fn patches_apply_upstream_pnp_before_luchta() {
+        // Load-bearing order: luchta.patch's hunks are anchored to blobs that
+        // upstream-pnp.patch produces, so it cannot apply first.
+        let patches = patch_paths(Path::new("/repo"));
+        let relative_names: Vec<_> = patches.iter().map(|(name, _)| *name).collect();
+        assert_eq!(
+            relative_names,
+            vec!["patches/upstream-pnp.patch", "patches/luchta.patch"]
+        );
+    }
+
+    #[test]
+    fn patch_paths_resolves_against_repo_root() {
+        let patches = patch_paths(Path::new("/repo"));
+        let full_paths: Vec<_> = patches.iter().map(|(_, path)| path.clone()).collect();
+        assert_eq!(
+            full_paths,
+            vec![
+                PathBuf::from("/repo/patches/upstream-pnp.patch"),
+                PathBuf::from("/repo/patches/luchta.patch"),
+            ]
         );
     }
 

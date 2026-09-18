@@ -1,2 +1,3 @@
-patches/tsgo.patch -text
+patches/luchta.patch -text
+patches/upstream-pnp.patch -text
 *.cmd text eol=crlf
