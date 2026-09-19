@@ -1,0 +1,33 @@
+[package]
+name = "luchta-yarn-env"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description.workspace = true
+
+[features]
+# Enables `luchta_yarn_env::test_fixture`, a builder for synthetic Yarn PnP
+# projects, for OTHER crates' tests. This crate's own tests get the module via
+# `cfg(test)` with `zip` as a dev-dependency, so `cargo nextest run --workspace`
+# runs them without any feature flag.
+test-fixture = ["dep:zip"]
+
+[dependencies]
+blake3 = { workspace = true }
+pnp = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+zip = { workspace = true, optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[dev-dependencies]
+luchta-test-support = { path = "../luchta-test-support" }
+tempfile = { workspace = true }
+zip = { workspace = true }

@@ -18,6 +18,7 @@ members = [
     "crates/luchta-worker",
     "crates/luchta-cli",
     "crates/luchta-yarn-worker",
+    "crates/luchta-yarn-env",
     "crates/luchta-bash-worker",
     "crates/luchta-extra-resolve-worker",
     "crates/luchta-lazy-worker",
@@ -70,6 +71,8 @@ clap = { version = "4.5.7", features = ["derive"] }
 globset = "0.4.14"
 walkdir = "2.5.0"
 blake3 = "1.5.1"
+pnp = "0.12.12"
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 gix = { version = "0.87.1", default-features = false, features = ["dirwalk", "status", "revision", "blob-diff", "sha1"] }
 bincode = { version = "2.0.1", features = ["serde"] }
 yarn-lock-parser = "0.14.0"

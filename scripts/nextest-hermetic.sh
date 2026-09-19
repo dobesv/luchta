@@ -37,6 +37,13 @@ for HERMETIC_ENV_ENTRY in $(env); do
         CARGO | CARGO_MANIFEST_DIR | CARGO_PKG_* | CARGO_BIN_EXE_* | CARGO_TARGET_TMPDIR | NEXTEST | NEXTEST_RUN_ID | NEXTEST_PROFILE | NEXTEST_VERSION | NEXTEST_WORKSPACE_ROOT | NEXTEST_BIN_EXE_* | NEXTEST_LD_* | NEXTEST_DYLD_* | LD_* | DYLD_*)
             ;;
 
+        # Tests that build another crate with cargo (escargot) must keep the
+        # outer toolchain selection. Without RUSTUP_TOOLCHAIN the rustc proxy
+        # obeys a rust-toolchain file inside a dependency's registry source
+        # (the `pnp` crate pins 1.95.0), auto-installs it, and the build fails.
+        RUSTUP_TOOLCHAIN | RUSTUP_HOME)
+            ;;
+
         # Coverage and the real-rclone suite are the two intentional ambient
         # customizations supported by this repository's test commands.
         LLVM_PROFILE_FILE | LUCHTA_TEST_RCLONE)

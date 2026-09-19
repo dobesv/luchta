@@ -13,6 +13,7 @@ Luchta is a Cargo workspace with the following crate layout:
 - `crates/luchta-engine`: Graph logic and execution engine.
 - `crates/luchta-cli`: CLI interface and configuration.
 - `crates/luchta-cache`: Filesystem-backed build cache, hashing, and skip logic (`thiserror`, filesystem records, no embedded DB).
+- `crates/luchta-yarn-env`: Computes the environment Yarn Berry injects when running a script (bin shims, `NODE_OPTIONS`, `npm_*`) from the PnP manifest via the `pnp` crate; `luchta-yarn-worker` uses it for direct execution. Its `test-fixture` feature exposes `PnpFixture`, a synthetic PnP project builder for other crates' tests.
 - `xtask`: Project automation crate (standard Rust `xtask` pattern), run via the `cargo xtask` alias.
 
 ## Key Architectural Decisions
@@ -84,10 +85,23 @@ line; when run under `cargo test` they panic with guidance instead of failing
 spuriously. When adding a test that mutates process-global state, call
 `require_nextest()` first and add `luchta-test-support` as a `[dev-dependency]`.
 
+Tests that need a real Yarn PnP project (anything exercising `luchta-yarn-worker`
+without `--no-direct`) build one with `luchta_yarn_env::test_fixture::PnpFixture`
+(dev-dependency on `luchta-yarn-env` with the `test-fixture` feature) instead of
+hand-writing `package.json` files; `FixtureOptions` switches between inline and
+split manifests and toggles the ESM loader. `luchta run` prints a task's stdout
+only when the task fails, so to assert what a script printed, give the task
+`cache: {}` and read it back with `luchta logs` (see
+`crates/luchta-cli/tests/yarn_direct_e2e.rs`).
+
 Nextest runs every test through the repository's hermetic environment wrapper
 in `.config/nextest.toml`. Host environment variables are removed unless they
-are runtime essentials, Cargo/nextest metadata, dynamic-loader or coverage
-settings, or the explicit `LUCHTA_TEST_RCLONE` opt-in. When a test suite needs
+are runtime essentials, Cargo/nextest metadata, rustup's toolchain selection
+(`RUSTUP_TOOLCHAIN`, `RUSTUP_HOME`), dynamic-loader or coverage settings, or
+the explicit `LUCHTA_TEST_RCLONE` opt-in. The rustup variables matter because
+some CLI tests build worker binaries with `escargot`: without them the `rustc`
+proxy obeys a `rust-toolchain.toml` shipped inside a dependency's registry
+source (the `pnp` crate pins an older release) and the build fails on CI. When a test suite needs
 a new ambient customization, add its exact variable to both wrapper scripts'
 allowlists and cover that behavior with a test; do not allow all `LUCHTA_*`
 variables through.
