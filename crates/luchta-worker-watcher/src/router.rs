@@ -1,4 +1,5 @@
-use std::mem;
+use std::collections::VecDeque;
+use std::time::{Duration, Instant};
 
 use luchta_worker::{ProxyError, ResolveResult, SharedWriter, WorkerMessage, WorkerResponse};
 use tokio::io::{stderr, AsyncWrite, AsyncWriteExt};
@@ -11,18 +12,56 @@ pub enum RouterEvent {
     Response(u64, WorkerResponse),
     StdoutClosed(u64),
     FileChanged,
+    /// A generation has been draining longer than [`DRAIN_TIMEOUT`]; carries the
+    /// draining generation's id so a stale timer for an already-finished drain is
+    /// ignored.
+    DrainTimeout(u64),
     ShutdownAll,
+    /// The shutdown grace period ([`SHUTDOWN_GRACE`]) elapsed; force-terminate any
+    /// worker that has not exited on its own.
+    ShutdownTimeout,
 }
 
+/// Restart throttle: after `RESTART_BURST` restarts within `RESTART_WINDOW`, each
+/// further restart waits `RESTART_BACKOFF`, so a crash loop or a noisy file watch
+/// cannot spawn worker processes without bound.
+const RESTART_WINDOW: Duration = Duration::from_secs(10);
+const RESTART_BURST: usize = 8;
+const RESTART_BACKOFF: Duration = Duration::from_secs(1);
+
+/// Safety valve for draining. A restart waits for the old worker to finish its
+/// in-flight tasks before starting the replacement; if a task never completes (a
+/// wedged worker), the drain would otherwise block all queued work forever. After
+/// this long the old worker is force-terminated and its stragglers are failed.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Grace period for shutdown. On shutdown the live worker's stdin is closed so it
+/// can finish in-flight work and exit on its own; a worker that ignores stdin EOF
+/// (or hangs) would otherwise keep the process alive forever, so after this long
+/// any remaining worker is force-terminated.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
+
 pub struct MessageRouter {
+    /// The single live worker. All new work is routed here. `None` only while a
+    /// predecessor is draining before its replacement starts: there is never more
+    /// than one worker process at a time.
     current: Option<Generation>,
-    draining: Vec<Generation>,
+    /// A predecessor finishing its in-flight tasks before the replacement starts.
+    /// Present only while `current` is `None`; the two are never live together.
+    draining: Option<Generation>,
+    /// Work received while draining, replayed to the replacement once the old
+    /// worker has finished and exited (no work runs on two worker versions at once).
+    pending: VecDeque<WorkerMessage>,
     next_gen_id: u64,
     command: Vec<String>,
     stdout: Box<dyn AsyncWrite + Unpin + Send>,
     stderr_writer: SharedWriter,
     events_tx: mpsc::Sender<RouterEvent>,
     shutting_down: bool,
+    /// Timestamps of recent restarts, pruned to `RESTART_WINDOW`, for throttling.
+    restarts: VecDeque<Instant>,
+    /// Opt-in lifecycle logging, enabled by `LUCHTA_WORKER_WATCHER_DEBUG`.
+    debug: bool,
 }
 
 impl MessageRouter {
@@ -42,13 +81,16 @@ impl MessageRouter {
         );
         Ok(Self {
             current: Some(current),
-            draining: Vec::new(),
+            draining: None,
+            pending: VecDeque::new(),
             next_gen_id: 1,
             command,
             stdout,
             stderr_writer,
             events_tx,
             shutting_down: false,
+            restarts: VecDeque::new(),
+            debug: std::env::var_os("LUCHTA_WORKER_WATCHER_DEBUG").is_some(),
         })
     }
 
@@ -71,8 +113,10 @@ impl MessageRouter {
             RouterEvent::Inbound(message) => self.handle_inbound(message).await,
             RouterEvent::Response(gen_id, response) => self.handle_response(gen_id, response).await,
             RouterEvent::StdoutClosed(gen_id) => self.handle_stdout_closed(gen_id).await,
-            RouterEvent::FileChanged => self.rotate().await,
+            RouterEvent::FileChanged => self.restart().await,
+            RouterEvent::DrainTimeout(gen_id) => self.handle_drain_timeout(gen_id).await,
             RouterEvent::ShutdownAll => self.handle_shutdown_all().await,
+            RouterEvent::ShutdownTimeout => self.handle_shutdown_timeout().await,
         }
     }
 
@@ -80,23 +124,37 @@ impl MessageRouter {
         if self.shutting_down {
             return Ok(());
         }
-
-        if let Some(current) = self.current.as_mut() {
-            if let Err(error) = current.send(&message) {
-                log_router_error(
-                    &self.stderr_writer,
-                    format!(
-                        "router failed to send inbound message {} to generation {}: {error}",
-                        message.id(),
-                        current.id()
-                    ),
-                )
-                .await;
-                self.synthesize_terminal_for_failed_send(message.id(), in_flight_kind(&message))
-                    .await?;
-            }
+        if self.current.is_some() {
+            self.send_to_current(message).await
+        } else {
+            // A predecessor is draining; hold new work until the replacement starts.
+            self.pending.push_back(message);
+            Ok(())
         }
-        Ok(())
+    }
+
+    async fn send_to_current(&mut self, message: WorkerMessage) -> Result<(), ProxyError> {
+        let id = message.id().to_owned();
+        let kind = in_flight_kind(&message);
+        match self.current.as_mut() {
+            Some(current) => {
+                if let Err(error) = current.send(&message) {
+                    let gen_id = current.id();
+                    log_router_error(
+                        &self.stderr_writer,
+                        format!(
+                            "router failed to send message {id} to generation {gen_id}: {error}"
+                        ),
+                    )
+                    .await;
+                    self.synthesize_terminal_for_failed_send(&id, kind).await?;
+                }
+                Ok(())
+            }
+            // No live worker (only reachable during shutdown teardown). Fail the job
+            // so the engine is not left waiting for a response.
+            None => self.synthesize_terminal_for_failed_send(&id, kind).await,
+        }
     }
 
     async fn handle_response(
@@ -104,44 +162,150 @@ impl MessageRouter {
         gen_id: u64,
         response: WorkerResponse,
     ) -> Result<(), ProxyError> {
-        self.write_response(&response).await?;
-
-        let drained = match self.find_gen_mut(gen_id) {
-            Some(generation) => generation.on_response(&response),
-            None => false,
-        };
-
-        if drained {
-            self.remove_drained_gen(gen_id).await?;
+        if self.current.as_ref().is_some_and(|c| c.id() == gen_id) {
+            self.current.as_mut().unwrap().on_response(&response);
+            return self.write_response(&response).await;
         }
-
+        if self.draining.as_ref().is_some_and(|d| d.id() == gen_id) {
+            self.draining.as_mut().unwrap().on_response(&response);
+            self.write_response(&response).await?;
+            if self.draining.as_ref().unwrap().in_flight_len() == 0 {
+                // The old worker has finished every in-flight task. Terminate it and
+                // start the replacement, replaying any work queued during the drain.
+                let drained = self.draining.take().unwrap();
+                self.log_lifecycle(format!(
+                    "generation {} finished draining; terminating",
+                    drained.id()
+                ))
+                .await;
+                drained.shutdown().await?;
+                return self.complete_drain().await;
+            }
+            return Ok(());
+        }
+        // A straggler from an already-reaped generation: its in-flight ids were
+        // terminated when it was reaped, so drop this to avoid double-reporting.
         Ok(())
     }
 
     async fn handle_stdout_closed(&mut self, gen_id: u64) -> Result<(), ProxyError> {
-        if let Some(current) = self.current.as_ref() {
-            if current.id() == gen_id {
-                self.handle_current_stdout_closed().await?;
+        if self.current.as_ref().is_some_and(|c| c.id() == gen_id) {
+            let current = self.current.take().unwrap();
+            if self.shutting_down {
+                // Exited after stdin EOF during shutdown: fail any stragglers, reap.
+                self.synthesize_terminals_for(&current).await?;
+                current.shutdown().await?;
                 return Ok(());
             }
+            // The live worker crashed. Fail its in-flight tasks (the engine treats a
+            // done/resolved as terminal) and respawn.
+            log_generation_exit(&current, &self.stderr_writer).await;
+            self.synthesize_terminals_for(&current).await?;
+            current.shutdown().await?;
+            self.throttle_restart().await;
+            return self.spawn_current().await;
         }
-
-        self.handle_draining_stdout_closed(gen_id).await
+        if self.draining.as_ref().is_some_and(|d| d.id() == gen_id) {
+            // The draining worker exited on its own. If it still had in-flight tasks
+            // it crashed mid-drain: fail them. Then start the replacement.
+            let drained = self.draining.take().unwrap();
+            self.synthesize_terminals_for(&drained).await?;
+            drained.shutdown().await?;
+            return self.complete_drain().await;
+        }
+        Ok(())
     }
 
-    async fn handle_current_stdout_closed(&mut self) -> Result<(), ProxyError> {
-        let Some(current) = self.current.take() else {
-            return Ok(());
-        };
-
-        log_generation_exit(&current, &self.stderr_writer).await;
-        self.synthesize_terminals_for(&current).await?;
-        current.shutdown().await?;
-
+    /// Begins replacing the current worker when a watched file changes.
+    ///
+    /// There is only ever one worker process. If the current worker is idle it is
+    /// terminated at once and the replacement starts immediately. If it is busy, it
+    /// is moved to the draining slot to finish its in-flight tasks; new work is
+    /// queued (see [`Self::handle_inbound`]) until it has finished and exited, at
+    /// which point the replacement starts and the queue is replayed. Running two
+    /// worker versions at once is deliberately avoided: it is low value (a restart
+    /// only happens when the worker source is edited or rebuilt) and a correctness
+    /// hazard. An earlier model let idle draining generations accumulate — one per
+    /// restart — because an idle generation was reaped only on a response or stdout
+    /// close that never came.
+    async fn restart(&mut self) -> Result<(), ProxyError> {
         if self.shutting_down {
             return Ok(());
         }
+        if self.draining.is_some() {
+            // Already draining a predecessor; its replacement will be fresh. Nothing
+            // to do — coalesce this change into the restart already in progress.
+            self.log_lifecycle("watched file changed while draining; coalescing".to_owned())
+                .await;
+            return Ok(());
+        }
+        let Some(old) = self.current.take() else {
+            return Ok(());
+        };
+        if old.in_flight_len() == 0 {
+            self.log_lifecycle(format!(
+                "watched file changed; generation {} idle, terminating",
+                old.id()
+            ))
+            .await;
+            old.shutdown().await?;
+            return self.complete_drain().await;
+        }
+        self.log_lifecycle(format!(
+            "watched file changed; draining generation {} ({} in-flight), queueing new work",
+            old.id(),
+            old.in_flight_len()
+        ))
+        .await;
+        let gen_id = old.id();
+        self.draining = Some(old);
+        self.schedule_drain_timeout(gen_id);
+        Ok(())
+    }
 
+    async fn handle_drain_timeout(&mut self, gen_id: u64) -> Result<(), ProxyError> {
+        if !self.draining.as_ref().is_some_and(|d| d.id() == gen_id) {
+            // The drain already finished; this is a stale timer.
+            return Ok(());
+        }
+        let drained = self.draining.take().unwrap();
+        log_router_error(
+            &self.stderr_writer,
+            format!(
+                "worker-watcher: generation {} did not finish draining within {DRAIN_TIMEOUT:?}; force-terminating and failing {} in-flight task(s)",
+                drained.id(),
+                drained.in_flight_len()
+            ),
+        )
+        .await;
+        self.synthesize_terminals_for(&drained).await?;
+        drained.shutdown().await?;
+        self.complete_drain().await
+    }
+
+    /// Starts the replacement worker once a predecessor has finished draining and
+    /// replays work queued during the drain. The caller has already reaped the
+    /// drained generation. During shutdown this still runs queued work — so the
+    /// engine is not left waiting — then closes the replacement's stdin so it exits.
+    async fn complete_drain(&mut self) -> Result<(), ProxyError> {
+        if self.shutting_down && self.pending.is_empty() {
+            return Ok(());
+        }
+        self.throttle_restart().await;
+        self.spawn_current().await?;
+        let pending = std::mem::take(&mut self.pending);
+        for message in pending {
+            self.send_to_current(message).await?;
+        }
+        if self.shutting_down {
+            if let Some(current) = self.current.as_ref() {
+                current.close_stdin().await;
+            }
+        }
+        Ok(())
+    }
+
+    async fn spawn_current(&mut self) -> Result<(), ProxyError> {
         let (next, stdout_rx) = Generation::new(
             self.next_gen_id,
             self.command.clone(),
@@ -153,95 +317,101 @@ impl MessageRouter {
             self.events_tx.clone(),
             std::sync::Arc::clone(&self.stderr_writer),
         );
+        self.log_lifecycle(format!("started worker generation {}", self.next_gen_id))
+            .await;
         self.current = Some(next);
         self.next_gen_id += 1;
         Ok(())
     }
 
-    async fn handle_draining_stdout_closed(&mut self, gen_id: u64) -> Result<(), ProxyError> {
-        self.remove_draining_generation(gen_id, true).await
+    fn schedule_drain_timeout(&self, gen_id: u64) {
+        let events_tx = self.events_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(DRAIN_TIMEOUT).await;
+            let _ = events_tx.send(RouterEvent::DrainTimeout(gen_id)).await;
+        });
+    }
+
+    /// Rate-limits restarts so a crash loop (a worker that exits immediately) or a
+    /// noisy file watch cannot spawn workers as fast as the CPU allows. After
+    /// `RESTART_BURST` restarts within `RESTART_WINDOW`, each further restart waits
+    /// `RESTART_BACKOFF` and logs a warning.
+    async fn throttle_restart(&mut self) {
+        let now = Instant::now();
+        while self
+            .restarts
+            .front()
+            .is_some_and(|t| now.duration_since(*t) > RESTART_WINDOW)
+        {
+            self.restarts.pop_front();
+        }
+        if self.restarts.len() >= RESTART_BURST {
+            log_router_error(
+                &self.stderr_writer,
+                format!(
+                    "worker-watcher: {} restarts within {RESTART_WINDOW:?}; backing off {RESTART_BACKOFF:?} before the next (possible crash loop or noisy watch)",
+                    self.restarts.len(),
+                ),
+            )
+            .await;
+            tokio::time::sleep(RESTART_BACKOFF).await;
+        }
+        self.restarts.push_back(Instant::now());
+    }
+
+    async fn log_lifecycle(&mut self, message: String) {
+        if self.debug {
+            log_router_error(&self.stderr_writer, format!("worker-watcher: {message}")).await;
+        }
     }
 
     async fn handle_shutdown_all(&mut self) -> Result<(), ProxyError> {
         if self.shutting_down {
             return Ok(());
         }
-
         self.shutting_down = true;
-        self.move_current_to_draining().await
-    }
-
-    async fn rotate(&mut self) -> Result<(), ProxyError> {
-        if self.shutting_down {
-            return Ok(());
+        // Stop new dispatch and let the live worker finish its in-flight jobs and
+        // exit on its own: closing stdin signals EOF, and the run loop reaps it when
+        // its stdout closes (see `handle_stdout_closed`). If a drain is in progress
+        // it finishes normally, any queued work still runs on the replacement (which
+        // is then closed too, see `complete_drain`), and `should_stop` ends the loop
+        // once nothing remains. A worker that ignores stdin EOF is force-terminated
+        // after `SHUTDOWN_GRACE` (see `handle_shutdown_timeout`) so shutdown cannot
+        // hang.
+        if let Some(current) = self.current.as_ref() {
+            current.close_stdin().await;
         }
-
-        let (next, stdout_rx) = Generation::new(
-            self.next_gen_id,
-            self.command.clone(),
-            std::sync::Arc::clone(&self.stderr_writer),
-        )?;
-        let next_id = next.id();
-        spawn_stdout_reader(
-            next_id,
-            stdout_rx,
-            self.events_tx.clone(),
-            std::sync::Arc::clone(&self.stderr_writer),
-        );
-        let old_current = self.current.replace(next);
-        self.next_gen_id += 1;
-
-        if let Some(mut generation) = old_current {
-            generation.mark_draining().await;
-            self.draining.push(generation);
-        }
-
+        self.schedule_shutdown_timeout();
         Ok(())
     }
 
-    async fn move_current_to_draining(&mut self) -> Result<(), ProxyError> {
-        if let Some(mut generation) = self.current.take() {
-            generation.mark_draining().await;
-            self.draining.push(generation);
+    fn schedule_shutdown_timeout(&self) {
+        let events_tx = self.events_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(SHUTDOWN_GRACE).await;
+            let _ = events_tx.send(RouterEvent::ShutdownTimeout).await;
+        });
+    }
+
+    async fn handle_shutdown_timeout(&mut self) -> Result<(), ProxyError> {
+        if let Some(current) = self.current.take() {
+            log_router_error(
+                &self.stderr_writer,
+                format!(
+                    "worker-watcher: generation {} did not exit within {SHUTDOWN_GRACE:?} of shutdown; force-terminating",
+                    current.id()
+                ),
+            )
+            .await;
+            self.synthesize_terminals_for(&current).await?;
+            current.shutdown().await?;
         }
+        if let Some(draining) = self.draining.take() {
+            self.synthesize_terminals_for(&draining).await?;
+            draining.shutdown().await?;
+        }
+        self.pending.clear();
         Ok(())
-    }
-
-    async fn remove_drained_gen(&mut self, gen_id: u64) -> Result<(), ProxyError> {
-        self.remove_draining_generation(gen_id, false).await
-    }
-
-    async fn remove_draining_generation(
-        &mut self,
-        gen_id: u64,
-        synthesize: bool,
-    ) -> Result<(), ProxyError> {
-        if let Some(generation) = self.take_draining_generation(gen_id) {
-            if synthesize {
-                self.synthesize_terminals_for(&generation).await?;
-            }
-            generation.shutdown().await?;
-        }
-        Ok(())
-    }
-
-    fn take_draining_generation(&mut self, gen_id: u64) -> Option<Generation> {
-        let index = self
-            .draining
-            .iter()
-            .position(|generation| generation.id() == gen_id)?;
-        Some(self.draining.swap_remove(index))
-    }
-
-    fn find_gen_mut(&mut self, gen_id: u64) -> Option<&mut Generation> {
-        if let Some(current) = self.current.as_mut() {
-            if current.id() == gen_id {
-                return Some(current);
-            }
-        }
-        self.draining
-            .iter_mut()
-            .find(|generation| generation.id() == gen_id)
     }
 
     async fn synthesize_terminals_for(
@@ -272,19 +442,19 @@ impl MessageRouter {
     }
 
     fn should_stop(&self) -> bool {
-        self.shutting_down && self.current.is_none() && self.draining.is_empty()
+        self.shutting_down
+            && self.current.is_none()
+            && self.draining.is_none()
+            && self.pending.is_empty()
     }
 
     async fn shutdown_remaining(&mut self) -> Result<(), ProxyError> {
         if let Some(current) = self.current.take() {
             current.shutdown().await?;
         }
-
-        let draining = mem::take(&mut self.draining);
-        for generation in draining {
-            generation.shutdown().await?;
+        if let Some(draining) = self.draining.take() {
+            draining.shutdown().await?;
         }
-
         Ok(())
     }
 }
@@ -345,24 +515,17 @@ async fn log_router_error(stderr_writer: &SharedWriter, message: String) {
 }
 
 async fn log_generation_exit(generation: &Generation, stderr_writer: &SharedWriter) {
-    let exit_status = generation.exit_status().await;
-    let has_in_flight = !generation.drain_in_flight().is_empty();
-    let dirty = !generation.is_draining() || has_in_flight;
-    if !dirty {
-        return;
-    }
-
-    let exit = exit_status
+    let exit = generation
+        .exit_status()
+        .await
         .map(|status| status.to_string())
         .unwrap_or_else(|| "<unknown>".to_owned());
-    let prefix = if generation.is_draining() {
-        "delegate exited during drain"
-    } else {
-        "delegate failed"
-    };
     log_router_error(
         stderr_writer,
-        format!("{prefix}: command={:?}, exit={exit}", generation.command()),
+        format!(
+            "delegate exited: command={:?}, exit={exit}",
+            generation.command()
+        ),
     )
     .await;
 }
@@ -541,7 +704,7 @@ exit 1
     }
 
     #[tokio::test]
-    async fn rotate_sends_new_work_to_new_current_and_old_work_still_finishes() {
+    async fn restart_queues_new_work_until_old_worker_drains() {
         let (events_tx, router_task, reader_task) =
             spawn_router(delayed_loopback_delegate_command()).await;
 
@@ -559,58 +722,56 @@ exit 1
             .expect("send new inbound");
 
         let output = finish_router(events_tx, router_task, reader_task).await;
+        // Single-worker model: the old worker keeps running its in-flight job to
+        // completion (no spurious failure), while new work is queued during the
+        // drain and then runs on the fresh worker once the old one has finished.
         assert!(output.contains(&WorkerResponse::done("old", 0)));
         assert!(output.contains(&WorkerResponse::done("new", 0)));
     }
 
     #[tokio::test]
-    async fn draining_generation_is_shutdown_when_last_terminal_arrives() {
-        let (events_tx, router_task, reader_task) =
-            spawn_router(delayed_loopback_delegate_command()).await;
+    async fn repeated_file_changes_keep_routing_and_do_not_wedge() {
+        // Regression test for the generation leak: before the single-worker fix,
+        // each FileChanged spawned a new generation and left the old one draining
+        // forever. Here many changes must still leave exactly one working worker
+        // that routes new work to completion.
+        let (events_tx, router_task, reader_task) = spawn_router(loopback_delegate_command()).await;
 
+        for _ in 0..5 {
+            events_tx
+                .send(RouterEvent::FileChanged)
+                .await
+                .expect("send file change");
+        }
         events_tx
-            .send(RouterEvent::Inbound(run_message("old", "slow-build")))
+            .send(RouterEvent::Inbound(run_message("after", "build")))
             .await
-            .expect("send slow inbound");
-        events_tx
-            .send(RouterEvent::FileChanged)
-            .await
-            .expect("send file change");
+            .expect("send inbound after rotations");
 
         let output = finish_router(events_tx, router_task, reader_task).await;
-        assert!(output.contains(&WorkerResponse::done("old", 0)));
+        assert!(output.contains(&WorkerResponse::done("after", 0)));
     }
 
     #[tokio::test]
-    async fn multiple_draining_generations_drain_independently() {
+    async fn shutdown_force_terminates_worker_that_ignores_stdin_eof() {
+        // A delegate that never exits on stdin EOF must not hang shutdown: after the
+        // grace period the run loop force-terminates it and stops.
         let (events_tx, router_task, reader_task) =
-            spawn_router(delayed_loopback_delegate_command()).await;
+            spawn_router(vec!["sleep".to_owned(), "30".to_owned()]).await;
 
         events_tx
-            .send(RouterEvent::Inbound(run_message("first", "slow-first")))
+            .send(RouterEvent::ShutdownAll)
             .await
-            .expect("send first inbound");
-        events_tx
-            .send(RouterEvent::FileChanged)
-            .await
-            .expect("send first rotation");
-        events_tx
-            .send(RouterEvent::Inbound(run_message("second", "slow-second")))
-            .await
-            .expect("send second inbound");
-        events_tx
-            .send(RouterEvent::FileChanged)
-            .await
-            .expect("send second rotation");
-        events_tx
-            .send(RouterEvent::Inbound(run_message("third", "build")))
-            .await
-            .expect("send third inbound");
+            .expect("send shutdown");
+        drop(events_tx);
 
-        let output = finish_router(events_tx, router_task, reader_task).await;
-        assert!(output.contains(&WorkerResponse::done("first", 0)));
-        assert!(output.contains(&WorkerResponse::done("second", 0)));
-        assert!(output.contains(&WorkerResponse::done("third", 0)));
+        tokio::time::timeout(SHUTDOWN_GRACE + Duration::from_secs(3), router_task)
+            .await
+            .expect("router shuts down within the grace period plus margin")
+            .expect("router join")
+            .expect("router ok");
+        let output = collect_json_lines(reader_task).await;
+        assert!(output.is_empty(), "no responses expected, got {output:?}");
     }
 
     #[tokio::test]
@@ -662,7 +823,7 @@ exit 1
         .expect("create router");
 
         let current = router.current.as_mut().expect("current generation");
-        current.mark_draining().await;
+        current.close_stdin().await;
 
         let router_task = tokio::spawn(async move { router.run(events_rx).await });
         events_tx

@@ -145,15 +145,6 @@ impl Harness {
         );
     }
 
-    fn wait_for_eof_count(&mut self, expected: usize, timeout: Duration) {
-        self.wait_for_marker_count(
-            |harness| harness.eof_markers.len(),
-            expected,
-            timeout,
-            "EOF marker before timeout",
-        );
-    }
-
     fn collect_stderr_for(&mut self, duration: Duration) {
         let deadline = Instant::now() + duration;
         while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
@@ -358,11 +349,16 @@ fn touch_until_restart_in(
     );
 }
 
-fn assert_clean_multi_gen_shutdown(harness: Harness, min_gens: usize) {
+/// Under the single-worker model a restart reaps the old worker via SIGTERM once
+/// it has finished draining its in-flight tasks (never via a stdin-EOF exit), so
+/// only the final worker — closed via stdin at shutdown — emits an EOF marker.
+/// `min_instances` workers should have been spawned in total, but at most one is
+/// ever alive at a time.
+fn assert_single_gen_shutdown(harness: Harness, min_instances: usize) {
     let (exit, instances, eof_markers) = harness.shutdown();
     assert_eq!(exit, 0);
-    assert!(instances.iter().collect::<HashSet<_>>().len() >= min_gens);
-    assert!(eof_markers.len() >= min_gens);
+    assert!(instances.iter().collect::<HashSet<_>>().len() >= min_instances);
+    assert_eq!(eof_markers.len(), 1);
 }
 
 #[test]
@@ -394,45 +390,7 @@ fn file_change_spawns_new_generation() {
     assert_eq!(response_type(&first), "done");
     assert_eq!(response_type(&second), "done");
 
-    assert_clean_multi_gen_shutdown(harness, 2);
-}
-
-#[test]
-fn old_generation_exits_on_stdin_eof() {
-    let mut harness = Harness::start_relative(300);
-    harness.send_run("old", "delay:300");
-    touch_until_restart_in(&mut harness, TouchTarget::Watched, "handoff/restart.txt", 2);
-    harness.send_run("new", "build");
-
-    let _ = harness.read_response(READ_TIMEOUT);
-    let _ = harness.read_response(READ_TIMEOUT);
-    harness.wait_for_eof_count(1, READ_TIMEOUT);
-
-    assert_clean_multi_gen_shutdown(harness, 2);
-}
-
-#[test]
-fn multiple_concurrent_draining_generations() {
-    let mut harness = Harness::start_relative(300);
-    harness.send_run("first", "delay:300");
-    touch_until_restart_in(&mut harness, TouchTarget::Watched, "multi/first.txt", 2);
-    harness.send_run("second", "delay:300");
-    touch_until_restart_in(&mut harness, TouchTarget::Watched, "multi/second.txt", 3);
-    harness.send_run("third", "build");
-
-    let mut ids = Vec::new();
-    for _ in 0..3 {
-        let response = harness.read_response(READ_TIMEOUT);
-        assert_eq!(response_type(&response), "done");
-        ids.push(response_id(&response).to_owned());
-    }
-    ids.sort();
-    assert_eq!(
-        ids,
-        vec!["first".to_owned(), "second".to_owned(), "third".to_owned()]
-    );
-
-    assert_clean_multi_gen_shutdown(harness, 3);
+    assert_single_gen_shutdown(harness, 2);
 }
 
 #[test]
@@ -470,5 +428,5 @@ fn gitignored_path_still_watched() {
     let response = harness.read_response(READ_TIMEOUT);
     assert_done(&response, "job-1");
 
-    assert_clean_multi_gen_shutdown(harness, 2);
+    assert_single_gen_shutdown(harness, 2);
 }
