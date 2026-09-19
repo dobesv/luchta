@@ -700,6 +700,8 @@ struct WorkspaceBinPackage {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+
     use super::*;
 
     /// Cargo metadata JSON modelling workspace packages with bin targets,
@@ -786,6 +788,131 @@ mod tests {
             .iter()
             .map(|(key, value)| ((*key).to_string(), OsString::from(value)))
             .collect()
+    }
+
+    fn workspace_manifests(repo_root: &Path) -> Vec<PathBuf> {
+        let mut manifests = vec![
+            repo_root.join("Cargo.toml"),
+            repo_root.join("xtask/Cargo.toml"),
+        ];
+        let crates_dir = repo_root.join("crates");
+        for entry in std::fs::read_dir(&crates_dir)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", crates_dir.display()))
+        {
+            let entry = entry.expect("failed to read crates directory entry");
+            let manifest = entry.path().join("Cargo.toml");
+            if manifest.is_file() {
+                manifests.push(manifest);
+            }
+        }
+        manifests.sort();
+        manifests
+    }
+
+    fn collect_oxc_git_revs(
+        value: &toml::Value,
+        manifest: &Path,
+        repo_root: &Path,
+        revisions: &mut BTreeMap<String, BTreeSet<String>>,
+    ) {
+        match value {
+            toml::Value::Table(table) => {
+                // Match both canonical forms of the oxc repo URL (with or without
+                // the `.git` suffix, tolerating a trailing slash) so a pin written
+                // in a different-but-equivalent form can't slip past the guard.
+                if table
+                    .get("git")
+                    .and_then(toml::Value::as_str)
+                    .map(|git| git.trim_end_matches('/').trim_end_matches(".git"))
+                    == Some("https://github.com/oxc-project/oxc")
+                {
+                    let rev = table
+                        .get("rev")
+                        .and_then(toml::Value::as_str)
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "oxc git dependency in {} has no string `rev`",
+                                manifest.display()
+                            )
+                        });
+                    let relative_manifest = manifest.strip_prefix(repo_root).unwrap_or(manifest);
+                    revisions
+                        .entry(rev.to_string())
+                        .or_default()
+                        .insert(relative_manifest.display().to_string());
+                }
+                for nested in table.values() {
+                    collect_oxc_git_revs(nested, manifest, repo_root, revisions);
+                }
+            }
+            toml::Value::Array(array) => {
+                for nested in array {
+                    collect_oxc_git_revs(nested, manifest, repo_root, revisions);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn oxc_git_dependencies_share_one_revision() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask manifest directory has a parent");
+        let mut revisions = BTreeMap::<String, BTreeSet<String>>::new();
+
+        for manifest in workspace_manifests(repo_root) {
+            let contents = std::fs::read_to_string(&manifest)
+                .unwrap_or_else(|error| panic!("failed to read {}: {error}", manifest.display()));
+            let document = toml::from_str::<toml::Value>(&contents)
+                .unwrap_or_else(|error| panic!("failed to parse {}: {error}", manifest.display()));
+            collect_oxc_git_revs(&document, &manifest, repo_root, &mut revisions);
+        }
+
+        let revisions_by_file = revisions
+            .iter()
+            .map(|(rev, manifests)| {
+                format!(
+                    "  {rev}: {}",
+                    manifests.iter().cloned().collect::<Vec<_>>().join(", ")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            revisions.len(),
+            1,
+            "expected exactly one oxc git dependency rev across workspace Cargo.toml files; found:\n{revisions_by_file}"
+        );
+    }
+
+    #[test]
+    fn collect_oxc_git_revs_matches_url_variants() {
+        // The `.git`-suffixed form, the bare form, and a trailing-slash form all
+        // point at the same repo, so all three must count toward the shared rev.
+        let manifest = toml::from_str::<toml::Value>(
+            r#"
+            [workspace.dependencies]
+            oxc_a = { git = "https://github.com/oxc-project/oxc.git", rev = "abc" }
+            oxc_b = { git = "https://github.com/oxc-project/oxc", rev = "abc" }
+            oxc_c = { git = "https://github.com/oxc-project/oxc/", rev = "abc" }
+            other = { git = "https://github.com/other/repo.git", rev = "zzz" }
+            "#,
+        )
+        .expect("parse");
+        let mut revisions = BTreeMap::<String, BTreeSet<String>>::new();
+        collect_oxc_git_revs(
+            &manifest,
+            Path::new("Cargo.toml"),
+            Path::new(""),
+            &mut revisions,
+        );
+
+        assert_eq!(
+            revisions.keys().cloned().collect::<Vec<_>>(),
+            vec!["abc".to_string()],
+            "all oxc URL forms must fold into one rev and non-oxc repos must be ignored"
+        );
     }
 
     #[test]

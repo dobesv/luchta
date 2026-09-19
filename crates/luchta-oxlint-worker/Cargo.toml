@@ -35,11 +35,7 @@ oxc_semantic = { workspace = true, optional = true }
 oxc_linter = { workspace = true, optional = true }
 oxc_span = { workspace = true, optional = true }
 oxc_diagnostics = { workspace = true, optional = true }
-# NOTE: the only oxc crate not routed through `[workspace.dependencies]`.
-# Its rev MUST stay in lockstep with the root Cargo.toml's oxc rev: a stale rev
-# here makes Cargo resolve a second copy of the whole oxc crate set (a distinct
-# `oxc_allocator`, `oxc_span`, ...) whose types do not unify with `oxc_linter`'s.
-oxc_syntax = { git = "https://github.com/oxc-project/oxc.git", rev = "7bf68f70c20f5329251f19be95076f6eab4fe396", optional = true }
+oxc_syntax = { workspace = true, optional = true }
 rustc-hash = "2.1.1"
 serde = { workspace = true, optional = true, features = ["derive"] }
 serde_json = { workspace = true, optional = true }

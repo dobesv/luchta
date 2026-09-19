@@ -67,16 +67,10 @@ struct OxfmtRc {
     single_attribute_per_line: Option<bool>,
     object_wrap: Option<ObjectWrap>,
     html_whitespace_sensitivity: Option<HtmlWhitespaceSensitivity>,
-    // Parsed but not applied; see `apply_markup_options` for why. Keeping the
-    // field is what still type-checks the value and keeps the key recognized.
-    embedded_language_formatting: Option<EmbeddedLanguageFormattingOption>,
-    // NOTE: `experimentalOperatorPosition` and `experimentalTernaries` are not
-    // supported by this worker. They are intentionally NOT fields here: serde
-    // ignores them, and they surface as unsupported-key warnings via
-    // `collect_unknown_options` (they are absent from
-    // `KNOWN_TOP_LEVEL_KEYS`). This keeps forward compatibility — a newer or
-    // shared `.oxfmtrc` degrades with a warning instead of hard-failing the
-    // whole repo's formatting.
+    // `embeddedLanguageFormatting`, `experimentalOperatorPosition`, and
+    // `experimentalTernaries` are unsupported and intentionally omitted.
+    // Serde ignores them, while `collect_unknown_options` reports keys absent
+    // from `KNOWN_FORMAT_OPTION_KEYS` without rejecting the config.
     #[serde(alias = "experimentalSortImports")]
     sort_imports: Option<sort_imports::SortImportsUserConfig>,
     ignore_patterns: Option<Vec<String>>,
@@ -161,13 +155,6 @@ enum HtmlWhitespaceSensitivity {
     Css,
     Strict,
     Ignore,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum EmbeddedLanguageFormattingOption {
-    Auto,
-    Off,
 }
 
 #[derive(Debug, Default)]
@@ -368,15 +355,6 @@ fn apply_markup_options(config: &OxfmtRc, options: &mut JsFormatOptions) {
             HtmlWhitespaceSensitivity::Ignore
         );
     }
-    // `embeddedLanguageFormatting` has no `JsFormatOptions` counterpart any
-    // more: oxc's formatter-session redesign moved the switch out of the
-    // options struct, and upstream oxfmt now honours `"off"` by installing no
-    // embedded dispatcher on the session. This worker installs one
-    // unconditionally, which is exactly what it did before the redesign too —
-    // the old `JsFormatOptions::embedded_language_formatting` field was inert
-    // data that `oxc_formatter` never read. `OxfmtRc` still carries the key so
-    // its value keeps being checked and configs that set it keep loading
-    // unchanged; honouring `"off"` would be a behaviour change, not a port.
 }
 
 fn map_quote_style(single_quote: bool) -> QuoteStyle {
@@ -494,7 +472,6 @@ const KNOWN_FORMAT_OPTION_KEYS: &[&str] = &[
     "arrowParens",
     "bracketSameLine",
     "bracketSpacing",
-    "embeddedLanguageFormatting",
     "endOfLine",
     "experimentalSortImports",
     "htmlWhitespaceSensitivity",
@@ -955,12 +932,25 @@ mod tests {
     }
 
     #[test]
-    fn markup_options_map() {
-        let options = oxfmtrc_to_options(
-            r#"{"htmlWhitespaceSensitivity":"ignore","embeddedLanguageFormatting":"off"}"#,
-        )
-        .expect("parse");
+    fn html_whitespace_sensitivity_maps() {
+        let options =
+            oxfmtrc_to_options(r#"{"htmlWhitespaceSensitivity":"ignore"}"#).expect("parse");
         assert!(options.html_whitespace_sensitivity_ignore);
+    }
+
+    #[test]
+    fn unsupported_embedded_language_formatting_emits_notice() {
+        let (_temp, loaded) = load_config_from_temp(r#"{"embeddedLanguageFormatting":"off"}"#);
+
+        assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+        // Exactly one notice, naming the key — a single unknown key must not
+        // fan out into duplicates.
+        assert!(
+            loaded.unsupported_option_notices.len() == 1
+                && loaded.unsupported_option_notices[0].contains("embeddedLanguageFormatting"),
+            "{:?}",
+            loaded.unsupported_option_notices
+        );
     }
 
     #[test]
