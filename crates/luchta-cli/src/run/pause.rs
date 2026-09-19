@@ -31,12 +31,22 @@ pub(super) enum PauseTick {
     Shutdown(ShutdownSignal),
 }
 
-/// The real implementation (ProdPressureEnv) preserves the exact behavior
-/// of original pause loop: 250ms TTL, no timeout escape hatch, intentional
-/// pause-forever comment.
+/// The real implementation (ProdPressureEnv) preserves the exact behavior of
+/// the original pause loop: a 250ms pressure re-check that resumes dispatch
+/// automatically once pressure clears, with no timeout that force-resumes
+/// while pressure persists.
 pub(super) trait PressureEnv {
     /// Check current memory pressure. Updates pressure_state for Task 5 visibility.
     fn check(&mut self) -> MemoryPressure;
+
+    /// Emit a one-shot notice that new task dispatch has paused on memory
+    /// pressure. Fires once per pause episode, in every output mode, so the
+    /// escape hatch stays discoverable even under `--output summary` where
+    /// periodic status lines are suppressed.
+    fn notify_paused(&self);
+
+    /// Emit a one-shot notice that the pressure cleared and dispatch resumes.
+    fn notify_resumed(&self);
 
     /// Await next tick event: re-check timer, progress interval, or shutdown.
     ///
@@ -64,11 +74,16 @@ pub(super) enum PressureClearance {
 /// Generic over `PressureEnv` so tests can inject deterministic fakes.
 ///
 /// Returns `PressureClearance::Dispatch` when pressure clears (caller should
-/// dispatch task), or `PressureClearance::Shutdown` if interrupted.
+/// dispatch task), or `PressureClearance::Shutdown` if interrupted. Emits
+/// one-shot pause and resume notices around each pressure pause episode.
 ///
-/// **Intentional pause-forever behavior**: If pressure never clears, this
-/// function will not return. User must interrupt with Ctrl-C/SIGTERM.
-/// This is BY DESIGN — we do NOT add timeout or auto-resume escape hatch.
+/// Dispatch resumes automatically: the loop re-checks pressure every 250ms
+/// (via `PauseTick::ReCheck`) and returns `Dispatch` as soon as pressure
+/// clears. What it deliberately does NOT have is a timeout that force-resumes
+/// while pressure persists — if pressure never clears, this function does not
+/// return, and the user must interrupt with Ctrl-C/SIGTERM (or rerun with
+/// `--no-mem-pressure`). Holding until the OS says memory is available is BY
+/// DESIGN; resuming into a thrashing machine would defeat the backpressure.
 pub(super) async fn await_pressure_clearance<E: PressureEnv>(
     env: &mut E,
 ) -> Result<PressureClearance> {
@@ -76,12 +91,16 @@ pub(super) async fn await_pressure_clearance<E: PressureEnv>(
         return Ok(PressureClearance::Dispatch);
     }
 
-    // **Intentional pause-forever behavior**: If pressure never clears,
-    // this loop runs forever. No timeout escape hatch.
+    env.notify_paused();
+
+    // Re-check pressure every 250ms and resume the moment it clears. There is
+    // no timeout that force-resumes while pressure persists, so if it never
+    // clears the loop waits until a shutdown signal arrives.
     loop {
         match env.next_tick().await? {
             PauseTick::ReCheck => {
                 if !env.check().paused {
+                    env.notify_resumed();
                     return Ok(PressureClearance::Dispatch);
                 }
             }
@@ -110,11 +129,40 @@ pub(super) struct ProdPressureEnv<'a> {
     shutdown_signal: &'a mut ShutdownFuture,
 }
 
+/// Builds the one-shot pause notice. Names the reason (when the OS gave one)
+/// and the `--no-mem-pressure` escape hatch, so a run gated under `--output
+/// summary` — where periodic status lines are suppressed — still explains why
+/// it stopped and how to override. Pure so the wording is unit-testable
+/// without a live reporter.
+fn pause_notice_line(detail: Option<crate::memory_pressure::PressureDetail>) -> String {
+    let reason = match detail {
+        Some(d) => format!("memory pressure ({d})"),
+        None => "memory pressure".to_string(),
+    };
+    format!("New task dispatch paused: {reason}. Ctrl-C to stop; rerun with --no-mem-pressure to bypass.")
+}
+
 impl<'a> PressureEnv for ProdPressureEnv<'a> {
     fn check(&mut self) -> MemoryPressure {
         let pressure = self.monitor.check();
         self.pressure_state.update(&pressure);
         pressure
+    }
+
+    fn notify_paused(&self) {
+        let line = pause_notice_line(self.pressure_state.snapshot().detail);
+        self.progress_reporter.output().stderr_line(
+            &line
+                .as_str()
+                .if_supports_color(owo_colors::Stream::Stderr, |t| t.yellow())
+                .to_string(),
+        );
+    }
+
+    fn notify_resumed(&self) {
+        self.progress_reporter
+            .output()
+            .stderr_line("Memory pressure cleared; resuming task dispatch.");
     }
 
     async fn next_tick(&mut self) -> Result<PauseTick> {
@@ -342,6 +390,8 @@ mod tests {
         tick_events: VecDeque<PauseTick>,
         render_calls: AtomicUsize,
         check_calls: AtomicUsize,
+        notify_paused_calls: AtomicUsize,
+        notify_resumed_calls: AtomicUsize,
     }
 
     impl FakePressureEnv {
@@ -351,6 +401,8 @@ mod tests {
                 tick_events: tick_events.into(),
                 render_calls: AtomicUsize::new(0),
                 check_calls: AtomicUsize::new(0),
+                notify_paused_calls: AtomicUsize::new(0),
+                notify_resumed_calls: AtomicUsize::new(0),
             }
         }
 
@@ -361,6 +413,14 @@ mod tests {
         fn check_count(&self) -> usize {
             self.check_calls.load(Ordering::SeqCst)
         }
+
+        fn notify_paused_count(&self) -> usize {
+            self.notify_paused_calls.load(Ordering::SeqCst)
+        }
+
+        fn notify_resumed_count(&self) -> usize {
+            self.notify_resumed_calls.load(Ordering::SeqCst)
+        }
     }
 
     impl PressureEnv for FakePressureEnv {
@@ -369,6 +429,14 @@ mod tests {
             self.check_results
                 .pop_front()
                 .expect("FakePressureEnv: check() called but no results remaining")
+        }
+
+        fn notify_paused(&self) {
+            self.notify_paused_calls.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn notify_resumed(&self) {
+            self.notify_resumed_calls.fetch_add(1, Ordering::SeqCst);
         }
 
         async fn next_tick(&mut self) -> Result<PauseTick> {
@@ -409,6 +477,8 @@ mod tests {
         clearance: PressureClearance,
         checks: usize,
         renders: usize,
+        paused_notices: usize,
+        resumed_notices: usize,
         remaining_ticks: usize,
     }
 
@@ -426,6 +496,8 @@ mod tests {
             clearance,
             checks: env.check_count(),
             renders: env.render_count(),
+            paused_notices: env.notify_paused_count(),
+            resumed_notices: env.notify_resumed_count(),
             remaining_ticks: env.tick_events.len(),
         }
     }
@@ -450,6 +522,8 @@ mod tests {
         assert_eq!(out.clearance, PressureClearance::Dispatch);
         assert_eq!(out.checks, 3);
         assert_eq!(out.renders, 2);
+        assert_eq!(out.paused_notices, 1);
+        assert_eq!(out.resumed_notices, 1);
     }
 
     #[tokio::test]
@@ -465,6 +539,8 @@ mod tests {
             PressureClearance::Shutdown(ShutdownSignal::CtrlC)
         );
         assert_eq!(out.checks, 1);
+        assert_eq!(out.paused_notices, 1);
+        assert_eq!(out.resumed_notices, 0);
     }
 
     #[tokio::test]
@@ -478,7 +554,24 @@ mod tests {
         assert_eq!(out.clearance, PressureClearance::Dispatch);
         assert_eq!(out.checks, 1);
         assert_eq!(out.renders, 0);
+        assert_eq!(out.paused_notices, 0);
+        assert_eq!(out.resumed_notices, 0);
         assert_eq!(out.remaining_ticks, 2);
+    }
+
+    #[tokio::test]
+    async fn pause_loop_notifies_pause_and_resume_without_progress_tick() {
+        let out = drive(
+            vec![paused_pressure(), clear_pressure()],
+            vec![PauseTick::ReCheck],
+        )
+        .await;
+
+        assert_eq!(out.clearance, PressureClearance::Dispatch);
+        assert_eq!(out.checks, 2);
+        assert_eq!(out.renders, 0);
+        assert_eq!(out.paused_notices, 1);
+        assert_eq!(out.resumed_notices, 1);
     }
 
     #[test]
@@ -502,6 +595,26 @@ mod tests {
 
         assert!(line.contains("🐏 32 MB"));
         assert!(line.contains("memory pressure (stalled 23%)"));
+    }
+
+    #[test]
+    fn pause_notice_names_reason_and_escape_hatch() {
+        let line = pause_notice_line(Some(PressureDetail::Stalled(60.0)));
+
+        // The whole point of #343: a gated run must say why it paused and how
+        // to override, even under `--output summary`.
+        assert!(line.contains("memory pressure (stalled 60%)"), "{line}");
+        assert!(line.contains("--no-mem-pressure"), "{line}");
+        assert!(line.contains("New task dispatch paused"), "{line}");
+    }
+
+    #[test]
+    fn pause_notice_without_detail_still_names_escape_hatch() {
+        let line = pause_notice_line(None);
+
+        assert!(line.contains("memory pressure"), "{line}");
+        assert!(!line.contains("("), "no empty reason parens: {line}");
+        assert!(line.contains("--no-mem-pressure"), "{line}");
     }
 
     #[test]
