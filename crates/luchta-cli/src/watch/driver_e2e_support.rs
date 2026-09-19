@@ -567,6 +567,31 @@ impl E2eHarness {
         .await;
     }
 
+    pub(super) async fn wait_for_api_input_watch_registration(&self) {
+        let task_id = luchta_types::TaskId::new("api", "build");
+        let relative_input_path = Path::new("packages/api/src/lib.rs");
+        let expected_hash =
+            luchta_cache::blake3_file(&self.workspace_root.join(relative_input_path))
+                .expect("hash api input before watch registration");
+        self.wait_until(
+            Duration::from_secs(10),
+            || "timed out waiting for failed api watch registration".to_string(),
+            || {
+                self.session
+                    .task_watch_registry()
+                    .lock()
+                    .expect("lock task watch registry")
+                    .get(&task_id)
+                    .is_some_and(|state| {
+                        state.inputs.iter().any(|(path, fingerprint)| {
+                            path.ends_with(relative_input_path) && fingerprint.hash == expected_hash
+                        })
+                    })
+            },
+        )
+        .await;
+    }
+
     pub(super) fn session_package_paths(&self) -> BTreeSet<PathBuf> {
         self.session
             .current_package_paths()
