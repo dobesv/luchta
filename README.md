@@ -706,9 +706,11 @@ An unparseable value for either tuning variable is a startup error naming the
 variable and what it accepts, not a silent fallback to the default — the point
 is to fail loudly if you think you tuned something and didn't.
 
-Behavior: there is no timeout or auto-abort while paused; use Ctrl-C to abort,
-or run with `--no-mem-pressure` if an unrelated process is holding the machine
-under pressure.
+Behavior: luchta re-checks pressure four times a second and resumes dispatch
+on its own as soon as the OS reports memory is available again. There is no
+timeout that force-resumes while pressure persists, so if it never clears the
+build waits indefinitely; use Ctrl-C to abort, or run with `--no-mem-pressure`
+if an unrelated process is holding the machine under pressure.
 
 If the indicator cannot be read — a Linux kernel built without `CONFIG_PSI`, or
 one needing the `psi=1` boot parameter — luchta dispatches normally and says
