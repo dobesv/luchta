@@ -52,7 +52,7 @@ cat src.txt > out.txt
     write_executable(
         temp.child("luchta-config.sh").path(),
         &format!(
-            "#!/bin/sh\necho '{{\"concurrency\":{{\"maxWeight\":4}},\"workers\":{{\"yarn\":{{\"command\":\"{}\"}}}},\"tasks\":{{\"build\":{{\"cache\":{{}},\"worker\":\"yarn\",\"inputs\":[\"src.txt\"],\"outputs\":[\"counter.txt\",\"out.txt\"]}}}}}}'\n",
+            "#!/bin/sh\necho '{{\"concurrency\":{{\"maxWeight\":4}},\"workers\":{{\"yarn\":{{\"command\":\"{} --no-direct\"}}}},\"tasks\":{{\"build\":{{\"cache\":{{}},\"worker\":\"yarn\",\"inputs\":[\"src.txt\"],\"outputs\":[\"counter.txt\",\"out.txt\"]}}}}}}'\n",
             yarn_worker_bin().display()
         ),
     );
