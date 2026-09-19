@@ -15,7 +15,6 @@ pub struct Generation {
     command: Vec<String>,
     delegate: RawDelegate,
     in_flight: HashMap<String, InFlightKind>,
-    draining: bool,
 }
 
 impl Generation {
@@ -34,7 +33,6 @@ impl Generation {
                 command,
                 delegate,
                 in_flight: HashMap::new(),
-                draining: false,
             },
             stdout,
         ))
@@ -60,24 +58,12 @@ impl Generation {
         Ok(())
     }
 
-    pub fn on_response(&mut self, resp: &WorkerResponse) -> bool {
+    /// Records a response against this generation's in-flight set, dropping the id
+    /// once its terminal (`done`/`resolved`) arrives.
+    pub fn on_response(&mut self, resp: &WorkerResponse) {
         if is_terminal(resp) {
             self.in_flight.remove(resp.id());
         }
-        self.is_drained()
-    }
-
-    pub async fn mark_draining(&mut self) {
-        self.draining = true;
-        self.delegate.close_stdin().await;
-    }
-
-    pub fn is_drained(&self) -> bool {
-        self.draining && self.in_flight.is_empty()
-    }
-
-    pub fn is_draining(&self) -> bool {
-        self.draining
     }
 
     pub fn in_flight_len(&self) -> usize {
@@ -89,6 +75,12 @@ impl Generation {
             .iter()
             .map(|(id, kind)| (id.clone(), *kind))
             .collect()
+    }
+
+    /// Closes the delegate's stdin without terminating it. Used by tests to
+    /// exercise the send-failure path.
+    pub async fn close_stdin(&self) {
+        self.delegate.close_stdin().await;
     }
 
     pub async fn shutdown(self) -> Result<(), ProxyError> {
@@ -119,9 +111,7 @@ fn test_stderr_writer() -> SharedWriter {
 mod tests {
     use std::time::Duration;
 
-    use luchta_worker::{
-        LogStream, ResolveMode, ResolveResult, ResolveTask, TaskProgress, WorkerRequest,
-    };
+    use luchta_worker::{LogStream, ResolveMode, ResolveTask, TaskProgress, WorkerRequest};
 
     use super::*;
 
@@ -155,7 +145,7 @@ mod tests {
         generation.send(&run_message("a")).expect("send succeeds");
 
         assert_eq!(generation.in_flight_len(), 1);
-        assert!(!generation.on_response(&WorkerResponse::done("a", 0)));
+        generation.on_response(&WorkerResponse::done("a", 0));
         assert_eq!(generation.in_flight_len(), 0);
 
         generation.shutdown().await.expect("shutdown succeeds");
@@ -166,7 +156,7 @@ mod tests {
         let mut generation = cat_generation(2).await;
         generation.send(&run_message("a")).expect("send succeeds");
 
-        assert!(!generation.on_response(&WorkerResponse::log("a", LogStream::Stdout, "line")));
+        generation.on_response(&WorkerResponse::log("a", LogStream::Stdout, "line"));
         assert_eq!(generation.in_flight_len(), 1);
 
         generation.shutdown().await.expect("shutdown succeeds");
@@ -177,55 +167,17 @@ mod tests {
         let mut generation = cat_generation(20).await;
         generation.send(&run_message("a")).expect("send succeeds");
 
-        assert!(!generation.on_response(&WorkerResponse::progress(
+        generation.on_response(&WorkerResponse::progress(
             "a",
             TaskProgress {
                 completed: 1,
                 pending: 2,
                 ..TaskProgress::default()
-            }
-        )));
+            },
+        ));
         assert_eq!(generation.in_flight_len(), 1);
 
         generation.shutdown().await.expect("shutdown succeeds");
-    }
-
-    #[tokio::test]
-    async fn mark_draining_then_terminal_response_marks_generation_drained() {
-        let mut generation = cat_generation(3).await;
-        generation.send(&run_message("a")).expect("send succeeds");
-
-        generation.mark_draining().await;
-
-        assert!(generation.on_response(&WorkerResponse::done("a", 0)));
-        assert!(generation.is_drained());
-
-        generation.shutdown().await.expect("shutdown succeeds");
-    }
-
-    #[tokio::test]
-    async fn is_drained_tracks_draining_and_in_flight_state() {
-        let mut empty_generation = cat_generation(4).await;
-        assert!(!empty_generation.is_drained());
-        empty_generation.mark_draining().await;
-        assert!(empty_generation.is_drained());
-        empty_generation
-            .shutdown()
-            .await
-            .expect("shutdown succeeds");
-
-        let mut busy_generation = cat_generation(5).await;
-        busy_generation
-            .send(&resolve_message("a"))
-            .expect("send succeeds");
-        assert!(!busy_generation.is_drained());
-        busy_generation.mark_draining().await;
-        assert!(!busy_generation.is_drained());
-        assert!(
-            busy_generation.on_response(&WorkerResponse::resolved("a", ResolveResult::accept()))
-        );
-        assert!(busy_generation.is_drained());
-        busy_generation.shutdown().await.expect("shutdown succeeds");
     }
 
     #[tokio::test]

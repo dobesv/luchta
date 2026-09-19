@@ -1,17 +1,29 @@
 //! `luchta-worker-watcher` is a binary middleware for the luchta JSONL-over-stdin/stdout
-//! worker protocol. It wraps a delegate worker command, watches file globs, and gracefully
-//! hot-swaps the delegate when matching changes occur.
+//! worker protocol. It wraps a delegate worker command, watches file globs, and restarts
+//! the delegate when matching changes occur.
 //!
-//! # Hot-swap and Drain Model
+//! # Single-worker restart model
 //!
-//! Upon detecting a file change, the watcher:
-//! 1. Spawns a **new generation** of the delegate worker.
-//! 2. Routes all **new inbound work** to this current generation.
-//! 3. Allows **prior generations** to drain their in-flight operations.
-//! 4. Shuts down old generations once idle (via a ladder: stdin EOF → wait → SIGTERM → wait → SIGKILL).
+//! There is only ever **one worker process at a time**. Upon detecting a watched file change,
+//! the watcher:
+//! 1. If the current worker is **idle**, terminates it at once and starts the replacement.
+//! 2. If it is **busy**, lets it finish its in-flight tasks and exit while **queueing** any new
+//!    work. Once the old worker has drained and exited, the replacement starts and the queued
+//!    work is replayed to it.
 //!
-//! Multiple draining generations can coexist independently; no generation is forced to terminate
-//! while it is still processing work.
+//! In-flight tasks are never abandoned: the engine treats a `done` with a non-zero exit code as
+//! a real task failure (no retry), so failing a task on restart would spuriously break the
+//! build. Two worker versions are deliberately never run at once — it is low value (a restart
+//! only happens when the worker source is edited or rebuilt) and a correctness hazard. An
+//! earlier model let multiple draining generations coexist; it leaked one idle generation per
+//! restart, because an idle generation was reaped only on a response or stdout close that never
+//! arrived.
+//!
+//! Two safety valves bound pathological cases: restarts are rate-limited (after a burst within a
+//! short window each further restart backs off briefly, so a crash loop or noisy watch cannot
+//! spawn workers without bound), and a drain that never completes (a wedged worker) is
+//! force-terminated after a timeout so queued work cannot block forever. Set
+//! `LUCHTA_WORKER_WATCHER_DEBUG` to log worker lifecycle transitions to stderr.
 //!
 //! # Usage
 //!
