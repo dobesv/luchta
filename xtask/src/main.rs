@@ -65,9 +65,16 @@ fn try_build_worker(args: BuildWorkerArgs) -> Result<(), String> {
     Ok(())
 }
 
+/// Vendored patches applied to `vendor/typescript`, in required order:
+/// `upstream-pnp.patch` first (PR #63919, mechanically regenerated — never
+/// hand-edited), then `luchta.patch` (our own additive packages and small
+/// upstream tweaks) on top of it. `luchta.patch`'s hunks are anchored to blobs
+/// that the upstream patch produces, so it cannot apply first.
+const PATCHES_IN_ORDER: &[&str] = &["patches/upstream-pnp.patch", "patches/luchta.patch"];
+
 fn build_worker_to(repo_root: &Path, target: &str, out_dir: &Path) -> Result<PathBuf, String> {
-    let vendor_dir = repo_root.join("vendor/tsgo");
-    ensure_tsgo_submodule_initialized(&vendor_dir)?;
+    let vendor_dir = repo_root.join("vendor/typescript");
+    ensure_vendor_submodule_initialized(&vendor_dir)?;
 
     let go_target = go_target_for_rust_triple(target)?;
     let current_dir = std::env::current_dir()
@@ -80,18 +87,60 @@ fn build_worker_to(repo_root: &Path, target: &str, out_dir: &Path) -> Result<Pat
         )
     })?;
 
-    let patch_path = repo_root.join("patches/tsgo.patch");
+    let patches = patch_paths(repo_root);
     let output_path = out_dir.join(worker_binary_name(go_target.goos));
+    let go_module_dir = vendor_dir.join("tsc");
 
-    reset_tsgo_worktree(&vendor_dir)?;
-    apply_tsgo_patch(&vendor_dir, &patch_path)?;
+    reset_vendor_worktree(&vendor_dir)?;
+    apply_patches_and_build(
+        &vendor_dir,
+        &patches,
+        &go_module_dir,
+        &output_path,
+        go_target,
+    )?;
+    Ok(output_path)
+}
 
-    let build_result = go_build_worker(&vendor_dir, &output_path, go_target);
-    let reset_result = reset_tsgo_worktree(&vendor_dir);
+/// Applies every patch and then builds the Go worker, bracketing both steps
+/// in a single reset of `vendor_dir` afterward — success or failure.
+///
+/// Patch application and the build used to be reset separately (the build
+/// alone was wrapped), which meant a failure partway through
+/// `apply_patches` — e.g. `upstream-pnp.patch` applies but `luchta.patch`
+/// then fails — returned early and left the submodule holding the first
+/// patch's changes uncommitted. That dirty worktree then confused the next
+/// `build-worker` run (and anyone poking at `vendor/typescript` by hand).
+/// Putting apply and build in one fallible section with one unconditional
+/// reset after it, mirroring how the build alone used to be handled, closes
+/// that gap: whatever fails, the reset still runs and the submodule ends up
+/// clean.
+fn apply_patches_and_build(
+    vendor_dir: &Path,
+    patches: &[(&'static str, PathBuf)],
+    go_module_dir: &Path,
+    output_path: &Path,
+    go_target: GoTarget,
+) -> Result<(), String> {
+    let build_result = apply_patches(vendor_dir, patches)
+        .and_then(|()| go_build_worker(go_module_dir, output_path, go_target));
+    let reset_result = reset_vendor_worktree(vendor_dir);
 
     build_result?;
     reset_result?;
-    Ok(output_path)
+    Ok(())
+}
+
+/// Resolves `PATCHES_IN_ORDER` to full paths under `repo_root`, paired with
+/// their repo-relative display name for diagnostics. Kept separate from
+/// `apply_patches` so the ordering itself — load-bearing, since
+/// `luchta.patch` cannot apply before `upstream-pnp.patch` — is unit
+/// testable without shelling out to git.
+fn patch_paths(repo_root: &Path) -> Vec<(&'static str, PathBuf)> {
+    PATCHES_IN_ORDER
+        .iter()
+        .map(|&relative| (relative, repo_root.join(relative)))
+        .collect()
 }
 
 fn resolve_out_dir(cwd: &Path, out_dir: &Path) -> PathBuf {
@@ -112,11 +161,11 @@ fn repo_root() -> Result<PathBuf, String> {
     })
 }
 
-fn ensure_tsgo_submodule_initialized(vendor_dir: &Path) -> Result<(), String> {
+fn ensure_vendor_submodule_initialized(vendor_dir: &Path) -> Result<(), String> {
     if vendor_dir.join(".git").exists() {
         Ok(())
     } else {
-        Err("vendor/tsgo not initialized — run: git submodule update --init".to_string())
+        Err("vendor/typescript not initialized — run: git submodule update --init".to_string())
     }
 }
 
@@ -143,47 +192,75 @@ fn host_target_triple() -> Result<String, String> {
         .ok_or_else(|| "failed to find host triple in rustc -vV output".to_string())
 }
 
-fn apply_tsgo_patch(vendor_dir: &Path, patch_path: &Path) -> Result<(), String> {
+/// Builds a `git` command scoped to `vendor_dir` via `-C`, with the
+/// environment variables that can override `-C` stripped.
+///
+/// Git itself sets `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, and
+/// `GIT_COMMON_DIR` on child processes in ordinary situations (running from
+/// a hook, for instance) — this isn't only a deliberate-misuse concern. Any
+/// of them take precedence over `-C` and can point git at a different
+/// repository, worktree, or index than the one we just named.
+/// `reset_vendor_worktree` runs `checkout .` and `clean -fd`, so under the
+/// wrong worktree that silently deletes files that were never meant to be
+/// touched. Stripping these here makes `-C vendor_dir` authoritative for
+/// every git invocation in this file, without touching any other inherited
+/// environment variable.
+fn git_command(vendor_dir: &Path) -> Command {
+    let mut command = Command::new("git");
+    command
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_COMMON_DIR")
+        .arg("-C")
+        .arg(vendor_dir);
+    command
+}
+
+/// Applies every patch in `patches`, in order, to `vendor_dir`. Stops at the
+/// first one that fails and names it — that diagnostic is what makes patch
+/// staleness obvious, so it must say *which* patch broke, not just that
+/// something did.
+fn apply_patches(vendor_dir: &Path, patches: &[(&'static str, PathBuf)]) -> Result<(), String> {
+    for (relative, patch_path) in patches {
+        apply_one_patch(vendor_dir, patch_path, relative)?;
+    }
+    Ok(())
+}
+
+fn apply_one_patch(vendor_dir: &Path, patch_path: &Path, patch_label: &str) -> Result<(), String> {
     let check_status = run_command(
-        Command::new("git")
-            .arg("-C")
-            .arg(vendor_dir)
+        git_command(vendor_dir)
             .arg("apply")
             .arg("--check")
             .arg(patch_path),
-        "failed to run git apply --check",
+        &format!("failed to run git apply --check for {patch_label}"),
     )?;
 
     if !check_status.success() {
-        return Err("patches/tsgo.patch does not apply to vendor/tsgo — rebase needed".to_string());
+        return Err(format!(
+            "{patch_label} does not apply to vendor/typescript — rebase needed"
+        ));
     }
 
     let apply_status = run_command(
-        Command::new("git")
-            .arg("-C")
-            .arg(vendor_dir)
-            .arg("apply")
-            .arg(patch_path),
-        "failed to run git apply",
+        git_command(vendor_dir).arg("apply").arg(patch_path),
+        &format!("failed to run git apply for {patch_label}"),
     )?;
 
     if apply_status.success() {
         Ok(())
     } else {
         Err(format!(
-            "git apply exited with {}",
+            "git apply exited with {} while applying {patch_label}",
             exit_code_label(apply_status.code())
         ))
     }
 }
 
-fn reset_tsgo_worktree(vendor_dir: &Path) -> Result<(), String> {
+fn reset_vendor_worktree(vendor_dir: &Path) -> Result<(), String> {
     let checkout_status = run_command(
-        Command::new("git")
-            .arg("-C")
-            .arg(vendor_dir)
-            .arg("checkout")
-            .arg("."),
+        git_command(vendor_dir).arg("checkout").arg("."),
         "failed to run git checkout .",
     )?;
 
@@ -195,11 +272,7 @@ fn reset_tsgo_worktree(vendor_dir: &Path) -> Result<(), String> {
     }
 
     let clean_status = run_command(
-        Command::new("git")
-            .arg("-C")
-            .arg(vendor_dir)
-            .arg("clean")
-            .arg("-fd"),
+        git_command(vendor_dir).arg("clean").arg("-fd"),
         "failed to run git clean -fd",
     )?;
 
@@ -215,12 +288,12 @@ fn reset_tsgo_worktree(vendor_dir: &Path) -> Result<(), String> {
 
 #[allow(clippy::suspicious_command_arg_space)]
 fn go_build_worker(
-    vendor_dir: &Path,
+    go_module_dir: &Path,
     output_path: &Path,
     go_target: GoTarget,
 ) -> Result<(), String> {
     let status = Command::new("go")
-        .current_dir(vendor_dir)
+        .current_dir(go_module_dir)
         .env("CGO_ENABLED", "0")
         .env("GOOS", go_target.goos)
         .env("GOARCH", go_target.goarch)
@@ -990,12 +1063,180 @@ mod tests {
     }
 
     #[test]
+    fn patches_apply_upstream_pnp_before_luchta() {
+        // Load-bearing order: luchta.patch's hunks are anchored to blobs that
+        // upstream-pnp.patch produces, so it cannot apply first.
+        let patches = patch_paths(Path::new("/repo"));
+        let relative_names: Vec<_> = patches.iter().map(|(name, _)| *name).collect();
+        assert_eq!(
+            relative_names,
+            vec!["patches/upstream-pnp.patch", "patches/luchta.patch"]
+        );
+    }
+
+    #[test]
+    fn patch_paths_resolves_against_repo_root() {
+        let patches = patch_paths(Path::new("/repo"));
+        let full_paths: Vec<_> = patches.iter().map(|(_, path)| path.clone()).collect();
+        assert_eq!(
+            full_paths,
+            vec![
+                PathBuf::from("/repo/patches/upstream-pnp.patch"),
+                PathBuf::from("/repo/patches/luchta.patch"),
+            ]
+        );
+    }
+
+    #[test]
     fn unsupported_target_lists_supported_triples() {
         let error = go_target_for_rust_triple("foo-bar").expect_err("target rejected");
         assert!(error.contains("unsupported target `foo-bar`"));
         for target in supported_target_triples() {
             assert!(error.contains(target), "missing {target} in {error}");
         }
+    }
+
+    #[test]
+    fn git_command_strips_repo_location_env_vars() {
+        // GIT_DIR, GIT_WORK_TREE, GIT_INDEX_FILE, and GIT_COMMON_DIR all
+        // override -C when set, and git sets some of these itself on child
+        // processes (e.g. from a hook). get_envs() reports env_remove'd keys
+        // as present with value None, which is how we assert they're
+        // explicitly stripped rather than merely never set.
+        let command = git_command(Path::new("/repo/vendor/typescript"));
+        let envs: HashMap<_, _> = command.get_envs().collect();
+        for var in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_COMMON_DIR",
+        ] {
+            assert_eq!(
+                envs.get(OsStr::new(var)),
+                Some(&None),
+                "{var} should be explicitly removed from the git command's environment"
+            );
+        }
+    }
+
+    /// Runs `git` with `args` in `dir`, panicking with stderr on failure.
+    /// Test-only plumbing for the fixture below, not a path production code
+    /// takes.
+    fn git(dir: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .expect("git spawns");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Builds a throwaway git repo with one committed file plus two
+    /// standalone patches against it. Both patches are diffed against the
+    /// same committed base (so each applies cleanly to a pristine checkout
+    /// on its own), but the second patch's context still assumes the
+    /// original line 2 — so once the first patch has already rewritten it
+    /// on disk, the second no longer applies. That mirrors the real failure
+    /// mode under test: a second patch, anchored to content the first patch
+    /// changes, fails mid-sequence and must not leave the worktree dirty.
+    fn two_patch_fixture(temp: &tempfile::TempDir) -> (PathBuf, PathBuf, PathBuf) {
+        let repo_dir = temp.path().join("repo");
+        std::fs::create_dir(&repo_dir).expect("create repo dir");
+        git(&repo_dir, &["init", "-q", "-b", "main"]);
+        git(&repo_dir, &["config", "user.email", "test@example.com"]);
+        git(&repo_dir, &["config", "user.name", "Test"]);
+
+        let file_path = repo_dir.join("foo.txt");
+        std::fs::write(&file_path, "line1\nline2\nline3\n").expect("write foo.txt");
+        git(&repo_dir, &["add", "foo.txt"]);
+        git(&repo_dir, &["commit", "-q", "-m", "init"]);
+
+        git(&repo_dir, &["checkout", "-q", "-b", "feature-1"]);
+        std::fs::write(&file_path, "line1\nPATCHED-A\nline3\n").expect("write feature-1");
+        git(&repo_dir, &["commit", "-q", "-am", "feature-1"]);
+        let patch1 = temp.path().join("patch1.patch");
+        let diff1 = Command::new("git")
+            .arg("-C")
+            .arg(&repo_dir)
+            .args(["diff", "main", "feature-1", "--", "foo.txt"])
+            .output()
+            .expect("git diff feature-1");
+        std::fs::write(&patch1, &diff1.stdout).expect("write patch1");
+
+        git(&repo_dir, &["checkout", "-q", "main"]);
+        git(&repo_dir, &["checkout", "-q", "-b", "feature-2"]);
+        std::fs::write(&file_path, "line1\nPATCHED-B\nline3\n").expect("write feature-2");
+        git(&repo_dir, &["commit", "-q", "-am", "feature-2"]);
+        let patch2 = temp.path().join("patch2.patch");
+        let diff2 = Command::new("git")
+            .arg("-C")
+            .arg(&repo_dir)
+            .args(["diff", "main", "feature-2", "--", "foo.txt"])
+            .output()
+            .expect("git diff feature-2");
+        std::fs::write(&patch2, &diff2.stdout).expect("write patch2");
+
+        git(&repo_dir, &["checkout", "-q", "main"]);
+
+        (repo_dir, patch1, patch2)
+    }
+
+    #[test]
+    fn apply_patches_and_build_resets_worktree_after_second_patch_fails() {
+        // Regression test for a real failure: apply_patches used to return
+        // early on the second patch's error, and reset_vendor_worktree only
+        // ran around the build step, so the first patch's change was left
+        // uncommitted in the submodule. apply_patches_and_build now brackets
+        // both apply_patches and the build in one fallible section with a
+        // single unconditional reset after it.
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let (repo_dir, patch1, patch2) = two_patch_fixture(&temp);
+        let patches: Vec<(&'static str, PathBuf)> =
+            vec![("patch1.patch", patch1), ("patch2.patch", patch2)];
+
+        // go_module_dir/output_path/go_target are never touched: the second
+        // patch fails inside apply_patches before go_build_worker would run,
+        // which is what lets this test exercise the reset without needing
+        // `go` installed.
+        let result = apply_patches_and_build(
+            &repo_dir,
+            &patches,
+            Path::new("unused-go-module-dir"),
+            Path::new("unused-output-path"),
+            GoTarget {
+                goos: "linux",
+                goarch: "amd64",
+            },
+        );
+
+        let error = result.expect_err("second patch's stale context must fail to apply");
+        assert!(
+            error.contains("patch2.patch"),
+            "error should name the failing patch: {error}"
+        );
+
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&repo_dir)
+            .args(["status", "--porcelain"])
+            .output()
+            .expect("git status");
+        assert!(
+            status.stdout.is_empty(),
+            "vendor worktree must be clean after a failed second patch, got: {}",
+            String::from_utf8_lossy(&status.stdout)
+        );
+
+        let contents = std::fs::read_to_string(repo_dir.join("foo.txt")).expect("read foo.txt");
+        assert_eq!(
+            contents, "line1\nline2\nline3\n",
+            "first patch's change must be reverted by the reset, not left dangling"
+        );
     }
 
     #[test]
