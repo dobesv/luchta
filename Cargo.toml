@@ -101,13 +101,14 @@ mimalloc = "0.1.43"
 # published oxc_formatter version on crates.io is yanked. "Just use the
 # released crates" is not an available option for this workspace.
 #
-# `crates/luchta-oxlint-worker/Cargo.toml` also carries its own `oxc_syntax`
-# git pin at this same rev, outside this table — check it too when bumping.
+# Keep every oxc git dependency, including `[patch.crates-io]`, at one rev.
+# `xtask::tests::oxc_git_dependencies_share_one_revision` guards this.
 oxc_allocator = { git = "https://github.com/oxc-project/oxc.git", rev = "7bf68f70c20f5329251f19be95076f6eab4fe396" }
 oxc_parser = { git = "https://github.com/oxc-project/oxc.git", rev = "7bf68f70c20f5329251f19be95076f6eab4fe396" }
 oxc_semantic = { git = "https://github.com/oxc-project/oxc.git", rev = "7bf68f70c20f5329251f19be95076f6eab4fe396" }
 oxc_linter = { git = "https://github.com/oxc-project/oxc.git", rev = "7bf68f70c20f5329251f19be95076f6eab4fe396" }
 oxc_span = { git = "https://github.com/oxc-project/oxc.git", rev = "7bf68f70c20f5329251f19be95076f6eab4fe396" }
+oxc_syntax = { git = "https://github.com/oxc-project/oxc.git", rev = "7bf68f70c20f5329251f19be95076f6eab4fe396" }
 oxc_diagnostics = { git = "https://github.com/oxc-project/oxc.git", rev = "7bf68f70c20f5329251f19be95076f6eab4fe396" }
 oxc_transformer = { git = "https://github.com/oxc-project/oxc.git", rev = "7bf68f70c20f5329251f19be95076f6eab4fe396" }
 oxc_codegen = { git = "https://github.com/oxc-project/oxc.git", rev = "7bf68f70c20f5329251f19be95076f6eab4fe396" }
