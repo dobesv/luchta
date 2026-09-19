@@ -7,11 +7,13 @@ use clap::{Parser, Subcommand};
 /// JSONL and color output are explicit future work and intentionally absent
 /// here.
 ///
-/// Two places decide what a mode prints, and neither matches on the whole enum,
+/// Three places decide what a mode prints, and none matches on the whole enum,
 /// so a new variant silently inherits a default from each. `live_status_enabled`
 /// admits only [`OutputMode::Default`], so a new variant is append-only.
 /// `should_render` in `run::pause` excludes only [`OutputMode::Summary`], so a
-/// new variant does emit periodic status lines. Revisit both when adding one.
+/// new variant does emit periodic status lines. Pause and resume notices via
+/// `PressureEnv::notify_paused`/`notify_resumed` print to stderr in all modes,
+/// bypassing both gates. Revisit all three when adding a new variant.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum OutputMode {
     /// Live in-place progress on a capable interactive terminal (`TERM` is not
@@ -27,7 +29,9 @@ pub enum OutputMode {
     /// line that never emits a newline is buffered instead of shown. See GitHub
     /// issue #335.
     Plain,
-    /// Only the final summary line; no periodic progress.
+    /// Only the final summary line; no periodic progress. Memory-pressure
+    /// pause and resume notices still print to stderr so a gated run does not
+    /// look hung.
     Summary,
 }
 
