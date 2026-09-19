@@ -58,9 +58,11 @@ pub fn format_path(
                 template_placeholders,
             ) {
                 Ok(embedded) => Ok(DispatchResponse::Formatted(embedded.into())),
-                // A child that will not parse is preserved, not an error: the
-                // `Err` the old code returned here was swallowed by the embed
-                // site, which left the template verbatim all the same.
+                // `format_to_ir` currently errors only when child CSS will not parse or a
+                // fragment contains front matter; both are deliberate preserve-as-is cases.
+                // `DispatchResponse` reserves `Result::Err` for operational/transport failures
+                // and says not to conflate them. Revisit this blanket match if `format_to_ir`
+                // gains such an error.
                 Err(_) => Ok(DispatchResponse::PreserveOriginal),
             }
         },
