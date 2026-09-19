@@ -125,6 +125,7 @@ url = "2.5.8"
 
 # swc pinned exact — SWC breaks public API on minor bumps. See plan note a394e139 (probe).
 swc_core = { version = "=80.0.0", features = ["base_module", "common", "ecma_ast", "ecma_parser", "ecma_helpers_inline"] }
+styled_components = "=18.0.0"
 
 # Match oxlint's own release settings (fat LTO, one codegen unit) so the
 # bundled oxc crates run at full speed; without this the workers lint

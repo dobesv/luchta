@@ -3000,6 +3000,7 @@ dependencies = [
  "luchta-worker",
  "mimalloc",
  "serde_json",
+ "styled_components",
  "swc_core",
  "tempfile",
  "tokio",
@@ -5203,6 +5204,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "styled_components"
+version = "18.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a6d00262a9640bc35e24ebb5013b40b95016daff538999216701c45f9f191be7"
+dependencies = [
+ "Inflector",
+ "once_cell",
+ "regex",
+ "rustc-hash",
+ "serde",
+ "swc_atoms",
+ "swc_common",
+ "swc_ecma_ast",
+ "swc_ecma_utils",
+ "swc_ecma_visit",
+ "tracing",
+]
+
+[[package]]
 name = "supports-color"
 version = "2.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5400,6 +5420,7 @@ dependencies = [
  "swc_allocator",
  "swc_atoms",
  "swc_common",
+ "swc_config",
  "swc_ecma_ast",
  "swc_ecma_parser",
  "swc_ecma_transforms_base",
