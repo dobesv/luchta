@@ -11,13 +11,14 @@ description.workspace = true
 
 [features]
 default = ["swc"]
-swc = ["dep:swc_core"]
+swc = ["dep:styled_components", "dep:swc_core"]
 
 [dependencies]
 luchta-worker = { path = "../luchta-worker" }
 serde_json = { workspace = true }
 tokio = { workspace = true }
-swc_core = { workspace = true, optional = true, features = ["base_react_compiler"] }
+styled_components = { workspace = true, optional = true }
+swc_core = { workspace = true, optional = true, features = ["base_react_compiler", "swc_config"] }
 
 # mimalloc as the global allocator — see luchta-oxlint-worker/Cargo.toml for
 # the rationale and target gating notes.
