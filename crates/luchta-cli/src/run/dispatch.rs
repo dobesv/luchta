@@ -39,7 +39,10 @@ use luchta_workspace::PackageGraph;
 use std::sync::OnceLock;
 
 use super::output::hydrate_local_cache;
-use crate::watch::registry::{register_task_watch_state, register_task_watch_state_from_packages};
+use crate::watch::registry::{
+    register_task_watch_state, register_task_watch_state_from_packages,
+    register_task_watch_state_with_inputs,
+};
 
 /// Shared empty env map used as a stable fallback when a task has no entry in
 /// `task_envs`. Mirrors the original `unwrap_or(&empty)` semantics (hash an
@@ -839,15 +842,17 @@ fn build_run_record(
     };
 
     if !args.succeeded {
-        // Failed run: record with post-run inputs and register watch state so
-        // subsequent edits to declared inputs still trigger watch rebuilds.
+        // Keep post-run inputs in the failed record for diagnostics, but use the
+        // pre-execution snapshot as the watch baseline. An edit made while the
+        // failed task finishes must remain visible to the next watch event.
         let record = assemble_run_record(cache_ctx, &args, &patterns, post_inputs);
-        register_task_watch_state(
+        register_task_watch_state_with_inputs(
             &cache_ctx.task_watch_registry,
             &cache_ctx.task_id,
             cache_ctx.source_pkg.clone(),
             cache_ctx.package_path.clone(),
             &record,
+            cache_ctx.pre_snapshot(),
         )
         .expect("failed to register task watch state");
         return BuildRecordResult::Ok(record);
@@ -2073,6 +2078,77 @@ mod tests {
 
         assert_eq!(record.schema_version, SCHEMA_VERSION_V5);
         assert_eq!(record.run_reason, Some(run_reason));
+    }
+
+    #[test]
+    fn build_failed_run_record_registers_pre_execution_watch_baseline() {
+        let task_id = TaskId::new("pkg", "build");
+        let mut cache_ctx = sample_cache_write_context(task_id.clone());
+        cache_ctx.task_def.inputs = vec!["src.txt".to_string()];
+        cache_ctx.repo_root = cache_ctx.package_path.clone();
+        init_git_repo(&cache_ctx.repo_root);
+        let input_path = cache_ctx.package_path.join("src.txt");
+
+        std::fs::write(&input_path, "fail\n").expect("write failing input");
+        let pre_snapshot = resolve_pre_execution_inputs(PreExecutionSnapshotRequest {
+            input_patterns: &cache_ctx.task_def.inputs,
+            source_pkg: &cache_ctx.source_pkg,
+            package_graph: &cache_ctx.package_graph,
+            repo_root: &cache_ctx.repo_root,
+            task_id: &cache_ctx.task_id,
+            inputs_from_worker: cache_ctx.inputs_from_worker,
+            output: &cache_ctx.output,
+        });
+        assert_eq!(pre_snapshot.len(), 1, "pre-snapshot should contain input");
+        assert_eq!(
+            pre_snapshot[0].path, "src.txt",
+            "pre-snapshot paths must be package-relative for watch registration"
+        );
+        let failing_hash = pre_snapshot[0].hash;
+        cache_ctx.pre_snapshot = Some(pre_snapshot);
+
+        std::fs::write(&input_path, "pass\n").expect("fix input while failed task finishes");
+        let record = match build_run_record(
+            &cache_ctx,
+            BuildRunRecordArgs {
+                outcome: None,
+                succeeded: false,
+                end_unix_ms: 20,
+                run_reason: Some(RunReason::NoPriorRecord),
+            },
+        ) {
+            BuildRecordResult::Ok(record) => record,
+            BuildRecordResult::ExpansionError(msg) => panic!("unexpected expansion error: {msg}"),
+            BuildRecordResult::StabilityMismatch(msg) => {
+                panic!("failed runs should not perform stability checks: {msg}")
+            }
+        };
+
+        assert_ne!(
+            record.inputs[0].hash, failing_hash,
+            "failed run record should retain post-execution inputs"
+        );
+        {
+            let registry = cache_ctx
+                .task_watch_registry
+                .lock()
+                .expect("lock watch registry");
+            let state = registry.get(&task_id).expect("registered task watch state");
+            assert_eq!(
+                state.inputs.get(&input_path).map(|input| input.hash),
+                Some(failing_hash),
+                "failed task watch baseline must retain pre-execution fingerprint"
+            );
+        }
+
+        let dirty = crate::watch::registry::dirty_packages_for_changes(
+            &cache_ctx.task_watch_registry,
+            &std::collections::HashSet::from([input_path]),
+        );
+        assert!(
+            dirty.contains(&cache_ctx.source_pkg),
+            "post-snapshot input edit must dirty failed task package"
+        );
     }
 
     #[test]

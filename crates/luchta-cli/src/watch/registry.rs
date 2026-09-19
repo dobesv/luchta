@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use globset::GlobSet;
-use luchta_cache::{blake3_file, TaskRunRecord};
+use luchta_cache::{blake3_file, FileEntry, TaskRunRecord};
 use luchta_types::{PackageName, TaskId};
 use luchta_workspace::PackageNode;
 use miette::Result;
@@ -85,10 +85,30 @@ pub(crate) fn register_task_watch_state(
     package_dir: PathBuf,
     record: &TaskRunRecord,
 ) -> Result<()> {
+    register_task_watch_state_with_inputs(
+        registry,
+        task_id,
+        package,
+        package_dir,
+        record,
+        &record.inputs,
+    )
+}
+
+/// Register watch state using explicit input fingerprints while retaining the
+/// record's input/output patterns. Failed tasks use their pre-execution inputs
+/// so an edit made while failure handling finishes remains dirty.
+pub(crate) fn register_task_watch_state_with_inputs(
+    registry: &TaskWatchRegistry,
+    task_id: &TaskId,
+    package: PackageName,
+    package_dir: PathBuf,
+    record: &TaskRunRecord,
+    input_entries: &[FileEntry],
+) -> Result<()> {
     let input_globset = build_globset(&record.input_patterns)?;
     let output_globset = build_globset(&record.output_patterns)?;
-    let inputs = record
-        .inputs
+    let inputs = input_entries
         .iter()
         .filter(|entry| !entry.absent)
         .map(|entry| {

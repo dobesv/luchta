@@ -34,6 +34,11 @@ pub struct TaskRunRecord {
     pub schema_version: u32,
     pub task_spec_hash: [u8; 32],
     pub input_patterns: Vec<String>,
+    /// Resolved input fingerprints. For a successful run these are the verified
+    /// pre-execution snapshot (stable across the run). For a FAILED run they are
+    /// the post-execution inputs, kept for diagnostics only — the watch baseline
+    /// is registered separately from the pre-execution snapshot so an edit made
+    /// while the task was failing is not swallowed (see run/dispatch.rs).
     pub inputs: Vec<FileEntry>,
     pub output_patterns: Vec<String>,
     pub outputs: Vec<FileEntry>,

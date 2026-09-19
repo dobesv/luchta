@@ -529,13 +529,7 @@ async fn config_reload_preserves_explicit_max_weight_override() {
 async fn failed_upstream_fix_reruns_dependent_task() {
     let harness = E2eHarness::start_two_package_dependency_watch().await;
 
-    harness
-        .wait_until(
-            Duration::from_secs(10),
-            || "timed out waiting for failed api build".to_string(),
-            || read_marker_count_for(&harness.workspace_root, "api") == 1,
-        )
-        .await;
+    harness.wait_for_api_input_watch_registration().await;
     assert_eq!(
         read_marker_count_for(&harness.workspace_root, "app"),
         0,
