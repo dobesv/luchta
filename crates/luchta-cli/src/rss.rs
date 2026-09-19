@@ -37,22 +37,58 @@ fn format_with_unit(bytes: u64, unit_size: u64, unit_label: &str) -> String {
 }
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// TTL cache over [`process_tree_rss_bytes`].
 ///
-/// Tree RSS is display-only: it feeds the `🐏` status-line and summary segment
-/// and no longer gates dispatch. The cache exists because the live status line
-/// renders every 100ms while walking the process tree costs a pass over every
-/// process on the machine.
+/// Tree RSS is display-only — it feeds the `🐏` status-line and summary segment —
+/// and does not gate dispatch. Memory-pressure backpressure is OS-driven
+/// (`memory_pressure/` module), so stale or missing RSS never affects correctness.
+///
+/// [`get`](Self::get) is non-blocking under a Tokio runtime: it returns the latest
+/// cached sample immediately and offloads refresh to `spawn_blocking`. Cold one-shot
+/// callers that must print a value (terminal summary, interrupt message) should use
+/// [`sample_now`](Self::sample_now) to avoid "unavailable" when the periodic renderer
+/// never ran (e.g. `--output summary` mode).
+///
+/// The cache exists because the live status line renders every ~100ms while walking
+/// the process tree costs a pass over every process on the machine.
 ///
 /// `Debug` is required: `ProgressReporter`, which owns one, derives it.
 #[derive(Debug)]
 pub struct RssCache {
-    last: Mutex<Option<(Instant, Option<u64>)>>,
+    inner: Arc<RssCacheInner>,
     ttl: Duration,
+}
+
+#[derive(Debug)]
+struct RssCacheInner {
+    state: Mutex<RssCacheState>,
     walks: AtomicU64,
+}
+
+#[derive(Debug)]
+struct RssCacheState {
+    last: Option<(Instant, Option<u64>)>,
+    refresh_in_flight: bool,
+}
+
+/// Clears `refresh_in_flight` when a background walk's scope exits, so a panic
+/// in the walk can't wedge the flag `true` and freeze all later refreshes.
+struct RefreshGuard<'a> {
+    inner: &'a RssCacheInner,
+}
+
+impl Drop for RefreshGuard<'_> {
+    fn drop(&mut self) {
+        // Don't `.expect()` here: a panic while unwinding aborts the process.
+        // A poisoned lock only means some other holder panicked; clearing the
+        // flag when we can is best-effort and never worth aborting over.
+        if let Ok(mut state) = self.inner.state.lock() {
+            state.refresh_in_flight = false;
+        }
+    }
 }
 
 impl RssCache {
@@ -64,33 +100,80 @@ impl RssCache {
 
     pub fn with_ttl(ttl: Duration) -> Self {
         Self {
-            last: Mutex::new(None),
+            inner: Arc::new(RssCacheInner {
+                state: Mutex::new(RssCacheState {
+                    last: None,
+                    refresh_in_flight: false,
+                }),
+                walks: AtomicU64::new(0),
+            }),
             ttl,
-            walks: AtomicU64::new(0),
         }
     }
 
-    /// Summed RSS of this process and its descendants, recomputed at most once
-    /// per TTL. `None` when the platform cannot report it.
+    /// Returns the latest summed RSS sample without blocking a Tokio runtime.
+    ///
+    /// A missing or stale sample starts one coalesced background refresh. With
+    /// no runtime, the refresh runs synchronously to preserve non-async caller
+    /// behavior. `None` means no sample is ready or the platform cannot report
+    /// process RSS.
     pub fn get(&self) -> Option<u64> {
-        let mut last = self.last.lock().expect("rss cache mutex poisoned");
+        let mut state = self.inner.state.lock().expect("rss cache mutex poisoned");
         let now = Instant::now();
+        let latest = state.last.and_then(|(_, value)| value);
 
-        if let Some((sampled_at, value)) = *last {
-            if now.duration_since(sampled_at) < self.ttl {
-                return value;
-            }
+        if state
+            .last
+            .is_some_and(|(sampled_at, _)| now.duration_since(sampled_at) < self.ttl)
+        {
+            return latest;
         }
 
-        self.walks.fetch_add(1, Ordering::Relaxed);
+        if tokio::runtime::Handle::try_current().is_err() {
+            self.inner.walks.fetch_add(1, Ordering::Relaxed);
+            let value = process_tree_rss_bytes();
+            state.last = Some((Instant::now(), value));
+            return value;
+        }
+
+        if state.refresh_in_flight {
+            return latest;
+        }
+        state.refresh_in_flight = true;
+        drop(state);
+
+        let inner = Arc::clone(&self.inner);
+        drop(tokio::task::spawn_blocking(move || {
+            // Clear the coalescing flag on scope exit, including a panic in the
+            // walk, so a failed refresh can never wedge the flag `true` and
+            // freeze all future background samples.
+            let _guard = RefreshGuard { inner: &inner };
+            inner.walks.fetch_add(1, Ordering::Relaxed);
+            let value = process_tree_rss_bytes();
+            let mut state = inner.state.lock().expect("rss cache mutex poisoned");
+            state.last = Some((Instant::now(), value));
+        }));
+
+        latest
+    }
+
+    /// Walks the process tree synchronously and stores a fresh RSS sample.
+    ///
+    /// Use this for terminal one-shot reports where blocking is acceptable
+    /// and a stale/missing value would regress the output (e.g. interrupt
+    /// message, run summary) — especially when `--output summary` mode never
+    /// warmed the cache via the periodic renderer.
+    pub fn sample_now(&self) -> Option<u64> {
+        self.inner.walks.fetch_add(1, Ordering::Relaxed);
         let value = process_tree_rss_bytes();
-        *last = Some((now, value));
+        let mut state = self.inner.state.lock().expect("rss cache mutex poisoned");
+        state.last = Some((Instant::now(), value));
         value
     }
 
     #[cfg(test)]
     fn walk_count(&self) -> u64 {
-        self.walks.load(Ordering::Relaxed)
+        self.inner.walks.load(Ordering::Relaxed)
     }
 }
 
@@ -436,5 +519,48 @@ mod tests {
         let _ = cache.get();
 
         assert_eq!(cache.walk_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn rss_cache_refreshes_in_background_and_coalesces_gets() {
+        use super::RssCache;
+        use std::time::Duration;
+
+        // A long TTL keeps the populated sample fresh for the rest of the test,
+        // so the coalescing assertion below can't be defeated by the sample
+        // going stale mid-test and triggering a second walk on slow CI.
+        let cache = RssCache::with_ttl(Duration::from_secs(60));
+
+        // A cold runtime-backed read cannot have a value until its background
+        // walk finishes, so returning None proves the walk did not run inline.
+        assert_eq!(cache.get(), None);
+        for _ in 0..100 {
+            let _ = cache.get();
+        }
+
+        let populated = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(value) = cache.get() {
+                    break value;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("background RSS refresh timed out");
+
+        assert!(populated > 0);
+        assert_eq!(cache.walk_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn rss_cache_sample_now_returns_fresh_value() {
+        use super::RssCache;
+
+        let cache = RssCache::new();
+        let sampled = cache.sample_now();
+
+        assert!(sampled.is_some_and(|bytes| bytes > 0));
+        assert_eq!(cache.walk_count(), 1);
     }
 }
