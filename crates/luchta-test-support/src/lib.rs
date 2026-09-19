@@ -34,4 +34,37 @@ mod tests {
             "the nextest wrapper leaked a non-allowlisted variable"
         );
     }
+
+    /// The wrapper must keep rustup's toolchain selection: tests that build
+    /// other crates with cargo otherwise let a dependency's own
+    /// `rust-toolchain.toml` pick the compiler.
+    #[cfg(unix)]
+    #[test]
+    fn hermetic_wrapper_keeps_rustup_toolchain_and_strips_the_rest() {
+        let wrapper = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../scripts/nextest-hermetic.sh");
+        let output = std::process::Command::new("sh")
+            .arg(&wrapper)
+            .arg("env")
+            .env("RUSTUP_TOOLCHAIN", "probe-toolchain")
+            .env("RUSTUP_HOME", "/probe/rustup")
+            .env("LUCHTA_HERMETIC_LEAK_PROBE", "leaked")
+            .output()
+            .expect("run the hermetic wrapper");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let env = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            env.lines().any(|l| l == "RUSTUP_TOOLCHAIN=probe-toolchain"),
+            "{env}"
+        );
+        assert!(
+            env.lines().any(|l| l == "RUSTUP_HOME=/probe/rustup"),
+            "{env}"
+        );
+        assert!(!env.contains("LUCHTA_HERMETIC_LEAK_PROBE"), "{env}");
+    }
 }

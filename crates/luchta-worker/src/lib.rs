@@ -21,7 +21,7 @@ pub use proxy::{
     DelegateHandle, ProxyError, RawDelegate, SharedWriter,
 };
 pub use runtime::{
-    run_worker, run_worker_main, shell_single_quote, InProcessOutcome, JobContext, Worker,
+    run_worker, run_worker_main, shell_single_quote, InProcessOutcome, JobContext, JobSpec, Worker,
     WorkerError,
 };
 pub use version::version_requested;
@@ -423,10 +423,15 @@ pub struct ResolveTask {
 }
 
 impl ResolveTask {
-    /// The script name this task resolves to: explicit non-blank `command`,
-    /// otherwise the task `name`.
+    /// The script name this task resolves to: the first token of a non-blank
+    /// `command` (extra tokens are arguments appended to the script),
+    /// otherwise the task `name`. The first token is taken by a plain
+    /// whitespace split, without dequoting, so a quoted script name is not
+    /// supported at resolve time; execution instead uses the quote-aware
+    /// `tokenize_command`, and the two agree for every unquoted script name.
     pub fn resolved_script_name(&self) -> &str {
-        luchta_types::resolve_script_name(Some(&self.command), &self.name)
+        let resolved = luchta_types::resolve_script_name(Some(&self.command), &self.name);
+        resolved.split_whitespace().next().unwrap_or(&self.name)
     }
 }
 
@@ -924,6 +929,33 @@ mod tests {
             ..with_command.clone()
         };
         assert_eq!(blank_command.resolved_script_name(), "build");
+    }
+
+    #[test]
+    fn resolved_script_name_takes_first_token_of_command_with_extra_args() {
+        let with_args = ResolveTask {
+            id: "id".to_owned(),
+            name: "build".to_owned(),
+            command: "args --flag 'two words'".to_owned(),
+            package: "p".to_owned(),
+            cwd: None,
+            scripts: Vec::new(),
+            inputs: Vec::new(),
+            mode: ResolveMode::Run,
+        };
+        assert_eq!(with_args.resolved_script_name(), "args");
+
+        let padded = ResolveTask {
+            command: "  serve ".to_owned(),
+            ..with_args.clone()
+        };
+        assert_eq!(padded.resolved_script_name(), "serve");
+
+        let blank = ResolveTask {
+            command: String::new(),
+            ..with_args
+        };
+        assert_eq!(blank.resolved_script_name(), "build");
     }
 
     #[test]

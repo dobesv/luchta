@@ -18,9 +18,36 @@ use crate::{
 };
 use crate::{ItemProgress, ParallelProgress, TaskProgress};
 
+/// What a worker wants spawned for a `Run` request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobSpec {
+    pub program: String,
+    pub args: Vec<String>,
+    pub env: std::collections::HashMap<String, String>,
+}
+
+impl JobSpec {
+    /// The classic job shape: `sh -c <command>` with the given environment.
+    pub fn shell(command: String, env: std::collections::HashMap<String, String>) -> Self {
+        Self {
+            program: "sh".to_owned(),
+            args: vec!["-c".to_owned(), command],
+            env,
+        }
+    }
+}
+
 pub trait Worker: Send + Sync + 'static {
     fn resolve_task(&self, req: &ResolveTask) -> ResolveResult;
     fn build_command(&self, req: &WorkerRequest) -> String;
+
+    /// Program, arguments, and environment for the job child. The default runs
+    /// `build_command` through `sh -c` with the request env. Returning `Err`
+    /// fails the task: the message is written to the task's stderr log and the
+    /// job completes with exit code 1.
+    fn build_job(&self, req: &WorkerRequest) -> Result<JobSpec, String> {
+        Ok(JobSpec::shell(self.build_command(req), req.env.clone()))
+    }
 
     fn run_in_process(
         &self,
@@ -337,8 +364,8 @@ async fn handle_request<W: Worker>(
             WorkerResponse::done_with_outputs(id.clone(), exit_code, outputs)
         }
         InProcessOutcome::NotHandled => {
-            let exit_code = match run_one_job(&request, worker.as_ref(), &writer).await {
-                Ok(status) => status.code().unwrap_or(1),
+            let exit_code = match run_one_job(&request, Arc::clone(&worker), &writer).await {
+                Ok(code) => code,
                 Err(error) if error.is_pipe_shutdown() => {
                     shutdown.store(true, Ordering::SeqCst);
                     return Ok(());
@@ -357,10 +384,30 @@ async fn handle_request<W: Worker>(
 
 async fn run_one_job<W: Worker>(
     request: &WorkerRequest,
-    worker: &W,
+    worker: Arc<W>,
     writer: &SharedWriter,
-) -> Result<std::process::ExitStatus, WorkerError> {
-    let mut child = spawn_child(request, worker)?;
+) -> Result<i32, WorkerError> {
+    // build_job may do blocking filesystem work (the yarn worker parses the
+    // PnP manifest and materializes shims), so run it off the event loop:
+    // otherwise it would stall every other in-flight job's log pumping and the
+    // protocol reader, which all run on this current-thread runtime.
+    let spec = {
+        let worker = Arc::clone(&worker);
+        let request = request.clone();
+        tokio::task::spawn_blocking(move || worker.build_job(&request)).await?
+    };
+    let spec = match spec {
+        Ok(spec) => spec,
+        Err(message) => {
+            write_response(
+                writer,
+                &WorkerResponse::log(request.id.clone(), LogStream::Stderr, message),
+            )
+            .await?;
+            return Ok(1);
+        }
+    };
+    let mut child = spawn_child(request, &spec)?;
     let stdout = child
         .stdout
         .take()
@@ -386,15 +433,15 @@ async fn run_one_job<W: Worker>(
     let status = child.wait().await?;
     stdout_task.await??;
     stderr_task.await??;
-    Ok(status)
+    Ok(status.code().unwrap_or(1))
 }
 
-fn spawn_child<W: Worker>(
+fn spawn_child(
     request: &WorkerRequest,
-    worker: &W,
+    spec: &JobSpec,
 ) -> Result<tokio::process::Child, WorkerError> {
-    let mut command = Command::new("sh");
-    command.arg("-c").arg(worker.build_command(request));
+    let mut command = Command::new(&spec.program);
+    command.args(&spec.args);
     // Detach the job from the worker's own stdin. The worker reads its JSONL
     // request protocol from fd 0; if a job child inherited that fd, a process in
     // its tree (notably Node/libuv, which flips inherited stdin to O_NONBLOCK on
@@ -407,9 +454,9 @@ fn spawn_child<W: Worker>(
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
     // Clear all inherited environment variables for strict isolation.
-    // The request.env contains the full effective env (whitelist + declared).
+    // The spec's env contains the full effective env (whitelist + declared).
     command.env_clear();
-    command.envs(&request.env);
+    command.envs(&spec.env);
 
     if let Some(cwd) = &request.cwd {
         command.current_dir(cwd);
@@ -709,19 +756,94 @@ mod tests {
         );
     }
 
+    struct JobSpecWorker;
+
+    impl Worker for JobSpecWorker {
+        fn resolve_task(&self, _req: &ResolveTask) -> ResolveResult {
+            ResolveResult::accept()
+        }
+
+        fn build_command(&self, _req: &WorkerRequest) -> String {
+            unreachable!("build_job is overridden")
+        }
+
+        fn build_job(&self, req: &WorkerRequest) -> Result<JobSpec, String> {
+            if req.command == "fail-setup" {
+                return Err("cannot prepare job: synthetic failure".to_owned());
+            }
+            Ok(JobSpec {
+                program: "sh".to_owned(),
+                args: vec!["-c".to_owned(), "echo \"$MARKER\"".to_owned()],
+                env: std::collections::HashMap::from([(
+                    "MARKER".to_owned(),
+                    "from-job-spec".to_owned(),
+                )]),
+            })
+        }
+    }
+
+    /// Runs `command` through a fresh `JobSpecWorker` and collects its
+    /// responses, the shared round trip behind the `build_job` tests below.
+    async fn run_job_spec_request(id: &str, command: &str) -> Vec<WorkerResponse> {
+        let worker = Arc::new(JobSpecWorker);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (writer, reader) = writer_pair();
+
+        handle_request(
+            WorkerRequest::new(id, command),
+            worker,
+            Arc::clone(&writer),
+            shutdown,
+        )
+        .await
+        .expect("handle request succeeds");
+        drop(writer);
+        read_responses(reader).await
+    }
+
+    #[tokio::test]
+    async fn build_job_controls_program_args_and_env() {
+        let responses = run_job_spec_request("j1", "anything").await;
+
+        assert_eq!(
+            responses,
+            vec![
+                WorkerResponse::log("j1", LogStream::Stdout, "from-job-spec"),
+                WorkerResponse::done("j1", 0),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn build_job_error_fails_task_with_message_in_log() {
+        let responses = run_job_spec_request("j2", "fail-setup").await;
+
+        assert_eq!(
+            responses,
+            vec![
+                WorkerResponse::log(
+                    "j2",
+                    LogStream::Stderr,
+                    "cannot prepare job: synthetic failure"
+                ),
+                WorkerResponse::done("j2", 1),
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn build_command_is_invoked_and_executed() {
-        let worker = TestWorker::new("printf 'alpha\\n' && printf 'beta\\n' >&2");
+        let worker = Arc::new(TestWorker::new("printf 'alpha\\n' && printf 'beta\\n' >&2"));
         let request = WorkerRequest::new("job-1", "ignored");
         let (writer, reader) = writer_pair();
 
-        let status = run_one_job(&request, &worker, &writer)
+        let status = run_one_job(&request, Arc::clone(&worker), &writer)
             .await
             .expect("job runs");
         drop(writer);
         let responses = read_responses(reader).await;
 
-        assert!(status.success());
+        assert_eq!(status, 0);
         assert_eq!(worker.build_calls.load(Ordering::SeqCst), 1);
         assert_eq!(
             responses,
@@ -858,13 +980,13 @@ mod tests {
         // If stdin were an inherited pipe with no data, `cat` would block forever
         // and this test would hang — so a prompt, "count: 0" result proves the
         // detach.
-        let worker = TestWorker::new("printf 'count: %s\\n' \"$(cat | wc -c)\"");
+        let worker = Arc::new(TestWorker::new("printf 'count: %s\\n' \"$(cat | wc -c)\""));
         let request = WorkerRequest::new("job-1", "ignored");
         let (writer, reader) = writer_pair();
 
         let status = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            run_one_job(&request, &worker, &writer),
+            run_one_job(&request, Arc::clone(&worker), &writer),
         )
         .await
         .expect("job must not hang on inherited stdin")
@@ -872,7 +994,7 @@ mod tests {
         drop(writer);
         let responses = read_responses(reader).await;
 
-        assert!(status.success());
+        assert_eq!(status, 0);
         assert_eq!(
             responses,
             vec![WorkerResponse::log("job-1", LogStream::Stdout, "count: 0")]

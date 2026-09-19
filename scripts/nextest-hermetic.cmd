@@ -27,6 +27,9 @@ if /i "%HERMETIC_ENV_NAME%"=="PWD" exit /b 0
 if /i "%HERMETIC_ENV_NAME%"=="LLVM_PROFILE_FILE" exit /b 0
 if /i "%HERMETIC_ENV_NAME%"=="LUCHTA_TEST_RCLONE" exit /b 0
 if /i "%HERMETIC_ENV_NAME%"=="CARGO" exit /b 0
+rem Keep the outer rustup toolchain selection for tests that build crates with cargo.
+if /i "%HERMETIC_ENV_NAME%"=="RUSTUP_TOOLCHAIN" exit /b 0
+if /i "%HERMETIC_ENV_NAME%"=="RUSTUP_HOME" exit /b 0
 if /i "%HERMETIC_ENV_NAME%"=="CARGO_MANIFEST_DIR" exit /b 0
 if /i "%HERMETIC_ENV_NAME%"=="CARGO_TARGET_TMPDIR" exit /b 0
 if /i "%HERMETIC_ENV_NAME%"=="NEXTEST" exit /b 0

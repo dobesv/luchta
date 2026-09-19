@@ -11,9 +11,12 @@ description.workspace = true
 
 [dependencies]
 luchta-worker = { path = "../luchta-worker" }
+luchta-yarn-env = { path = "../luchta-yarn-env" }
 tokio = { workspace = true }
 
 [dev-dependencies]
 assert_cmd = { workspace = true }
 luchta-engine = { path = "../luchta-engine" }
+luchta-yarn-env = { path = "../luchta-yarn-env", features = ["test-fixture"] }
 serde_json = { workspace = true }
+tempfile = { workspace = true }
