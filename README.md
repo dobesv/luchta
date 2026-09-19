@@ -186,6 +186,23 @@ different maintenance stories:
   friends, since the worker is long-lived and re-parsing `.pnp.cjs` on every
   compile is waste), and a handful of small upstream-file edits. This one is
   hand-maintained; edit it directly when Luchta's own code needs to change.
+  To edit the Go worker code and regenerate the patch, run from the repo root:
+  ```bash
+  # Commit upstream-pnp on the pinned base so it becomes the diff baseline.
+  git -C vendor/typescript checkout --detach e26b8d24bee09bf66d59941912166c5aa7975d20
+  git -C vendor/typescript apply ../../patches/upstream-pnp.patch
+  git -C vendor/typescript add -A
+  git -C vendor/typescript -c user.email=x -c user.name=x commit -qm base
+  git -C vendor/typescript apply ../../patches/luchta.patch
+  # Edit files under vendor/typescript, then stage and regenerate:
+  git -C vendor/typescript add -A
+  git -C vendor/typescript -c core.abbrev=10 diff --cached --binary > patches/luchta.patch
+  ```
+  The `core.abbrev=10` is load-bearing: it reproduces the checked-in patch's
+  10-character blob hashes in `index` lines. Using the default abbreviation
+  (typically 7 characters) would churn every `index` header even with no
+  actual content changes. The redirect path is repo-root-relative because the
+  shell (not `git -C`) resolves it.
 
 Apply them **in order** — `upstream-pnp.patch` first, then `luchta.patch` —
 exactly as `cargo xtask build-worker` does:

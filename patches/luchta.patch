@@ -105,14 +105,15 @@ index e7580a55cd..5c5e2e0700 100644
  		node,
 diff --git a/tsc/internal/luchta/compile.go b/tsc/internal/luchta/compile.go
 new file mode 100644
-index 0000000000..6b464e58ce
+index 0000000000..a36bf06697
 --- /dev/null
 +++ b/tsc/internal/luchta/compile.go
-@@ -0,0 +1,259 @@
+@@ -0,0 +1,276 @@
 +package luchta
 +
 +import (
 +	"context"
++	"fmt"
 +	"io"
 +	"path/filepath"
 +	"sort"
@@ -123,7 +124,10 @@ index 0000000000..6b464e58ce
 +	"github.com/microsoft/TypeScript/tsc/internal/collections"
 +	"github.com/microsoft/TypeScript/tsc/internal/compiler"
 +	"github.com/microsoft/TypeScript/tsc/internal/core"
++	"github.com/microsoft/TypeScript/tsc/internal/diagnostics"
++	"github.com/microsoft/TypeScript/tsc/internal/diagnosticwriter"
 +	"github.com/microsoft/TypeScript/tsc/internal/execute/tsc"
++	"github.com/microsoft/TypeScript/tsc/internal/locale"
 +	"github.com/microsoft/TypeScript/tsc/internal/pnp"
 +	"github.com/microsoft/TypeScript/tsc/internal/tsoptions"
 +	"github.com/microsoft/TypeScript/tsc/internal/vfs"
@@ -166,14 +170,10 @@ index 0000000000..6b464e58ce
 +// the include globs plus the tsconfig file names, suitable for cache invalidation.
 +// This is a static metadata read only — no typecheck/emit.
 +func ResolveInputs(cwd string) ([]string, error) {
-+	// NOTE: deliberately does NOT use compilerFS here. compilerFS calls
-+	// pnp.InitPnpApi, which loads and parses the workspace .pnp.cjs (multiple MB)
-+	// on every invocation (~30ms). Yarn PnP resolution is only needed to compile
-+	// modules, not to read a tsconfig's include/exclude GLOB patterns. Using the
-+	// plain bundled OS filesystem keeps resolve-time input calculation cheap and
-+	// avoids re-parsing .pnp.cjs once per task during the resolve phase.
-+	fsys := bundled.WrapFS(osvfs.FS())
-+	sys := newRunSystem(cwd, fsys, bundled.LibPath(), io.Discard, nil)
++	// Package-specifier `extends` entries require the PnP API. compilerFS uses
++	// the process-wide manifest cache, so warm resolves avoid reparsing .pnp.cjs.
++	fsys, pnpApi := compilerFS(cwd)
++	sys := newRunSystem(cwd, fsys, bundled.LibPath(), io.Discard, pnpApi)
 +	extendedConfigCache := &tsc.ExtendedConfigCache{}
 +
 +	inputs := collections.NewSetWithSizeHint[string](4)
@@ -197,9 +197,14 @@ index 0000000000..6b464e58ce
 +		parsed, errs := tsoptions.GetParsedCommandLineOfConfigFile(
 +			configPath, &core.CompilerOptions{}, nil, sys, extendedConfigCache,
 +		)
-+		if len(errs) > 0 {
-+			// Return what we have so far on error — caller can fall back to accept
-+			return sortedKeys(inputs), nil
++		if err := configParsingError(configPath, errs); err != nil {
++			return nil, err
++		}
++		if parsed == nil {
++			return nil, fmt.Errorf("parse %s: no parsed command line returned", configPath)
++		}
++		if err := configParsingError(configPath, parsed.GetConfigFileParsingDiagnostics()); err != nil {
++			return nil, err
 +		}
 +		for _, p := range includePatterns(parsed) {
 +			inputs.Add(p)
@@ -227,6 +232,20 @@ index 0000000000..6b464e58ce
 +	}
 +
 +	return sortedKeys(inputs), nil
++}
++
++func configParsingError(configPath string, parseDiagnostics []*ast.Diagnostic) error {
++	for _, diagnostic := range parseDiagnostics {
++		if diagnostic == nil || diagnostic.Code() == diagnostics.No_inputs_were_found_in_config_file_0_Specified_include_paths_were_1_and_exclude_paths_were_2.Code() {
++			continue
++		}
++		if diagnostic.Category() != diagnostics.CategoryError {
++			continue
++		}
++		message := diagnosticwriter.FlattenDiagnosticMessage(diagnosticwriter.WrapASTDiagnostic(diagnostic), "\n", locale.Default)
++		return fmt.Errorf("parse %s: TS%d: %s", configPath, diagnostic.Code(), message)
++	}
++	return nil
 +}
 +
 +// CompilePackage replicates the project's tsc worker: for each candidate tsconfig
@@ -258,7 +277,7 @@ index 0000000000..6b464e58ce
 +		}
 +
 +		opts := parsed.CompilerOptions()
-+		if err := CleanOutputs(cwd, outDirOf(opts), rootDirOf(opts), opts.NoEmit.IsTrue()); err != nil {
++		if err := CleanOutputs(cwd, cleanDirOf(cwd, opts), parsed.CommonSourceDirectory(), opts.NoEmit.IsTrue()); err != nil {
 +			internalErr = "clean outputs failed: " + err.Error()
 +			exitCode = 1
 +			break
@@ -314,18 +333,16 @@ index 0000000000..6b464e58ce
 +	)
 +}
 +
-+func outDirOf(o *core.CompilerOptions) string {
-+	if o != nil && o.OutDir != "" {
-+		return o.OutDir
++func cleanDirOf(cwd string, o *core.CompilerOptions) string {
++	if o != nil {
++		if o.DeclarationDir != "" {
++			return o.DeclarationDir
++		}
++		if o.OutDir != "" {
++			return o.OutDir
++		}
 +	}
-+	return "dist/types"
-+}
-+
-+func rootDirOf(o *core.CompilerOptions) string {
-+	if o != nil && o.RootDir != "" {
-+		return o.RootDir
-+	}
-+	return "src"
++	return filepath.Join(cwd, "dist/types")
 +}
 +
 +// includePatterns extracts the tsconfig "include" globs from the raw config,
@@ -370,10 +387,10 @@ index 0000000000..6b464e58ce
 +}
 diff --git a/tsc/internal/luchta/compile_test.go b/tsc/internal/luchta/compile_test.go
 new file mode 100644
-index 0000000000..3335dbd1b7
+index 0000000000..985f8e2bd2
 --- /dev/null
 +++ b/tsc/internal/luchta/compile_test.go
-@@ -0,0 +1,316 @@
+@@ -0,0 +1,483 @@
 +package luchta
 +
 +import (
@@ -381,6 +398,7 @@ index 0000000000..3335dbd1b7
 +	"encoding/json"
 +	"path/filepath"
 +	"slices"
++	"strings"
 +	"testing"
 +)
 +
@@ -409,6 +427,107 @@ index 0000000000..3335dbd1b7
 +	}
 +	if !slices.Contains(res.Outputs, "dist/index.js") {
 +		t.Fatalf("outputs missing dist/index.js: %v", res.Outputs)
++	}
++}
++
++func TestCompilePackageRemovesStaleDeclaration(t *testing.T) {
++	cwd := t.TempDir()
++	writeTsPackage(t, cwd, `{
++		"compilerOptions": {"declaration": true, "outDir": "dist", "rootDir": "src"},
++		"include": ["src/**/*"]
++	}`, "index.ts", "export const answer = 42;\n")
++	stale := filepath.Join(cwd, "dist", "gone.d.ts")
++	mustWrite(t, stale, "export declare const gone: number;")
++
++	res := CompilePackage(context.Background(), cwd)
++	if res.ExitCode != 0 {
++		t.Fatalf("exitCode=%d internalError=%q sarif=%s", res.ExitCode, res.InternalError, DiagnosticsToSARIF(cwd, res.Diagnostics))
++	}
++	if fileExists(stale) {
++		t.Fatalf("stale declaration survived CompilePackage: %s", stale)
++	}
++}
++
++func TestCompilePackageCleansDeclarationDir(t *testing.T) {
++	cwd := t.TempDir()
++	writeTsPackage(t, cwd, `{
++		"compilerOptions": {"declaration": true, "outDir": "dist/js", "declarationDir": "dist/types", "rootDir": "src"},
++		"include": ["src/**/*"]
++	}`, "index.ts", "export const answer = 42;\n")
++	stale := filepath.Join(cwd, "dist", "types", "gone.d.ts")
++	mustWrite(t, stale, "export declare const gone: number;")
++
++	res := CompilePackage(context.Background(), cwd)
++	if res.ExitCode != 0 {
++		t.Fatalf("exitCode=%d internalError=%q sarif=%s", res.ExitCode, res.InternalError, DiagnosticsToSARIF(cwd, res.Diagnostics))
++	}
++	if fileExists(stale) {
++		t.Fatalf("stale declaration in declarationDir survived: %s", stale)
++	}
++	if !fileExists(filepath.Join(cwd, "dist", "types", "index.d.ts")) {
++		t.Fatal("expected declaration emit under declarationDir")
++	}
++}
++
++func TestCompilePackageRejectsEscapingCleanDirectory(t *testing.T) {
++	tests := []struct {
++		name    string
++		options string
++		inside  string
++	}{
++		{
++			name:    "outDir",
++			options: `{"declaration":true,"outDir":"../../dist","rootDir":"src"}`,
++		},
++		{
++			name:    "declarationDir",
++			options: `{"declaration":true,"outDir":"dist/js","declarationDir":"../../dist","rootDir":"src"}`,
++			inside:  "dist/js/gone.d.ts",
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			root := t.TempDir()
++			cwd := filepath.Join(root, "packages", "pkg")
++			writeTsPackage(t, cwd, `{"compilerOptions":`+tt.options+`,"include":["src/**/*"]}`,
++				"index.ts", "export const answer = 42;\n")
++			outside := filepath.Join(root, "dist", "gone.d.ts")
++			mustWrite(t, outside, "export declare const gone: number;")
++			if tt.inside != "" {
++				mustWrite(t, filepath.Join(cwd, filepath.FromSlash(tt.inside)), "export declare const gone: number;")
++			}
++
++			res := CompilePackage(context.Background(), cwd)
++			if res.ExitCode == 0 || !strings.Contains(res.InternalError, "outside package") {
++				t.Fatalf("expected cleanup-boundary error, exitCode=%d internalError=%q", res.ExitCode, res.InternalError)
++			}
++			if !fileExists(outside) {
++				t.Fatalf("cleanup deleted file outside package: %s", outside)
++			}
++			if tt.inside != "" && !fileExists(filepath.Join(cwd, filepath.FromSlash(tt.inside))) {
++				t.Fatal("cleanup fell back from declarationDir to outDir")
++			}
++		})
++	}
++}
++
++func TestCompilePackageUsesConfigDirAsSourceRootWhenRootDirOmitted(t *testing.T) {
++	cwd := t.TempDir()
++	mustWrite(t, filepath.Join(cwd, "tsconfig.json"), `{
++		"compilerOptions": {"outDir": "dist"},
++		"include": ["*.ts"]
++	}`)
++	mustWrite(t, filepath.Join(cwd, "index.ts"), "export const answer = 42;\n")
++	declaration := filepath.Join(cwd, "dist", "index.d.ts")
++	mustWrite(t, declaration, "export declare const answer: number;")
++
++	res := CompilePackage(context.Background(), cwd)
++	if res.ExitCode != 0 {
++		t.Fatalf("exitCode=%d internalError=%q sarif=%s", res.ExitCode, res.InternalError, DiagnosticsToSARIF(cwd, res.Diagnostics))
++	}
++	if !fileExists(declaration) {
++		t.Fatal("cleanup removed declaration whose source exists beside tsconfig")
 +	}
 +}
 +
@@ -525,7 +644,7 @@ index 0000000000..3335dbd1b7
 +	cwd := t.TempDir()
 +	writeTsPackage(t, cwd, `{
 +		"compilerOptions": {"outDir": "dist"},
-+		"include": ["src/**"]
++		"include": ["src/**/*"]
 +	}`, "index.ts", "export const x = 1;\n")
 +
 +	inputs, err := ResolveInputs(cwd)
@@ -541,8 +660,8 @@ index 0000000000..3335dbd1b7
 +		t.Fatalf("inputs missing tsconfig.build.json candidate: %v", inputs)
 +	}
 +	// Should contain include pattern
-+	if !slices.Contains(inputs, "src/**") {
-+		t.Fatalf("inputs missing src/** pattern: %v", inputs)
++	if !slices.Contains(inputs, "src/**/*") {
++		t.Fatalf("inputs missing src/**/* pattern: %v", inputs)
 +	}
 +}
 +
@@ -573,14 +692,14 @@ index 0000000000..3335dbd1b7
 +	// it reads the raw include specs rather than enumerating files.
 +	mustWrite(t, filepath.Join(cwd, "tsconfig.json"), `{
 +		"compilerOptions": {"outDir": "dist"},
-+		"include": ["lib/**/*.ts", "types/**"]
++		"include": ["lib/**/*.ts", "types/**/*"]
 +	}`)
 +
 +	inputs, err := ResolveInputs(cwd)
 +	if err != nil {
 +		t.Fatalf("ResolveInputs: %v", err)
 +	}
-+	for _, want := range []string{"lib/**/*.ts", "types/**", "tsconfig.json", "tsconfig.build.json"} {
++	for _, want := range []string{"lib/**/*.ts", "types/**/*", "tsconfig.json", "tsconfig.build.json"} {
 +		if !slices.Contains(inputs, want) {
 +			t.Fatalf("inputs missing %q: %v", want, inputs)
 +		}
@@ -645,6 +764,71 @@ index 0000000000..3335dbd1b7
 +	}
 +}
 +
++func TestResolveInputsBareExtendsUnderPnp(t *testing.T) {
++	root := t.TempDir()
++	app := filepath.Join(root, "packages", "app")
++	base := filepath.Join(root, "packages", "tsconfig-base")
++	mustWrite(t, filepath.Join(root, ".pnp.cjs"), "")
++	mustWrite(t, filepath.Join(root, ".pnp.data.json"), `{
++		"dependencyTreeRoots": [{"name": "app", "reference": "workspace:packages/app"}],
++		"enableTopLevelFallback": false,
++		"fallbackPool": [],
++		"fallbackExclusionList": [],
++		"packageRegistryData": [
++			[null, [[null, {
++				"packageLocation": "./",
++				"packageDependencies": [],
++				"linkType": "SOFT"
++			}]]],
++			["app", [["workspace:packages/app", {
++				"packageLocation": "./packages/app/",
++				"packageDependencies": [
++					["app", "workspace:packages/app"],
++					["@company/tsconfig-base", "workspace:packages/tsconfig-base"]
++				],
++				"linkType": "SOFT"
++			}]]],
++			["@company/tsconfig-base", [["workspace:packages/tsconfig-base", {
++				"packageLocation": "./packages/tsconfig-base/",
++				"packageDependencies": [
++					["@company/tsconfig-base", "workspace:packages/tsconfig-base"]
++				],
++				"linkType": "SOFT"
++			}]]]
++		]
++	}`)
++	mustWrite(t, filepath.Join(base, "strict.json"), `{"include":["shared/**/*.ts"]}`)
++	mustWrite(t, filepath.Join(base, "shared", "existing.ts"), "export const shared = true;\n")
++	mustWrite(t, filepath.Join(app, "tsconfig.json"), `{
++		"extends": "@company/tsconfig-base/strict.json",
++		"compilerOptions": {"outDir": "dist"}
++	}`)
++
++	inputs, err := ResolveInputs(app)
++	if err != nil {
++		t.Fatalf("ResolveInputs: %v", err)
++	}
++	if want := "../tsconfig-base/shared/**/*.ts"; !slices.Contains(inputs, want) {
++		t.Fatalf("inputs missing inherited PnP include %q: %v", want, inputs)
++	}
++}
++
++func TestResolveInputsUnresolvableBareExtendsFails(t *testing.T) {
++	cwd := t.TempDir()
++	mustWrite(t, filepath.Join(cwd, "tsconfig.json"), `{
++		"extends": "@company/missing-config/strict.json",
++		"include": ["src/**/*"]
++	}`)
++
++	inputs, err := ResolveInputs(cwd)
++	if err == nil {
++		t.Fatalf("ResolveInputs returned partial inputs %v for an unresolvable extends", inputs)
++	}
++	if !strings.Contains(err.Error(), "tsconfig.json") || !strings.Contains(err.Error(), "@company/missing-config/strict.json") {
++		t.Fatalf("error missing config path or diagnostic text: %v", err)
++	}
++}
++
 +func TestCompilePackageConcurrentRace(t *testing.T) {
 +	const goroutines = 4
 +
@@ -692,17 +876,22 @@ index 0000000000..3335dbd1b7
 +}
 diff --git a/tsc/internal/luchta/outputs.go b/tsc/internal/luchta/outputs.go
 new file mode 100644
-index 0000000000..b386ddb317
+index 0000000000..86965cfae6
 --- /dev/null
 +++ b/tsc/internal/luchta/outputs.go
-@@ -0,0 +1,63 @@
+@@ -0,0 +1,139 @@
 +package luchta
 +
 +import (
++	"fmt"
 +	"os"
 +	"path/filepath"
 +	"strings"
++
++	"github.com/microsoft/TypeScript/tsc/internal/tspath"
 +)
++
++const sourceMapExtension = ".map"
 +
 +// RelativizeOutputs makes absolute output paths relative to cwd (forward slashes).
 +func RelativizeOutputs(cwd string, outputs []string) []string {
@@ -717,42 +906,113 @@ index 0000000000..b386ddb317
 +	return out
 +}
 +
-+// CleanOutputs removes *.d.ts and *.d.ts.map files under outDir whose originating
-+// source file under rootDir no longer exists. No-op when noEmit is true or outDir
-+// is absent.
-+func CleanOutputs(cwd, outDir, rootDir string, noEmit bool) error {
++// CleanOutputs removes declaration files and declaration maps under cleanDir
++// whose originating source file under sourceRoot no longer exists. All
++// directories are absolute. No-op when noEmit is true or cleanDir is absent.
++func CleanOutputs(cwd, cleanDir, sourceRoot string, noEmit bool) error {
 +	if noEmit {
 +		return nil
 +	}
-+	absOut := filepath.Join(cwd, outDir)
-+	absRoot := filepath.Join(cwd, rootDir)
-+	if _, err := os.Stat(absOut); os.IsNotExist(err) {
++
++	resolvedCwd, err := filepath.EvalSymlinks(cwd)
++	if err != nil {
++		return fmt.Errorf("resolve package directory %q: %w", cwd, err)
++	}
++	resolvedCleanDir, cleanDirExists, err := resolveCleanDir(cleanDir)
++	if err != nil {
++		return err
++	}
++	if err := ensureLocalCleanDir(resolvedCwd, resolvedCleanDir); err != nil {
++		return err
++	}
++	if !cleanDirExists {
 +		return nil
 +	}
-+	return filepath.WalkDir(absOut, func(path string, d os.DirEntry, err error) error {
++
++	return filepath.WalkDir(resolvedCleanDir, func(path string, d os.DirEntry, err error) error {
 +		if err != nil || d.IsDir() {
 +			return err
 +		}
-+		base := d.Name()
-+		var stem string
-+		switch {
-+		case strings.HasSuffix(base, ".d.ts.map"):
-+			stem = strings.TrimSuffix(base, ".d.ts.map")
-+		case strings.HasSuffix(base, ".d.ts"):
-+			stem = strings.TrimSuffix(base, ".d.ts")
-+		default:
++
++		declarationPath := path
++		if strings.HasSuffix(declarationPath, sourceMapExtension) {
++			declarationPath = strings.TrimSuffix(declarationPath, sourceMapExtension)
++		}
++		if !tspath.FileExtensionIsOneOf(declarationPath, tspath.SupportedDeclarationExtensions) {
 +			return nil
 +		}
-+		rel, err := filepath.Rel(absOut, filepath.Join(filepath.Dir(path), stem))
++
++		declarationExtension := tspath.GetDeclarationFileExtension(declarationPath)
++		stemPath := strings.TrimSuffix(declarationPath, declarationExtension)
++		rel, err := filepath.Rel(resolvedCleanDir, stemPath)
 +		if err != nil {
-+			return nil
++			return err
 +		}
-+		// source could be .ts or .tsx
-+		if fileExists(filepath.Join(absRoot, rel+".ts")) || fileExists(filepath.Join(absRoot, rel+".tsx")) {
-+			return nil
++		for _, extension := range tspath.GetPossibleOriginalInputExtensionForExtension(declarationPath) {
++			exists, err := sourceFileExists(filepath.Join(sourceRoot, rel+extension))
++			if err != nil {
++				return err
++			}
++			if exists {
++				return nil
++			}
 +		}
 +		return os.Remove(path)
 +	})
++}
++
++func resolveCleanDir(cleanDir string) (resolved string, exists bool, err error) {
++	resolved, err = filepath.EvalSymlinks(cleanDir)
++	if err == nil {
++		return resolved, true, nil
++	}
++	if !os.IsNotExist(err) {
++		return "", false, fmt.Errorf("resolve output directory %q: %w", cleanDir, err)
++	}
++
++	ancestor := cleanDir
++	var suffix []string
++	for {
++		parent := filepath.Dir(ancestor)
++		if parent == ancestor {
++			return "", false, fmt.Errorf("resolve output directory %q: %w", cleanDir, err)
++		}
++		suffix = append(suffix, filepath.Base(ancestor))
++		ancestor = parent
++		resolvedAncestor, ancestorErr := filepath.EvalSymlinks(ancestor)
++		if ancestorErr == nil {
++			resolved = resolvedAncestor
++			for i := len(suffix) - 1; i >= 0; i-- {
++				resolved = filepath.Join(resolved, suffix[i])
++			}
++			return resolved, false, nil
++		}
++		if !os.IsNotExist(ancestorErr) {
++			return "", false, fmt.Errorf("resolve output directory ancestor %q: %w", ancestor, ancestorErr)
++		}
++	}
++}
++
++func ensureLocalCleanDir(cwd, cleanDir string) error {
++	relCleanDir, err := filepath.Rel(cwd, cleanDir)
++	if err != nil {
++		return fmt.Errorf("determine cleanup boundary for %q: %w", cleanDir, err)
++	}
++	if !filepath.IsLocal(relCleanDir) {
++		return fmt.Errorf("refusing to clean output directory %q outside package %q", cleanDir, cwd)
++	}
++	return nil
++}
++
++func sourceFileExists(path string) (bool, error) {
++	_, err := os.Stat(path)
++	if err == nil {
++		return true, nil
++	}
++	if os.IsNotExist(err) {
++		return false, nil
++	}
++	return false, err
 +}
 +
 +func fileExists(path string) bool {
@@ -761,15 +1021,16 @@ index 0000000000..b386ddb317
 +}
 diff --git a/tsc/internal/luchta/outputs_test.go b/tsc/internal/luchta/outputs_test.go
 new file mode 100644
-index 0000000000..4ffc4b56b5
+index 0000000000..9253b61225
 --- /dev/null
 +++ b/tsc/internal/luchta/outputs_test.go
-@@ -0,0 +1,69 @@
+@@ -0,0 +1,191 @@
 +package luchta
 +
 +import (
 +	"os"
 +	"path/filepath"
++	"runtime"
 +	"sort"
 +	"testing"
 +)
@@ -790,7 +1051,7 @@ index 0000000000..4ffc4b56b5
 +	mustWrite(t, filepath.Join(cwd, "dist/types", "gone.d.ts"), "export declare const y: number;")
 +	mustWrite(t, filepath.Join(cwd, "dist/types", "gone.d.ts.map"), "{}")
 +
-+	if err := CleanOutputs(cwd, "dist/types", "src", false); err != nil {
++	if err := CleanOutputs(cwd, filepath.Join(cwd, "dist/types"), filepath.Join(cwd, "src"), false); err != nil {
 +		t.Fatalf("CleanOutputs: %v", err)
 +	}
 +	got := listFiles(t, filepath.Join(cwd, "dist/types"))
@@ -800,14 +1061,135 @@ index 0000000000..4ffc4b56b5
 +	}
 +}
 +
++func TestCleanOutputsPreservesAllowJSSources(t *testing.T) {
++	cwd := t.TempDir()
++	sourceRoot := filepath.Join(cwd, "src")
++	cleanDir := filepath.Join(cwd, "dist", "types")
++	for _, fixture := range []struct {
++		stem      string
++		extension string
++	}{
++		{stem: "from-js", extension: ".js"},
++		{stem: "from-jsx", extension: ".jsx"},
++	} {
++		mustWrite(t, filepath.Join(sourceRoot, fixture.stem+fixture.extension), "export const value = 1;")
++		mustWrite(t, filepath.Join(cleanDir, fixture.stem+".d.ts"), "export declare const value: number;")
++		mustWrite(t, filepath.Join(cleanDir, fixture.stem+".d.ts.map"), "{}")
++	}
++
++	if err := CleanOutputs(cwd, cleanDir, sourceRoot, false); err != nil {
++		t.Fatalf("CleanOutputs: %v", err)
++	}
++	for _, name := range []string{"from-js.d.ts", "from-js.d.ts.map", "from-jsx.d.ts", "from-jsx.d.ts.map"} {
++		if !fileExists(filepath.Join(cleanDir, name)) {
++			t.Fatalf("declaration for allowJs source was removed: %s", name)
++		}
++	}
++}
++
++func TestCleanOutputsHandlesModuleDeclarationExtensions(t *testing.T) {
++	cwd := t.TempDir()
++	sourceRoot := filepath.Join(cwd, "src")
++	cleanDir := filepath.Join(cwd, "dist", "types")
++	mustWrite(t, filepath.Join(sourceRoot, "live-esm.mts"), "export const value = 1;")
++	mustWrite(t, filepath.Join(sourceRoot, "live-esm-js.mjs"), "export const value = 1;")
++	mustWrite(t, filepath.Join(sourceRoot, "live-cjs.cts"), "export const value = 1;")
++	mustWrite(t, filepath.Join(sourceRoot, "live-cjs-js.cjs"), "export const value = 1;")
++	for _, name := range []string{
++		"live-esm.d.mts", "live-esm.d.mts.map", "live-esm-js.d.mts", "live-esm-js.d.mts.map", "gone-esm.d.mts", "gone-esm.d.mts.map",
++		"live-cjs.d.cts", "live-cjs.d.cts.map", "live-cjs-js.d.cts", "live-cjs-js.d.cts.map", "gone-cjs.d.cts", "gone-cjs.d.cts.map",
++	} {
++		mustWrite(t, filepath.Join(cleanDir, name), "declaration")
++	}
++
++	if err := CleanOutputs(cwd, cleanDir, sourceRoot, false); err != nil {
++		t.Fatalf("CleanOutputs: %v", err)
++	}
++	got := listFiles(t, cleanDir)
++	want := []string{
++		"live-cjs-js.d.cts", "live-cjs-js.d.cts.map", "live-cjs.d.cts", "live-cjs.d.cts.map",
++		"live-esm-js.d.mts", "live-esm-js.d.mts.map", "live-esm.d.mts", "live-esm.d.mts.map",
++	}
++	if len(got) != len(want) {
++		t.Fatalf("got %v want %v", got, want)
++	}
++	for i := range want {
++		if got[i] != want[i] {
++			t.Fatalf("got %v want %v", got, want)
++		}
++	}
++}
++
 +func TestCleanOutputsSkipsWhenNoEmit(t *testing.T) {
 +	cwd := t.TempDir()
 +	mustWrite(t, filepath.Join(cwd, "dist/types", "gone.d.ts"), "x")
-+	if err := CleanOutputs(cwd, "dist/types", "src", true); err != nil {
++	if err := CleanOutputs(cwd, filepath.Join(cwd, "dist/types"), filepath.Join(cwd, "src"), true); err != nil {
 +		t.Fatalf("CleanOutputs: %v", err)
 +	}
 +	if _, err := os.Stat(filepath.Join(cwd, "dist/types", "gone.d.ts")); err != nil {
 +		t.Fatalf("noEmit should leave files untouched: %v", err)
++	}
++}
++
++func TestCleanOutputsRejectsOutsideMissingDirectory(t *testing.T) {
++	root := t.TempDir()
++	cwd := filepath.Join(root, "packages", "pkg")
++	if err := os.MkdirAll(cwd, 0o755); err != nil {
++		t.Fatal(err)
++	}
++
++	err := CleanOutputs(cwd, filepath.Join(root, "dist"), filepath.Join(cwd, "src"), false)
++	if err == nil {
++		t.Fatal("CleanOutputs accepted an output directory outside the package")
++	}
++}
++
++func TestCleanOutputsRejectsIntermediateSymlinkEscape(t *testing.T) {
++	if runtime.GOOS == "windows" {
++		t.Skip("symlink creation requires elevated privileges on Windows")
++	}
++
++	root := t.TempDir()
++	cwd := filepath.Join(root, "pkg")
++	outsideDir := filepath.Join(root, "outside")
++	if err := os.MkdirAll(filepath.Join(cwd, "build"), 0o755); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.MkdirAll(filepath.Join(outsideDir, "types"), 0o755); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.Symlink(outsideDir, filepath.Join(cwd, "build", "link")); err != nil {
++		t.Fatal(err)
++	}
++	declaration := filepath.Join(outsideDir, "types", "gone.d.ts")
++	declarationMap := declaration + ".map"
++	mustWrite(t, declaration, "export declare const gone: number;")
++	mustWrite(t, declarationMap, "{}")
++
++	cleanDir := filepath.Join(cwd, "build", "link", "types")
++	if err := CleanOutputs(cwd, cleanDir, filepath.Join(cwd, "src"), false); err == nil {
++		t.Fatal("CleanOutputs accepted a directory escaping through an intermediate symlink")
++	}
++	for _, path := range []string{declaration, declarationMap} {
++		if !fileExists(path) {
++			t.Fatalf("CleanOutputs deleted file outside package: %s", path)
++		}
++	}
++}
++
++func TestCleanOutputsDoesNotDeleteWhenSourceStatFails(t *testing.T) {
++	cwd := t.TempDir()
++	sourceRoot := filepath.Join(cwd, "src")
++	cleanDir := filepath.Join(cwd, "dist", "types")
++	mustWrite(t, filepath.Join(sourceRoot, "nested"), "not a directory")
++	declaration := filepath.Join(cleanDir, "nested", "gone.d.ts")
++	mustWrite(t, declaration, "export declare const gone: number;")
++
++	if err := CleanOutputs(cwd, cleanDir, sourceRoot, false); err == nil {
++		t.Fatal("CleanOutputs returned nil after source stat failed")
++	}
++	if !fileExists(declaration) {
++		t.Fatal("CleanOutputs deleted declaration after an inconclusive source stat")
 +	}
 +}
 +
@@ -898,10 +1280,10 @@ index 0000000000..c2b155d0e0
 +}
 diff --git a/tsc/internal/luchta/protocol.go b/tsc/internal/luchta/protocol.go
 new file mode 100644
-index 0000000000..6eefe01974
+index 0000000000..7f3657f0e0
 --- /dev/null
 +++ b/tsc/internal/luchta/protocol.go
-@@ -0,0 +1,136 @@
+@@ -0,0 +1,152 @@
 +package luchta
 +
 +import (
@@ -961,17 +1343,33 @@ index 0000000000..6eefe01974
 +// Writer serializes protocol responses onto an io.Writer (one JSON object per line).
 +type Writer struct {
 +	mu  sync.Mutex
++	out io.Writer
 +	enc *json.Encoder
++	err error
 +}
 +
 +func NewWriter(w io.Writer) *Writer {
-+	return &Writer{enc: json.NewEncoder(w)}
++	return &Writer{out: w, enc: json.NewEncoder(w)}
 +}
 +
 +func (w *Writer) emit(v any) {
 +	w.mu.Lock()
 +	defer w.mu.Unlock()
-+	_ = w.enc.Encode(v) // json.Encoder.Encode appends '\n'
++	if err := w.enc.Encode(v); err != nil {
++		if w.err == nil {
++			w.err = err
++		}
++		// json.Encoder stops writing after its first error. Replace it so later
++		// protocol messages still get a write attempt.
++		w.enc = json.NewEncoder(w.out)
++	}
++}
++
++// Err returns the first protocol write error.
++func (w *Writer) Err() error {
++	w.mu.Lock()
++	defer w.mu.Unlock()
++	return w.err
 +}
 +
 +func (w *Writer) Log(id, stream, line string) {
@@ -1040,18 +1438,29 @@ index 0000000000..6eefe01974
 +}
 diff --git a/tsc/internal/luchta/protocol_test.go b/tsc/internal/luchta/protocol_test.go
 new file mode 100644
-index 0000000000..909e7abd0f
+index 0000000000..157d7eb5f5
 --- /dev/null
 +++ b/tsc/internal/luchta/protocol_test.go
-@@ -0,0 +1,97 @@
+@@ -0,0 +1,125 @@
 +package luchta
 +
 +import (
 +	"bytes"
 +	"encoding/json"
++	"errors"
 +	"strings"
 +	"testing"
 +)
++
++type failingWriter struct {
++	err    error
++	writes int
++}
++
++func (w *failingWriter) Write(_ []byte) (int, error) {
++	w.writes++
++	return 0, w.err
++}
 +
 +func TestDecodeRun(t *testing.T) {
 +	msg, err := DecodeMessage([]byte(`{"type":"run","id":"pkg#task","command":"","cwd":"packages/pkg","env":{"A":"b"}}`))
@@ -1096,6 +1505,23 @@ index 0000000000..909e7abd0f
 +	// each message on its own line
 +	if lines := strings.Count(strings.TrimSpace(out), "\n"); lines != 2 {
 +		t.Fatalf("want 3 lines (2 newlines), got %d:\n%s", lines, out)
++	}
++}
++
++func TestWriterRecordsFirstErrorAndKeepsEmitting(t *testing.T) {
++	firstErr := errors.New("first write failed")
++	out := &failingWriter{err: firstErr}
++	w := NewWriter(out)
++
++	w.Log("id1", "stdout", "hello")
++	out.err = errors.New("second write failed")
++	w.Done("id1", 0, nil)
++
++	if !errors.Is(w.Err(), firstErr) {
++		t.Fatalf("Err() = %v, want %v", w.Err(), firstErr)
++	}
++	if out.writes != 2 {
++		t.Fatalf("writes = %d, want 2", out.writes)
 +	}
 +}
 +
@@ -1350,10 +1776,10 @@ index 0000000000..09cf143be1
 +func (s *runSystem) PnpApi() *pnp.PnpApi                       { return s.pnpApi }
 diff --git a/tsc/internal/luchta/worker.go b/tsc/internal/luchta/worker.go
 new file mode 100644
-index 0000000000..ac81568b7a
+index 0000000000..134190f91f
 --- /dev/null
 +++ b/tsc/internal/luchta/worker.go
-@@ -0,0 +1,124 @@
+@@ -0,0 +1,126 @@
 +package luchta
 +
 +import (
@@ -1417,9 +1843,11 @@ index 0000000000..ac81568b7a
 +	}
 +	wg.Wait()
 +	if err := scanner.Err(); err != nil {
++		// Prefer the read error when both sides fail: it is the upstream cause and
++		// may explain why the response stream could not be completed.
 +		return err
 +	}
-+	return nil
++	return w.Err()
 +}
 +
 +// mergeInputs combines declared inputs from task config with worker-specific inputs.
@@ -1480,10 +1908,10 @@ index 0000000000..ac81568b7a
 +}
 diff --git a/tsc/internal/luchta/worker_test.go b/tsc/internal/luchta/worker_test.go
 new file mode 100644
-index 0000000000..6431b3be72
+index 0000000000..14a6c56ecd
 --- /dev/null
 +++ b/tsc/internal/luchta/worker_test.go
-@@ -0,0 +1,163 @@
+@@ -0,0 +1,179 @@
 +package luchta
 +
 +import (
@@ -1518,9 +1946,25 @@ index 0000000000..6431b3be72
 +	}
 +}
 +
++func TestServeReturnsProtocolWriteError(t *testing.T) {
++	cwd := t.TempDir()
++	writeTsPackage(t, cwd, `{"compilerOptions":{"outDir":"dist","rootDir":"src"}}`,
++		"index.ts", "export const x = 1;\n")
++
++	in := strings.NewReader(`{"type":"run","id":"t1","command":"","cwd":` + jsonString(cwd) + `,"env":{}}` + "\n")
++	out := &failingWriter{err: context.Canceled}
++	var errw bytes.Buffer
++	if err := Serve(context.Background(), in, out, &errw); err == nil {
++		t.Fatal("Serve returned nil after protocol write failed")
++	}
++	if out.writes == 0 {
++		t.Fatal("Serve did not attempt a protocol write")
++	}
++}
++
 +func TestServeResolveTaskModifies(t *testing.T) {
 +	cwd := t.TempDir()
-+	writeTsPackage(t, cwd, `{"include":["src/**"],"compilerOptions":{"outDir":"dist"}}`,
++	writeTsPackage(t, cwd, `{"include":["src/**/*"],"compilerOptions":{"outDir":"dist"}}`,
 +		"index.ts", "export const x = 1;\n")
 +
 +	// JSON-encode cwd safely into the ResolveTask message.
@@ -1537,18 +1981,18 @@ index 0000000000..6431b3be72
 +	if !strings.Contains(outStr, `"inputs"`) {
 +		t.Fatalf("expected inputs in modify: %s", outStr)
 +	}
-+	// Should contain tsconfig.json and src/**
++	// Should contain tsconfig.json and src/**/*
 +	if !strings.Contains(outStr, "tsconfig.json") {
 +		t.Fatalf("expected tsconfig.json in inputs: %s", outStr)
 +	}
-+	if !strings.Contains(outStr, "src/**") {
-+		t.Fatalf("expected src/** in inputs: %s", outStr)
++	if !strings.Contains(outStr, "src/**/*") {
++		t.Fatalf("expected src/**/* in inputs: %s", outStr)
 +	}
 +}
 +
 +func TestServeResolveTaskMergesDeclaredInputs(t *testing.T) {
 +	cwd := t.TempDir()
-+	writeTsPackage(t, cwd, `{"include":["src/**"],"compilerOptions":{"outDir":"dist"}}`,
++	writeTsPackage(t, cwd, `{"include":["src/**/*"],"compilerOptions":{"outDir":"dist"}}`,
 +		"index.ts", "export const x = 1;\n")
 +
 +	// ResolveTask JSON with declared inputs (custom/**) that should be merged
@@ -1576,17 +2020,17 @@ index 0000000000..6431b3be72
 +	if !strings.Contains(outStr, "tsconfig.json") {
 +		t.Fatalf("expected tsconfig.json (worker-derived) in inputs: %s", outStr)
 +	}
-+	if !strings.Contains(outStr, "src/**") {
-+		t.Fatalf("expected src/** (worker-derived) in inputs: %s", outStr)
++	if !strings.Contains(outStr, "src/**/*") {
++		t.Fatalf("expected src/**/* (worker-derived) in inputs: %s", outStr)
 +	}
 +}
 +
 +func TestMergeInputs(t *testing.T) {
 +	tests := []struct {
-+		name        string
-+		declared    []string
-+		worker      []string
-+		want        []string
++		name     string
++		declared []string
++		worker   []string
++		want     []string
 +	}{
 +		{
 +			name:     "both empty",
