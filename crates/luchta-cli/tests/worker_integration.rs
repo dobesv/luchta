@@ -376,7 +376,7 @@ fn resident_worker_reuse_and_output_streaming() {
         &temp,
         "yarn-wrapper.sh",
         &format!(
-            "#!/bin/sh\necho $$ >> \"{pid}\"\nexec \"{worker}\" \"$@\"\n",
+            "#!/bin/sh\necho $$ >> \"{pid}\"\nexec \"{worker}\" --no-direct \"$@\"\n",
             pid = pid_marker.display(),
             worker = yarn_worker_bin().display()
         ),
@@ -861,7 +861,7 @@ fn real_yarn_worker_e2e() {
     write_config(
         &temp,
         &format!(
-            r#"{{"concurrency":{{"maxWeight":4}},"tasks":{{"build":{{"worker":"yarn"}}}},"workers":{{"yarn":{{"command":"{}"}}}}}}"#,
+            r#"{{"concurrency":{{"maxWeight":4}},"tasks":{{"build":{{"worker":"yarn"}}}},"workers":{{"yarn":{{"command":"{} --no-direct"}}}}}}"#,
             yarn_worker_bin().display()
         ),
     );
@@ -931,7 +931,7 @@ fn global_task_prunes_packages_missing_the_script() {
     write_config(
         &temp,
         &format!(
-            r#"{{"concurrency":{{"maxWeight":4}},"tasks":{{"build":{{"worker":"yarn"}}}},"workers":{{"yarn":{{"command":"{}"}}}}}}"#,
+            r#"{{"concurrency":{{"maxWeight":4}},"tasks":{{"build":{{"worker":"yarn"}}}},"workers":{{"yarn":{{"command":"{} --no-direct"}}}}}}"#,
             yarn_worker_bin().display()
         ),
     );
@@ -965,7 +965,7 @@ fn explicit_command_resolves_against_scripts_for_pruning() {
     write_config(
         &temp,
         &format!(
-            r#"{{"concurrency":{{"maxWeight":4}},"tasks":{{"start":{{"worker":"yarn","command":"build"}}}},"workers":{{"yarn":{{"command":"{}"}}}}}}"#,
+            r#"{{"concurrency":{{"maxWeight":4}},"tasks":{{"start":{{"worker":"yarn","command":"build"}}}},"workers":{{"yarn":{{"command":"{} --no-direct"}}}}}}"#,
             yarn_worker_bin().display()
         ),
     );
@@ -1044,7 +1044,7 @@ fn root_worker_task_resolves_against_root_package_scripts() {
     write_config(
         &temp,
         &format!(
-            r##"{{"concurrency":{{"maxWeight":4}},"tasks":{{"#release":{{"worker":"yarn"}}}},"workers":{{"yarn":{{"command":"{}"}}}}}}"##,
+            r##"{{"concurrency":{{"maxWeight":4}},"tasks":{{"#release":{{"worker":"yarn"}}}},"workers":{{"yarn":{{"command":"{} --no-direct"}}}}}}"##,
             yarn_worker_bin().display()
         ),
     );

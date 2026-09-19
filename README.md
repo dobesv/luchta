@@ -1019,14 +1019,52 @@ Standard worker binaries are resolved via `PATH`. They ship inside each release 
 
 - **luchta-tsc-worker** is a high-performance TypeScript/tsc worker built from an in-tree vendored and patched [TypeScript](https://github.com/microsoft/TypeScript) (see [Patch Maintenance](#patch-maintenance) above).
 - **luchta-ast-grep-worker** scans source files in-process using the custom rules in `sgconfig.yml`. Inline `ast-grep-ignore` comments have the same next-line, same-line, file-level, and rule-specific suppression semantics as the ast-grep CLI, and suppressed matches are also excluded from `--fix`.
-- **luchta-yarn-worker** runs each task through Yarn so that Yarn-injected
-  environment variables (`PATH`, `NODE_OPTIONS`, …) are available. For
-  yarn-worker tasks, the task's `command` becomes the Yarn subcommand
-  (defaulting to the task name) and is invoked as `yarn workspace <pkg> <command>`
-  for package tasks, or `yarn <command>` at the workspace root.
-  Worker-reported detected inputs/outputs replace declared cache patterns for
-  next run decisions; yarn worker always adds `package.json` to detected inputs
-  so script changes invalidate cache entries.
+- **luchta-yarn-worker** runs `package.json` scripts for Yarn Plug'n'Play
+  projects. The task's `command` is the script name (defaulting to the task
+  name); anything after it is appended to the script as extra arguments.
+
+  By default the worker runs the script **directly**: it reads `.pnp.cjs` /
+  `.pnp.data.json` from its working directory (the workspace root), computes
+  the environment Yarn would inject (`PATH` with the bin shims for the
+  workspace and its direct dependencies, `NODE_OPTIONS` with the PnP loader,
+  `PROJECT_CWD`, `INIT_CWD`, `npm_package_*`, `npm_lifecycle_event`,
+  `npm_config_user_agent`, plus `.env.yarn`), and executes the script body as
+  `bash -c` the same way Yarn 6 does. No `yarn` process is spawned per task,
+  which saves the Node startup time and memory of each invocation.
+  The bin shims are written once per workspace into a per-user,
+  content-addressed directory under the OS temp dir (`luchta-yarn-bin-<uid>`)
+  and reused across runs; the shim set is recomputed whenever the manifest, the
+  workspace `package.json`, or `PATH` changes.
+
+  Direct mode is strict: if the manifest is missing (not a PnP project, or the
+  worker is not running from the project root), the script is not declared,
+  `bash`, `node`, or `yarn` are not on `PATH`, or the platform is Windows, the
+  task fails with a message naming the reason. Yarn plugins that customize the
+  script environment are not consulted. This breaks two configurations until
+  they pass `--no-direct`: projects using the `node-modules` linker (no
+  `.pnp.cjs` is produced), and tasks whose `command` is a yarn CLI command
+  rather than a `package.json` script (for example `install`, `dlx`, or `run
+  build`). Pass `--no-direct` to fall back to invoking `yarn workspace <pkg>
+  <command>` (or `yarn <command>` at the root) for every task. To mix both,
+  define two workers and point tasks at either:
+
+  ```typescript
+  workers: {
+    yarn: 'luchta-yarn-worker',
+    'yarn-cli': 'luchta-yarn-worker --no-direct',
+  }
+  ```
+
+  Scripts run under `bash`, not Yarn Berry's portable shell, so an unquoted
+  `**` glob expands like bash's `*` unless `globstar` is enabled in the script.
+  In direct mode `command` is `<script> [args]`, not a shell line: the first
+  token names the `package.json` script and the rest are appended as literal
+  extra arguments, so shell syntax (pipes, redirects, `&&`) in `command` is
+  not interpreted. Worker-reported detected inputs/outputs replace declared
+  cache patterns for next run decisions; the yarn worker always adds
+  `package.json` to detected inputs so script changes invalidate cache
+  entries. Before this change the worker always went through `yarn` to get
+  that environment; direct mode reproduces it instead.
 - **luchta-bash-worker** runs arbitrary commands via `sh -c`, useful for
   tasks that don't need Yarn workspace wrapping.
 
