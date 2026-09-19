@@ -195,10 +195,17 @@ impl ProgressReporter {
         running.len()
     }
 
-    /// Summed RSS of the luchta process tree for the `🐏` segment, recomputed
-    /// at most once per cache TTL.
+    /// Latest summed RSS sample for the `🐏` segment. Non-blocking:
+    /// starts a background refresh when the cache is stale.
     pub(crate) fn tree_rss(&self) -> Option<u64> {
         self.rss.get()
+    }
+
+    /// Synchronously samples summed RSS. Use for one-shot reports after the
+    /// dispatch loop exits (interrupt message, terminal summary) where the
+    /// cache may be cold (e.g. `--output summary` never rendered).
+    pub(crate) fn tree_rss_blocking(&self) -> Option<u64> {
+        self.rss.sample_now()
     }
 
     #[cfg(test)]

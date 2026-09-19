@@ -58,7 +58,7 @@ pub(super) fn report_run_outcome(
     run_result?;
 
     reporter.output().stdout_line(&reporter.render_summary(
-        &crate::rss::format_rss(reporter.tree_rss()),
+        &crate::rss::format_rss(reporter.tree_rss_blocking()),
         was_cancelled,
         owo_colors::Stream::Stdout,
     ));

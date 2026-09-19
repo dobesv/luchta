@@ -353,7 +353,7 @@ where
 fn report_interrupted(ctx: &DispatchContext<'_>, shutdown: Option<ShutdownSignal>) -> Result<()> {
     ctx.interrupted
         .store(true, std::sync::atomic::Ordering::SeqCst);
-    let rss = ctx.reporter.tree_rss();
+    let rss = ctx.reporter.tree_rss_blocking();
     let source = shutdown
         .map(|signal| format!(" by {}", signal.name()))
         .unwrap_or_default();
