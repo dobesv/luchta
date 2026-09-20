@@ -928,6 +928,7 @@ async fn write_run_record(
     let pkg_dep_hash = cache_ctx.pkg_dep_hash;
     let dep_outputs = cache_ctx.dep_outputs.clone();
     let cache_file_patterns = cache_ctx.task_def.cache_files.clone();
+    let tool_version = cache_ctx.task_def.tool_version.clone();
     let outputs_hash = record.outputs_hash;
     let record_for_local = (*record).clone();
     let record_for_shared = record_for_local.clone();
@@ -987,6 +988,7 @@ async fn write_run_record(
                 match shared.store_with_execution_duration(
                     SharedCacheStoreRequest {
                         task_id: &task_id_str,
+                        tool_version: tool_version.as_deref(),
                         input_key: &input_key,
                         outputs_hash: &outputs_hash,
                         package_dir: &package_dir,
@@ -1971,6 +1973,10 @@ mod tests {
 
     fn sample_cache_write_context(task_id: TaskId) -> CacheWriteContext {
         let root = tempfile::tempdir().expect("tempdir").keep();
+        sample_cache_write_context_in(task_id, root)
+    }
+
+    fn sample_cache_write_context_in(task_id: TaskId, root: PathBuf) -> CacheWriteContext {
         let package = make_test_package(&root);
         let package_graph = Arc::new(build_test_package_graph(&package));
         CacheWriteContext {
@@ -2276,6 +2282,61 @@ mod tests {
             output_hashes.lock().expect("lock output hashes").is_empty(),
             "no output hash should be recorded on a stability mismatch"
         );
+    }
+
+    #[tokio::test]
+    async fn write_run_record_stores_resolved_tool_version_metadata() {
+        for tool_version in [None, Some("swc_core=80.0.0")] {
+            let repo = tempfile::tempdir().unwrap();
+            let shared_dir = tempfile::tempdir().unwrap();
+            let mut cache_ctx = sample_cache_write_context_in(
+                TaskId::new("pkg", "build"),
+                repo.path().to_path_buf(),
+            );
+            luchta_worker::TaskModification {
+                tool_version: tool_version.map(str::to_owned),
+                ..Default::default()
+            }
+            .apply_to(&mut cache_ctx.task_def);
+            let task_spec_hash = luchta_cache::task_spec_hash(&cache_ctx.task_def, None);
+            cache_ctx.task_spec_hash = task_spec_hash;
+            let shared = Arc::new(
+                SharedCache::open_with_cache_dir(
+                    repo.path(),
+                    1_000_000,
+                    3,
+                    Some(shared_dir.path()),
+                )
+                .unwrap(),
+            );
+
+            let result = write_run_record(
+                open_test_cache(repo.path()),
+                cache_ctx,
+                Arc::new(Mutex::new(HashMap::new())),
+                None,
+                None,
+                true,
+                210,
+                200,
+                Some(RunReason::NoPriorRecord),
+                Some(Arc::clone(&shared)),
+                true,
+                repo.path().to_path_buf(),
+            )
+            .await;
+            assert!(matches!(result, WriteRecordResult::Ok));
+            shared.flush_pending_entries();
+
+            let snapshot = luchta_cache::shared::SnapshotStore::new(shared.paths().clone())
+                .load(shared.write_bucket_key().unwrap())
+                .expect("shared snapshot should be written");
+            assert_eq!(snapshot.entries.len(), 1);
+            let entry = snapshot.entries.values().next().unwrap();
+            assert_eq!(entry.task_id, "pkg#build");
+            assert_eq!(entry.task_spec_hash, task_spec_hash);
+            assert_eq!(entry.tool_version.as_deref(), tool_version);
+        }
     }
 
     #[test]

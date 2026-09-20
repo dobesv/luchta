@@ -95,6 +95,7 @@ impl Worker for OxcTransformWorker {
         let Some(cwd) = req.cwd.as_deref() else {
             return ResolveResult::modify(TaskModification {
                 inputs: Some(inputs.into_iter().collect()),
+                tool_version: Some(env!("LUCHTA_TOOL_VERSION").to_owned()),
                 ..TaskModification::default()
             });
         };
@@ -108,6 +109,7 @@ impl Worker for OxcTransformWorker {
 
         ResolveResult::modify(TaskModification {
             inputs: Some(inputs.into_iter().collect()),
+            tool_version: Some(env!("LUCHTA_TOOL_VERSION").to_owned()),
             ..TaskModification::default()
         })
     }
@@ -508,7 +510,45 @@ mod tests {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
     use super::OxcTransformWorker;
+    use luchta_worker::{ResolveDecision, ResolveMode, ResolveTask};
 
+    #[test]
+    fn resolve_task_reports_tool_version() {
+        let temp = TempDir::new().expect("tempdir");
+        let cwd = temp.path();
+        fs::create_dir_all(cwd.join("src")).expect("src dir");
+        fs::write(cwd.join("src/index.ts"), "export const x = 1;\n").expect("source file");
+
+        let req = ResolveTask {
+            id: "resolve-tool-version".to_owned(),
+            name: "build".to_owned(),
+            command: "build".to_owned(),
+            package: "pkg".to_owned(),
+            cwd: Some(cwd.display().to_string()),
+            scripts: vec![],
+            inputs: vec![],
+            mode: ResolveMode::Run,
+        };
+        let result = OxcTransformWorker.resolve_task(&req);
+        let ResolveDecision::Modify(modification) = result.decision else {
+            panic!("expected modify decision");
+        };
+        let tool_version = modification
+            .tool_version
+            .expect("tool_version must be present");
+        // Must match expected format: oxc_transformer=<sha>
+        assert!(
+            tool_version.starts_with("oxc_transformer="),
+            "unexpected tool_version: {tool_version}"
+        );
+        // Git SHAs are 40 hex chars
+        let sha = tool_version.strip_prefix("oxc_transformer=").unwrap();
+        assert_eq!(sha.len(), 40, "git SHA should be 40 chars: {sha}");
+        assert!(
+            sha.chars().all(|c| c.is_ascii_hexdigit()),
+            "SHA must be hex: {sha}"
+        );
+    }
     #[tokio::test]
     async fn run_in_process_transforms_source_and_reports_outputs() {
         let temp = TempDir::new().expect("tempdir");

@@ -366,9 +366,8 @@ async fn run_worker_jsonl_in(
     }
 }
 
-/// Drives a `resolveTask` request through the real worker binary and returns the
-/// resolve decision name (e.g. `"modify"`, `"prune"`, `"reject"`).
-async fn resolve_decision(cwd: &std::path::Path) -> String {
+/// Drives a `resolveTask` request through the real worker binary and returns its result.
+async fn resolve_result(cwd: &std::path::Path) -> serde_json::Value {
     let request = serde_json::json!({
         "type": "resolveTask",
         "id": "pkg#oxfmt",
@@ -379,11 +378,37 @@ async fn resolve_decision(cwd: &std::path::Path) -> String {
 
     send_request(cwd, request)
         .await
-        .iter()
+        .into_iter()
         .find(|value| value.get("type").and_then(serde_json::Value::as_str) == Some("resolved"))
-        .and_then(|value| value["result"]["decision"].as_str())
-        .expect("resolved response")
+        .expect("resolved response")["result"]
+        .clone()
+}
+
+async fn resolve_decision(cwd: &std::path::Path) -> String {
+    resolve_result(cwd).await["decision"]
+        .as_str()
+        .expect("resolve decision")
         .to_owned()
+}
+
+#[tokio::test]
+async fn resolve_task_reports_tool_version() {
+    let (temp, _file) = ts_package("index.ts", "export const x = 1;\n").await;
+    let result = resolve_result(temp.path()).await;
+    assert_eq!(result["decision"], "modify");
+    let tool_version = result["toolVersion"]
+        .as_str()
+        .expect("tool_version must be present");
+    assert!(
+        tool_version.starts_with("oxc_formatter="),
+        "unexpected tool_version: {tool_version}"
+    );
+    let sha = tool_version.strip_prefix("oxc_formatter=").unwrap();
+    assert_eq!(sha.len(), 40, "git SHA should be 40 chars: {sha}");
+    assert!(
+        sha.chars().all(|c| c.is_ascii_hexdigit()),
+        "SHA must be hex: {sha}"
+    );
 }
 
 /// Regression (#242 follow-up): resolution must NOT prune/reject a task over

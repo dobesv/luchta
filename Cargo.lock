@@ -2750,6 +2750,7 @@ dependencies = [
  "ignore",
  "indexmap",
  "luchta-engine",
+ "luchta-lockfile-version",
  "luchta-worker",
  "mimalloc",
  "serde",
@@ -2920,6 +2921,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "luchta-lockfile-version"
+version = "0.2.11"
+
+[[package]]
 name = "luchta-lockfiles"
 version = "0.2.11"
 dependencies = [
@@ -2934,6 +2939,7 @@ name = "luchta-oxc-transform-worker"
 version = "0.2.11"
 dependencies = [
  "assert_fs",
+ "luchta-lockfile-version",
  "luchta-worker",
  "mimalloc",
  "oxc_allocator",
@@ -2955,6 +2961,7 @@ dependencies = [
  "assert_fs",
  "ignore",
  "json-strip-comments",
+ "luchta-lockfile-version",
  "luchta-worker",
  "mimalloc",
  "oxc_allocator",
@@ -2975,6 +2982,7 @@ dependencies = [
  "assert_fs",
  "ignore",
  "luchta-engine",
+ "luchta-lockfile-version",
  "luchta-worker",
  "mimalloc",
  "oxc_allocator",
@@ -2997,6 +3005,7 @@ name = "luchta-swc-transform-worker"
 version = "0.2.11"
 dependencies = [
  "assert_fs",
+ "luchta-lockfile-version",
  "luchta-worker",
  "mimalloc",
  "serde_json",

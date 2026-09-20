@@ -35,20 +35,31 @@ pub fn task_spec_hash(task_def: &TaskDefinition, nonce: Option<&str>) -> [u8; 32
     };
     let bytes = bincode::serde::encode_to_vec(spec, bincode_config())
         .expect("task spec canonical bincode serialization should succeed");
-    if task_def.cache_files.is_empty() {
-        // Preserve every pre-cacheFiles task hash. Adding an empty field to the
-        // bincode struct would otherwise invalidate the whole existing cache.
+    if task_def.cache_files.is_empty() && task_def.tool_version.is_none() {
+        // Keep optional hash extensions outside the bincode struct so their
+        // absence preserves existing cache keys.
         return *blake3::hash(&bytes).as_bytes();
     }
 
-    let cache_files = bincode::serde::encode_to_vec(&task_def.cache_files, bincode_config())
-        .expect("cache file declaration canonical bincode serialization should succeed");
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"luchta-cache:task-spec-cache-files:v1");
-    hasher.update(&(bytes.len() as u64).to_le_bytes());
-    hasher.update(&bytes);
-    hasher.update(&(cache_files.len() as u64).to_le_bytes());
-    hasher.update(&cache_files);
+    if task_def.cache_files.is_empty() {
+        hasher.update(&bytes);
+    } else {
+        // Preserve the cache-files-only stream, including its leading domain tag.
+        let cache_files = bincode::serde::encode_to_vec(&task_def.cache_files, bincode_config())
+            .expect("cache file declaration canonical bincode serialization should succeed");
+        hasher.update(b"luchta-cache:task-spec-cache-files:v1");
+        hasher.update(&(bytes.len() as u64).to_le_bytes());
+        hasher.update(&bytes);
+        hasher.update(&(cache_files.len() as u64).to_le_bytes());
+        hasher.update(&cache_files);
+    }
+    if let Some(version) = task_def.tool_version.as_deref() {
+        hasher.update(b"luchta-cache:task-spec-tool-version:v1");
+        let vb = version.as_bytes();
+        hasher.update(&(vb.len() as u64).to_le_bytes());
+        hasher.update(vb);
+    }
     *hasher.finalize().as_bytes()
 }
 
@@ -259,38 +270,116 @@ mod tests {
     fn empty_cache_files_preserve_the_legacy_task_hash() {
         let task = sample_task_definition();
         assert!(task.cache_files.is_empty());
-        assert_eq!(
-            task_spec_hash(&task, None),
-            *blake3::hash(
-                &bincode::serde::encode_to_vec(
-                    TaskSpecHashInput {
-                        command: task.command.as_deref(),
-                        worker: task.worker.as_deref(),
-                        weight: task.weight,
-                        depends_on: &task.depends_on,
-                        cache_enabled: task.cache_enabled(),
-                        inputs: &task.inputs,
-                        outputs: &task.outputs,
-                        nonce: None,
-                    },
-                    bincode_config(),
-                )
-                .unwrap()
-            )
-            .as_bytes()
-        );
+        assert!(task.tool_version.is_none());
+
+        for nonce in [None, Some("global=legacy")] {
+            let bytes = legacy_task_spec_bytes(&task, nonce);
+            assert_eq!(
+                task_spec_hash(&task, nonce),
+                *blake3::hash(&bytes).as_bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn cache_files_without_tool_version_preserve_the_legacy_task_hash() {
+        let mut task = sample_task_definition();
+        task.cache_files = vec![".eslintcache".to_owned(), ".babel-cache/**".to_owned()];
+        assert!(task.tool_version.is_none());
+
+        for nonce in [None, Some("global=legacy")] {
+            let bytes = legacy_task_spec_bytes(&task, nonce);
+            let cache_files =
+                bincode::serde::encode_to_vec(&task.cache_files, bincode_config()).unwrap();
+            // Keep the pre-tool-version byte stream independent of task_spec_hash.
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(b"luchta-cache:task-spec-cache-files:v1");
+            hasher.update(&(bytes.len() as u64).to_le_bytes());
+            hasher.update(&bytes);
+            hasher.update(&(cache_files.len() as u64).to_le_bytes());
+            hasher.update(&cache_files);
+
+            assert_eq!(task_spec_hash(&task, nonce), *hasher.finalize().as_bytes());
+        }
     }
 
     #[test]
     fn task_spec_hash_changes_when_cache_file_declaration_changes() {
-        let mut task = sample_task_definition();
-        let baseline = task_spec_hash(&task, None);
-        task.cache_files = vec![".eslintcache".to_owned()];
-        let eslint = task_spec_hash(&task, None);
-        task.cache_files = vec![".babel-cache/**".to_owned()];
+        for tool_version in [None, Some("swc_core=80.0.0".to_owned())] {
+            let mut task = sample_task_definition();
+            task.tool_version = tool_version;
+            let baseline = task_spec_hash(&task, None);
+            task.cache_files = vec![".eslintcache".to_owned()];
+            let eslint = task_spec_hash(&task, None);
+            task.cache_files = vec![".babel-cache/**".to_owned()];
 
-        assert_ne!(baseline, eslint);
-        assert_ne!(eslint, task_spec_hash(&task, None));
+            assert_ne!(baseline, eslint);
+            assert_ne!(eslint, task_spec_hash(&task, None));
+        }
+    }
+
+    #[test]
+    fn task_spec_hash_changes_when_tool_version_changes() {
+        for cache_files in [Vec::new(), vec![".eslintcache".to_owned()]] {
+            let mut task = sample_task_definition();
+            task.cache_files = cache_files;
+            task.tool_version = Some("swc_core=80.0.0".to_owned());
+            let baseline = task_spec_hash(&task, None);
+            task.tool_version = Some("swc_core=80.0.1".to_owned());
+
+            assert_ne!(
+                baseline,
+                task_spec_hash(&task, None),
+                "cache_files={:?}",
+                task.cache_files
+            );
+        }
+    }
+
+    #[test]
+    fn task_spec_hash_changes_when_tool_version_added() {
+        for cache_files in [Vec::new(), vec![".eslintcache".to_owned()]] {
+            let mut task = sample_task_definition();
+            task.cache_files = cache_files;
+            let baseline = task_spec_hash(&task, None);
+
+            for version in ["", "swc_core=80.0.0"] {
+                task.tool_version = Some(version.to_owned());
+                assert_ne!(
+                    baseline,
+                    task_spec_hash(&task, None),
+                    "cache_files={:?}, version={version:?}",
+                    task.cache_files
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn task_spec_hash_with_tool_version_is_deterministic() {
+        for cache_files in [Vec::new(), vec![".eslintcache".to_owned()]] {
+            let mut task = sample_task_definition();
+            task.cache_files = cache_files;
+            task.tool_version = Some("swc_core=80.0.0".to_owned());
+            let first = task_spec_hash(&task, None);
+            let second = task_spec_hash(&task, None);
+
+            assert_eq!(first, second, "cache_files={:?}", task.cache_files);
+        }
+    }
+
+    #[test]
+    fn task_spec_hash_with_tool_version_still_tracks_the_task_spec() {
+        for cache_files in [Vec::new(), vec![".eslintcache".to_owned()]] {
+            let mut task = sample_task_definition();
+            task.cache_files = cache_files;
+            task.tool_version = Some("swc_core=80.0.0".to_owned());
+            let baseline = task_spec_hash(&task, None);
+            assert_ne!(baseline, task_spec_hash(&task, Some("global=changed")));
+
+            task.command = Some("pnpm run test".to_owned());
+            assert_ne!(baseline, task_spec_hash(&task, None));
+        }
     }
 
     #[test]
@@ -618,6 +707,23 @@ mod tests {
         assert_eq!(pkg_dep_hash(&unsorted), pkg_dep_hash(&sorted));
     }
 
+    fn legacy_task_spec_bytes(task: &TaskDefinition, nonce: Option<&str>) -> Vec<u8> {
+        bincode::serde::encode_to_vec(
+            TaskSpecHashInput {
+                command: task.command.as_deref(),
+                worker: task.worker.as_deref(),
+                weight: task.weight,
+                depends_on: &task.depends_on,
+                cache_enabled: task.cache_enabled(),
+                inputs: &task.inputs,
+                outputs: &task.outputs,
+                nonce,
+            },
+            bincode_config(),
+        )
+        .unwrap()
+    }
+
     fn sample_task_definition() -> TaskDefinition {
         let mut env = BTreeMap::new();
         env.insert(
@@ -652,6 +758,7 @@ mod tests {
             cache_files: Vec::new(),
             dependencies: vec!["**/*".to_string()],
             env,
+            tool_version: None,
         }
     }
 }

@@ -2854,6 +2854,7 @@ mod tests {
                 weight: Some(7),
                 dependencies: None,
                 inputs: None,
+                tool_version: None,
             })
         });
         let (graph, pruned) = TaskGraph::build_resolved(
@@ -3178,6 +3179,7 @@ mod tests {
                 weight: None,
                 dependencies: None,
                 inputs: None,
+                tool_version: None,
             })
         });
 

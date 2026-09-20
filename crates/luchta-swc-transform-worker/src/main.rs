@@ -93,6 +93,7 @@ impl Worker for SwcTransformWorker {
         let Some(cwd) = req.cwd.as_deref() else {
             return ResolveResult::modify(TaskModification {
                 inputs: Some(inputs.into_iter().collect()),
+                tool_version: Some(env!("LUCHTA_TOOL_VERSION").to_owned()),
                 ..TaskModification::default()
             });
         };
@@ -106,6 +107,7 @@ impl Worker for SwcTransformWorker {
 
         ResolveResult::modify(TaskModification {
             inputs: Some(inputs.into_iter().collect()),
+            tool_version: Some(env!("LUCHTA_TOOL_VERSION").to_owned()),
             ..TaskModification::default()
         })
     }
@@ -549,6 +551,31 @@ mod tests {
         assert!(inputs.contains(&".swcrc".to_owned()));
         assert!(inputs.contains(&"#**/.swcrc".to_owned()));
         assert!(inputs.contains(&"configs/shared.swcrc".to_owned()));
+    }
+
+    #[test]
+    fn resolve_task_reports_tool_version() {
+        let temp = TempDir::new().expect("tempdir");
+        let cwd = temp.path();
+        fs::create_dir_all(cwd.join("src")).expect("src dir");
+        fs::write(cwd.join("src/index.ts"), "export const x = 1;\n").expect("source file");
+
+        let result = SwcTransformWorker.resolve_task(&resolve_task(cwd, ""));
+        let ResolveDecision::Modify(modification) = result.decision else {
+            panic!("expected modify decision");
+        };
+        let tool_version = modification
+            .tool_version
+            .expect("tool_version must be present");
+        // Must match expected format: styled_components=<version>,swc_core=<version> (sorted)
+        assert!(
+            tool_version.contains("swc_core=") && tool_version.contains("styled_components="),
+            "unexpected tool_version: {tool_version}"
+        );
+        // Verify sorted order (comma-separated)
+        let parts: Vec<&str> = tool_version.split(',').collect();
+        assert_eq!(parts.len(), 2, "expected 2 components: {tool_version}");
+        assert!(parts[0] < parts[1], "expected sorted order: {tool_version}");
     }
 
     #[test]

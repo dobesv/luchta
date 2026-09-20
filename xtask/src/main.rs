@@ -292,15 +292,51 @@ fn go_build_worker(
     output_path: &Path,
     go_target: GoTarget,
 ) -> Result<(), String> {
+    // Determine the TypeScript submodule commit SHA to bake into the binary.
+    // go_module_dir is vendor/typescript/tsc, so the submodule root is one level up.
+    let submodule_dir = go_module_dir
+        .parent()
+        .ok_or_else(|| "go_module_dir has no parent".to_string())?;
+    let sha_output = git_command(submodule_dir)
+        .arg("rev-parse")
+        .arg("HEAD")
+        .output()
+        .map_err(|error| format!("failed to run git rev-parse: {error}"))?;
+    if !sha_output.status.success() {
+        return Err(format!(
+            "git -C {} rev-parse HEAD failed: {}",
+            submodule_dir.display(),
+            String::from_utf8_lossy(&sha_output.stderr).trim()
+        ));
+    }
+    let sha = String::from_utf8_lossy(&sha_output.stdout)
+        .trim()
+        .to_string();
+    if sha.is_empty() {
+        return Err(format!(
+            "git -C {} rev-parse HEAD returned empty SHA",
+            submodule_dir.display()
+        ));
+    }
+
+    // Build ldflags with version injection. The full import path is required for -X.
+    // The go.mod declares module "github.com/microsoft/TypeScript/tsc", and the luchta
+    // package is at tsc/internal/luchta, so the full path is that plus "/internal/luchta".
+    let ldflags = format!(
+        "-s -w -X 'github.com/microsoft/TypeScript/tsc/internal/luchta.LuchtaToolVersion={}'",
+        sha
+    );
+
     let status = Command::new("go")
         .current_dir(go_module_dir)
         .env("CGO_ENABLED", "0")
         .env("GOOS", go_target.goos)
         .env("GOARCH", go_target.goarch)
         .arg("build")
+        .arg("-buildvcs=false")
         .arg("-trimpath")
         .arg("-ldflags")
-        .arg("-s -w")
+        .arg(&ldflags)
         .arg("-o")
         .arg(output_path)
         .arg("./cmd/luchta-tsc-worker")

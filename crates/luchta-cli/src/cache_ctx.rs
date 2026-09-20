@@ -1186,6 +1186,7 @@ chalk@^5.0.0:
             weight: None,
             dependencies: Some(vec!["left-pad".to_string()]),
             inputs: None,
+            tool_version: None,
         };
         modification.apply_to(&mut definition);
 
@@ -1251,6 +1252,7 @@ chalk@^5.0.0:
             weight: None,
             dependencies: None,
             inputs: None,
+            tool_version: None,
         };
         modification.apply_to(&mut definition);
 

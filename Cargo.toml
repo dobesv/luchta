@@ -9,6 +9,7 @@
 # `cargo build` under the current toolchain.
 resolver = "2"
 members = [
+    "crates/luchta-lockfile-version",
     "crates/luchta-types",
     "crates/luchta-glob",
     "crates/luchta-lockfiles",

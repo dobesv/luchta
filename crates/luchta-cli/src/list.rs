@@ -401,6 +401,7 @@ mod tests {
             cache_files: vec![".eslintcache".to_string()],
             dependencies: vec!["left-pad".to_string(), "react".to_string()],
             env,
+            tool_version: None,
         };
 
         assert_eq!(
