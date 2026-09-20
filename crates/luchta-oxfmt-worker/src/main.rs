@@ -15,6 +15,8 @@ mod config;
 #[cfg(feature = "oxc")]
 mod format;
 #[cfg(feature = "oxc")]
+mod jsdoc;
+#[cfg(feature = "oxc")]
 mod opts;
 #[cfg(feature = "oxc")]
 mod sort_imports;

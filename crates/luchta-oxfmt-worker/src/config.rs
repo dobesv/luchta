@@ -8,12 +8,13 @@ use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use json_strip_comments::StripComments;
 use oxc_formatter::{
     ArrowParentheses, AttributePosition, BracketSameLine, BracketSpacing, Expand, JsFormatOptions,
-    QuoteProperties, QuoteStyle, Semicolons, TrailingCommas,
+    OperatorPosition, QuoteProperties, QuoteStyle, Semicolons, TrailingCommas,
 };
 use oxc_formatter_core::{IndentStyle, IndentWidth, LineEnding, LineWidth};
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::jsdoc;
 use crate::sort_imports;
 
 const CONFIG_FILENAMES: [&str; 2] = [".oxfmtrc.json", ".oxfmtrc.jsonc"];
@@ -67,10 +68,12 @@ struct OxfmtRc {
     single_attribute_per_line: Option<bool>,
     object_wrap: Option<ObjectWrap>,
     html_whitespace_sensitivity: Option<HtmlWhitespaceSensitivity>,
-    // `embeddedLanguageFormatting`, `experimentalOperatorPosition`, and
-    // `experimentalTernaries` are unsupported and intentionally omitted.
-    // Serde ignores them, while `collect_unknown_options` reports keys absent
-    // from `KNOWN_FORMAT_OPTION_KEYS` without rejecting the config.
+    experimental_operator_position: Option<OperatorPositionConfig>,
+    jsdoc: Option<jsdoc::JsdocUserConfig>,
+    // `embeddedLanguageFormatting` and `experimentalTernaries` are recognized
+    // schema keys but not applied by luchta's in-process formatter.
+    // `collect_unknown_options` classifies them via `KNOWN_NOT_APPLIED_OPTION_KEYS`
+    // and emits an accurate notice instead of a generic "unsupported" warning.
     #[serde(alias = "experimentalSortImports")]
     sort_imports: Option<sort_imports::SortImportsUserConfig>,
     ignore_patterns: Option<Vec<String>>,
@@ -157,10 +160,50 @@ enum HtmlWhitespaceSensitivity {
     Ignore,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum OperatorPositionConfig {
+    Start,
+    End,
+}
+
 #[derive(Debug, Default)]
 struct UnknownOptions {
     top_level: Vec<String>,
     override_options: Vec<Vec<String>>,
+}
+
+/// Classification of a known-not-applied key for diagnostic purposes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NotAppliedDiagnostic {
+    /// Warn: key is recognized by oxfmt but not applied by luchta.
+    WarnNotApplied,
+    /// Silent: key only affects rejected file types, no warning needed.
+    Silent,
+}
+
+/// Classify a known-not-applied key for diagnostic purposes.
+fn classify_not_applied_key(key: &str, value: Option<&Value>) -> NotAppliedDiagnostic {
+    match key {
+        // Always warn: these options have no effect regardless of file type
+        "insertFinalNewline" | "embeddedLanguageFormatting" => NotAppliedDiagnostic::WarnNotApplied,
+        // Conditional: warn if truthy, silent if false
+        "sortTailwindcss" => {
+            match value {
+                None => NotAppliedDiagnostic::Silent,
+                Some(Value::Bool(false)) => NotAppliedDiagnostic::Silent,
+                Some(Value::Bool(true)) | Some(Value::Object(_)) => {
+                    NotAppliedDiagnostic::WarnNotApplied
+                }
+                Some(_) => NotAppliedDiagnostic::WarnNotApplied, // other truthy values
+            }
+        }
+        // Silent: these only affect unsupported file types
+        "proseWrap" | "svelte" | "vueIndentScriptAndStyle" | "sortPackageJson" => {
+            NotAppliedDiagnostic::Silent
+        }
+        _ => NotAppliedDiagnostic::WarnNotApplied, // fallback for unknown keys
+    }
 }
 
 impl LoadedConfig {
@@ -252,6 +295,11 @@ fn apply_oxfmtrc_to_options(config: &OxfmtRc, options: &mut JsFormatOptions) -> 
     // explicit `sortImports: false` still flows through (resolves to `None`).
     if config.sort_imports.is_some() {
         options.sort_imports = sort_imports::resolve_sort_imports(config.sort_imports.clone())?;
+    }
+    // Same semantics as sortImports: only apply if explicitly set, so overriding
+    // configs don't accidentally clobber a higher-level jsdoc setting.
+    if config.jsdoc.is_some() {
+        options.jsdoc = jsdoc::resolve_jsdoc(config.jsdoc.clone());
     }
     Ok(())
 }
@@ -348,12 +396,22 @@ fn map_expand(object_wrap: ObjectWrap) -> Expand {
     }
 }
 
+fn map_operator_position(operator_position: OperatorPositionConfig) -> OperatorPosition {
+    match operator_position {
+        OperatorPositionConfig::Start => OperatorPosition::Start,
+        OperatorPositionConfig::End => OperatorPosition::End,
+    }
+}
+
 fn apply_markup_options(config: &OxfmtRc, options: &mut JsFormatOptions) {
     if let Some(html_whitespace_sensitivity) = config.html_whitespace_sensitivity {
         options.html_whitespace_sensitivity_ignore = matches!(
             html_whitespace_sensitivity,
             HtmlWhitespaceSensitivity::Ignore
         );
+    }
+    if let Some(operator_position) = config.experimental_operator_position {
+        options.operator_position = map_operator_position(operator_position);
     }
 }
 
@@ -465,16 +523,23 @@ fn parse_oxfmtrc(json: &str) -> Result<OxfmtRc, String> {
     serde_json::from_str(json).map_err(|error| format!("failed to parse .oxfmtrc: {error}"))
 }
 
-/// Formatter-option keys the worker recognizes. These are valid both at the
-/// `.oxfmtrc` top level and inside an `overrides[].options` object. Single
-/// source of truth to keep the two scopes in sync.
+/// Formatter-option keys the worker recognizes and applies.
+/// These are valid both at the `.oxfmtrc` top level and inside an
+/// `overrides[].options` object. Single source of truth to keep the two scopes in sync.
+///
+/// **Drift guardrail:** The `schema_drift_guardrail` test module verifies this
+/// list plus `KNOWN_NOT_APPLIED_OPTION_KEYS` partition the bundled oxfmt schema
+/// exactly. When upgrading oxc, add or remove schema keys from the appropriate
+/// list and the guardrail will enforce coverage.
 const KNOWN_FORMAT_OPTION_KEYS: &[&str] = &[
     "arrowParens",
     "bracketSameLine",
     "bracketSpacing",
     "endOfLine",
+    "experimentalOperatorPosition",
     "experimentalSortImports",
     "htmlWhitespaceSensitivity",
+    "jsdoc",
     "jsxSingleQuote",
     "objectWrap",
     "printWidth",
@@ -512,6 +577,25 @@ const KNOWN_SORT_IMPORTS_KEYS: &[&str] = &[
     "customGroups",
 ];
 
+/// Option keys recognized by oxfmt but not applied by luchta's in-process formatter.
+/// These produce an accurate "recognized but not applied" notice instead of a generic
+/// "unsupported" warning, matching the bundled oxfmt schema precisely.
+///
+/// **Drift guardrail:** The `schema_drift_guardrail` test module verifies this
+/// list plus `KNOWN_FORMAT_OPTION_KEYS` partition the bundled oxfmt schema exactly.
+/// When upgrading oxc, update this list if new schema keys appear that luchta
+/// cannot apply (e.g., options for file types luchta doesn't format, or app-layer
+/// post-processing).
+pub const KNOWN_NOT_APPLIED_OPTION_KEYS: &[&str] = &[
+    "embeddedLanguageFormatting",
+    "insertFinalNewline",
+    "proseWrap",
+    "sortPackageJson",
+    "sortTailwindcss",
+    "svelte",
+    "vueIndentScriptAndStyle",
+];
+
 fn is_known(known: &[&str], key: &str) -> bool {
     known.contains(&key)
 }
@@ -543,12 +627,15 @@ fn unknown_sort_imports_keys(object: &serde_json::Map<String, Value>) -> Vec<Str
 
 /// Unknown option keys within a formatter-option object (used for both the
 /// top-level config and an override's nested `options`): keys not recognized as
-/// formatter options, plus unknown sub-keys nested inside `sortImports`
-/// (or its `experimentalSortImports` alias).
+/// formatter options or known-not-applied, plus unknown sub-keys nested inside
+/// `sortImports` (or its `experimentalSortImports` alias).
 fn unknown_format_option_keys(object: &serde_json::Map<String, Value>) -> Vec<String> {
     let mut unknown: Vec<String> = object
         .keys()
-        .filter(|key| !is_known(KNOWN_FORMAT_OPTION_KEYS, key))
+        .filter(|key| {
+            !is_known(KNOWN_FORMAT_OPTION_KEYS, key)
+                && !is_known(KNOWN_NOT_APPLIED_OPTION_KEYS, key)
+        })
         .cloned()
         .collect();
     unknown.extend(unknown_sort_imports_keys(object));
@@ -562,7 +649,9 @@ fn unknown_top_level_keys(object: &serde_json::Map<String, Value>) -> Vec<String
     let mut unknown: Vec<String> = object
         .keys()
         .filter(|key| {
-            !is_known(KNOWN_FORMAT_OPTION_KEYS, key) && !is_known(KNOWN_TOP_LEVEL_ONLY_KEYS, key)
+            !is_known(KNOWN_FORMAT_OPTION_KEYS, key)
+                && !is_known(KNOWN_TOP_LEVEL_ONLY_KEYS, key)
+                && !is_known(KNOWN_NOT_APPLIED_OPTION_KEYS, key)
         })
         .cloned()
         .collect();
@@ -610,6 +699,55 @@ fn collect_unknown_options(json: &str) -> Result<UnknownOptions, String> {
     })
 }
 
+/// Known-not-applied key information for diagnostic generation.
+struct KnownNotAppliedOptions {
+    top_level: Vec<(String, Option<Value>)>,
+    override_options: Vec<Vec<(String, Option<Value>)>>,
+}
+
+fn collect_known_not_applied_options(json: &str) -> Result<KnownNotAppliedOptions, String> {
+    let value: Value = serde_json::from_str(json)
+        .map_err(|error| format!("failed to parse .oxfmtrc for known-not-applied scan: {error}"))?;
+    let Some(object) = value.as_object() else {
+        return Ok(KnownNotAppliedOptions {
+            top_level: Vec::new(),
+            override_options: Vec::new(),
+        });
+    };
+
+    let top_level: Vec<(String, Option<Value>)> = object
+        .keys()
+        .filter(|key| is_known(KNOWN_NOT_APPLIED_OPTION_KEYS, key))
+        .map(|key| (key.clone(), object.get(key).cloned()))
+        .collect();
+
+    let override_options: Vec<Vec<(String, Option<Value>)>> = object
+        .get("overrides")
+        .and_then(Value::as_array)
+        .map(|overrides| {
+            overrides
+                .iter()
+                .filter_map(|entry| {
+                    let entry_obj = entry.as_object()?;
+                    let options = entry_obj.get("options")?.as_object()?;
+                    Some(
+                        options
+                            .keys()
+                            .filter(|key| is_known(KNOWN_NOT_APPLIED_OPTION_KEYS, key))
+                            .map(|key| (key.clone(), options.get(key).cloned()))
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Ok(KnownNotAppliedOptions {
+        top_level,
+        override_options,
+    })
+}
+
 struct ParsedConfig {
     options: JsFormatOptions,
     ignore_matcher: Option<Gitignore>,
@@ -652,12 +790,38 @@ fn load_config_from_path(path: &Path) -> Result<ParsedConfig, String> {
         .map_err(|error| format!("failed to strip comments in {}: {error}", path.display()))?;
 
     let unknown = collect_unknown_options(&json)?;
+    let known_not_applied = collect_known_not_applied_options(&json)?;
     let config = parse_oxfmtrc(&json)?;
     let options = options_from_oxfmtrc(&config)?;
 
-    // Unsupported/unknown keys are informational only — they must NOT reject the
-    // task during resolution (an unrecognized key is normal forward-compat).
+    // Build diagnostics for known-not-applied keys.
     let mut unsupported_option_notices = Vec::new();
+
+    // Generate notices for known-not-applied keys at the top level.
+    for (key, value) in known_not_applied.top_level {
+        let diagnostic = classify_not_applied_key(&key, value.as_ref());
+        if diagnostic == NotAppliedDiagnostic::WarnNotApplied {
+            unsupported_option_notices.push(format!(
+                "warning: .oxfmtrc option `{key}` in {} is recognized by bundled oxfmt but not applied by luchta's in-process formatter",
+                path.display()
+            ));
+        }
+    }
+
+    // Generate notices for known-not-applied keys inside overrides.
+    for (index, keys) in known_not_applied.override_options.into_iter().enumerate() {
+        for (key, value) in keys {
+            let diagnostic = classify_not_applied_key(&key, value.as_ref());
+            if diagnostic == NotAppliedDiagnostic::WarnNotApplied {
+                unsupported_option_notices.push(format!(
+                    "warning: .oxfmtrc option `overrides[{index}].options.{key}` in {} is recognized by bundled oxfmt but not applied by luchta's in-process formatter",
+                    path.display()
+                ));
+            }
+        }
+    }
+
+    // Genuinely unknown keys: emit the generic "unsupported" warning.
     for key in unknown.top_level {
         unsupported_option_notices.push(format!(
             "warning: unsupported .oxfmtrc option `{key}` in {}; ignoring",
@@ -939,25 +1103,25 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_embedded_language_formatting_emits_notice() {
+    fn embedded_language_formatting_recognized_but_not_applied() {
         let (_temp, loaded) = load_config_from_temp(r#"{"embeddedLanguageFormatting":"off"}"#);
 
         assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
-        // Exactly one notice, naming the key — a single unknown key must not
-        // fan out into duplicates.
+        // Exactly one notice, naming the key with the new message.
         assert!(
             loaded.unsupported_option_notices.len() == 1
-                && loaded.unsupported_option_notices[0].contains("embeddedLanguageFormatting"),
+                && loaded.unsupported_option_notices[0].contains("embeddedLanguageFormatting")
+                && loaded.unsupported_option_notices[0]
+                    .contains("recognized by bundled oxfmt but not applied"),
             "{:?}",
             loaded.unsupported_option_notices
         );
     }
 
     #[test]
-    fn unsupported_experimental_options_warn_and_do_not_fail() {
-        // Unsupported experimental options must NOT hard-fail config load
-        // (that would stop formatting the whole repo for a newer/shared
-        // .oxfmtrc). They are ignored and surfaced as warnings instead.
+    fn unsupported_experimental_ternaries_warns_but_not_operator_position() {
+        // `experimentalTernaries` is unsupported and should emit a notice.
+        // `experimentalOperatorPosition` is now supported (mapped to OperatorPosition).
         let temp = TempDir::new().expect("tempdir");
         let config_path = temp.path().join(CONFIG_FILENAMES[0]);
         fs::write(
@@ -967,14 +1131,275 @@ mod tests {
         .expect("config");
 
         let loaded = discover_config(temp.path()).expect("discover should not fail");
-        // Unsupported keys are informational notices, NOT reject-worthy warnings.
+        // No warnings — unsupported keys are informational notices.
         assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
-        let notices = loaded.unsupported_option_notices.join("\n");
+        // Only `experimentalTernaries` should produce a notice.
         assert!(
-            loaded.unsupported_option_notices.len() == 2
-                && notices.contains("experimentalTernaries")
-                && notices.contains("experimentalOperatorPosition"),
-            "{notices}"
+            loaded.unsupported_option_notices.len() == 1
+                && loaded.unsupported_option_notices[0].contains("experimentalTernaries")
+                && !loaded.unsupported_option_notices[0].contains("experimentalOperatorPosition"),
+            "{:?}",
+            loaded.unsupported_option_notices
+        );
+    }
+
+    #[test]
+    fn experimental_operator_position_start_maps_correctly() {
+        let options =
+            oxfmtrc_to_options(r#"{"experimentalOperatorPosition":"start"}"#).expect("parse");
+        assert_eq!(
+            options.operator_position,
+            oxc_formatter::OperatorPosition::Start
+        );
+    }
+
+    #[test]
+    fn experimental_operator_position_end_maps_correctly() {
+        let options =
+            oxfmtrc_to_options(r#"{"experimentalOperatorPosition":"end"}"#).expect("parse");
+        assert_eq!(
+            options.operator_position,
+            oxc_formatter::OperatorPosition::End
+        );
+    }
+
+    #[test]
+    fn experimental_operator_position_unset_uses_default() {
+        let options = oxfmtrc_to_options(r#"{}"#).expect("parse");
+        // Default is `End` per oxc_formatter.
+        assert_eq!(
+            options.operator_position,
+            oxc_formatter::OperatorPosition::End
+        );
+    }
+
+    #[test]
+    fn experimental_operator_position_no_warning_emitted() {
+        let temp = TempDir::new().expect("tempdir");
+        let config_path = temp.path().join(CONFIG_FILENAMES[0]);
+        fs::write(&config_path, r#"{"experimentalOperatorPosition":"start"}"#).expect("config");
+
+        let loaded = discover_config(temp.path()).expect("discover should not fail");
+        assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+        assert!(
+            loaded.unsupported_option_notices.is_empty(),
+            "{:?}",
+            loaded.unsupported_option_notices
+        );
+    }
+
+    #[test]
+    fn jsdoc_boolean_true_enables_defaults() {
+        let options = oxfmtrc_to_options(r#"{"jsdoc":true}"#).expect("parse");
+        assert!(options.jsdoc.is_some());
+        let jsdoc = options.jsdoc.unwrap();
+        assert!(jsdoc.capitalize_descriptions); // default is true
+        assert!(!jsdoc.separate_tag_groups); // default is false
+    }
+
+    #[test]
+    fn jsdoc_boolean_false_disables_jsdoc() {
+        let options = oxfmtrc_to_options(r#"{"jsdoc":false}"#).expect("parse");
+        assert!(options.jsdoc.is_none());
+    }
+
+    #[test]
+    fn jsdoc_object_applies_overrides() {
+        let options = oxfmtrc_to_options(r#"{"jsdoc":{"bracketSpacing":true}}"#).expect("parse");
+        assert!(options.jsdoc.is_some());
+        let jsdoc = options.jsdoc.unwrap();
+        assert!(jsdoc.bracket_spacing);
+        assert!(jsdoc.capitalize_descriptions); // still default
+    }
+
+    #[test]
+    fn jsdoc_comment_line_strategy_maps() {
+        let options =
+            oxfmtrc_to_options(r#"{"jsdoc":{"commentLineStrategy":"multiline"}}"#).expect("parse");
+        assert!(options.jsdoc.is_some());
+        let jsdoc = options.jsdoc.unwrap();
+        assert_eq!(
+            jsdoc.comment_line_strategy,
+            oxc_formatter::CommentLineStrategy::Multiline
+        );
+    }
+
+    #[test]
+    fn jsdoc_line_wrapping_style_maps() {
+        let options =
+            oxfmtrc_to_options(r#"{"jsdoc":{"lineWrappingStyle":"balance"}}"#).expect("parse");
+        assert!(options.jsdoc.is_some());
+        let jsdoc = options.jsdoc.unwrap();
+        assert_eq!(
+            jsdoc.line_wrapping_style,
+            oxc_formatter::LineWrappingStyle::Balance
+        );
+    }
+
+    #[test]
+    fn jsdoc_no_warning_emitted() {
+        let temp = TempDir::new().expect("tempdir");
+        let config_path = temp.path().join(CONFIG_FILENAMES[0]);
+        fs::write(&config_path, r#"{"jsdoc":{"bracketSpacing":true}}"#).expect("config");
+
+        let loaded = discover_config(temp.path()).expect("discover should not fail");
+        assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+        assert!(
+            loaded.unsupported_option_notices.is_empty(),
+            "{:?}",
+            loaded.unsupported_option_notices
+        );
+    }
+
+    #[test]
+    fn insert_final_newline_recognized_but_not_applied() {
+        let (_temp, loaded) = load_config_from_temp(r#"{"insertFinalNewline":true}"#);
+
+        assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+        assert!(
+            loaded.unsupported_option_notices.len() == 1
+                && loaded.unsupported_option_notices[0].contains("insertFinalNewline")
+                && loaded.unsupported_option_notices[0]
+                    .contains("recognized by bundled oxfmt but not applied"),
+            "{:?}",
+            loaded.unsupported_option_notices
+        );
+    }
+
+    #[test]
+    fn prose_wrap_silent_no_warning() {
+        let (_temp, loaded) = load_config_from_temp(r#"{"proseWrap":"always"}"#);
+
+        assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+        // proseWrap is silent - no notice
+        assert!(
+            loaded.unsupported_option_notices.is_empty(),
+            "{:?}",
+            loaded.unsupported_option_notices
+        );
+    }
+
+    #[test]
+    fn sort_tailwindcss_true_warns() {
+        let (_temp, loaded) = load_config_from_temp(r#"{"sortTailwindcss":true}"#);
+
+        assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+        assert!(
+            loaded.unsupported_option_notices.len() == 1
+                && loaded.unsupported_option_notices[0].contains("sortTailwindcss")
+                && loaded.unsupported_option_notices[0]
+                    .contains("recognized by bundled oxfmt but not applied"),
+            "{:?}",
+            loaded.unsupported_option_notices
+        );
+    }
+
+    #[test]
+    fn sort_tailwindcss_false_silent() {
+        let (_temp, loaded) = load_config_from_temp(r#"{"sortTailwindcss":false}"#);
+
+        assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+        // sortTailwindcss: false is silent
+        assert!(
+            loaded.unsupported_option_notices.is_empty(),
+            "{:?}",
+            loaded.unsupported_option_notices
+        );
+    }
+
+    #[test]
+    fn svelte_silent_no_warning() {
+        let (_temp, loaded) = load_config_from_temp(r#"{"svelte":{"plugins":[]}}"#);
+
+        assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+        // svelte is silent - only affects rejected file types
+        assert!(
+            loaded.unsupported_option_notices.is_empty(),
+            "{:?}",
+            loaded.unsupported_option_notices
+        );
+    }
+
+    #[test]
+    fn vue_indent_script_and_style_silent() {
+        let (_temp, loaded) = load_config_from_temp(r#"{"vueIndentScriptAndStyle":true}"#);
+
+        assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+        // vueIndentScriptAndStyle is silent - only affects .vue files
+        assert!(
+            loaded.unsupported_option_notices.is_empty(),
+            "{:?}",
+            loaded.unsupported_option_notices
+        );
+    }
+
+    #[test]
+    fn sort_package_json_silent() {
+        let (_temp, loaded) = load_config_from_temp(r#"{"sortPackageJson":true}"#);
+
+        assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+        // sortPackageJson is silent - only affects package.json files
+        assert!(
+            loaded.unsupported_option_notices.is_empty(),
+            "{:?}",
+            loaded.unsupported_option_notices
+        );
+    }
+
+    #[test]
+    fn genuinely_unknown_key_emits_unsupported_warning() {
+        let (_temp, loaded) = load_config_from_temp(r#"{"bogusOption":true}"#);
+
+        assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+        assert!(
+            loaded.unsupported_option_notices.len() == 1
+                && loaded.unsupported_option_notices[0]
+                    .contains("unsupported .oxfmtrc option `bogusOption`"),
+            "{:?}",
+            loaded.unsupported_option_notices
+        );
+    }
+
+    #[test]
+    fn insert_final_newline_in_override_warns_with_path() {
+        let temp = TempDir::new().expect("tempdir");
+        let config_path = temp.path().join(CONFIG_FILENAMES[0]);
+        fs::write(
+            &config_path,
+            r#"{"overrides":[{"files":["*.ts"],"options":{"insertFinalNewline":true}}]}"#,
+        )
+        .expect("config");
+
+        let loaded = discover_config(temp.path()).expect("discover should not fail");
+        assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+        assert!(
+            loaded.unsupported_option_notices.len() == 1
+                && loaded.unsupported_option_notices[0]
+                    .contains("overrides[0].options.insertFinalNewline")
+                && loaded.unsupported_option_notices[0]
+                    .contains("recognized by bundled oxfmt but not applied"),
+            "{:?}",
+            loaded.unsupported_option_notices
+        );
+    }
+
+    #[test]
+    fn prose_wrap_in_override_silent() {
+        let temp = TempDir::new().expect("tempdir");
+        let config_path = temp.path().join(CONFIG_FILENAMES[0]);
+        fs::write(
+            &config_path,
+            r#"{"overrides":[{"files":["*.md"],"options":{"proseWrap":"always"}}]}"#,
+        )
+        .expect("config");
+
+        let loaded = discover_config(temp.path()).expect("discover should not fail");
+        assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+        // proseWrap is silent even inside overrides
+        assert!(
+            loaded.unsupported_option_notices.is_empty(),
+            "{:?}",
+            loaded.unsupported_option_notices
         );
     }
 
@@ -1490,5 +1915,163 @@ mod tests {
                 "unexpected printWidth for {relative_path}"
             );
         }
+    }
+}
+
+/// Bidirectional schema-drift guardrail: verifies that luchta's option
+/// classification matches the bundled oxfmt configuration schema.
+///
+/// This test:
+/// 1. Runs `cargo metadata` to locate the oxc_formatter crate
+/// 2. Navigates to `<oxc_checkout>/npm/oxfmt/configuration_schema.json`
+/// 3. Extracts `definitions.FormatConfig.properties` keys
+/// 4. Verifies sets match: honored + known-not-applied == schema keys
+///
+/// If any step fails (cargo metadata, schema file missing, JSON layout
+/// unexpected), the test panics with a clear error — never silently skips.
+#[cfg(test)]
+mod schema_drift_guardrail {
+    use super::*;
+    use std::collections::HashSet;
+    use std::process::Command;
+
+    fn load_schema_keys() -> HashSet<String> {
+        // Run cargo metadata to locate oxc_formatter
+        let output = Command::new("cargo")
+            .args(["metadata", "--format-version", "1", "--locked", "--offline"])
+            .output()
+            .expect("failed to run `cargo metadata`");
+
+        if !output.status.success() {
+            panic!(
+                "cargo metadata failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let metadata: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .expect("cargo metadata output is not valid JSON");
+
+        // Find oxc_formatter package
+        let packages = metadata
+            .get("packages")
+            .and_then(|p| p.as_array())
+            .expect("cargo metadata missing `packages` array");
+
+        let oxc_formatter = packages
+            .iter()
+            .find(|p| {
+                p.get("name")
+                    .and_then(|n| n.as_str())
+                    .map(|n| n == "oxc_formatter")
+                    .unwrap_or(false)
+            })
+            .expect("oxc_formatter package not found in cargo metadata");
+
+        let manifest_path = oxc_formatter
+            .get("manifest_path")
+            .and_then(|m| m.as_str())
+            .expect("oxc_formatter missing manifest_path");
+
+        // Navigate from Cargo.toml to checkout root
+        // manifest_path is: <checkout>/crates/oxc_formatter/Cargo.toml
+        // checkout root is: <checkout>
+        let manifest_path = std::path::Path::new(manifest_path);
+        let oxc_crate_root = manifest_path
+            .parent()
+            .expect("manifest_path should have parent (crate root)");
+        let oxc_crates_dir = oxc_crate_root
+            .parent()
+            .expect("crate root should have parent (crates dir)");
+        let oxc_checkout = oxc_crates_dir
+            .parent()
+            .expect("crates dir should have parent (checkout root)");
+
+        let schema_path = oxc_checkout.join("npm/oxfmt/configuration_schema.json");
+
+        if !schema_path.exists() {
+            panic!(
+                "oxfmt configuration schema not found at {}",
+                schema_path.display()
+            );
+        }
+
+        let schema_content = std::fs::read_to_string(&schema_path)
+            .unwrap_or_else(|e| panic!("failed to read schema: {e}"));
+
+        let schema: serde_json::Value = serde_json::from_str(&schema_content)
+            .expect("configuration_schema.json is not valid JSON");
+
+        // Extract definitions.FormatConfig.properties keys
+        let properties = schema
+            .get("definitions")
+            .and_then(|d| d.get("FormatConfig"))
+            .and_then(|fc| fc.get("properties"))
+            .and_then(|p| p.as_object())
+            .unwrap_or_else(|| {
+                panic!(
+                    "schema missing definitions.FormatConfig.properties \
+                     (path: {})",
+                    schema_path.display()
+                )
+            });
+
+        properties.keys().map(|k| k.to_string()).collect()
+    }
+
+    #[test]
+    fn schema_format_keys_covered_by_honored_and_known_not_applied() {
+        let schema_keys = load_schema_keys();
+
+        // Build honored keys set (excluding experimentalSortImports alias)
+        let honored_keys: HashSet<String> = KNOWN_FORMAT_OPTION_KEYS
+            .iter()
+            .filter(|k| *k != &"experimentalSortImports")
+            .map(|k| k.to_string())
+            .collect();
+
+        // Build known-not-applied keys set
+        let known_not_applied_keys: HashSet<String> = KNOWN_NOT_APPLIED_OPTION_KEYS
+            .iter()
+            .map(|k| k.to_string())
+            .collect();
+
+        // Ensure sets are disjoint
+        let intersection: Vec<_> = honored_keys.intersection(&known_not_applied_keys).collect();
+        assert!(
+            intersection.is_empty(),
+            "honored and known_not_applied must be disjoint, but found: {:?}",
+            intersection
+        );
+
+        // Union should equal schema keys
+        let union: HashSet<String> = honored_keys
+            .union(&known_not_applied_keys)
+            .map(|k| (*k).clone())
+            .collect();
+
+        // Check for schema keys not covered by luchta
+        let missing_from_luchta: Vec<_> = schema_keys.difference(&union).collect();
+        assert!(
+            missing_from_luchta.is_empty(),
+            "schema has keys not classified in luchta (add to honored or known_not_applied): {:?}",
+            missing_from_luchta
+        );
+
+        // Check for luchta keys not in schema
+        let extra_keys: Vec<_> = union.difference(&schema_keys).collect();
+        assert!(
+            extra_keys.is_empty(),
+            "luchta has classified keys not in schema (remove or update): {:?}",
+            extra_keys
+        );
+
+        // Log the counts for visibility
+        eprintln!(
+            "schema_keys={}, honored_keys={}, known_not_applied_keys={}",
+            schema_keys.len(),
+            honored_keys.len(),
+            known_not_applied_keys.len()
+        );
     }
 }
