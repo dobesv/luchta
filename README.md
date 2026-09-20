@@ -1189,8 +1189,9 @@ Luchta bundles three in-process workers built on the oxc toolchain (git-pinned t
   - `--check` — Check mode: reports unformatted files and exits nonzero without writing. Without this flag, files are formatted in place.
 
   **Config discovery:** Finds `.oxfmtrc.json` or `.oxfmtrc.jsonc` by walking up from the task's `cwd`. If no config is found, it uses oxfmt defaults.
-  - **Supported fields:** `useTabs`, `tabWidth`, `printWidth`, `endOfLine` (lf|crlf|cr), `singleQuote`, `jsxSingleQuote`, `semi`, `trailingComma` (all|es5|none), `bracketSpacing`, `bracketSameLine`.
-  - **Other fields:** All other Prettier/oxfmt fields (overrides, ignore patterns, editorconfig, plugins, arrowParens, etc.) are currently ignored.
+  - **Supported fields:** `useTabs`, `tabWidth`, `printWidth`, `endOfLine` (lf|crlf|cr), `singleQuote`, `jsxSingleQuote`, `semi`, `trailingComma` (all|es5|none), `bracketSpacing`, `bracketSameLine`, `arrowParens`, `quoteProps`, `singleAttributePerLine`, `objectWrap`, `htmlWhitespaceSensitivity`, `experimentalOperatorPosition` (`"start"`|`"end"`), `jsdoc` (boolean or object with 11 fields), `sortImports`/`experimentalSortImports` (boolean or object), `overrides`, `ignorePatterns`.
+  - **Recognized but not applied:** `insertFinalNewline`, `embeddedLanguageFormatting`, `sortTailwindcss` (when truthy) emit an informational notice; `proseWrap`, `svelte`, `vueIndentScriptAndStyle`, `sortPackageJson` are silent (apply only to non-JS/TS file types).
+  - **Unsupported fields:** Genuinely unknown fields (not in oxfmt's schema) emit an "unsupported" warning and are ignored.
 
 #### Wrapper & Filter Workers
 Luchta provides a set of composable wrapper workers that can be chained using

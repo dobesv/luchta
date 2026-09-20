@@ -109,11 +109,13 @@ async fn sort_imports_from_oxfmtrc_reorders_imports_end_to_end() {
 
 #[tokio::test]
 async fn unsupported_oxfmtrc_key_still_runs_and_warns() {
-    // Regression: an `.oxfmtrc` with an unrecognized key (here `plugins`) must
-    // NOT prevent the oxfmt task from running. The worker formats normally and
-    // emits an informational notice on stderr.
+    // Regression: an `.oxfmtrc` with a genuinely unknown key must NOT prevent
+    // the oxfmt task from running. The worker formats normally and emits an
+    // informational "unsupported" notice on stderr.
+    // Using `bogusOption` (not in schema) ensures this tests the genuinely
+    // unknown path, not known-not-applied keys like `insertFinalNewline`.
     let (temp, file) = ts_package("index.ts", "export const value={foo:'bar'}\n").await;
-    tokio::fs::write(temp.path().join(".oxfmtrc.json"), r#"{"plugins":["x"]}"#)
+    tokio::fs::write(temp.path().join(".oxfmtrc.json"), r#"{"bogusOption":true}"#)
         .await
         .expect("config");
 
@@ -126,7 +128,7 @@ async fn unsupported_oxfmtrc_key_still_runs_and_warns() {
         response
             .stderr_lines
             .iter()
-            .any(|line| line.contains("unsupported .oxfmtrc option `plugins`")),
+            .any(|line| line.contains("unsupported .oxfmtrc option `bogusOption`")),
         "expected unsupported-key notice on stderr, got: {:?}",
         response.stderr_lines
     );
