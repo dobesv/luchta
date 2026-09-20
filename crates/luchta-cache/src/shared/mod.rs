@@ -885,6 +885,7 @@ impl SharedCache {
 
     /// Compatibility store for callers without a monotonic executor duration.
     /// The wall-clock record span is accepted but marked untrusted, like v2.
+    /// No resolved tool version is available here, so its snapshot metadata is `None`.
     ///
     /// Requirements for cacheable:
     /// - Task succeeded
@@ -913,6 +914,7 @@ impl SharedCache {
         self.store_internal(
             SharedCacheStoreRequest {
                 task_id,
+                tool_version: None,
                 input_key,
                 outputs_hash,
                 package_dir,
@@ -1021,7 +1023,7 @@ impl SharedCache {
             duration_ms: timing.duration_ms,
             output_bytes,
             cached_at_unix_ms: request.record.end_unix_ms,
-            tool_version: None,
+            tool_version: request.tool_version.map(str::to_owned),
             inline_meta,
             duration_trusted: timing.trusted,
         };
@@ -2063,6 +2065,66 @@ mod tests {
     }
 
     #[test]
+    fn store_records_optional_tool_version_without_changing_cache_identity() {
+        let repo = TempDir::new().unwrap();
+        let record = no_output_record([1; 32], crate::combined_outputs_hash(&[]));
+        let input_key = derive_input_key(
+            record.task_spec_hash,
+            record.env_hash,
+            record.pkg_dep_hash,
+            combined_dep_outputs_hash(&record.dep_outputs),
+            crate::combined_inputs_hash(&record.inputs),
+        );
+
+        // Hold identity fixed: the version here is metadata, not another key component.
+        for tool_version in [None, Some("swc_core=80.0.0"), Some("")] {
+            let cache_dir = TempDir::new().unwrap();
+            let cache = open_test_cache(repo.path(), cache_dir.path(), 3);
+            let result = cache
+                .store_with_execution_duration(
+                    SharedCacheStoreRequest {
+                        task_id: "pkg#lint",
+                        tool_version,
+                        input_key: &input_key,
+                        outputs_hash: &record.outputs_hash,
+                        package_dir: repo.path(),
+                        rel_output_paths: &[],
+                        record: &record,
+                        stdout: b"",
+                        stderr: b"",
+                        reports: &[],
+                        repo_root: repo.path(),
+                    },
+                    200,
+                )
+                .unwrap();
+            assert_eq!(result, StoreOutcome::Stored);
+            cache.flush_pending_entries();
+
+            let snapshot = cache
+                .snapshot_store
+                .load(cache.write_bucket_key().unwrap())
+                .expect("stored snapshot");
+            assert_eq!(snapshot.schema_version, SNAPSHOT_SCHEMA_VERSION);
+            assert_eq!(snapshot.entries.len(), 1);
+            let entry = &snapshot.entries[&input_key_hex(input_key)];
+            assert_eq!(entry.tool_version.as_deref(), tool_version);
+            assert_eq!(entry.input_key, input_key);
+            assert_eq!(entry.task_spec_hash, record.task_spec_hash);
+
+            let reader = open_test_cache(repo.path(), cache_dir.path(), 3);
+            let (candidate, restored_entry) = reader
+                .prepare_restore(&input_key, repo.path())
+                .expect("version metadata must not prevent restore")
+                .into_parts();
+            assert_eq!(restored_entry, *entry);
+            let (hit, written_paths) = candidate.commit().unwrap();
+            assert_eq!(hit.record, record);
+            assert!(written_paths.is_empty());
+        }
+    }
+
+    #[test]
     fn explicit_execution_duration_controls_eligibility_not_wall_record_span() {
         let temp_repo = TempDir::new().unwrap();
         setup_git_repo(temp_repo.path());
@@ -2084,6 +2146,7 @@ mod tests {
             .store_with_execution_duration(
                 SharedCacheStoreRequest {
                     task_id: "pkg#lint",
+                    tool_version: None,
                     input_key: &input_key,
                     outputs_hash: &[7; 32],
                     package_dir: &package_dir,

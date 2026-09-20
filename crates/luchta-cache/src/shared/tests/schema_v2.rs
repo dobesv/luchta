@@ -80,6 +80,7 @@ fn snapshot_restores_through_fallback_entry_meta() {
     let (candidate, entry) = prepared.into_parts();
     assert!(!entry.duration_trusted);
     assert!(entry.inline_meta.is_none());
+    assert_eq!(entry.tool_version, None);
     assert_eq!(candidate.stdout, b"legacy stdout");
     candidate.discard().unwrap();
 }

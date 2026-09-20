@@ -2158,6 +2158,7 @@ mod tests {
             .store_with_execution_duration(
                 SharedCacheStoreRequest {
                     task_id: "pkg#lint",
+                    tool_version: None,
                     input_key: &input_key,
                     outputs_hash: &empty_hash,
                     package_dir: &package_dir,

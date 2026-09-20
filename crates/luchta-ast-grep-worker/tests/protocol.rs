@@ -114,6 +114,37 @@ fn write_language_globs_fixture_rule_set(root: &Path) {
 }
 
 #[test]
+fn resolve_task_reports_tool_version() {
+    let fixture = tempdir().expect("tempdir");
+    write_fixture_rule_set(fixture.path());
+    write_file(fixture.path().join("src/index.ts"), "console.log('hi');\n");
+    let input = format!(
+        "{}\n",
+        resolve_line(resolve_task_request(
+            "resolve-tool-version",
+            Some(fixture.path()),
+            ResolveMode::Run
+        ))
+    );
+    let (output, stderr) = run_worker(&input);
+    assert!(stderr.is_empty(), "unexpected worker stderr: {stderr}");
+    let resolved = output
+        .iter()
+        .find(|value| value["type"].as_str() == Some("resolved"))
+        .expect("resolved message");
+    assert_eq!(resolved["id"].as_str(), Some("resolve-tool-version"));
+    assert_eq!(resolved["result"]["decision"].as_str(), Some("modify"));
+    let tool_version = resolved["result"]["toolVersion"]
+        .as_str()
+        .expect("tool_version must be present");
+    // Must be non-empty and match expected format: ast-grep-core=<version>
+    assert!(
+        tool_version.starts_with("ast-grep-core="),
+        "unexpected tool_version: {tool_version}"
+    );
+}
+
+#[test]
 fn resolve_prunes_when_no_sgconfig() {
     let fixture = tempdir().expect("tempdir");
     let input = format!(

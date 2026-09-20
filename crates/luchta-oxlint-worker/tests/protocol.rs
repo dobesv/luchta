@@ -92,6 +92,47 @@ fn resolve_task_request(id: &str, cwd: &Path, mode: ResolveMode) -> ResolveTask 
 }
 
 #[test]
+fn resolve_task_reports_tool_version() {
+    let fixture = tempdir().expect("tempdir");
+    write_file(
+        fixture.path().join("package.json"),
+        r#"{"name":"fixture","scripts":{"lint":"oxlint"}}"#,
+    );
+    write_file(fixture.path().join("src/index.js"), "export const x = 1;\n");
+    let input = format!(
+        "{}\n",
+        resolve_line(resolve_task_request(
+            "resolve-tool-version",
+            fixture.path(),
+            ResolveMode::Run
+        ))
+    );
+    let (output, stderr) = run_worker(&input);
+    assert!(stderr.is_empty(), "unexpected worker stderr: {stderr}");
+    let resolved = output
+        .iter()
+        .find(|value| value["type"].as_str() == Some("resolved"))
+        .expect("resolved message");
+    assert_eq!(resolved["id"].as_str(), Some("resolve-tool-version"));
+    assert_eq!(resolved["result"]["decision"].as_str(), Some("modify"));
+    let tool_version = resolved["result"]["toolVersion"]
+        .as_str()
+        .expect("tool_version must be present");
+    // Must be non-empty and match expected format: oxc_linter=<sha>
+    assert!(
+        tool_version.starts_with("oxc_linter="),
+        "unexpected tool_version: {tool_version}"
+    );
+    // Git SHAs are 40 hex chars
+    let sha = tool_version.strip_prefix("oxc_linter=").unwrap();
+    assert_eq!(sha.len(), 40, "git SHA should be 40 chars: {sha}");
+    assert!(
+        sha.chars().all(|c| c.is_ascii_hexdigit()),
+        "SHA must be hex: {sha}"
+    );
+}
+
+#[test]
 fn resolve_task_prunes_when_no_supported_files() {
     let fixture = tempdir().expect("tempdir");
     write_file(

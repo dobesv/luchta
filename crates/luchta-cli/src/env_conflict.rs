@@ -164,6 +164,7 @@ mod tests {
             cache_files: vec![],
             dependencies: vec!["**/*".to_string()],
             env,
+            tool_version: None,
         }
     }
 
@@ -221,6 +222,7 @@ mod tests {
                 cache_files: vec![],
                 dependencies: vec!["**/*".to_string()],
                 env: task_env,
+                tool_version: None,
             },
         );
 
@@ -335,6 +337,7 @@ mod tests {
                 cache_files: vec![],
                 dependencies: vec!["**/*".to_string()],
                 env: task_env,
+                tool_version: None,
             },
         );
 

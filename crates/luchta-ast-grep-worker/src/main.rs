@@ -73,6 +73,7 @@ impl Worker for AstGrepWorker {
 
         ResolveResult::modify(TaskModification {
             inputs: Some(resolve_inputs(cwd, &config, &req.inputs)),
+            tool_version: Some(env!("LUCHTA_TOOL_VERSION").to_owned()),
             ..TaskModification::default()
         })
     }
@@ -470,6 +471,7 @@ mod tests {
             result.decision,
             ResolveDecision::Modify(TaskModification {
                 inputs: Some(resolve_inputs(temp.path(), &config, &[])),
+                tool_version: Some(env!("LUCHTA_TOOL_VERSION").to_owned()),
                 ..TaskModification::default()
             })
         );

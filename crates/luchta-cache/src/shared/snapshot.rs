@@ -34,6 +34,8 @@ pub struct SnapshotEntry {
     pub duration_ms: u64,
     pub output_bytes: u64,
     pub cached_at_unix_ms: u64,
+    /// Resolved tool version for inspection. Restore eligibility uses
+    /// `task_spec_hash`, not this metadata field.
     pub tool_version: Option<String>,
     /// Complete restore metadata when its compressed entry representation fits
     /// the shared-cache inline budget. `None` uses `entries/<input_key>.bin`.

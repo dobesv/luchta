@@ -485,6 +485,42 @@ pub struct TaskModification {
     /// output — are what the build cache hashes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inputs: Option<Vec<String>>,
+    /// Tool version identifier computed by the worker at resolve time.
+    ///
+    /// A worker may report `tool_version: Some(String)` in its resolve-time
+    /// [`TaskModification`] to declare upstream tool version(s) embedded in the
+    /// worker binary (e.g. `ast-grep-core=0.43.0`, `oxc_transformer=<sha>`, or
+    /// `styled_components=18.0.0,swc_core=80.0.0`).
+    ///
+    /// # Why report tool versions?
+    /// Embedded tool versions are invisible to the target project's `package.json`
+    /// and `Cargo.lock`. Without this marker, updating a worker binary does not
+    /// invalidate cached task outputs until an unrelated input changes. Reporting
+    /// the version folds it into `task_spec_hash`, invalidating both local and
+    /// shared caches whenever the tool version changes.
+    ///
+    /// # Sourcing tool versions
+    /// - **Rust workers:** Add `luchta-lockfile-version` to `[build-dependencies]`,
+    ///   add a `build.rs` calling `luchta_lockfile_version::emit_and_read` to
+    ///   extract the version or git rev from `Cargo.lock` and set
+    ///   `cargo::rustc-env=LUCHTA_TOOL_VERSION=...`, then use
+    ///   `env!("LUCHTA_TOOL_VERSION").to_owned()` at resolve time. For multiple
+    ///   tools, format as sorted, comma-separated `name=version` or `name=<sha>` pairs.
+    /// - **Go workers:** Inject the tool/submodule commit at build time via `-ldflags -X`
+    ///   (e.g., `-X 'github.com/microsoft/TypeScript/tsc/internal/luchta.LuchtaToolVersion=<sha>'`).
+    ///
+    /// # When not to use
+    /// Workers whose outputs depend only on declared task inputs or `package.json`
+    /// dependencies (such as `luchta-yarn-worker`) do not need this; package-dependency
+    /// filtering handles invalidation.
+    ///
+    /// # Observability
+    /// Shared cache entries record the reported version in `SnapshotEntry.tool_version`
+    /// for inspection and debugging.
+    ///
+    /// See issue #364.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_version: Option<String>,
 }
 
 impl TaskModification {
@@ -504,6 +540,9 @@ impl TaskModification {
         }
         if let Some(inputs) = &self.inputs {
             definition.inputs = inputs.clone();
+        }
+        if let Some(tool_version) = &self.tool_version {
+            definition.tool_version = Some(tool_version.clone());
         }
     }
 }
@@ -973,6 +1012,7 @@ mod tests {
                     weight: Some(4),
                     dependencies: None,
                     inputs: None,
+                    tool_version: None,
                 }),
                 json!({
                     "decision": "modify",
@@ -1036,6 +1076,7 @@ mod tests {
             weight: None,
             dependencies: Some(vec!["babel".to_owned()]),
             inputs: None,
+            tool_version: None,
         };
         modification.apply_to(&mut definition);
 
@@ -1059,6 +1100,7 @@ mod tests {
             weight: None,
             dependencies: None,
             inputs: None,
+            tool_version: None,
         };
         modification.apply_to(&mut definition);
 
@@ -1067,5 +1109,45 @@ mod tests {
             vec!["webpack".to_owned(), "rollup".to_owned()],
             "should remain unchanged"
         );
+    }
+
+    #[test]
+    fn task_modification_tool_version_replaces_when_some() {
+        assert!(luchta_types::TaskDefinition::default()
+            .tool_version
+            .is_none());
+        assert_eq!(
+            modified_tool_version(None, Some("v2.0.0")).as_deref(),
+            Some("v2.0.0")
+        );
+    }
+
+    #[test]
+    fn task_modification_tool_version_unchanged_when_none() {
+        assert_eq!(
+            modified_tool_version(Some("v1.5.0"), None).as_deref(),
+            Some("v1.5.0")
+        );
+    }
+
+    #[test]
+    fn task_modification_tool_version_replaces_existing_value() {
+        assert_eq!(
+            modified_tool_version(Some("v1.0.0"), Some("v2.0.0")).as_deref(),
+            Some("v2.0.0")
+        );
+    }
+
+    fn modified_tool_version(existing: Option<&str>, replacement: Option<&str>) -> Option<String> {
+        let mut definition = luchta_types::TaskDefinition {
+            tool_version: existing.map(str::to_owned),
+            ..luchta_types::TaskDefinition::default()
+        };
+        let modification = TaskModification {
+            tool_version: replacement.map(str::to_owned),
+            ..TaskModification::default()
+        };
+        modification.apply_to(&mut definition);
+        definition.tool_version
     }
 }

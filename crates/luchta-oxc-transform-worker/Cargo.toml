@@ -40,6 +40,9 @@ mimalloc = { workspace = true }
 [target.'cfg(all(target_os = "linux", not(target_arch = "arm"), not(target_arch = "riscv64")))'.dependencies]
 mimalloc = { workspace = true, features = ["local_dynamic_tls"] }
 
+[build-dependencies]
+luchta-lockfile-version = { path = "../luchta-lockfile-version" }
+
 [dev-dependencies]
 assert_fs = { workspace = true }
 serde_json = { workspace = true }

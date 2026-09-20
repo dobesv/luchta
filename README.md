@@ -987,6 +987,21 @@ Injected worker dependencies are:
 
 **Worker Overrides:** A worker's `Modify` decision (during the `resolve` protocol phase) may include `dependsOn` or `dependencies` (raw pattern strings) which **fully replaces** the task's static definition for that run. This mirrors how workers can override other task fields like `command` or `weight`. Omitting a field in the `Modify` decision leaves the static filter unchanged.
 
+#### Reporting tool versions for cache invalidation
+
+Workers can embed upstream tools (such as SWC, oxc, ast-grep, or tsc). These embedded tool versions are invisible to the target project's `package.json` and `yarn.lock`. Without explicit version reporting, updating a worker binary or bumping an embedded tool does not invalidate cached task outputs until an unrelated change forces a rebuild.
+
+To solve this, a worker may return `tool_version: Some(String)` in its resolve-time `TaskModification` (or `toolVersion` in the JSONL `resolved` message). The engine folds this string into `task_spec_hash`, invalidating both local and shared caches when the tool version changes. Tasks without a reported version keep their existing cache keys.
+
+- **How to report in Rust workers:**
+  Add `luchta-lockfile-version` to `[build-dependencies]`. In `build.rs`, call `luchta_lockfile_version::emit_and_read("<crate-name>")` to read the version or git rev from `Cargo.lock`, set `cargo::rustc-env=LUCHTA_TOOL_VERSION=...`, and read it at resolve time via `env!("LUCHTA_TOOL_VERSION").to_owned()`. For workers embedding multiple tools, sort the pairs by name and join with commas (e.g. `styled_components=18.0.0,swc_core=80.0.0`).
+- **How to report in Go workers:**
+  Inject the tool or submodule commit SHA at build time via `-ldflags -X` (e.g. `-X 'github.com/microsoft/TypeScript/tsc/internal/luchta.LuchtaToolVersion=<sha>'`), then emit it in the resolve response.
+- **When NOT to use:**
+  Workers whose output depends only on declared task inputs or `package.json` dependencies (like `luchta-yarn-worker`) do not need this. Package-dependency filtering already handles cache invalidation for them.
+- **Observability:**
+  Shared cache entries record the reported version in `SnapshotEntry.tool_version` for inspection and debugging (GitHub #364).
+
 #### Worker progress
 
 The engine negotiates transient worker-level progress by adding `"progress": true`
@@ -1318,7 +1333,7 @@ Nonces are available at four scopes and are **additive**:
 #### Semantics
 - **Combine:** All nonces combine; changing any single one invalidates the affected scope's cache. Empty/absent everywhere has no effect.
 - **Stale Entries:** Setting a nonce does NOT delete old cache entries; it changes the hash so a fresh entry is written. The local cache keeps only the most recent entry per task, so reverting a nonce is a fresh cache miss (the task re-runs) rather than restoring the old result; the shared cache may still hold a matching prior candidate.
-- **Recovery (GitHub #118):** If a worker under-reports a task's inputs (a worker bug), a cache entry can be "poisoned" with wrong outputs. Fixing the worker does NOT invalidate that entry, because the task spec hash does not include the worker's version/code. To recover, bump the relevant-scope `nonce` (e.g. change `nonce: "v1"` → `"v2"`), set `LUCHTA_CACHE_NONCE`, or use `--no-cache`.
+- **Recovery (GitHub #118):** If a worker under-reports a task's inputs (a worker bug), a cache entry can be "poisoned" with wrong outputs. Fixing the worker does NOT automatically invalidate that entry unless the worker reports a `tool_version` that changes. Workers can opt in to version-based cache invalidation by reporting `tool_version` during resolve (see [Reporting tool versions for cache invalidation](#reporting-tool-versions-for-cache-invalidation)). For workers that don't report versions, or when the fix itself doesn't change the embedded tool, bump the relevant-scope `nonce` (e.g. change `nonce: "v1"` → `"v2"`), set `LUCHTA_CACHE_NONCE`, or use `--no-cache`.
 - **Upgrade Note:** Upgrading to the version containing `luchta why` bumps the cache schema to V4. This triggers a one-time cache invalidation and full rebuild on the first run after upgrade, which is expected and harmless.
 
 #### Inspection

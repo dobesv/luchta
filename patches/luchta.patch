@@ -1280,10 +1280,10 @@ index 0000000000..c2b155d0e0
 +}
 diff --git a/tsc/internal/luchta/protocol.go b/tsc/internal/luchta/protocol.go
 new file mode 100644
-index 0000000000..7f3657f0e0
+index 0000000000..760b0a959e
 --- /dev/null
 +++ b/tsc/internal/luchta/protocol.go
-@@ -0,0 +1,152 @@
+@@ -0,0 +1,157 @@
 +package luchta
 +
 +import (
@@ -1424,24 +1424,29 @@ index 0000000000..7f3657f0e0
 +	w.emitResolvedDecision(id, "reject", nil)
 +}
 +
++// LuchtaToolVersion is set at build time via -ldflags. Empty if unset.
++var LuchtaToolVersion string
++
 +func (w *Writer) emitResolvedDecision(id, decision string, inputs []string) {
 +	type resultMsg struct {
-+		Decision string   `json:"decision"`
-+		Inputs   []string `json:"inputs,omitempty"`
++		Decision    string   `json:"decision"`
++		Inputs      []string `json:"inputs,omitempty"`
++		ToolVersion string   `json:"toolVersion,omitempty"`
 +	}
 +	type resolvedMsg struct {
 +		Type   string    `json:"type"`
 +		ID     string    `json:"id"`
 +		Result resultMsg `json:"result"`
 +	}
-+	w.emit(resolvedMsg{Type: "resolved", ID: id, Result: resultMsg{Decision: decision, Inputs: inputs}})
++	toolVersion := LuchtaToolVersion
++	w.emit(resolvedMsg{Type: "resolved", ID: id, Result: resultMsg{Decision: decision, Inputs: inputs, ToolVersion: toolVersion}})
 +}
 diff --git a/tsc/internal/luchta/protocol_test.go b/tsc/internal/luchta/protocol_test.go
 new file mode 100644
-index 0000000000..157d7eb5f5
+index 0000000000..bc691a1057
 --- /dev/null
 +++ b/tsc/internal/luchta/protocol_test.go
-@@ -0,0 +1,125 @@
+@@ -0,0 +1,160 @@
 +package luchta
 +
 +import (
@@ -1560,6 +1565,41 @@ index 0000000000..157d7eb5f5
 +	// Accept should not have inputs key (omitempty)
 +	if strings.Contains(out, `"inputs"`) {
 +		t.Fatalf("accept must not contain inputs key:\n%s", out)
++	}
++}
++
++func TestResolvedModifyIncludesToolVersionWhenSet(t *testing.T) {
++	// Set the version that would be injected at build time via ldflags.
++	original := LuchtaToolVersion
++	LuchtaToolVersion = "abc123def456"
++	defer func() { LuchtaToolVersion = original }()
++
++	var buf bytes.Buffer
++	w := NewWriter(&buf)
++	w.ResolvedModify("id1", []string{"src/**"})
++	out := buf.String()
++
++	if !strings.Contains(out, `"toolVersion":"abc123def456"`) {
++		t.Fatalf("missing toolVersion in output:\n%s", out)
++	}
++	if !strings.Contains(out, `"decision":"modify"`) {
++		t.Fatalf("missing decision:\n%s", out)
++	}
++}
++
++func TestResolvedModifyOmitsToolVersionWhenEmpty(t *testing.T) {
++	// Ensure version is empty (no ldflags injection).
++	original := LuchtaToolVersion
++	LuchtaToolVersion = ""
++	defer func() { LuchtaToolVersion = original }()
++
++	var buf bytes.Buffer
++	w := NewWriter(&buf)
++	w.ResolvedModify("id1", []string{"src/**"})
++	out := buf.String()
++
++	if strings.Contains(out, `"toolVersion"`) {
++		t.Fatalf("toolVersion must be omitted when empty:\n%s", out)
 +	}
 +}
 +

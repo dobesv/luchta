@@ -248,6 +248,13 @@ pub struct TaskDefinition {
     /// Environment variables provided to task, keyed by variable name.
     #[serde(default)]
     pub env: BTreeMap<String, EnvSpec>,
+    /// Tool version identifier set by worker at resolve time.
+    ///
+    /// This is a runtime-only value computed by the worker; it does not appear
+    /// in config files. `#[serde(default)]` ensures backward compatibility with
+    /// existing configs that have no such key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_version: Option<String>,
 }
 
 impl TaskDefinition {
@@ -265,6 +272,7 @@ impl TaskDefinition {
             cache_files: Vec::new(),
             dependencies: default_dependencies(),
             env: BTreeMap::new(),
+            tool_version: None,
         }
     }
 }
@@ -318,6 +326,7 @@ impl Default for TaskDefinition {
             cache_files: Vec::new(),
             dependencies: default_dependencies(),
             env: BTreeMap::new(),
+            tool_version: None,
         }
     }
 }

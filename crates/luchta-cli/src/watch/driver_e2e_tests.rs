@@ -536,21 +536,7 @@ async fn failed_upstream_fix_reruns_dependent_task() {
         "expected app build to stay skipped while api build fails"
     );
 
-    let api_src = harness.workspace_root.join("packages/api/src/lib.rs");
-    std::fs::write(&api_src, "pass\n").expect("rewrite api src");
-    harness
-        .send_batch(std::collections::HashSet::from([api_src]), false)
-        .await;
-    harness
-        .wait_until(
-            Duration::from_secs(10),
-            || "timed out waiting for dependent app build after api fix".to_string(),
-            || {
-                read_marker_count_for(&harness.workspace_root, "api") >= 2
-                    && read_marker_count_for(&harness.workspace_root, "app") >= 1
-            },
-        )
-        .await;
+    rerun_api_and_wait_for_app(&harness, "pass\n", 1).await;
 
     assert_eq!(
         read_marker_count_for(&harness.workspace_root, "api"),
@@ -581,21 +567,7 @@ async fn rerun_upstream_change_reruns_dependent_task() {
         )
         .await;
 
-    let api_src = harness.workspace_root.join("packages/api/src/lib.rs");
-    std::fs::write(&api_src, "pass-again\n").expect("rewrite api src");
-    harness
-        .send_batch(std::collections::HashSet::from([api_src]), false)
-        .await;
-    harness
-        .wait_until(
-            Duration::from_secs(10),
-            || "timed out waiting for dependent app rerun after api change".to_string(),
-            || {
-                read_marker_count_for(&harness.workspace_root, "api") >= 2
-                    && read_marker_count_for(&harness.workspace_root, "app") >= 2
-            },
-        )
-        .await;
+    rerun_api_and_wait_for_app(&harness, "pass-again\n", 2).await;
 
     assert_eq!(
         read_marker_entries_for(&harness.workspace_root, "app"),
@@ -604,6 +576,24 @@ async fn rerun_upstream_change_reruns_dependent_task() {
     );
 
     harness.shutdown().await;
+}
+
+async fn rerun_api_and_wait_for_app(harness: &E2eHarness, source: &str, app_runs: usize) {
+    let api_src = harness.workspace_root.join("packages/api/src/lib.rs");
+    std::fs::write(&api_src, source).expect("rewrite api src");
+    harness
+        .send_batch(std::collections::HashSet::from([api_src]), false)
+        .await;
+    harness
+        .wait_until(
+            Duration::from_secs(10),
+            || format!("timed out waiting for api rerun and {app_runs} app builds"),
+            || {
+                read_marker_count_for(&harness.workspace_root, "api") >= 2
+                    && read_marker_count_for(&harness.workspace_root, "app") >= app_runs
+            },
+        )
+        .await;
 }
 
 #[tokio::test]

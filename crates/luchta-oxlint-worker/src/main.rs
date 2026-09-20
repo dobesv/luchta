@@ -53,6 +53,7 @@ impl Worker for OxlintWorker {
         let Some(cwd) = req.cwd.as_deref() else {
             return ResolveResult::modify(TaskModification {
                 inputs: Some(inputs),
+                tool_version: Some(env!("LUCHTA_TOOL_VERSION").to_owned()),
                 ..TaskModification::default()
             });
         };
@@ -90,6 +91,7 @@ impl Worker for OxlintWorker {
 
         ResolveResult::modify(TaskModification {
             inputs: Some(inputs),
+            tool_version: Some(env!("LUCHTA_TOOL_VERSION").to_owned()),
             ..TaskModification::default()
         })
     }

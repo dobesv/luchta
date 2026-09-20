@@ -44,6 +44,7 @@ impl Worker for OxfmtWorker {
         let Some(cwd) = req.cwd.as_deref() else {
             return ResolveResult::modify(TaskModification {
                 inputs: Some(inputs.into_iter().collect()),
+                tool_version: Some(env!("LUCHTA_TOOL_VERSION").to_owned()),
                 ..TaskModification::default()
             });
         };
@@ -51,6 +52,7 @@ impl Worker for OxfmtWorker {
         let cwd = Path::new(cwd);
         let modify = ResolveResult::modify(TaskModification {
             inputs: Some(inputs.into_iter().collect()),
+            tool_version: Some(env!("LUCHTA_TOOL_VERSION").to_owned()),
             ..TaskModification::default()
         });
 
@@ -378,13 +380,12 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
 
-    use assert_fs::TempDir;
-    use luchta_worker::{InProcessOutcome, JobContext, SharedWriter, Worker, WorkerRequest};
-
     use super::{
         collect_formattable_files, format_file, is_formattable_path, FileOutcome, OxfmtWorker,
     };
     use crate::opts::OxfmtOpts;
+    use assert_fs::TempDir;
+    use luchta_worker::{InProcessOutcome, JobContext, SharedWriter, Worker, WorkerRequest};
 
     fn relative_paths(cwd: &Path, paths: Vec<PathBuf>) -> Vec<String> {
         let mut out = paths
