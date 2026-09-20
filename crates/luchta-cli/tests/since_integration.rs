@@ -6,7 +6,7 @@ use common::{
     git_commit_all, git_commit_paths, setup_workspace, write_task_config_with_named_worker,
 };
 use predicates::prelude::*;
-use std::process::Command;
+use std::{process::Command, sync::OnceLock};
 
 fn add_third_package(temp: &assert_fs::TempDir) {
     temp.child("packages/c").create_dir_all().unwrap();
@@ -88,14 +88,36 @@ fn assert_run(
     task: &str,
     extra_args: &[&str],
 ) -> assert_cmd::assert::Assert {
+    assert_run_tasks(temp, &[task], extra_args)
+}
+
+fn assert_run_tasks(
+    temp: &assert_fs::TempDir,
+    tasks: &[&str],
+    extra_args: &[&str],
+) -> assert_cmd::assert::Assert {
     let mut cmd = AssertCommand::cargo_bin("luchta").unwrap();
     cmd.env("NO_COLOR", "1")
         .arg("run")
-        .arg(task)
+        .args(tasks)
         .args(extra_args)
         .arg("--workspace-root")
         .arg(temp.path());
     cmd.assert()
+}
+
+fn bash_worker_bin() -> std::path::PathBuf {
+    static BIN: OnceLock<std::path::PathBuf> = OnceLock::new();
+    BIN.get_or_init(|| {
+        escargot::CargoBuild::new()
+            .bin("luchta-bash-worker")
+            .package("luchta-bash-worker")
+            .run()
+            .expect("build luchta-bash-worker")
+            .path()
+            .to_path_buf()
+    })
+    .clone()
 }
 
 #[test]
@@ -113,6 +135,39 @@ fn since_changed_package_selects_changed_package_and_dependent() {
                 .and(predicate::str::contains("a#build"))
                 .and(predicate::str::contains("b#build")),
         );
+
+    temp.close().unwrap();
+}
+
+#[test]
+fn since_allows_multiple_literal_tasks_pruned_to_nothing() {
+    let temp = setup();
+    let worker = bash_worker_bin();
+    write_task_config_with_named_worker(
+        &temp,
+        "bash",
+        &worker,
+        "\"test\":{\"worker\":\"bash\",\"command\":\"   \"},\"run-storybook-tests\":{\"worker\":\"bash\",\"command\":\"   \"}",
+    );
+    temp.child("packages/a/changed.ts")
+        .write_str("export const changed = true;\n")
+        .unwrap();
+
+    assert_run_tasks(
+        &temp,
+        &["test", "run-storybook-tests"],
+        &["--since", "HEAD"],
+    )
+    .success()
+    .stdout(
+        predicate::str::contains(
+            "task 'test' was pruned from every package during resolution; nothing to run",
+        )
+        .and(predicate::str::contains(
+            "task 'run-storybook-tests' was pruned from every package during resolution; nothing to run",
+        ))
+        .and(predicate::str::contains("No tasks matched filter").not()),
+    );
 
     temp.close().unwrap();
 }

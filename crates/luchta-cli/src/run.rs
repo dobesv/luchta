@@ -1146,8 +1146,7 @@ pub(crate) fn collect_requested_subgraph(
         &available_nodes,
     )?;
 
-    if requested_ids.is_empty() && single_literal_task_request(selection.requested_tasks).is_none()
-    {
+    if requested_ids.is_empty() && !all_literal_task_requests(selection.requested_tasks) {
         bail!(
             "No tasks matched filter: packages=[{}] tasks=[{}]",
             selection.packages.join(", "),
@@ -1250,11 +1249,11 @@ fn validate_literal_task_requests(
     Ok(())
 }
 
-fn single_literal_task_request(requested_tasks: &[String]) -> Option<&str> {
-    match requested_tasks {
-        [requested] if is_literal_pattern(requested) => Some(requested.as_str()),
-        _ => None,
-    }
+fn all_literal_task_requests(requested_tasks: &[String]) -> bool {
+    !requested_tasks.is_empty()
+        && requested_tasks
+            .iter()
+            .all(|requested| is_literal_pattern(requested))
 }
 
 /// Handles literal task request that matched no graph node. A task that survives
@@ -1950,6 +1949,77 @@ mod tests {
             since_affected: None,
             expand_dependencies,
         })
+    }
+
+    #[test]
+    fn collect_requested_subgraph_returns_empty_for_multiple_pruned_literal_tasks() {
+        let task_graph = package_selection_task_graph();
+        let requested_tasks = vec!["lint".to_string(), "typecheck".to_string()];
+        let selection = TaskSelection {
+            requested_tasks: &requested_tasks,
+            packages: &[],
+            top_level: false,
+            since: None,
+        };
+        let pruned = vec![
+            PrunedTask {
+                task_id: TaskId::new("@repo/app", "lint"),
+                outcome: PruneOutcome::Pruned { reason: None },
+            },
+            PrunedTask {
+                task_id: TaskId::new("@repo/app", "typecheck"),
+                outcome: PruneOutcome::Pruned { reason: None },
+            },
+        ];
+
+        let requested = collect_requested_subgraph(CollectSubgraphRequest {
+            task_graph: &task_graph,
+            selection: &selection,
+            pruned: &pruned,
+            since_affected: None,
+            expand_dependencies: true,
+        })
+        .expect("multiple pruned literal tasks should be a successful no-op");
+
+        assert!(requested.is_empty());
+    }
+
+    #[test]
+    fn collect_requested_subgraph_bare_request_still_errors() {
+        let task_graph = package_selection_task_graph();
+        let error = collect_requested_for_test(
+            &task_graph,
+            TaskSelection {
+                requested_tasks: &[],
+                packages: &[],
+                top_level: false,
+                since: None,
+            },
+            true,
+        )
+        .expect_err("bare request should fail the catch-all guard");
+
+        assert!(error.to_string().contains("No tasks matched filter"));
+    }
+
+    #[test]
+    fn collect_requested_subgraph_single_unknown_literal_still_errors() {
+        let task_graph = package_selection_task_graph();
+        let error = collect_requested_for_test(
+            &task_graph,
+            TaskSelection {
+                requested_tasks: &["does-not-exist".to_string()],
+                packages: &[],
+                top_level: false,
+                since: None,
+            },
+            true,
+        )
+        .expect_err("unknown literal should fail validation");
+
+        assert!(error
+            .to_string()
+            .contains("task 'does-not-exist' not found in task graph"));
     }
 
     #[test]
