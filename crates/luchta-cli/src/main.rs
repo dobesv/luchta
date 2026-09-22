@@ -493,8 +493,9 @@ async fn watch_command(workspace_root: &Path, command: Commands) -> Result<()> {
     else {
         return Ok(());
     };
-    let (watcher_handle, changes_rx) =
-        watch::watcher::spawn_watcher(workspace_root, debounce).into_diagnostic()?;
+    let (watcher_handle, changes_rx) = watch::watcher::spawn_watcher(workspace_root, debounce)
+        .await
+        .into_diagnostic()?;
     let selection = watch::driver::OwnedSelection {
         requested_tasks: tasks,
         packages,

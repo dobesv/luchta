@@ -25,6 +25,8 @@ pub struct WatchSession {
     max_weight_override: Option<u32>,
     #[cfg(test)]
     rebuild_generation: AtomicU64,
+    #[cfg(test)]
+    completed_cycles: AtomicU64,
 }
 
 impl WatchSession {
@@ -47,6 +49,8 @@ impl WatchSession {
             max_weight_override,
             #[cfg(test)]
             rebuild_generation: AtomicU64::new(0),
+            #[cfg(test)]
+            completed_cycles: AtomicU64::new(0),
         }))
     }
 
@@ -127,6 +131,11 @@ impl WatchSession {
         self.rebuild_generation.load(Ordering::Relaxed)
     }
 
+    #[cfg(test)]
+    pub(crate) fn completed_cycles(&self) -> u64 {
+        self.completed_cycles.load(Ordering::Acquire)
+    }
+
     /// Repo root used for absolute-path -> package mapping.
     pub(crate) fn repo_root(&self) -> Arc<PathBuf> {
         Arc::new(self.run_context().workspace_root.clone())
@@ -170,6 +179,8 @@ impl WatchSession {
     ) -> Result<CycleOutcome> {
         let run = self.run_context();
         let (outcome, _was_interrupted) = run_cycle(&run, params, cancel).await?;
+        #[cfg(test)]
+        self.completed_cycles.fetch_add(1, Ordering::Release);
         Ok(outcome)
     }
 
