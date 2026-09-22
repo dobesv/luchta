@@ -544,9 +544,20 @@ impl E2eHarness {
             .send(WatchBatch {
                 changed_paths,
                 structural,
+                ..WatchBatch::default()
             })
             .await
             .expect("send watch batch");
+    }
+
+    pub(super) async fn send_rescan(&self) {
+        self.changes_tx
+            .send(WatchBatch {
+                rescan: true,
+                ..WatchBatch::default()
+            })
+            .await
+            .expect("send rescan batch");
     }
 
     pub(super) async fn wait_for_jobs(&self, target: usize) {
@@ -563,6 +574,15 @@ impl E2eHarness {
             Duration::from_secs(10),
             || format!("timed out waiting for marker count {target}"),
             || count_lines(&self.workspace_root.join(".run-marker")) >= target,
+        )
+        .await;
+    }
+
+    pub(super) async fn wait_for_completed_cycles(&self, target: u64) {
+        self.wait_until(
+            Duration::from_secs(10),
+            || format!("timed out waiting for completed cycle count {target}"),
+            || self.session.completed_cycles() >= target,
         )
         .await;
     }

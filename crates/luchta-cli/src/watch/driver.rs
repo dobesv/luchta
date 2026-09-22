@@ -30,7 +30,6 @@ use owo_colors::{OwoColorize, Stream};
 use tokio::sync::{mpsc, Notify};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::warn;
 
 use super::lockfile_watch::LockfileWatchState;
 use super::registry::dirty_packages_for_changes;
@@ -43,6 +42,37 @@ use crate::run::{CycleOutcome, RunCycleParams, TaskSelection};
 /// Maximum number of changed file paths to list under `--show-changed-files`
 /// before collapsing the remainder into a count.
 const MAX_LISTED_CHANGED_FILES: usize = 10;
+const RECOVERY_RETRY_MIN: Duration = Duration::from_millis(250);
+const RECOVERY_RETRY_MAX: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Default)]
+struct RecoveryRetry {
+    consecutive_failures: u32,
+    retry_at: Option<Instant>,
+}
+
+impl RecoveryRetry {
+    fn record_failure(&mut self) -> Duration {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        let exponent = self.consecutive_failures.saturating_sub(1).min(5);
+        let delay = RECOVERY_RETRY_MIN
+            .saturating_mul(1_u32 << exponent)
+            .min(RECOVERY_RETRY_MAX);
+        self.retry_at = Some(Instant::now() + delay);
+        delay
+    }
+
+    fn remaining_delay(&self) -> Duration {
+        self.retry_at
+            .map(|retry_at| retry_at.saturating_duration_since(Instant::now()))
+            .unwrap_or_default()
+    }
+
+    fn reset(&mut self) {
+        self.consecutive_failures = 0;
+        self.retry_at = None;
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum StructuralPackageSetDiff {
@@ -70,11 +100,31 @@ pub(crate) fn diff_discovered_package_paths(
             }
         }
         Err(error) => {
-            warn!(
-                error = %error,
-                workspace_root = %workspace_root.display(),
-                "workspace discovery failed"
-            );
+            watch_warning(&format!(
+                "workspace discovery failed for '{}': {error}",
+                workspace_root.display()
+            ));
+            StructuralPackageSetDiff::KeepPrevious
+        }
+    }
+}
+
+async fn diff_discovered_package_paths_async(
+    watcher_handle: &WatcherHandle,
+    workspace_root: &Path,
+    current_package_paths: &BTreeSet<PathBuf>,
+) -> StructuralPackageSetDiff {
+    let workspace_root = workspace_root.to_path_buf();
+    let current_package_paths = current_package_paths.clone();
+    match watcher_handle
+        .run_tracked_blocking(move || {
+            diff_discovered_package_paths(&workspace_root, &current_package_paths)
+        })
+        .await
+    {
+        Ok(diff) => diff,
+        Err(error) => {
+            watch_warning(&format!("workspace discovery task failed: {error}"));
             StructuralPackageSetDiff::KeepPrevious
         }
     }
@@ -83,21 +133,55 @@ pub(crate) fn diff_discovered_package_paths(
 async fn rebuild_and_reconcile_watch_state(
     context: &WatchIterationContext<'_>,
     package_paths: &BTreeSet<PathBuf>,
-) -> Result<WatchControl> {
+) -> RecoveryOutcome {
     if let Err(error) = context.session.rebuild_for_packages(package_paths).await {
-        warn!(error = %error, "structural workspace rebuild failed; keeping previous graph");
-        return Ok(WatchControl::Continue);
+        watch_warning(&format!(
+            "structural workspace rebuild failed; keeping previous graph: {error}"
+        ));
+        return RecoveryOutcome::Retry {
+            requires_rescan: false,
+        };
     }
     let package_nodes = context.session.current_package_nodes();
     if let Err(error) = context
         .watcher_handle
         .reconcile_watch_roots(context.session.repo_root().as_ref(), &package_nodes)
+        .await
     {
-        warn!(error = %error, "watch root reconcile failed after rebuild");
-        return Ok(WatchControl::Continue);
+        if error.is_terminal_recovery_error() {
+            return RecoveryOutcome::Fatal(error.to_string());
+        }
+        watch_warning(&format!(
+            "watch root reconcile failed after rebuild; scheduling another reconciliation: {error}"
+        ));
+        return RecoveryOutcome::Retry {
+            requires_rescan: true,
+        };
     }
-    Ok(WatchControl::Stop)
+    RecoveryOutcome::Complete
 }
+
+async fn recover_structural_watch_state(context: WatchIterationContext<'_>) -> RecoveryOutcome {
+    match diff_discovered_package_paths_async(
+        context.watcher_handle,
+        context.session.repo_root().as_ref(),
+        &context.session.current_package_paths(),
+    )
+    .await
+    {
+        StructuralPackageSetDiff::KeepPrevious => RecoveryOutcome::Retry {
+            requires_rescan: false,
+        },
+        StructuralPackageSetDiff::Unchanged => {
+            rebuild_and_reconcile_watch_state(&context, &context.session.current_package_paths())
+                .await
+        }
+        StructuralPackageSetDiff::Changed(discovered_package_paths) => {
+            rebuild_and_reconcile_watch_state(&context, &discovered_package_paths).await
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct OwnedSelection {
     pub requested_tasks: Vec<String>,
@@ -130,6 +214,8 @@ pub struct PendingChanges {
 struct PendingState {
     paths: HashSet<PathBuf>,
     structural: bool,
+    rescan: bool,
+    watcher_failure: Option<String>,
 }
 
 impl PendingChanges {
@@ -145,14 +231,14 @@ impl PendingChanges {
         }
 
         let mut pending = self.inner.lock().expect("pending changes mutex poisoned");
-        let was_empty = pending.paths.is_empty() && !pending.structural;
+        let was_empty = pending.is_empty();
         pending.paths.extend(batch);
-        was_empty && (!pending.paths.is_empty() || pending.structural)
+        was_empty && !pending.is_empty()
     }
 
     pub fn mark_structural(&self) -> bool {
         let mut pending = self.inner.lock().expect("pending changes mutex poisoned");
-        let was_empty = pending.paths.is_empty() && !pending.structural;
+        let was_empty = pending.is_empty();
         pending.structural = true;
         was_empty
     }
@@ -160,6 +246,28 @@ impl PendingChanges {
     pub fn take_structural(&self) -> bool {
         let mut pending = self.inner.lock().expect("pending changes mutex poisoned");
         std::mem::take(&mut pending.structural)
+    }
+
+    pub fn mark_rescan(&self) -> bool {
+        let mut pending = self.inner.lock().expect("pending changes mutex poisoned");
+        let was_empty = pending.is_empty();
+        pending.rescan = true;
+        was_empty
+    }
+
+    pub fn take_rescan(&self) -> bool {
+        let mut pending = self.inner.lock().expect("pending changes mutex poisoned");
+        std::mem::take(&mut pending.rescan)
+    }
+
+    fn mark_watcher_failed(&self, message: String) {
+        let mut pending = self.inner.lock().expect("pending changes mutex poisoned");
+        pending.watcher_failure.get_or_insert(message);
+    }
+
+    fn take_watcher_failure(&self) -> Option<String> {
+        let mut pending = self.inner.lock().expect("pending changes mutex poisoned");
+        pending.watcher_failure.take()
     }
 
     /// Drain and return whether set was non-empty.
@@ -175,11 +283,17 @@ impl PendingChanges {
 
     pub fn is_empty(&self) -> bool {
         let pending = self.inner.lock().expect("pending changes mutex poisoned");
-        pending.paths.is_empty() && !pending.structural
+        pending.is_empty()
     }
 
     fn has_changes(&self) -> bool {
         !self.is_empty()
+    }
+}
+
+impl PendingState {
+    fn is_empty(&self) -> bool {
+        self.paths.is_empty() && !self.structural && !self.rescan && self.watcher_failure.is_none()
     }
 }
 
@@ -371,95 +485,152 @@ where
     );
     let ui = WatchUi::new(config.show_changed_files);
     let mut signals = WatchSignals::new(shutdown, force_shutdown);
+    let context = WatchIterationContext {
+        session: &session,
+        watcher_handle: &watcher_handle,
+        selection: &selection,
+        config: &config,
+        pending: &pending,
+        wake: &wake,
+        active_cycle: &active_cycle,
+        lockfile_state: &lockfile_state,
+        ui: &ui,
+    };
 
     ui.started();
-
-    let result: Result<()> = async {
-        if should_stop(
-            run_initial_watch_cycle(
-                &session,
-                &selection,
-                &config,
-                &active_cycle,
-                &ui,
-                &mut signals,
-            )
-            .await?,
-        ) {
-            return Ok(());
-        }
-
-        loop {
-            if should_stop(
-                run_one_iteration(
-                    WatchIterationContext {
-                        session: &session,
-                        watcher_handle: &watcher_handle,
-                        selection: &selection,
-                        config: &config,
-                        pending: &pending,
-                        wake: &wake,
-                        active_cycle: &active_cycle,
-                        lockfile_state: &lockfile_state,
-                        ui: &ui,
-                    },
-                    &mut signals,
-                )
-                .await?,
-            ) {
-                return Ok(());
-            }
-        }
-    }
-    .await;
+    let result = drive_watch_loop(context, &mut signals).await;
 
     finish_shutdown(session, watcher_handle, drain_task).await;
     result
+}
+
+async fn drive_watch_loop<F, G>(
+    context: WatchIterationContext<'_>,
+    signals: &mut WatchSignals<F, G>,
+) -> Result<()>
+where
+    F: Future<Output = std::result::Result<(), std::io::Error>> + Send,
+    G: Future<Output = std::result::Result<(), std::io::Error>> + Send,
+{
+    if should_stop(run_initial_watch_cycle(context, signals).await?) {
+        return Ok(());
+    }
+
+    let mut recovery_retry = RecoveryRetry::default();
+    loop {
+        if should_stop(run_one_iteration(context, &mut recovery_retry, signals).await?) {
+            return Ok(());
+        }
+    }
 }
 
 fn should_stop(control: WatchControl) -> bool {
     matches!(control, WatchControl::Stop)
 }
 
-async fn run_initial_watch_cycle<F, G>(
-    session: &WatchSession,
-    selection: &OwnedSelection,
-    config: &WatchRunConfig,
+fn begin_cycle_if_caught_up(
     active_cycle: &ActiveCycle,
-    ui: &WatchUi,
+    pending: &PendingChanges,
+) -> Option<CancellationToken> {
+    let cancel = CancellationToken::new();
+    active_cycle.set(cancel.clone());
+    if pending.has_changes() {
+        active_cycle.clear();
+        None
+    } else {
+        Some(cancel)
+    }
+}
+
+fn requeue_processed_changes(
+    pending: &PendingChanges,
+    changed: &HashSet<PathBuf>,
+    structural: bool,
+    rescan: bool,
+) {
+    pending.add(changed.clone());
+    if structural {
+        pending.mark_structural();
+    }
+    if rescan {
+        pending.mark_rescan();
+    }
+}
+
+async fn run_initial_watch_cycle<F, G>(
+    context: WatchIterationContext<'_>,
     signals: &mut WatchSignals<F, G>,
 ) -> Result<WatchControl>
 where
     F: Future<Output = std::result::Result<(), std::io::Error>> + Send,
     G: Future<Output = std::result::Result<(), std::io::Error>> + Send,
 {
-    let cache_dir = resolve_cache_dir(session.repo_root().as_ref());
-    let acquire_lock = build_lock::acquire(&cache_dir);
-    tokio::pin!(acquire_lock);
-    let _build_lock = tokio::select! {
-        lock = &mut acquire_lock => match lock? {
-            Some(lock) => lock,
-            None => return Ok(WatchControl::Stop), // Ctrl+C while waiting
-        },
-        _ = &mut signals.shutdown => {
-            ui.shutting_down();
-            shutdown_watch(session, ui, signals).await;
-            return Ok(WatchControl::Stop);
-        }
+    let cache_dir = resolve_cache_dir(context.session.repo_root().as_ref());
+    let Some(lock) =
+        wait_for_watch_operation(context, signals, build_lock::acquire(&cache_dir)).await?
+    else {
+        return Ok(WatchControl::Stop);
     };
-    let initial_selection = selection.as_task_selection();
+    let Some(_build_lock) = lock? else {
+        return Ok(WatchControl::Stop);
+    };
+    let initial_selection = context.selection.as_task_selection();
+    let Some(cancel) = begin_cycle_if_caught_up(context.active_cycle, context.pending) else {
+        // The initial full selection has not run yet, so retry it as a full rescan.
+        context.pending.mark_rescan();
+        return Ok(WatchControl::Continue);
+    };
     run_cycle_with_status(
-        session,
-        cycle_request(&initial_selection, None, config),
-        active_cycle,
-        ui,
+        context.session,
+        cycle_request(&initial_selection, None, context.config),
+        context.active_cycle,
+        cancel,
+        context.ui,
         signals,
     )
     .await
 }
 
+async fn wait_for_watch_operation<F, G, O, T>(
+    context: WatchIterationContext<'_>,
+    signals: &mut WatchSignals<F, G>,
+    operation: O,
+) -> Result<Option<T>>
+where
+    F: Future<Output = std::result::Result<(), std::io::Error>> + Send,
+    G: Future<Output = std::result::Result<(), std::io::Error>> + Send,
+    O: Future<Output = T>,
+{
+    check_watcher_failure(context.pending)?;
+    tokio::pin!(operation);
+    loop {
+        tokio::select! {
+            output = &mut operation => {
+                check_watcher_failure(context.pending)?;
+                return Ok(Some(output));
+            }
+            _ = context.wake.notified() => {
+                check_watcher_failure(context.pending)?;
+            }
+            _ = &mut signals.shutdown => {
+                context.ui.shutting_down();
+                shutdown_watch(context.session, context.ui, signals).await;
+                return Ok(None);
+            }
+        }
+    }
+}
+
+fn check_watcher_failure(pending: &PendingChanges) -> Result<()> {
+    if let Some(message) = pending.take_watcher_failure() {
+        return Err(miette::miette!("filesystem watcher stopped: {message}"));
+    }
+    Ok(())
+}
+
 async fn run_one_iteration<F, G>(
     context: WatchIterationContext<'_>,
+    recovery_retry: &mut RecoveryRetry,
     signals: &mut WatchSignals<F, G>,
 ) -> Result<WatchControl>
 where
@@ -478,45 +649,94 @@ where
         return Ok(WatchControl::Stop);
     }
 
+    check_watcher_failure(context.pending)?;
+
+    let rescan_pending = context.pending.take_rescan();
     let structural_pending = context.pending.take_structural();
-    if structural_pending {
-        match diff_discovered_package_paths(
-            context.session.repo_root().as_ref(),
-            &context.session.current_package_paths(),
-        ) {
-            StructuralPackageSetDiff::KeepPrevious => return Ok(WatchControl::Continue),
-            StructuralPackageSetDiff::Unchanged => {
-                if matches!(
-                    rebuild_and_reconcile_watch_state(
-                        &context,
-                        &context.session.current_package_paths(),
-                    )
-                    .await?,
-                    WatchControl::Continue
-                ) {
-                    return Ok(WatchControl::Continue);
+    if structural_pending || rescan_pending {
+        let retry_delay = recovery_retry.remaining_delay();
+        if !retry_delay.is_zero()
+            && wait_for_watch_operation(context, signals, tokio::time::sleep(retry_delay))
+                .await?
+                .is_none()
+        {
+            return Ok(WatchControl::Stop);
+        }
+    }
+    if structural_pending || rescan_pending {
+        let Some(recovery) =
+            wait_for_watch_operation(context, signals, recover_structural_watch_state(context))
+                .await?
+        else {
+            return Ok(WatchControl::Stop);
+        };
+        match recovery {
+            RecoveryOutcome::Complete => recovery_retry.reset(),
+            RecoveryOutcome::Retry { requires_rescan } => {
+                // Reconciliation may have partially changed backend coverage. Retry the
+                // structure update and force a full scan once coverage is restored.
+                context.pending.mark_structural();
+                if rescan_pending || requires_rescan {
+                    context.pending.mark_rescan();
                 }
+                let delay = recovery_retry.record_failure();
+                watch_warning(&format!(
+                    "workspace watch recovery will retry in {} ms",
+                    delay.as_millis()
+                ));
+                return Ok(WatchControl::Continue);
             }
-            StructuralPackageSetDiff::Changed(discovered_package_paths) => {
-                if matches!(
-                    rebuild_and_reconcile_watch_state(&context, &discovered_package_paths).await?,
-                    WatchControl::Continue
-                ) {
-                    return Ok(WatchControl::Continue);
-                }
+            RecoveryOutcome::Fatal(message) => {
+                return Err(miette::miette!(
+                    "filesystem watcher recovery stopped: {message}"
+                ));
             }
         }
     }
 
     let changed = match context.pending.drain_non_empty() {
         Some(changed) => changed,
-        None if structural_pending => context
+        None if structural_pending || rescan_pending => context
             .session
             .current_package_paths()
             .into_iter()
             .collect::<HashSet<_>>(),
         None => return Ok(WatchControl::Continue),
     };
+
+    if rescan_pending {
+        watch_warning(
+            "the filesystem backend reported dropped events; rescanning by running the full selection",
+        );
+        let cycle_selection = context.selection.as_task_selection();
+        let cache_dir = resolve_cache_dir(context.session.repo_root().as_ref());
+        let Some(lock) =
+            wait_for_watch_operation(context, signals, build_lock::acquire(&cache_dir)).await?
+        else {
+            return Ok(WatchControl::Stop);
+        };
+        let Some(_build_lock) = lock? else {
+            return Ok(WatchControl::Stop);
+        };
+        let Some(cancel) = begin_cycle_if_caught_up(context.active_cycle, context.pending) else {
+            requeue_processed_changes(
+                context.pending,
+                &changed,
+                structural_pending,
+                rescan_pending,
+            );
+            return Ok(WatchControl::Continue);
+        };
+        return run_cycle_with_status(
+            context.session,
+            cycle_request(&cycle_selection, None, context.config),
+            context.active_cycle,
+            cancel,
+            context.ui,
+            signals,
+        )
+        .await;
+    }
     // Only real changes to a task's declared inputs (verified by size/mtime, then
     // content hash) — or new files matching a task's input globs — dirty a package.
     // Cache outputs, restore staging dirs, and touch-only events are ignored, which
@@ -561,23 +781,28 @@ where
         .change_detected(&affected, &changed, context.session.repo_root().as_ref());
     let cycle_selection = context.selection.as_task_selection();
     let cache_dir = resolve_cache_dir(context.session.repo_root().as_ref());
-    let acquire_lock = build_lock::acquire(&cache_dir);
-    tokio::pin!(acquire_lock);
-    let _build_lock = tokio::select! {
-        lock = &mut acquire_lock => match lock? {
-            Some(lock) => lock,
-            None => return Ok(WatchControl::Stop), // Ctrl+C while waiting
-        },
-        _ = &mut signals.shutdown => {
-            context.ui.shutting_down();
-            shutdown_watch(context.session, context.ui, signals).await;
-            return Ok(WatchControl::Stop);
-        }
+    let Some(lock) =
+        wait_for_watch_operation(context, signals, build_lock::acquire(&cache_dir)).await?
+    else {
+        return Ok(WatchControl::Stop);
+    };
+    let Some(_build_lock) = lock? else {
+        return Ok(WatchControl::Stop);
+    };
+    let Some(cancel) = begin_cycle_if_caught_up(context.active_cycle, context.pending) else {
+        requeue_processed_changes(
+            context.pending,
+            &changed,
+            structural_pending,
+            rescan_pending,
+        );
+        return Ok(WatchControl::Continue);
     };
     run_cycle_with_status(
         context.session,
         cycle_request(&cycle_selection, Some(&affected), context.config),
         context.active_cycle,
+        cancel,
         context.ui,
         signals,
     )
@@ -616,7 +841,9 @@ fn expand_affected_with_dependents(
     match package_graph.transitive_dependents_of(affected.iter().cloned()) {
         Ok(expanded) => expanded,
         Err(error) => {
-            warn!(error = %error, "failed to expand affected packages with dependents");
+            watch_warning(&format!(
+                "failed to expand affected packages with dependents: {error}"
+            ));
             affected
         }
     }
@@ -645,24 +872,44 @@ fn spawn_change_drain_task(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(batch) = changes_rx.recv().await {
-            let structural_pending = batch.structural && pending.mark_structural();
-            let paths_pending = pending.add(batch.changed_paths);
-            if batch.structural {
-                active_cycle.cancel_if_active();
-                wake.notify_one();
-            } else if paths_pending {
-                // Cancel the active cycle directly. This ensures the change is NOT lost
-                // even if Notify permit semantics would have dropped it.
-                // Only fire cancellation if there's an active cycle.
-                active_cycle.cancel_if_active();
-                // Wake hint — may or may not be consumed; pending.is_empty() is the source of truth.
-                wake.notify_one();
-            }
-            if structural_pending {
-                continue;
-            }
+            apply_watch_batch(batch, &pending, &wake, &active_cycle);
         }
+        pending.mark_watcher_failed("event channel closed unexpectedly".to_string());
+        active_cycle.cancel_if_active();
+        wake.notify_one();
     })
+}
+
+fn apply_watch_batch(
+    mut batch: WatchBatch,
+    pending: &PendingChanges,
+    wake: &Notify,
+    active_cycle: &ActiveCycle,
+) {
+    for warning in batch.warnings.drain(..) {
+        watch_warning(&warning);
+    }
+    if let Some(failure) = batch.failure.take() {
+        pending.mark_watcher_failed(failure);
+        active_cycle.cancel_if_active();
+        wake.notify_one();
+        return;
+    }
+    if batch.structural {
+        pending.mark_structural();
+    }
+    if batch.rescan {
+        pending.mark_rescan();
+    }
+    let paths_pending = pending.add(batch.changed_paths);
+    let should_wake = batch.structural || batch.rescan || paths_pending;
+    if should_wake {
+        // Cancel the active cycle directly. This ensures the change is NOT lost
+        // even if Notify permit semantics would have dropped it. Notify remains
+        // only a wake hint; pending state is the source of truth.
+        active_cycle.cancel_if_active();
+        wake.notify_one();
+    }
 }
 
 enum WatchControl {
@@ -670,6 +917,13 @@ enum WatchControl {
     Stop,
 }
 
+enum RecoveryOutcome {
+    Complete,
+    Retry { requires_rescan: bool },
+    Fatal(String),
+}
+
+#[derive(Clone, Copy)]
 struct WatchIterationContext<'a> {
     session: &'a WatchSession,
     watcher_handle: &'a WatcherHandle,
@@ -695,6 +949,7 @@ async fn run_cycle_with_status<F, G>(
     session: &WatchSession,
     request: CycleRequest<'_>,
     active_cycle: &ActiveCycle,
+    cancel: CancellationToken,
     ui: &WatchUi,
     signals: &mut WatchSignals<F, G>,
 ) -> Result<WatchControl>
@@ -703,10 +958,6 @@ where
     G: Future<Output = std::result::Result<(), std::io::Error>> + Send,
 {
     ui.cycle_started()?;
-
-    let cancel = CancellationToken::new();
-    // Register as the active cycle so the drain task can cancel us on new changes.
-    active_cycle.set(cancel.clone());
 
     let cycle = session.run_cycle(
         RunCycleParams {
@@ -768,14 +1019,18 @@ async fn finish_shutdown(
     watcher_handle: WatcherHandle,
     drain_task: JoinHandle<()>,
 ) {
-    drop(watcher_handle);
     drain_task.abort();
     let _ = drain_task.await;
+    watcher_handle.shutdown().await;
     session.shutdown().await;
 }
 
 fn print_status(line: &str) {
     println!("{line}");
+}
+
+fn watch_warning(message: &str) {
+    eprintln!("[watch] warning: {message}");
 }
 
 fn format_watch_started_line() -> String {
@@ -876,6 +1131,66 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn recovery_retry_uses_capped_exponential_backoff_and_resets() {
+        let mut retry = RecoveryRetry::default();
+
+        let delays = (0..7).map(|_| retry.record_failure()).collect::<Vec<_>>();
+        assert_eq!(
+            delays,
+            vec![
+                Duration::from_millis(250),
+                Duration::from_millis(500),
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(4),
+                RECOVERY_RETRY_MAX,
+                RECOVERY_RETRY_MAX,
+            ]
+        );
+
+        retry.reset();
+        assert_eq!(retry.consecutive_failures, 0);
+        assert_eq!(retry.retry_at, None);
+        assert_eq!(retry.record_failure(), RECOVERY_RETRY_MIN);
+    }
+
+    #[test]
+    fn cycle_handoff_registers_cancellation_before_checking_pending_state() {
+        let pending = PendingChanges::new();
+        let active_cycle = ActiveCycle::new();
+
+        let cancel = begin_cycle_if_caught_up(&active_cycle, &pending)
+            .expect("caught-up watcher can begin cycle");
+        assert_eq!(
+            (active_cycle.cancel_if_active(), cancel.is_cancelled()),
+            (true, true)
+        );
+
+        pending.mark_rescan();
+        assert_eq!(
+            (
+                begin_cycle_if_caught_up(&active_cycle, &pending).is_none(),
+                active_cycle.is_active()
+            ),
+            (true, false)
+        );
+    }
+
+    #[test]
+    fn deferred_cycle_requeues_every_consumed_signal() {
+        let pending = PendingChanges::new();
+        let changed = HashSet::from([PathBuf::from("/repo/pkg/src/lib.rs")]);
+
+        requeue_processed_changes(&pending, &changed, true, true);
+
+        assert_eq!(pending.drain_non_empty(), Some(changed));
+        assert_eq!(
+            (pending.take_structural(), pending.take_rescan()),
+            (true, true)
+        );
+    }
+
+    #[test]
     fn drain_swaps_to_fresh_pending_set() {
         let pending = PendingChanges::new();
         pending.add(HashSet::from([PathBuf::from("/repo/pkg-a/src/lib.rs")]));
@@ -970,6 +1285,82 @@ mod tests {
             Some(HashSet::from([PathBuf::from("/repo/pkg-a/src/lib.rs")]))
         );
         assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn rescan_pending_coalesces_and_is_independent_of_paths() {
+        let pending = PendingChanges::new();
+
+        assert_eq!(
+            (
+                pending.mark_rescan(),
+                pending.mark_rescan(),
+                pending.has_changes()
+            ),
+            (true, false, true),
+            "only the first rescan should wake the loop"
+        );
+        assert_eq!(
+            (
+                pending.take_rescan(),
+                pending.take_rescan(),
+                pending.is_empty()
+            ),
+            (true, false, true),
+            "taking the rescan should clear the coalesced latch"
+        );
+    }
+
+    #[tokio::test]
+    async fn closed_watcher_channel_wakes_loop_with_failure() {
+        let (changes_tx, changes_rx) = mpsc::channel(1);
+        let pending = Arc::new(PendingChanges::new());
+        let wake = Arc::new(Notify::new());
+        let active_cycle = Arc::new(ActiveCycle::new());
+        let drain_task = spawn_change_drain_task(
+            changes_rx,
+            Arc::clone(&pending),
+            Arc::clone(&wake),
+            active_cycle,
+        );
+
+        drop(changes_tx);
+        wake.notified().await;
+
+        assert_eq!(
+            pending.take_watcher_failure().as_deref(),
+            Some("event channel closed unexpectedly")
+        );
+        drain_task.await.expect("drain task exits cleanly");
+    }
+
+    #[tokio::test]
+    async fn backend_failure_survives_the_following_channel_close() {
+        let (changes_tx, changes_rx) = mpsc::channel(1);
+        let pending = Arc::new(PendingChanges::new());
+        let wake = Arc::new(Notify::new());
+        let active_cycle = Arc::new(ActiveCycle::new());
+        let drain_task = spawn_change_drain_task(
+            changes_rx,
+            Arc::clone(&pending),
+            Arc::clone(&wake),
+            active_cycle,
+        );
+
+        changes_tx
+            .send(WatchBatch {
+                failure: Some("backend invalidated its watch".to_string()),
+                ..WatchBatch::default()
+            })
+            .await
+            .expect("send failure batch");
+        drop(changes_tx);
+        drain_task.await.expect("drain task exits cleanly");
+
+        assert_eq!(
+            pending.take_watcher_failure().as_deref(),
+            Some("backend invalidated its watch")
+        );
     }
 
     #[test]
@@ -1190,3 +1581,7 @@ mod driver_e2e_support;
 #[cfg(test)]
 #[path = "driver_e2e_tests.rs"]
 mod driver_e2e_tests;
+
+#[cfg(test)]
+#[path = "driver_rescan_e2e_tests.rs"]
+mod driver_rescan_e2e_tests;

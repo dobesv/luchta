@@ -1935,10 +1935,31 @@ mod schema_drift_guardrail {
     use std::collections::HashSet;
     use std::process::Command;
 
-    fn load_schema_keys() -> HashSet<String> {
-        // Run cargo metadata to locate oxc_formatter
+    fn rustc_host_target() -> String {
+        let rustc = Command::new("rustc")
+            .arg("-vV")
+            .output()
+            .expect("failed to run `rustc -vV`");
+        assert!(rustc.status.success(), "`rustc -vV` failed");
+        let rustc_version = String::from_utf8(rustc.stdout).expect("rustc output is not UTF-8");
+        rustc_version
+            .lines()
+            .find_map(|line| line.strip_prefix("host: "))
+            .expect("rustc output is missing its host target")
+            .to_string()
+    }
+
+    fn cargo_metadata(host_target: &str) -> serde_json::Value {
         let output = Command::new("cargo")
-            .args(["metadata", "--format-version", "1", "--locked", "--offline"])
+            .args([
+                "metadata",
+                "--format-version",
+                "1",
+                "--locked",
+                "--offline",
+                "--filter-platform",
+                host_target,
+            ])
             .output()
             .expect("failed to run `cargo metadata`");
 
@@ -1949,9 +1970,12 @@ mod schema_drift_guardrail {
             );
         }
 
-        let metadata: serde_json::Value = serde_json::from_slice(&output.stdout)
-            .expect("cargo metadata output is not valid JSON");
+        serde_json::from_slice(&output.stdout).expect("cargo metadata output is not valid JSON")
+    }
 
+    fn load_schema_keys() -> HashSet<String> {
+        // Run cargo metadata to locate oxc_formatter.
+        let metadata = cargo_metadata(&rustc_host_target());
         // Find oxc_formatter package
         let packages = metadata
             .get("packages")
