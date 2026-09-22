@@ -38,7 +38,7 @@ members = [
 
 [workspace.package]
 edition = "2021"
-version = "0.3.1"
+version = "0.3.2"
 license = "MIT"
 authors = ["Luchta Contributors"]
 # Rust 1.96.0 required by oxc at pinned rev 7bf68f70c20f5329251f19be95076f6eab4fe396,
