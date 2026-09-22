@@ -1190,6 +1190,7 @@ fn created_directories<'a>(
         .collect()
 }
 
+#[cfg(any(not(target_os = "macos"), test))]
 fn pending_watch_dirs(
     watched_dirs: &HashSet<PathBuf>,
     created_dirs: HashSet<PathBuf>,
