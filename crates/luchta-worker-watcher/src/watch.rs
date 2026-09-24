@@ -2,12 +2,14 @@
 //!
 //! Watches file globs and emits a signal on matching (debounced) changes.
 //! Does NOT respect `.gitignore` — build outputs are commonly watched.
+//! Only create/remove/modify events count; file reads (access events) are ignored.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use luchta_glob::PathMatcher;
-use notify_debouncer_full::{new_debouncer, DebounceEventResult};
+use notify::{Event, EventKind, EventKindMask, RecommendedWatcher};
+use notify_debouncer_full::{new_debouncer_opt, DebounceEventResult, RecommendedCache};
 use thiserror::Error;
 
 /// Configuration for the file watcher.
@@ -50,6 +52,31 @@ fn path_matches(
     matches_raw(globset, path)
         || matches_relative_to(globset, cwd, path)
         || matches_canonical_relative(globset, canonical_cwd, path)
+}
+
+/// Whether a debounced event should restart the watched process.
+///
+/// Access events (open/close/read) never change contents; every Node start reads
+/// `.pnp.cjs`, so treating reads as changes would restart the worker in a loop.
+fn event_matches(
+    globset: &PathMatcher,
+    cwd: &Option<PathBuf>,
+    canonical_cwd: &Option<PathBuf>,
+    event: &Event,
+) -> bool {
+    !matches!(event.kind, EventKind::Access(_))
+        && event
+            .paths
+            .iter()
+            .any(|path| path_matches(globset, cwd, canonical_cwd, path))
+}
+
+/// Backend configuration: only create/remove/modify events, never access events.
+///
+/// `notify` 9 subscribes to opens and closes by default; skipping them in the
+/// kernel keeps reads by the watched tools from flooding the event queue.
+fn watcher_config() -> notify::Config {
+    notify::Config::default().with_event_kinds(EventKindMask::CORE)
 }
 
 fn matches_raw(globset: &PathMatcher, path: &Path) -> bool {
@@ -234,15 +261,13 @@ pub async fn run(
     let callback = move |result: DebounceEventResult| {
         match result {
             Ok(events) => {
-                for event in events {
-                    for path in &event.paths {
-                        if path_matches(&callback_globset, &cwd, &canonical_cwd, path) {
-                            // Send exactly one signal per batch
-                            // UnboundedSender::send is synchronous and non-blocking
-                            let _ = tx.send(());
-                            return; // Exit after first match in batch
-                        }
-                    }
+                let matched = events
+                    .iter()
+                    .any(|event| event_matches(&callback_globset, &cwd, &canonical_cwd, event));
+                if matched {
+                    // Send exactly one signal per batch.
+                    // UnboundedSender::send is synchronous and non-blocking.
+                    let _ = tx.send(());
                 }
             }
             Err(errors) => {
@@ -252,8 +277,14 @@ pub async fn run(
     };
 
     // Create the debouncer
-    let mut debouncer = new_debouncer(config.debounce, None, callback)
-        .map_err(|e| WatchError::WatcherCreate(e.to_string()))?;
+    let mut debouncer = new_debouncer_opt::<_, RecommendedWatcher, RecommendedCache>(
+        config.debounce,
+        None,
+        callback,
+        RecommendedCache::new(),
+        watcher_config(),
+    )
+    .map_err(|e| WatchError::WatcherCreate(e.to_string()))?;
 
     // Watch each root recursively
     for root in roots {
@@ -549,5 +580,59 @@ mod tests {
         let path = Path::new("/var/folders/x/project/watched/a.txt");
         // This may or may not match depending on FS state, but should not panic
         let _ = path_matches(&globset, &cwd, &canonical_cwd, path);
+    }
+
+    fn event(kind: EventKind, path: &Path) -> Event {
+        Event::new(kind).add_path(path.to_path_buf())
+    }
+
+    #[test]
+    fn watcher_config_excludes_access_events() {
+        let config = watcher_config();
+        assert!(!config.event_kinds().intersects(EventKindMask::ALL_ACCESS));
+        assert!(config.event_kinds().contains(EventKindMask::CORE));
+    }
+
+    #[test]
+    fn event_matches_ignores_access_events() {
+        use notify::event::{AccessKind, AccessMode};
+
+        let globset = build_glob_set(&[".pnp.cjs".to_string()]).expect("build globset");
+        let cwd = Some(PathBuf::from("/workspace"));
+        let path = Path::new("/workspace/.pnp.cjs");
+
+        for kind in [
+            EventKind::Access(AccessKind::Open(AccessMode::Any)),
+            EventKind::Access(AccessKind::Close(AccessMode::Read)),
+            EventKind::Access(AccessKind::Read),
+            EventKind::Access(AccessKind::Any),
+        ] {
+            assert!(
+                !event_matches(&globset, &cwd, &None, &event(kind, path)),
+                "access event {kind:?} must not trigger a change"
+            );
+        }
+    }
+
+    #[test]
+    fn event_matches_honors_modify_events() {
+        use notify::event::{DataChange, ModifyKind};
+
+        let globset = build_glob_set(&[".pnp.cjs".to_string()]).expect("build globset");
+        let cwd = Some(PathBuf::from("/workspace"));
+        let modify = EventKind::Modify(ModifyKind::Data(DataChange::Any));
+
+        assert!(event_matches(
+            &globset,
+            &cwd,
+            &None,
+            &event(modify, Path::new("/workspace/.pnp.cjs"))
+        ));
+        assert!(!event_matches(
+            &globset,
+            &cwd,
+            &None,
+            &event(modify, Path::new("/workspace/other.js"))
+        ));
     }
 }

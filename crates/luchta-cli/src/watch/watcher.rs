@@ -6,6 +6,9 @@
 //! non-recursive watch per directory, which keeps inotify usage away from ignored trees
 //! such as `node_modules/`, `target/`, `.git/`, and `.luchta/`.
 //!
+//! Only create/remove/modify events are subscribed (see [`watcher_config`]); file reads by
+//! the build's own tools must not look like changes or flood the backend queue.
+//!
 //! The synchronous debouncer callback forwards events and errors into a bounded Tokio
 //! channel. If that channel fills, an overflow latch wakes the bridge and requests a full
 //! rescan instead of allowing unbounded memory growth. The bridge task owned by
@@ -21,7 +24,7 @@ use std::time::Duration;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use luchta_workspace::PackageNode;
 use notify::event::{CreateKind, ModifyKind, RemoveKind};
-use notify::{EventKind, RecommendedWatcher, RecursiveMode};
+use notify::{EventKind, EventKindMask, RecommendedWatcher, RecursiveMode};
 #[cfg(target_os = "macos")]
 use notify_debouncer_full::NoCache as WatcherCache;
 #[cfg(not(target_os = "macos"))]
@@ -698,6 +701,16 @@ fn format_error_details(errors: Vec<notify::Error>) -> String {
         .join("; ")
 }
 
+/// Backend configuration shared by every watcher this module creates.
+///
+/// Only content and namespace changes (create/remove/modify) are subscribed. `notify` 9
+/// defaults to every event kind, including opens and closes; the build's own tools read
+/// config files in watched directories so often that those access events overflow the
+/// inotify queue, and the resulting rescan re-runs the tools, which read the files again.
+fn watcher_config() -> notify::Config {
+    notify::Config::default().with_event_kinds(EventKindMask::CORE)
+}
+
 fn create_debouncer(
     timeout: Duration,
     event_handler: impl DebounceEventHandler,
@@ -707,7 +720,7 @@ fn create_debouncer(
         None,
         event_handler,
         WatcherCache::new(),
-        notify::Config::default(),
+        watcher_config(),
     )
 }
 
@@ -771,30 +784,48 @@ fn watch_directories_strict(
 fn collect_watch_batch(ignore_filter: &IgnoreFilter, events: Vec<DebouncedEvent>) -> WatchBatch {
     let mut batch = WatchBatch::default();
     for event in events {
+        // Checked before any kind filter: a backend overflow must always trigger a rescan.
         batch.rescan |= event.need_rescan();
+        if is_access_event(&event.kind) {
+            continue;
+        }
         for path in event
             .paths
             .iter()
             .cloned()
             .filter_map(normalize_absolute_path)
         {
-            if is_ignore_file(&path) && ignore_filter.should_process_ignore_file(&path) {
-                // Ignore files control which paths are visible to the watcher. Always keep
-                // their events, even when a rule happens to ignore the ignore file itself,
-                // and rehash the full selection in case previously hidden files appear.
-                batch.changed_paths.insert(path);
-                batch.structural = true;
-                batch.rescan = true;
-                continue;
-            }
-            if ignore_filter.should_ignore(&path) {
-                continue;
-            }
-            batch.structural |= is_structural_path(&event.kind, &path);
-            batch.changed_paths.insert(path);
+            record_changed_path(&mut batch, ignore_filter, &event.kind, path);
         }
     }
     batch
+}
+
+/// Reads (open/close/access) never change file contents, so they are not changes.
+fn is_access_event(kind: &EventKind) -> bool {
+    matches!(kind, EventKind::Access(_))
+}
+
+fn record_changed_path(
+    batch: &mut WatchBatch,
+    ignore_filter: &IgnoreFilter,
+    kind: &EventKind,
+    path: PathBuf,
+) {
+    if is_ignore_file(&path) && ignore_filter.should_process_ignore_file(&path) {
+        // Ignore files control which paths are visible to the watcher. Always keep
+        // their events, even when a rule happens to ignore the ignore file itself,
+        // and rehash the full selection in case previously hidden files appear.
+        batch.changed_paths.insert(path);
+        batch.structural = true;
+        batch.rescan = true;
+        return;
+    }
+    if ignore_filter.should_ignore(&path) {
+        return;
+    }
+    batch.structural |= is_structural_path(kind, &path);
+    batch.changed_paths.insert(path);
 }
 
 fn is_structural_path(kind: &EventKind, path: &Path) -> bool {
@@ -1247,11 +1278,12 @@ mod tests {
     use super::{
         backend_error_batch, collect_watch_batch, create_debouncer, created_directories,
         discover_watch_dirs, pending_watch_dirs, reconcile_watched_dirs, spawn_bridge_task,
-        spawn_watcher, BridgeTaskParams, DebouncedEvent, IgnoreFilter, RawEventForwarder,
-        RawWatchMessage, WatchBatch, WatcherCache, WatcherError, DEFAULT_DEBOUNCE_MS,
+        spawn_watcher, watcher_config, BridgeTaskParams, DebouncedEvent, IgnoreFilter,
+        RawEventForwarder, RawWatchMessage, WatchBatch, WatcherCache, WatcherError,
+        DEFAULT_DEBOUNCE_MS,
     };
-    use notify::event::{CreateKind, Flag, ModifyKind};
-    use notify::{Event, EventKind, RecommendedWatcher};
+    use notify::event::{AccessKind, AccessMode, CreateKind, Flag, ModifyKind};
+    use notify::{Event, EventKind, EventKindMask, RecommendedWatcher};
     use notify_debouncer_full::Debouncer;
     use std::collections::HashSet;
     use std::fs;
@@ -1458,6 +1490,29 @@ mod tests {
         let file_path = root.join("src.txt");
         fs::write(&file_path, "hello").expect("write file");
 
+        let batch = receive_batch_containing(&mut rx, &file_path).await;
+        assert!(batch.contains(&canonical(&file_path)));
+
+        drop(handle);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn spawn_watcher_ignores_reads_but_reports_writes() {
+        let temp = tempdir().expect("create tempdir");
+        let root = temp.path();
+        let file_path = root.join("tsconfig.base.json");
+        fs::write(&file_path, "{}\n").expect("write file");
+        let (handle, mut rx) = spawn_watcher(root, DEFAULT_DEBOUNCE_MS)
+            .await
+            .expect("spawn watcher");
+
+        for _ in 0..200 {
+            fs::read_to_string(&file_path).expect("read file");
+        }
+        assert_no_batch_containing(&mut rx, &file_path).await;
+
+        fs::write(&file_path, "{\"compilerOptions\":{}}\n").expect("rewrite file");
         let batch = receive_batch_containing(&mut rx, &file_path).await;
         assert!(batch.contains(&canonical(&file_path)));
 
@@ -1674,6 +1729,87 @@ mod tests {
 
         assert!(batch.rescan);
         assert_eq!(batch.changed_paths, HashSet::from([root]));
+    }
+
+    #[test]
+    fn watcher_config_excludes_access_events() {
+        let config = watcher_config();
+        assert!(!config.event_kinds().intersects(EventKindMask::ALL_ACCESS));
+        assert!(config.event_kinds().contains(EventKindMask::CORE));
+    }
+
+    #[test]
+    fn collect_watch_batch_ignores_access_events() {
+        let temp = tempdir().expect("create tempdir");
+        let root = canonical(temp.path());
+        let read_file = root.join("tsconfig.base.json");
+        let gitignore = root.join(".gitignore");
+        let config_path = root.join("luchta-config.sh");
+        let edited_file = root.join("src/lib.rs");
+        fs::create_dir_all(edited_file.parent().expect("edited file parent"))
+            .expect("create edited file parent");
+        fs::write(&read_file, "{}\n").expect("write read file");
+        fs::write(&gitignore, "dist/\n").expect("write gitignore");
+        fs::write(&config_path, "#!/bin/sh\necho '{}'\n").expect("write config file");
+        fs::write(&edited_file, "export const value = 1;\n").expect("write edited file");
+        let ignore_filter = IgnoreFilter::new(&root).expect("build ignore filter");
+        let read_paths = vec![read_file, gitignore, config_path];
+
+        let access_only = collect_watch_batch(
+            &ignore_filter,
+            vec![
+                debounced_event(
+                    EventKind::Access(AccessKind::Open(AccessMode::Any)),
+                    read_paths.clone(),
+                ),
+                debounced_event(
+                    EventKind::Access(AccessKind::Close(AccessMode::Read)),
+                    read_paths.clone(),
+                ),
+                debounced_event(EventKind::Access(AccessKind::Read), read_paths.clone()),
+            ],
+        );
+        assert!(access_only.changed_paths.is_empty(), "{access_only:?}");
+        assert!(!access_only.structural);
+        assert!(!access_only.rescan);
+
+        let mixed = collect_watch_batch(
+            &ignore_filter,
+            vec![
+                debounced_event(
+                    EventKind::Access(AccessKind::Open(AccessMode::Any)),
+                    read_paths,
+                ),
+                debounced_event(
+                    EventKind::Modify(ModifyKind::Data(notify::event::DataChange::Any)),
+                    vec![edited_file.clone()],
+                ),
+            ],
+        );
+        assert_eq!(mixed.changed_paths, HashSet::from([edited_file]));
+        assert!(!mixed.structural);
+        assert!(!mixed.rescan);
+    }
+
+    #[test]
+    fn collect_watch_batch_honors_rescan_flag_on_access_event() {
+        let temp = tempdir().expect("create tempdir");
+        let root = canonical(temp.path());
+        let event = Event::new(EventKind::Access(AccessKind::Any))
+            .set_flag(Flag::Rescan)
+            .add_path(root.clone());
+        let ignore_filter = IgnoreFilter::new(&root).expect("build ignore filter");
+
+        let batch = collect_watch_batch(
+            &ignore_filter,
+            vec![DebouncedEvent {
+                event,
+                time: std::time::Instant::now(),
+            }],
+        );
+
+        assert!(batch.rescan);
+        assert!(batch.changed_paths.is_empty());
     }
 
     #[test]
