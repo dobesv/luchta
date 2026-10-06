@@ -64,7 +64,8 @@ fn is_empty_suppressions_value(value: &Value) -> bool {
     }
 }
 
-pub fn remove_empty_suppressions_file(
+/// Remove empty baselines and normalize final newlines only for written files.
+pub fn finalize_suppressions_file(
     path: &Path,
     action: OxlintSuppressionFileAction,
 ) -> Result<OxlintSuppressionFileAction, String> {
@@ -87,6 +88,12 @@ pub fn remove_empty_suppressions_file(
     })?;
 
     if !is_empty_suppressions_value(&parsed) {
+        if matches!(
+            action,
+            OxlintSuppressionFileAction::Created | OxlintSuppressionFileAction::Updated
+        ) {
+            normalize_final_newline(path, &contents)?;
+        }
         return Ok(action);
     }
 
@@ -102,12 +109,65 @@ pub fn remove_empty_suppressions_file(
     }
 }
 
+/// Preserve the serialized bytes while giving written baselines exactly one LF.
+fn normalize_final_newline(path: &Path, contents: &str) -> Result<(), String> {
+    let trimmed = contents.trim_end_matches('\n');
+    if contents.len() == trimmed.len() + 1 {
+        return Ok(());
+    }
+    std::fs::write(path, format!("{trimmed}\n")).map_err(|error| {
+        format!(
+            "failed to write suppressions file {}: {error}",
+            path.display()
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use assert_fs::TempDir;
     use oxc_linter::OxlintSuppressionFileAction;
 
-    use super::remove_empty_suppressions_file;
+    use super::{finalize_suppressions_file, normalize_final_newline};
+
+    #[test]
+    fn normalizes_only_trailing_lfs() {
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("oxlint-suppressions.json");
+        for ending in ["", "\n", "\n\n\n"] {
+            let contents = format!("{{\n  \"file.js\": {{\"no-debugger\": {{\"count\": 1}}}}\n}}{ending}");
+            std::fs::write(&path, &contents).expect("write suppressions");
+            normalize_final_newline(&path, &contents).expect("normalize newline");
+            assert_eq!(
+                std::fs::read(&path).expect("read suppressions"),
+                b"{\n  \"file.js\": {\"no-debugger\": {\"count\": 1}}\n}\n"
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_newline_does_not_write_again() {
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("missing").join("oxlint-suppressions.json");
+        normalize_final_newline(&path, "{}\n").expect("already normalized; no write needed");
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn newline_write_failure_includes_path_and_cause() {
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("missing").join("oxlint-suppressions.json");
+        let cause = std::fs::write(&path, "{}\n").expect_err("missing parent");
+        let error = normalize_final_newline(&path, "{}").expect_err("write should fail");
+        assert_eq!(
+            error,
+            format!(
+                "failed to write suppressions file {}: {cause}",
+                path.display()
+            )
+        );
+        assert!(!path.exists());
+    }
 
     #[test]
     fn removes_empty_object_file_and_clears_action() {
@@ -115,7 +175,7 @@ mod tests {
         let path = temp.path().join("oxlint-suppressions.json");
         std::fs::write(&path, "{\n  \n}\n").expect("write suppressions");
 
-        let action = remove_empty_suppressions_file(&path, OxlintSuppressionFileAction::Created)
+        let action = finalize_suppressions_file(&path, OxlintSuppressionFileAction::Created)
             .expect("remove empty suppressions file");
 
         assert!(matches!(action, OxlintSuppressionFileAction::None));
@@ -132,7 +192,7 @@ mod tests {
         )
         .expect("write suppressions");
 
-        let action = remove_empty_suppressions_file(&path, OxlintSuppressionFileAction::Updated)
+        let action = finalize_suppressions_file(&path, OxlintSuppressionFileAction::Updated)
             .expect("remove nested empty suppressions file");
 
         assert!(matches!(action, OxlintSuppressionFileAction::None));
@@ -144,7 +204,7 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let path = temp.path().join("oxlint-suppressions.json");
 
-        let action = remove_empty_suppressions_file(&path, OxlintSuppressionFileAction::Exists)
+        let action = finalize_suppressions_file(&path, OxlintSuppressionFileAction::Exists)
             .expect("missing suppressions file should not error");
 
         assert!(matches!(action, OxlintSuppressionFileAction::Exists));
@@ -157,7 +217,7 @@ mod tests {
         let path = temp.path().join("oxlint-suppressions.json");
         std::fs::write(&path, "{ not json").expect("write malformed suppressions");
 
-        let error = remove_empty_suppressions_file(&path, OxlintSuppressionFileAction::Created)
+        let error = finalize_suppressions_file(&path, OxlintSuppressionFileAction::Created)
             .expect_err("malformed json should error");
 
         assert!(error.contains("failed to parse suppressions file"));
@@ -174,7 +234,7 @@ mod tests {
         )
         .expect("write suppressions");
 
-        let action = remove_empty_suppressions_file(&path, OxlintSuppressionFileAction::Updated)
+        let action = finalize_suppressions_file(&path, OxlintSuppressionFileAction::Updated)
             .expect("keep non-empty suppressions file");
 
         assert!(matches!(action, OxlintSuppressionFileAction::Updated));

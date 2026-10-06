@@ -440,6 +440,8 @@ fn clean_fixture_emits_no_report_and_zero_done() {
     }));
 }
 
+const DEBUGGER_BASELINE: &str = "{\n  \"src/index.js\": {\n    \"no-debugger\": {\n      \"count\": 1\n    }\n  }\n}\n";
+
 #[test]
 fn suppress_all_writes_expected_file_and_clean_run_skips_sarif() {
     let fixture = tempdir().expect("tempdir");
@@ -470,9 +472,7 @@ fn suppress_all_writes_expected_file_and_clean_run_skips_sarif() {
 
     let suppression_file = fixture.path().join("oxlint-suppressions.json");
     let actual = fs::read_to_string(&suppression_file).expect("suppression file written");
-    let expected =
-        "{\n  \"src/index.js\": {\n    \"no-debugger\": {\n      \"count\": 1\n    }\n  }\n}";
-    assert_eq!(actual, expected);
+    assert_eq!(actual, DEBUGGER_BASELINE);
 
     let input = format!(
         "{}\n",
@@ -490,6 +490,95 @@ fn suppress_all_writes_expected_file_and_clean_run_skips_sarif() {
             && value["id"].as_str() == Some("job-suppressed")
             && value["exitCode"].as_i64() == Some(0)
     }));
+}
+
+fn suppression_fixture() -> tempfile::TempDir {
+    let fixture = tempdir().expect("tempdir");
+    write_file(
+        fixture.path().join("package.json"),
+        r#"{"name":"fixture","scripts":{"lint":"oxlint"}}"#,
+    );
+    write_file(
+        fixture.path().join(".oxlintrc.json"),
+        r#"{"rules":{"no-debugger":"error","no-console":"error"}}"#,
+    );
+    write_file(fixture.path().join("src/index.js"), "debugger;\n");
+    fixture
+}
+
+fn run_suppression_mode(cwd: &Path, opts: &str) {
+    let request = WorkerRequest::new("job-baseline", "lint")
+        .with_cwd(cwd.display().to_string())
+        .with_env(env_map([("OXLINT_OPTS", opts)]));
+    let (output, stderr) = run_worker(&format!("{}\n", run_line(request)));
+    assert!(
+        output.iter().any(|value| {
+            value["type"].as_str() == Some("done")
+                && value["id"].as_str() == Some("job-baseline")
+                && value["exitCode"].as_i64() == Some(0)
+        }),
+        "suppression run failed: {output:?}, stderr={stderr}"
+    );
+}
+
+#[test]
+fn fix_preserves_baseline_bytes_on_repeated_runs() {
+    let fixture = suppression_fixture();
+    let path = fixture.path().join("oxlint-suppressions.json");
+    write_file(&path, DEBUGGER_BASELINE);
+    for _ in 0..2 {
+        run_suppression_mode(fixture.path(), "--fix");
+        assert_eq!(
+            fs::read(&path).expect("read baseline"),
+            DEBUGGER_BASELINE.as_bytes()
+        );
+    }
+}
+
+#[test]
+fn writing_modes_prune_stale_entries_and_keep_final_newline() {
+    for mode in ["--fix", "--prune-suppressions", "--suppress-all"] {
+        let fixture = suppression_fixture();
+        let path = fixture.path().join("oxlint-suppressions.json");
+        let mut baseline: Value = serde_json::from_str(DEBUGGER_BASELINE).expect("baseline json");
+        baseline["src/index.js"]["no-console"] = serde_json::json!({"count": 1});
+        write_file(
+            &path,
+            &serde_json::to_string_pretty(&baseline).expect("serialize baseline"),
+        );
+        run_suppression_mode(fixture.path(), mode);
+        assert_eq!(
+            fs::read(&path).expect("read pruned baseline"),
+            DEBUGGER_BASELINE.as_bytes(),
+            "mode={mode}"
+        );
+    }
+}
+
+#[test]
+fn check_preserves_baseline_with_or_without_final_newline() {
+    let fixture = suppression_fixture();
+    let path = fixture.path().join("oxlint-suppressions.json");
+    for baseline in [DEBUGGER_BASELINE, DEBUGGER_BASELINE.trim_end_matches('\n')] {
+        write_file(&path, baseline);
+        run_suppression_mode(fixture.path(), "");
+        assert_eq!(fs::read(&path).expect("read baseline"), baseline.as_bytes());
+    }
+}
+
+#[test]
+fn pruning_all_suppressions_removes_file() {
+    for mode in ["--fix", "--prune-suppressions"] {
+        let fixture = suppression_fixture();
+        let path = fixture.path().join("oxlint-suppressions.json");
+        write_file(&path, DEBUGGER_BASELINE);
+        write_file(
+            fixture.path().join("src/index.js"),
+            "export const value = 1;\n",
+        );
+        run_suppression_mode(fixture.path(), mode);
+        assert!(!path.exists(), "mode={mode}");
+    }
 }
 
 #[test]
