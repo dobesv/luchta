@@ -135,7 +135,8 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let path = temp.path().join("oxlint-suppressions.json");
         for ending in ["", "\n", "\n\n\n"] {
-            let contents = format!("{{\n  \"file.js\": {{\"no-debugger\": {{\"count\": 1}}}}\n}}{ending}");
+            let contents =
+                format!("{{\n  \"file.js\": {{\"no-debugger\": {{\"count\": 1}}}}\n}}{ending}");
             std::fs::write(&path, &contents).expect("write suppressions");
             normalize_final_newline(&path, &contents).expect("normalize newline");
             assert_eq!(

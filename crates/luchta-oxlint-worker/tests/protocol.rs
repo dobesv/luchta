@@ -440,7 +440,8 @@ fn clean_fixture_emits_no_report_and_zero_done() {
     }));
 }
 
-const DEBUGGER_BASELINE: &str = "{\n  \"src/index.js\": {\n    \"no-debugger\": {\n      \"count\": 1\n    }\n  }\n}\n";
+const DEBUGGER_BASELINE: &str =
+    "{\n  \"src/index.js\": {\n    \"no-debugger\": {\n      \"count\": 1\n    }\n  }\n}\n";
 
 #[test]
 fn suppress_all_writes_expected_file_and_clean_run_skips_sarif() {

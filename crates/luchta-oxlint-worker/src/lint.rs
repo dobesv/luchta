@@ -118,8 +118,7 @@ fn lint_files_blocking(
         .finalize(diff, &tx_error, &cwd)
         .map_err(|error| error.to_string())?;
     let suppressions_path = cwd.join(SUPPRESSIONS_FILENAME);
-    let file_action =
-        finalize_suppressions_file(&suppressions_path, manager.file_action.clone())?;
+    let file_action = finalize_suppressions_file(&suppressions_path, manager.file_action.clone())?;
     drop(tx_error);
 
     let mut findings: Vec<WrappedDiagnostic> = rx_error
