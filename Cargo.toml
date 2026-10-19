@@ -107,7 +107,7 @@ mimalloc = "0.1.43"
 #
 # Keep every oxc git dependency, including `[patch.crates-io]`, at one rev.
 # `xtask::tests::oxc_git_dependencies_share_one_revision` guards this.
-oxc_allocator = { git = "https://github.com/oxc-project/oxc.git", rev = "7bf68f70c20f5329251f19be95076f6eab4fe396" }
+oxc_allocator = { git = "https://github.com/oxc-project/oxc.git", rev = "2645d2c76c801bdf3beba18357d52f7e8262c6a0" }
 oxc_parser = { git = "https://github.com/oxc-project/oxc.git", rev = "7bf68f70c20f5329251f19be95076f6eab4fe396" }
 oxc_semantic = { git = "https://github.com/oxc-project/oxc.git", rev = "7bf68f70c20f5329251f19be95076f6eab4fe396" }
 oxc_linter = { git = "https://github.com/oxc-project/oxc.git", rev = "7bf68f70c20f5329251f19be95076f6eab4fe396" }
