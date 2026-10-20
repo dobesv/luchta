@@ -110,10 +110,8 @@ fn cache_yarn_berry_lockfile_version_bump_reruns() {
     );
 }
 
-/// Helper for transitive-only lockfile bump tests.
-/// Unlike `assert_pkgbuild_lockfile_bump_reruns`, this does NOT change the
-/// package.json specifier — only the lockfile's transitive dep version changes.
-fn assert_pkgbuild_transitive_bump_reruns(
+/// Changes only the lockfile, leaving manifest specifiers and task inputs intact.
+fn assert_pkgbuild_lockfile_only_change_reruns(
     temp: &assert_fs::TempDir,
     yarn_lock: &str,
     next_yarn_lock: &str,
@@ -126,7 +124,11 @@ fn assert_pkgbuild_transitive_bump_reruns(
         |temp| {
             // Do NOT change package.json — only swap the lockfile.
             temp.child("yarn.lock").write_str(next_yarn_lock).unwrap();
-            git_commit_all(temp.path(), "transitive dep bump");
+            common::git_commit_paths(
+                temp.path(),
+                &["yarn.lock"],
+                "lockfile-only dependency change",
+            );
         },
         ("packages/app/counter.txt", "2\n"),
     );
@@ -135,7 +137,7 @@ fn assert_pkgbuild_transitive_bump_reruns(
 #[test]
 fn cache_yarn_v1_transitive_dep_bump_reruns() {
     let temp = assert_fs::TempDir::new().unwrap();
-    assert_pkgbuild_transitive_bump_reruns(
+    assert_pkgbuild_lockfile_only_change_reruns(
         &temp,
         YARN1_LOCK_LEFT_PAD_TRANSITIVE_3_0_0,
         YARN1_LOCK_LEFT_PAD_TRANSITIVE_3_0_1,
@@ -145,7 +147,7 @@ fn cache_yarn_v1_transitive_dep_bump_reruns() {
 #[test]
 fn cache_yarn_berry_transitive_dep_bump_reruns() {
     let temp = assert_fs::TempDir::new().unwrap();
-    assert_pkgbuild_transitive_bump_reruns(
+    assert_pkgbuild_lockfile_only_change_reruns(
         &temp,
         YARN_BERRY_LEFT_PAD_TRANSITIVE_3_0_0,
         YARN_BERRY_LEFT_PAD_TRANSITIVE_3_0_1,
@@ -194,4 +196,17 @@ fn cache_yarn_v1_dependencies_filter_narrows_invalidation() {
     common::git_commit_all(temp.path(), "left-pad version bump");
     run_luchta(&temp, "pkgbuild").success();
     temp.child("packages/app/counter.txt").assert("2\n"); // incremented = cache miss
+}
+
+#[test]
+fn cache_yarn_berry_checksum_only_change_reruns() {
+    for checksum in ["10/leftpad", "10/repeat"] {
+        let temp = assert_fs::TempDir::new().unwrap();
+        let head = common::YARN_BERRY_DEP_CLOSURES.replace(checksum, "10/changed");
+        assert_pkgbuild_lockfile_only_change_reruns(&temp, common::YARN_BERRY_DEP_CLOSURES, &head);
+
+        // A successful checksum-triggered run must itself be cacheable.
+        common::run_luchta(&temp, "pkgbuild").success();
+        temp.child("packages/app/counter.txt").assert("2\n");
+    }
 }

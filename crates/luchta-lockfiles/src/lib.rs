@@ -21,14 +21,24 @@ pub struct Package {
     pub key: String,
     /// Concrete version selected by lockfile.
     pub version: String,
+    /// Version plus resolution and integrity metadata used for dependency change detection.
+    ///
+    /// Format: `"{version}"` followed by space-separated `"resolution=..."` (Berry) or
+    /// `"resolved=..."` (Yarn 1), then `"checksum=..."` / `"integrity=..."` if present.
+    /// Designed to be hashable; used for cache keys and --since/watch dependency-closure
+    /// comparisons. Changes that affect only patch integrity (`checksum`/`integrity`) or
+    /// Berry `resolution` patch hash invalidate affected packages without version bumps.
+    pub lock_identity: String,
 }
 
 impl Package {
-    /// Creates a resolved package record.
+    /// Creates a resolved package record with version-only lock identity.
     pub fn new(key: impl Into<String>, version: impl Into<String>) -> Self {
+        let version = version.into();
         Self {
             key: key.into(),
-            version: version.into(),
+            lock_identity: version.clone(),
+            version,
         }
     }
 }
@@ -48,7 +58,7 @@ pub trait Lockfile: Send + Sync + std::fmt::Debug {
 
     /// Returns full transitive dependency closure for package identified by lockfile key.
     ///
-    /// Result contains external dependency `(name, version)` pairs reachable from
+    /// Result contains external dependency `(name, lock_identity)` pairs reachable from
     /// `key` through its dependency closure. In cyclic graphs this may conservatively
     /// include the seed package if a cycle points back to it.
     fn transitive_dependencies(
@@ -67,7 +77,7 @@ pub trait Lockfile: Send + Sync + std::fmt::Debug {
                 continue;
             };
 
-            dependencies.insert((dependency_name, package.version.clone()));
+            dependencies.insert((dependency_name, package.lock_identity.clone()));
 
             if visited.insert(package.key.clone()) {
                 pending.extend(self.all_dependencies(&package.key)?);

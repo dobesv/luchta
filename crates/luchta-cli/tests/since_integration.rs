@@ -401,3 +401,203 @@ fn since_root_only_change_is_noop() {
 
     temp.close().unwrap();
 }
+
+#[derive(Clone, Copy)]
+enum ExpectedTasks {
+    None,
+    AAndB,
+    OnlyC,
+    AllNonRoot,
+}
+
+impl ExpectedTasks {
+    fn task_ids(self) -> &'static [&'static str] {
+        match self {
+            Self::None => &[],
+            Self::AAndB => &["a#build", "b#build"],
+            Self::OnlyC => &["c#build"],
+            Self::AllNonRoot => &["a#build", "b#build", "c#build"],
+        }
+    }
+}
+
+struct LockfileSinceFixture {
+    temp: assert_fs::TempDir,
+    base: String,
+}
+
+impl LockfileSinceFixture {
+    fn new(lockfile: &str) -> Self {
+        let temp = setup();
+        add_third_package(&temp);
+        for (path, value) in [
+            (
+                "packages/a/package.json",
+                serde_json::json!({"left-pad": "^1.0.0"}),
+            ),
+            ("package.json", serde_json::json!({"dev-tool": "^2.0.0"})),
+        ] {
+            let file = temp.child(path);
+            let mut manifest: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(file.path()).unwrap()).unwrap();
+            manifest["dependencies"] = value;
+            file.write_str(&manifest.to_string()).unwrap();
+        }
+        let file = temp.child("packages/c/package.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(file.path()).unwrap()).unwrap();
+        manifest["devDependencies"] = serde_json::json!({"dev-tool": "^2.0.0"});
+        file.write_str(&manifest.to_string()).unwrap();
+        temp.child("yarn.lock").write_str(lockfile).unwrap();
+        git_commit_all(temp.path(), "dependency closure baseline");
+        let base = git_stdout(&temp, &["rev-parse", "HEAD"]);
+        Self { temp, base }
+    }
+
+    fn change_lockfile(&self, content: &str, commit: bool) {
+        self.temp.child("yarn.lock").write_str(content).unwrap();
+        if commit {
+            git_commit_paths(
+                self.temp.path(),
+                &["yarn.lock"],
+                "change dependency closure",
+            );
+            assert_eq!(
+                git_stdout(&self.temp, &["diff", "--name-only", &self.base, "HEAD"]),
+                "yarn.lock"
+            );
+        } else {
+            assert_eq!(git_stdout(&self.temp, &["rev-parse", "HEAD"]), self.base);
+            assert_eq!(
+                git_stdout(&self.temp, &["diff", "--name-only"]),
+                "yarn.lock"
+            );
+        }
+    }
+
+    fn assert_dry_run_tasks(&self, expected: ExpectedTasks) {
+        let result =
+            assert_run(&self.temp, "build", &["--since", &self.base, "--dry-run"]).success();
+        let stdout = std::str::from_utf8(&result.get_output().stdout).unwrap();
+        let mut actual: Vec<_> = stdout
+            .lines()
+            .filter_map(|line| line.strip_prefix("  "))
+            .filter_map(|line| line.split_whitespace().next())
+            .collect();
+        actual.sort_unstable();
+        let mut expected = expected.task_ids().to_vec();
+        expected.sort_unstable();
+        assert_eq!(actual, expected, "unexpected dry-run task set: {stdout}");
+    }
+
+    fn assert_list_tasks(&self, expected: ExpectedTasks) {
+        let result = AssertCommand::cargo_bin("luchta")
+            .unwrap()
+            .env("NO_COLOR", "1")
+            .args([
+                "list",
+                "build",
+                "--since",
+                &self.base,
+                "--json",
+                "--workspace-root",
+            ])
+            .arg(self.temp.path())
+            .assert()
+            .success();
+        let tasks: Vec<serde_json::Value> =
+            serde_json::from_slice(&result.get_output().stdout).unwrap();
+        let actual: Vec<_> = tasks
+            .iter()
+            .map(|task| task["task_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(actual, expected.task_ids());
+    }
+
+    fn assert_selection(&self, expected: ExpectedTasks) {
+        self.assert_dry_run_tasks(expected);
+        self.assert_list_tasks(expected);
+    }
+}
+
+#[test]
+fn since_lockfile_committed_transitive_bumps_select_dependents_in_run_and_list() {
+    let berry_head = common::YARN_BERRY_DEP_CLOSURES.replace("3.0.1", "3.0.2");
+    for (base, head) in [
+        (common::YARN_BERRY_DEP_CLOSURES, berry_head.as_str()),
+        (
+            common::YARN1_LOCK_LEFT_PAD_TRANSITIVE_3_0_0,
+            common::YARN1_LOCK_LEFT_PAD_TRANSITIVE_3_0_1,
+        ),
+    ] {
+        let fixture = LockfileSinceFixture::new(base);
+        fixture.assert_dry_run_tasks(ExpectedTasks::None);
+        fixture.change_lockfile(head, true);
+        fixture.assert_selection(ExpectedTasks::AAndB);
+    }
+}
+
+#[test]
+fn since_lockfile_dev_dependency_resolution_change_selects_only_its_package() {
+    let fixture = LockfileSinceFixture::new(common::YARN_BERRY_DEP_CLOSURES);
+    fixture.change_lockfile(
+        &common::YARN_BERRY_DEP_CLOSURES.replace("2.0.1", "2.0.2"),
+        true,
+    );
+    fixture.assert_selection(ExpectedTasks::OnlyC);
+}
+
+#[test]
+fn since_lockfile_patch_identity_only_changes_select_dependents() {
+    for head in [
+        common::YARN_BERRY_DEP_CLOSURES.replace("checksum: 10/leftpad", "checksum: 10/changed"),
+        common::YARN_BERRY_DEP_CLOSURES.replace("hash=abc123", "hash=def456"),
+    ] {
+        let fixture = LockfileSinceFixture::new(common::YARN_BERRY_DEP_CLOSURES);
+        fixture.change_lockfile(&head, true);
+        fixture.assert_selection(ExpectedTasks::AAndB);
+    }
+}
+
+#[test]
+fn since_lockfile_garbage_base_selects_all_non_root_packages() {
+    for head in [common::YARN_BERRY_DEP_CLOSURES, "not-a-lockfile"] {
+        let fixture = LockfileSinceFixture::new("not-a-lockfile");
+        if head != "not-a-lockfile" {
+            fixture.change_lockfile(head, true);
+        }
+        fixture.assert_selection(ExpectedTasks::AllNonRoot);
+    }
+}
+
+#[test]
+fn since_lockfile_unchanged_with_readme_change_selects_nothing() {
+    let fixture = LockfileSinceFixture::new(common::YARN_BERRY_DEP_CLOSURES);
+    fixture
+        .temp
+        .child("README.md")
+        .write_str("root-only change\n")
+        .unwrap();
+    git_commit_paths(fixture.temp.path(), &["README.md"], "root-only change");
+    assert_run(
+        &fixture.temp,
+        "build",
+        &["--since", &fixture.base, "--dry-run"],
+    )
+    .success()
+    .stdout(predicate::str::contains(format!(
+        "No packages changed since {}; nothing to run.",
+        fixture.base
+    )));
+    fixture.assert_selection(ExpectedTasks::None);
+}
+
+#[test]
+fn since_lockfile_uncommitted_transitive_change_selects_dependents() {
+    let fixture = LockfileSinceFixture::new(common::YARN_BERRY_DEP_CLOSURES);
+    fixture.change_lockfile(
+        &common::YARN_BERRY_DEP_CLOSURES.replace("3.0.1", "3.0.2"),
+        false,
+    );
+    fixture.assert_selection(ExpectedTasks::AAndB);
+}
