@@ -7,6 +7,7 @@ use crate::{Lockfile, LockfileError, Package};
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct YarnBerryEntry {
     version: String,
+    lock_identity: String,
     dependencies: BTreeMap<String, String>,
 }
 
@@ -20,6 +21,10 @@ struct YarnBerryMetadata {
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 struct YarnBerryRawEntry {
     version: String,
+    #[serde(default)]
+    resolution: Option<String>,
+    #[serde(default)]
+    checksum: Option<String>,
     #[serde(default)]
     dependencies: BTreeMap<String, String>,
 }
@@ -56,8 +61,16 @@ impl YarnBerryLockfile {
 
             let entry: YarnBerryRawEntry = serde_norway::from_value(value)
                 .map_err(|error| LockfileError::Parse(error.to_string()))?;
+            let mut lock_identity = entry.version.clone();
+            if let Some(resolution) = entry.resolution {
+                lock_identity.push_str(&format!(" resolution={resolution}"));
+            }
+            if let Some(checksum) = entry.checksum {
+                lock_identity.push_str(&format!(" checksum={checksum}"));
+            }
             let normalized_entry = YarnBerryEntry {
                 version: entry.version,
+                lock_identity,
                 dependencies: entry.dependencies,
             };
 
@@ -95,9 +108,11 @@ impl Lockfile for YarnBerryLockfile {
         Ok(Self::candidate_keys(name, version)
             .into_iter()
             .find_map(|key| {
-                self.entries_by_descriptor
-                    .get(&key)
-                    .map(|entry| Package::new(key, entry.version.clone()))
+                self.entries_by_descriptor.get(&key).map(|entry| Package {
+                    key,
+                    version: entry.version.clone(),
+                    lock_identity: entry.lock_identity.clone(),
+                })
             }))
     }
 
@@ -185,6 +200,10 @@ chalk@^4.1.2:
 
         assert_eq!(package.key, "chalk@npm:^4.1.2");
         assert_eq!(package.version, "4.1.2");
+        assert_eq!(
+            package.lock_identity,
+            "4.1.2 resolution=chalk@npm:4.1.2 checksum=10/abc123"
+        );
     }
 
     #[test]
@@ -367,8 +386,14 @@ chalk@^4.1.2:
         assert_eq!(
             deps,
             BTreeSet::from([
-                ("package-b".to_string(), "2.0.0".to_string()),
-                ("package-c".to_string(), "3.0.0".to_string()),
+                (
+                    "package-b".to_string(),
+                    "2.0.0 resolution=package-b@npm:2.0.0".to_string()
+                ),
+                (
+                    "package-c".to_string(),
+                    "3.0.0 resolution=package-c@npm:3.0.0".to_string()
+                ),
             ])
         );
     }
@@ -406,8 +431,14 @@ chalk@^4.1.2:
         assert_eq!(
             deps,
             BTreeSet::from([
-                ("package-a".to_string(), "1.0.0".to_string()),
-                ("package-b".to_string(), "2.0.0".to_string()),
+                (
+                    "package-a".to_string(),
+                    "1.0.0 resolution=package-a@npm:1.0.0".to_string()
+                ),
+                (
+                    "package-b".to_string(),
+                    "2.0.0 resolution=package-b@npm:2.0.0".to_string()
+                ),
             ])
         );
     }
@@ -424,5 +455,78 @@ chalk@^4.1.2:
             .expect("transitive lookup should succeed");
 
         assert_eq!(deps1, deps2);
+    }
+
+    const PATCH_FIXTURE: &str = r#"__metadata:
+  version: 8
+  cacheKey: 10
+
+"my-app@workspace:.":
+  version: 0.0.0-use.local
+  resolution: "my-app@workspace:."
+  dependencies:
+    left-pad: "patch:left-pad@npm%3A1.3.0#./.yarn/patches/left-pad.patch"
+
+"left-pad@patch:left-pad@npm%3A1.3.0#./.yarn/patches/left-pad.patch":
+  version: 1.3.0
+  resolution: "left-pad@patch:left-pad@npm%3A1.3.0#./.yarn/patches/left-pad.patch::version=1.3.0&hash=abc123"
+  checksum: 10/abc123
+"#;
+
+    fn assert_patch_identity_change(changed: &str, expected_identity: &str) {
+        let base = YarnBerryLockfile::parse(PATCH_FIXTURE).expect("fixture should parse");
+        let head = YarnBerryLockfile::parse(changed).expect("fixture should parse");
+        let base_deps = base
+            .transitive_dependencies("my-app@workspace:.")
+            .expect("transitive lookup should succeed");
+        let head_deps = head
+            .transitive_dependencies("my-app@workspace:.")
+            .expect("transitive lookup should succeed");
+
+        assert_eq!(base_deps.len(), 1);
+        assert_ne!(base_deps, head_deps);
+        assert_eq!(
+            head_deps,
+            BTreeSet::from([("left-pad".to_string(), expected_identity.to_string())])
+        );
+    }
+
+    #[test]
+    fn transitive_dependencies_detects_checksum_only_change() {
+        let changed = PATCH_FIXTURE.replace("checksum: 10/abc123", "checksum: 10/def456");
+        assert_patch_identity_change(
+            &changed,
+            "1.3.0 resolution=left-pad@patch:left-pad@npm%3A1.3.0#./.yarn/patches/left-pad.patch::version=1.3.0&hash=abc123 checksum=10/def456",
+        );
+    }
+
+    #[test]
+    fn transitive_dependencies_detects_patch_resolution_only_change() {
+        let changed = PATCH_FIXTURE.replace("hash=abc123", "hash=def456");
+        assert_patch_identity_change(
+            &changed,
+            "1.3.0 resolution=left-pad@patch:left-pad@npm%3A1.3.0#./.yarn/patches/left-pad.patch::version=1.3.0&hash=def456 checksum=10/abc123",
+        );
+    }
+
+    #[test]
+    fn lock_identity_defaults_to_version_without_extra_fields() {
+        let lockfile = YarnBerryLockfile::parse(
+            r#"__metadata:
+  version: 8
+  cacheKey: 10
+
+"left-pad@npm:^1.3.0":
+  version: 1.3.0
+"#,
+        )
+        .expect("fixture should parse");
+        let package = lockfile
+            .resolve_package("", "left-pad", "^1.3.0")
+            .expect("resolution should succeed")
+            .expect("package should exist");
+
+        assert_eq!(package.version, "1.3.0");
+        assert_eq!(package.lock_identity, package.version);
     }
 }

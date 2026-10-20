@@ -7,6 +7,9 @@ use luchta_workspace::{PackageGraph, PackageNode, WorkspaceError};
 use miette::Diagnostic;
 use thiserror::Error;
 
+use crate::cache_ctx::{load_lockfile_state, parse_lockfile_content, LockfileState};
+use crate::dep_closure_diff::packages_with_changed_dep_closures;
+
 #[derive(Debug, Error, Diagnostic)]
 pub enum SinceError {
     #[error("Not a git repository; --since requires a git repository.")]
@@ -23,6 +26,8 @@ pub enum SinceError {
     Status(String),
     #[error("Failed to query package graph for --since: {0}")]
     Graph(String),
+    #[error("Failed to locate workspace lockfile for --since: {0}")]
+    LockfilePath(String),
 }
 
 impl From<WorkspaceError> for SinceError {
@@ -96,19 +101,85 @@ pub fn affected_packages(
     package_graph: &PackageGraph,
 ) -> Result<HashSet<PackageName>, SinceError> {
     let changed_paths = changed_paths_since(workspace_root, since_ref)?;
-    affected_packages_from_paths(&changed_paths, repo_root, package_graph)
+    let mut changed_packages =
+        affected_packages_from_paths(&changed_paths, repo_root, package_graph)?;
+
+    let lockfile_path = repo_relative_lockfile_path(workspace_root, repo_root)?;
+    let repo = discover_repo(workspace_root)?;
+    let base_tree = resolve_ref_tree(&repo, since_ref)?;
+    let base = lockfile_state_from_tree(&base_tree, &lockfile_path);
+    let head = load_lockfile_state(workspace_root);
+    let candidates = package_graph
+        .as_graph()
+        .node_weights()
+        .filter(|node| Some(&node.name) != package_graph.root_package());
+    changed_packages.extend(packages_with_changed_dep_closures(
+        candidates,
+        package_graph,
+        &base,
+        &head,
+    ));
+
+    // Path-based changes already include dependents; expand again for the closure-change seeds.
+    // Note: no byte-equality fast path (e.g., base.blob == head.bytes) because
+    // identical malformed lockfiles at both base and head must select all candidates.
+    // The Failed → all rule in packages_with_changed_dep_closures runs first.
+    package_graph
+        .transitive_dependents_of(changed_packages)
+        .map_err(SinceError::from)
+}
+
+fn repo_relative_lockfile_path(
+    workspace_root: &Path,
+    repo_root: &Path,
+) -> Result<PathBuf, SinceError> {
+    let workspace_root = workspace_root
+        .canonicalize()
+        .map_err(|error| SinceError::LockfilePath(error.to_string()))?;
+    let repo_root = repo_root
+        .canonicalize()
+        .map_err(|error| SinceError::LockfilePath(error.to_string()))?;
+    workspace_root
+        .strip_prefix(&repo_root)
+        .map(|relative| relative.join("yarn.lock"))
+        .map_err(|error| {
+            SinceError::LockfilePath(format!(
+                "workspace '{}' is outside repository '{}': {error}",
+                workspace_root.display(),
+                repo_root.display()
+            ))
+        })
+}
+
+fn lockfile_state_from_tree(tree: &gix::Tree<'_>, path: &Path) -> LockfileState {
+    let entry = match tree.lookup_entry_by_path(path) {
+        Ok(Some(entry)) => entry,
+        Ok(None) => return LockfileState::Absent,
+        Err(error) => return LockfileState::Failed(error.to_string()),
+    };
+    let object = match entry.object() {
+        Ok(object) => object,
+        Err(error) => return LockfileState::Failed(error.to_string()),
+    };
+    let blob = match object.try_into_blob() {
+        Ok(blob) => blob,
+        Err(error) => return LockfileState::Failed(error.to_string()),
+    };
+    match std::str::from_utf8(&blob.data) {
+        Ok(content) => parse_lockfile_content(content),
+        Err(error) => LockfileState::Failed(error.to_string()),
+    }
 }
 
 fn discover_repo(workspace_root: &Path) -> Result<gix::Repository, SinceError> {
     gix::discover(workspace_root).map_err(|_| SinceError::NotGitRepository)
 }
 
-fn collect_committed_changes(
-    repo: &gix::Repository,
+fn resolve_ref_tree<'repo>(
+    repo: &'repo gix::Repository,
     since_ref: &str,
-) -> Result<HashSet<PathBuf>, SinceError> {
-    let base_tree = repo
-        .rev_parse_single(since_ref)
+) -> Result<gix::Tree<'repo>, SinceError> {
+    repo.rev_parse_single(since_ref)
         .map_err(|error| SinceError::InvalidRef {
             reference: since_ref.to_owned(),
             reason: error.to_string(),
@@ -122,7 +193,14 @@ fn collect_committed_changes(
         .map_err(|error| SinceError::InvalidRef {
             reference: since_ref.to_owned(),
             reason: error.to_string(),
-        })?;
+        })
+}
+
+fn collect_committed_changes(
+    repo: &gix::Repository,
+    since_ref: &str,
+) -> Result<HashSet<PathBuf>, SinceError> {
+    let base_tree = resolve_ref_tree(repo, since_ref)?;
 
     let head_tree = repo
         .rev_parse_single("HEAD")
@@ -411,6 +489,182 @@ mod tests {
         let affected = affected_packages_from_paths(&changed_paths, repo.path(), &graph).unwrap();
 
         assert_eq!(affected, package_name_set(["@repo/a", "@repo/b"]));
+    }
+
+    const BERRY_LOCKFILE: &str = r#"__metadata:
+  version: 8
+  cacheKey: 10
+
+"foo@npm:^2.0.0":
+  version: 2.0.1
+  resolution: "foo@npm:2.0.1"
+  dependencies:
+    bar: "npm:^3.0.0"
+
+"bar@npm:^3.0.0":
+  version: 3.0.1
+  resolution: "bar@npm:3.0.1"
+  checksum: 10/bar
+
+"left-pad@npm:^1.0.0":
+  version: 1.0.0
+  resolution: "left-pad@npm:1.0.0"
+"#;
+
+    fn lockfile_workspace(
+        repo: &TestRepo,
+        prefix: &Path,
+        lockfile: impl AsRef<[u8]>,
+    ) -> PackageGraph {
+        for (path, contents) in [
+            ("package.json", ROOT_PKG_JSON.to_owned()),
+            (
+                "packages/a/package.json",
+                r#"{"name":"@repo/a","dependencies":{"foo":"^2.0.0"}}"#.to_owned(),
+            ),
+            (
+                "packages/b/package.json",
+                package_json("@repo/b", &["@repo/a"]),
+            ),
+            (
+                "packages/c/package.json",
+                r#"{"name":"@repo/c","dependencies":{"left-pad":"^1.0.0"}}"#.to_owned(),
+            ),
+        ] {
+            let path = repo.path().join(prefix).join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, contents).unwrap();
+        }
+        fs::write(repo.path().join(prefix).join("yarn.lock"), lockfile).unwrap();
+        repo.git_add_and_commit_all();
+        package_graph_with_root(
+            &repo.path().join(prefix),
+            "root",
+            [
+                ("root", "."),
+                ("@repo/a", "packages/a"),
+                ("@repo/b", "packages/b"),
+                ("@repo/c", "packages/c"),
+            ],
+        )
+    }
+
+    fn affected_after_lockfile_change(
+        base: impl AsRef<[u8]>,
+        head: impl AsRef<[u8]>,
+    ) -> HashSet<PackageName> {
+        let repo = TestRepo::new();
+        let graph = lockfile_workspace(&repo, Path::new("."), base);
+        let base_ref = repo.head_commit();
+        fs::write(repo.path().join("yarn.lock"), head).unwrap();
+
+        affected_packages(repo.path(), repo.path(), &base_ref, &graph).unwrap()
+    }
+
+    #[test]
+    fn lockfile_only_transitive_bump_selects_package_and_dependents() {
+        let head = BERRY_LOCKFILE.replace("3.0.1", "3.0.2");
+        let affected = affected_after_lockfile_change(BERRY_LOCKFILE, &head);
+
+        assert_eq!(affected, package_name_set(["@repo/a", "@repo/b"]));
+    }
+
+    #[test]
+    fn unchanged_lockfile_selects_no_packages() {
+        assert!(affected_after_lockfile_change(BERRY_LOCKFILE, BERRY_LOCKFILE).is_empty());
+    }
+
+    #[test]
+    fn malformed_base_selects_all_non_root_packages() {
+        for head in [BERRY_LOCKFILE, "not-a-lockfile"] {
+            let affected = affected_after_lockfile_change("not-a-lockfile", head);
+            assert_eq!(
+                affected,
+                package_name_set(["@repo/a", "@repo/b", "@repo/c"])
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_head_selects_all_non_root_packages() {
+        let affected = affected_after_lockfile_change(BERRY_LOCKFILE, "not-a-lockfile");
+
+        assert_eq!(
+            affected,
+            package_name_set(["@repo/a", "@repo/b", "@repo/c"])
+        );
+    }
+
+    #[test]
+    fn missing_base_lockfile_selects_packages_with_external_dependencies() {
+        let repo = TestRepo::new();
+        let graph = lockfile_workspace(&repo, Path::new("."), BERRY_LOCKFILE);
+        fs::remove_file(repo.path().join("yarn.lock")).unwrap();
+        repo.git_add_and_commit_all();
+        let base_ref = repo.head_commit();
+        repo.write_file("yarn.lock", BERRY_LOCKFILE);
+
+        let affected = affected_packages(repo.path(), repo.path(), &base_ref, &graph).unwrap();
+        assert_eq!(
+            affected,
+            package_name_set(["@repo/a", "@repo/b", "@repo/c"])
+        );
+    }
+
+    #[test]
+    fn non_utf8_base_lockfile_selects_all_non_root_packages() {
+        let affected = affected_after_lockfile_change([0xff, 0xfe], BERRY_LOCKFILE);
+        assert_eq!(
+            affected,
+            package_name_set(["@repo/a", "@repo/b", "@repo/c"])
+        );
+    }
+
+    #[test]
+    fn unreadable_head_lockfile_selects_all_non_root_packages() {
+        let repo = TestRepo::new();
+        let graph = lockfile_workspace(&repo, Path::new("."), BERRY_LOCKFILE);
+        let base_ref = repo.head_commit();
+        fs::remove_file(repo.path().join("yarn.lock")).unwrap();
+        fs::create_dir(repo.path().join("yarn.lock")).unwrap();
+
+        let affected = affected_packages(repo.path(), repo.path(), &base_ref, &graph).unwrap();
+        assert_eq!(
+            affected,
+            package_name_set(["@repo/a", "@repo/b", "@repo/c"])
+        );
+    }
+
+    #[test]
+    fn relative_nested_workspace_uses_its_lockfile_not_repo_root_decoy() {
+        luchta_test_support::require_nextest();
+        let repo = TestRepo::new();
+        let head = BERRY_LOCKFILE.replace("3.0.1", "3.0.2");
+        repo.write_file("yarn.lock", &head);
+        let graph = lockfile_workspace(&repo, Path::new("nested"), BERRY_LOCKFILE);
+        let base_ref = repo.head_commit();
+        repo.write_file("nested/yarn.lock", &head);
+
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(repo.path()).unwrap();
+        let result = affected_packages(
+            Path::new("nested/../nested"),
+            Path::new("."),
+            &base_ref,
+            &graph,
+        );
+        std::env::set_current_dir(original_dir).unwrap();
+
+        assert_eq!(result.unwrap(), package_name_set(["@repo/a", "@repo/b"]));
+    }
+
+    #[test]
+    fn workspace_outside_repo_does_not_fall_back_to_repo_root_lockfile() {
+        let repo = TestRepo::new();
+        let other_workspace = TempDir::new().unwrap();
+        let result = super::repo_relative_lockfile_path(other_workspace.path(), repo.path());
+
+        assert!(matches!(result, Err(SinceError::LockfilePath(_))));
     }
 
     fn package_graph<const N: usize>(

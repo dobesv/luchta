@@ -114,15 +114,19 @@ fn discover_config_script(workspace_root: &Path) -> Result<PathBuf> {
     matches.sort();
 
     match matches.len() {
-        0 => bail!("no config file found (expected a file matching luchta-config.*)"),
+        0 => {
+            bail!("no config file found (expected a file matching luchta-config.*)");
+        }
         1 => Ok(matches.remove(0)),
-        _ => bail!(
-            "multiple config files found: {:?} — remove all but one",
-            matches
-                .iter()
-                .map(|path| path.display().to_string())
-                .collect::<Vec<_>>()
-        ),
+        _ => {
+            bail!(
+                "multiple config files found: {:?} — remove all but one",
+                matches
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+            );
+        }
     }
 }
 

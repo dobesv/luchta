@@ -558,6 +558,30 @@ pub const YARN_BERRY_LEFT_PAD_1_1_0: &str = r#"__metadata:
   linkType: soft
 "#;
 
+/// Berry closure fixture with a patched left-pad resolution and an independent dev-tool.
+/// Both original and patch descriptors resolve to the same patched package.
+pub const YARN_BERRY_DEP_CLOSURES: &str = r#"__metadata:
+  version: 8
+  cacheKey: 10
+
+"left-pad@npm:^1.0.0, left-pad@patch:left-pad@npm%3A1.0.0#./.yarn/patches/left-pad.patch":
+  version: 1.0.0
+  resolution: "left-pad@patch:left-pad@npm%3A1.0.0#./.yarn/patches/left-pad.patch::version=1.0.0&hash=abc123"
+  checksum: 10/leftpad
+  dependencies:
+    repeat-string: "npm:^3.0.0"
+
+"repeat-string@npm:^3.0.0":
+  version: 3.0.1
+  resolution: "repeat-string@npm:3.0.1"
+  checksum: 10/repeat
+
+"dev-tool@npm:^2.0.0":
+  version: 2.0.1
+  resolution: "dev-tool@npm:2.0.1"
+  checksum: 10/devtool
+"#;
+
 /// Cached `app#pkgbuild` fixture with a `left-pad@^1.0.0` dependency, using the
 /// supplied `yarn_lock` contents.
 pub fn setup_lockfile_workspace(temp: &assert_fs::TempDir, yarn_lock: &str) {

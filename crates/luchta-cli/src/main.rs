@@ -4,6 +4,7 @@ mod cache_ctx;
 mod cache_nonce;
 mod cli;
 mod config;
+mod dep_closure_diff;
 mod dep_outputs;
 mod env_conflict;
 mod env_merge;
