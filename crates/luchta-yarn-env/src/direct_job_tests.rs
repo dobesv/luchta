@@ -73,13 +73,24 @@ fn builds_bash_job_with_yarn_environment() {
     );
     assert_eq!(job.env["npm_execpath"], format!("{shim_dir}/yarn"));
     assert_eq!(job.env["npm_node_execpath"], format!("{shim_dir}/node"));
-    assert_eq!(job.env["INIT_CWD"], fixture.app_dir.to_string_lossy());
-    assert_eq!(job.env["PROJECT_CWD"], fixture.root.to_string_lossy());
+    assert_eq!(
+        job.env["INIT_CWD"],
+        fixture.app_dir.canonicalize().unwrap().to_string_lossy()
+    );
+    assert_eq!(
+        job.env["PROJECT_CWD"],
+        fixture.root.canonicalize().unwrap().to_string_lossy()
+    );
     assert_eq!(job.env["npm_package_name"], "@fixture/app");
     assert_eq!(job.env["npm_package_version"], "1.2.3");
     assert_eq!(
         job.env["npm_package_json"],
-        fixture.app_dir.join("package.json").to_string_lossy()
+        fixture
+            .app_dir
+            .join("package.json")
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
     );
     assert_eq!(job.env["npm_lifecycle_event"], "build");
     assert!(job.env["npm_config_user_agent"].starts_with("yarn/4.18.0 npm/? node/v22.1.0 "));
@@ -87,8 +98,18 @@ fn builds_bash_job_with_yarn_environment() {
         job.env["NODE_OPTIONS"],
         format!(
             "--require {} --experimental-loader file://{}",
-            fixture.root.join(".pnp.cjs").display(),
-            fixture.root.join(".pnp.loader.mjs").display()
+            fixture
+                .root
+                .join(".pnp.cjs")
+                .canonicalize()
+                .unwrap()
+                .display(),
+            fixture
+                .root
+                .join(".pnp.loader.mjs")
+                .canonicalize()
+                .unwrap()
+                .display()
         )
     );
     assert_eq!(job.env["HOME"], "/home/test");
@@ -149,7 +170,12 @@ fn env_file_values_are_injected_before_yarn_variables() {
         job.env["NODE_OPTIONS"],
         format!(
             "--require {} --no-warnings",
-            fixture.root.join(".pnp.cjs").display()
+            fixture
+                .root
+                .join(".pnp.cjs")
+                .canonicalize()
+                .unwrap()
+                .display()
         )
     );
 }
@@ -333,7 +359,10 @@ fn relative_workspace_dir_is_resolved_against_project_root() {
             &base_env(&path_value),
         )
         .unwrap();
-    assert_eq!(job.env["INIT_CWD"], fixture.app_dir.to_string_lossy());
+    assert_eq!(
+        job.env["INIT_CWD"],
+        fixture.app_dir.canonicalize().unwrap().to_string_lossy()
+    );
 }
 
 #[test]
@@ -357,11 +386,24 @@ fn node_options_across_pnp_layouts() {
                 .direct_job(&fixture.app_dir, "build", &[], &base_env(&path_value))
                 .unwrap_or_else(|error| panic!("{combo}: direct_job failed: {error}"));
 
-            let mut expected = format!("--require {}", fixture.root.join(".pnp.cjs").display());
+            let mut expected = format!(
+                "--require {}",
+                fixture
+                    .root
+                    .join(".pnp.cjs")
+                    .canonicalize()
+                    .unwrap()
+                    .display()
+            );
             if with_loader {
                 expected.push_str(&format!(
                     " --experimental-loader file://{}",
-                    fixture.root.join(".pnp.loader.mjs").display()
+                    fixture
+                        .root
+                        .join(".pnp.loader.mjs")
+                        .canonicalize()
+                        .unwrap()
+                        .display()
                 ));
             }
             assert_eq!(job.env["NODE_OPTIONS"], expected, "{combo}");

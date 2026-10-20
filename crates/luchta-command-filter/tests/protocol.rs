@@ -62,7 +62,7 @@ fn parse_jsonl(stdout: &[u8]) -> Vec<Value> {
 #[test]
 fn resolve_forwards_when_predicate_exits_zero() {
     let output = run_filter(
-        &["/bin/true"],
+        &["sh", "-c", "exit 0"],
         r#"while IFS= read -r line; do
   case "$line" in
     *'"type":"resolveTask"'*)
