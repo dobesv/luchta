@@ -2,6 +2,8 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use gix::bstr::BStr;
+use gix::status::index_worktree::BuiltinSubmoduleStatus;
+use gix::status::plumbing::{self, index_as_worktree::traits::SubmoduleStatus};
 use luchta_types::PackageName;
 use luchta_workspace::{PackageGraph, PackageNode, WorkspaceError};
 use miette::Diagnostic;
@@ -247,21 +249,117 @@ fn collect_worktree_changes(
     repo: &gix::Repository,
     changed_paths: &mut HashSet<PathBuf>,
 ) -> Result<(), SinceError> {
-    let status = repo
-        .status(gix::progress::Discard)
-        .map_err(|error| SinceError::Status(error.to_string()))?
-        .untracked_files(gix::status::UntrackedFiles::Files);
+    let index = repo.index_or_empty().map_err(map_status_error)?;
+    collect_unstaged_changes(repo, &index, changed_paths)?;
+    collect_staged_changes(repo, &index, changed_paths)
+}
 
-    let items = status
-        .into_iter(std::iter::empty::<gix::bstr::BString>())
-        .map_err(|error| SinceError::Status(error.to_string()))?;
+fn collect_unstaged_changes(
+    repo: &gix::Repository,
+    index: &gix::index::State,
+    changed_paths: &mut HashSet<PathBuf>,
+) -> Result<(), SinceError> {
+    let mut records = plumbing::index_as_worktree_with_renames::Recorder::default();
+    let options = gix::status::index_worktree::Options {
+        sorting: None,
+        rewrites: None,
+        thread_limit: None,
+        dirwalk_options: Some(
+            repo.dirwalk_options()
+                .map_err(map_status_error)?
+                .emit_untracked(gix::dir::walk::EmissionMode::Matching),
+        ),
+    };
+    // The high-level status iterator reads .gitmodules even without gitlinks.
+    repo.index_worktree_status(
+        index,
+        std::iter::empty::<&BStr>(),
+        &mut records,
+        plumbing::index_as_worktree::traits::FastEq,
+        WorktreeSubmodules::new(repo, index),
+        &mut gix::progress::Discard,
+        &std::sync::atomic::AtomicBool::new(false),
+        options,
+    )
+    .map_err(map_status_error)?;
 
-    for item in items {
-        let item = item.map_err(|error| SinceError::Status(error.to_string()))?;
-        changed_paths.insert(bstr_to_path(item.location()));
+    for record in records.records {
+        // Stat-only index refreshes and ignored dirwalk entries aren't changes.
+        if record.summary().is_some() {
+            changed_paths.insert(bstr_to_path(record.destination_rela_path()));
+        }
     }
-
     Ok(())
+}
+
+fn collect_staged_changes(
+    repo: &gix::Repository,
+    index: &gix::index::State,
+    changed_paths: &mut HashSet<PathBuf>,
+) -> Result<(), SinceError> {
+    repo.tree_index_status(
+        &repo.head_tree_id_or_empty().map_err(map_status_error)?,
+        index,
+        None,
+        // Report both paths of a rename as removal and addition.
+        gix::status::tree_index::TrackRenames::Disabled,
+        |change, _, _| {
+            changed_paths.insert(bstr_to_path(change.location()));
+            Ok::<_, std::convert::Infallible>(gix::diff::index::Action::Continue(()))
+        },
+    )
+    .map_err(map_status_error)?;
+    Ok(())
+}
+
+/// Submodule status provider that only loads `.gitmodules` when the index has
+/// gitlinks, and treats a config load failure as "no submodules configured".
+///
+/// gix's high-level `status().into_iter()` reads `.gitmodules` unconditionally
+/// and fails when it can't, while git ignores the file unless submodules exist
+/// (#941).
+#[derive(Clone)]
+struct WorktreeSubmodules(Option<BuiltinSubmoduleStatus>);
+
+impl WorktreeSubmodules {
+    fn new(repo: &gix::Repository, index: &gix::index::State) -> Self {
+        if !index
+            .entries()
+            .iter()
+            .any(|entry| entry.mode == gix::index::entry::Mode::COMMIT)
+        {
+            return Self(None);
+        }
+        let status = BuiltinSubmoduleStatus::new(repo.clone().into_sync(), Default::default())
+            .inspect_err(|error| {
+                eprintln!(
+                    "warning: unable to read submodule configuration for --since: {error}; \
+                     continuing with submodules unconfigured"
+                );
+            })
+            .ok();
+        Self(status)
+    }
+}
+
+impl SubmoduleStatus for WorktreeSubmodules {
+    type Output = <BuiltinSubmoduleStatus as SubmoduleStatus>::Output;
+    type Error = <BuiltinSubmoduleStatus as SubmoduleStatus>::Error;
+
+    fn status(
+        &mut self,
+        entry: &gix::index::Entry,
+        rela_path: &BStr,
+    ) -> Result<Option<Self::Output>, Self::Error> {
+        match &mut self.0 {
+            Some(status) => status.status(entry, rela_path),
+            None => Ok(None),
+        }
+    }
+}
+
+fn map_status_error(error: impl std::fmt::Display) -> SinceError {
+    SinceError::Status(error.to_string())
 }
 
 fn bstr_to_path(location: &BStr) -> PathBuf {
@@ -289,14 +387,6 @@ mod tests {
     const PKG_A_JSON: &str = "{\n  \"name\": \"@repo/a\"\n}\n";
     const ROOT_PKG_JSON: &str = "{\n  \"name\": \"root\"\n}\n";
 
-    // NOTE: `untracked.txt` below sits at the repo root, so this test does not
-    // exercise `gix::status::UntrackedFiles::Files` vs. a hypothetical
-    // regression to `Collapsed` the way it looks like it does:
-    // `EmissionMode::CollapseDirectory` only collapses untracked *directories*,
-    // not top-level files, so a `Files` -> `Collapsed` mistake here would still
-    // pass. Only source-level review of `collect_worktree_changes` currently
-    // establishes that untracked files are reported individually; a nested
-    // `untracked/nested/file.txt` case would make this test load-bearing.
     #[test]
     fn unions_committed_staged_unstaged_and_untracked_changes() {
         let repo = TestRepo::new();
@@ -324,6 +414,71 @@ mod tests {
         assert!(changed.contains(Path::new("unstaged.txt")));
         assert!(changed.contains(Path::new("untracked.txt")));
         assert!(!changed.contains(Path::new("ignored.txt")));
+    }
+
+    #[test]
+    fn gitmodules_directory_without_gitlinks_does_not_break_status() {
+        let repo = TestRepo::with_status_changes();
+        fs::create_dir(repo.path().join(".gitmodules")).unwrap();
+        repo.assert_status_changes(&[]);
+    }
+
+    #[test]
+    fn gitmodules_directory_with_gitlinks_does_not_break_status() {
+        let repo = TestRepo::with_status_changes();
+        repo.add_gitlink();
+        fs::create_dir(repo.path().join(".gitmodules")).unwrap();
+        repo.assert_status_changes(&["sub"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_gitmodules_without_gitlinks_does_not_break_status() {
+        let repo = TestRepo::with_status_changes();
+        let Some(_permissions) = repo.unreadable_gitmodules() else {
+            return;
+        };
+        repo.assert_status_changes(&[".gitmodules"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_gitmodules_with_gitlinks_does_not_break_status() {
+        let repo = TestRepo::with_status_changes();
+        repo.add_gitlink();
+        let Some(_permissions) = repo.unreadable_gitmodules() else {
+            return;
+        };
+        repo.assert_status_changes(&[".gitmodules", "sub"]);
+    }
+
+    #[test]
+    fn readable_gitmodules_preserves_configured_submodule_status() {
+        let repo = TestRepo::new();
+        repo.write_file("tracked.txt", "base\n");
+        repo.git_add_and_commit_all();
+        let sub = TestRepo::new();
+        sub.write_file("tracked.txt", "base\n");
+        sub.git_add_and_commit_all();
+        git(
+            repo.path(),
+            [
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                sub.path().to_str().unwrap(),
+                "sub",
+            ],
+        );
+        repo.git_add_and_commit_all();
+        repo.write_file("sub/tracked.txt", "dirty\n");
+
+        let changed = changed_paths_since(repo.path(), "HEAD").unwrap();
+        assert_eq!(changed, HashSet::from(["sub".into()]));
+
+        git(repo.path(), ["config", "submodule.sub.ignore", "all"]);
+        assert!(changed_paths_since(repo.path(), "HEAD").unwrap().is_empty());
     }
 
     #[test]
@@ -748,6 +903,80 @@ mod tests {
             Self { root }
         }
 
+        fn with_status_changes() -> Self {
+            let repo = Self::new();
+            for path in [
+                "modified",
+                "deleted",
+                "staged-deleted",
+                "rename-old",
+                "clean",
+            ] {
+                repo.write_file(path, "base\n");
+            }
+            repo.write_file(".gitignore", "ignored/\n");
+            repo.git_add_and_commit_all();
+            repo.write_file("modified", "changed\n");
+            fs::remove_file(repo.path().join("deleted")).unwrap();
+            git(repo.path(), ["rm", "staged-deleted"]);
+            git(repo.path(), ["mv", "rename-old", "rename-new"]);
+            repo.write_file("staged", "staged\n");
+            git(repo.path(), ["add", "staged"]);
+            repo.write_file("untracked", "new\n");
+            repo.write_file("nested/deep/one", "new\n");
+            repo.write_file("nested/deep/two", "new\n");
+            repo.write_file("ignored/file", "ignored\n");
+            repo
+        }
+
+        fn add_gitlink(&self) {
+            git(
+                self.path(),
+                [
+                    "update-index",
+                    "--add",
+                    "--cacheinfo",
+                    &format!("160000,{},sub", self.head_commit()),
+                ],
+            );
+            fs::create_dir(self.path().join("sub")).unwrap();
+        }
+
+        fn assert_status_changes(&self, extra: &[&str]) {
+            let expected = [
+                "modified",
+                "deleted",
+                "staged-deleted",
+                "rename-old",
+                "rename-new",
+                "staged",
+                "untracked",
+                "nested/deep/one",
+                "nested/deep/two",
+            ]
+            .into_iter()
+            .chain(extra.iter().copied())
+            .map(Into::into)
+            .collect();
+            assert_eq!(changed_paths_since(self.path(), "HEAD").unwrap(), expected);
+        }
+
+        #[cfg(unix)]
+        fn unreadable_gitmodules(&self) -> Option<RestorePermissions> {
+            use std::os::unix::fs::PermissionsExt;
+
+            self.write_file(".gitmodules", "");
+            let path = self.path().join(".gitmodules");
+            let permissions = fs::metadata(&path).unwrap().permissions();
+            let restore = RestorePermissions(path.clone(), permissions);
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+            if fs::read(&path).is_ok() {
+                eprintln!("skipping: chmod 000 does not prevent reading .gitmodules");
+                return None;
+            }
+            Some(restore)
+        }
+
         fn path(&self) -> &Path {
             self.root.path()
         }
@@ -778,6 +1007,17 @@ mod tests {
             git_output(self.path(), ["rev-parse", "HEAD"])
                 .trim()
                 .to_owned()
+        }
+    }
+
+    #[cfg(unix)]
+    struct RestorePermissions(std::path::PathBuf, fs::Permissions);
+
+    #[cfg(unix)]
+    impl Drop for RestorePermissions {
+        fn drop(&mut self) {
+            // Ignore failures so a panic during unwind can't mask the real assertion.
+            let _ = fs::set_permissions(&self.0, self.1.clone());
         }
     }
 

@@ -121,6 +121,55 @@ fn bash_worker_bin() -> std::path::PathBuf {
 }
 
 #[test]
+fn since_gitmodules_directory_without_gitlinks_does_not_warn() {
+    let temp = setup_committed();
+    temp.child(".gitmodules").create_dir_all().unwrap();
+    temp.child("packages/a/src.ts")
+        .write_str("changed\n")
+        .unwrap();
+
+    assert_run(&temp, "build", &["--since", "HEAD", "--dry-run"])
+        .success()
+        .stdout(predicate::str::contains("a#build"))
+        .stderr(predicate::str::contains("warning:").not());
+}
+
+#[test]
+fn since_gitmodules_directory_with_gitlinks_warns_and_continues() {
+    let temp = setup_committed();
+    let head = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(temp.path())
+        .output()
+        .unwrap();
+    assert!(head.status.success());
+    let head = String::from_utf8(head.stdout).unwrap();
+    let status = Command::new("git")
+        .args([
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("160000,{},sub", head.trim()),
+        ])
+        .current_dir(temp.path())
+        .status()
+        .unwrap();
+    assert!(status.success());
+    temp.child("sub").create_dir_all().unwrap();
+    temp.child(".gitmodules").create_dir_all().unwrap();
+    temp.child("packages/a/src.ts")
+        .write_str("changed\n")
+        .unwrap();
+
+    assert_run(&temp, "build", &["--since", "HEAD", "--dry-run"])
+        .success()
+        .stdout(predicate::str::contains("a#build"))
+        .stderr(predicate::str::contains(
+            "warning: unable to read submodule configuration for --since:",
+        ));
+}
+
+#[test]
 fn since_changed_package_selects_changed_package_and_dependent() {
     let temp = setup();
 
