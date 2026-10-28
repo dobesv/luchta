@@ -111,7 +111,7 @@ oxc_allocator = { git = "https://github.com/oxc-project/oxc.git", rev = "7bf68f7
 oxc_parser = { git = "https://github.com/oxc-project/oxc.git", rev = "7bf68f70c20f5329251f19be95076f6eab4fe396" }
 oxc_semantic = { git = "https://github.com/oxc-project/oxc.git", rev = "7bf68f70c20f5329251f19be95076f6eab4fe396" }
 oxc_linter = { git = "https://github.com/oxc-project/oxc.git", rev = "7bf68f70c20f5329251f19be95076f6eab4fe396" }
-oxc_span = { git = "https://github.com/oxc-project/oxc.git", rev = "7bf68f70c20f5329251f19be95076f6eab4fe396" }
+oxc_span = { git = "https://github.com/oxc-project/oxc.git", rev = "ed7df7de929c32fc4b18627b4e4ca27db0310349" }
 oxc_syntax = { git = "https://github.com/oxc-project/oxc.git", rev = "7bf68f70c20f5329251f19be95076f6eab4fe396" }
 oxc_diagnostics = { git = "https://github.com/oxc-project/oxc.git", rev = "7bf68f70c20f5329251f19be95076f6eab4fe396" }
 oxc_transformer = { git = "https://github.com/oxc-project/oxc.git", rev = "7bf68f70c20f5329251f19be95076f6eab4fe396" }
