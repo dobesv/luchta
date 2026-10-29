@@ -2,7 +2,7 @@ nextest-version = "0.9.99"
 experimental = ["wrapper-scripts"]
 
 # Cap concurrency for the process-spawning end-to-end tests. They spawn real
-# processes and wait on filesystem events against a ~10s deadline; under
+# processes and wait on filesystem events against short deadlines; under
 # full CPU-count parallelism the contention occasionally pushes one past the
 # deadline and it fails as a bare timeout (see issue #352). Throttling this
 # group to 4 concurrent tests reduces that contention while the other ~1660
@@ -11,7 +11,9 @@ experimental = ["wrapper-scripts"]
 #
 # max-threads = 4: matches the vCPU count of typical CI runners (so the cap is
 # effectively a no-op there) while meaningfully cutting parallel load on
-# higher-core dev machines, where the timeouts actually showed up.
+# higher-core dev machines, where the timeouts actually showed up. Worker-manager
+# lifecycle tests share this group because their protocol waits also include
+# child-process startup and become flaky under full process-spawning contention.
 [test-groups]
 watch-e2e = { max-threads = 4 }
 
@@ -40,5 +42,5 @@ run-wrapper = "hermetic-windows"
 # `driver::driver_e2e_tests::*`) instead. Verify with:
 #   cargo nextest list -E '<filter>'
 [[profile.default.overrides]]
-filter = 'binary_id(luchta-worker-watcher::e2e) + binary_id(luchta-cli::worker_integration) + (package(luchta-cli) & test(/driver_e2e/))'
+filter = 'binary_id(luchta-worker-watcher::e2e) + binary_id(luchta-cli::worker_integration) + (package(luchta-cli) & test(/driver_e2e/)) + (package(luchta-engine) & test(/^worker::manager::tests::/))'
 test-group = "watch-e2e"
