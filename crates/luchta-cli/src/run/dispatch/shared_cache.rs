@@ -1,5 +1,5 @@
 use super::*;
-use luchta_cache::{path_matches_resolve_requests, CurrentState, ResolveRequest};
+use luchta_cache::{CurrentState, PathRequestMatcher, ResolveRequest};
 
 struct SharedCacheSkipInput<'a> {
     task_def: &'a TaskDefinition,
@@ -273,13 +273,19 @@ fn staged_cache_files_are_disjoint(validation: StagedCacheFileValidation<'_>) ->
                 .map(|entry| validation.package_path.join(&entry.path)),
         )
         .collect::<HashSet<_>>();
+    // Compile each request set once rather than once per restored path. A
+    // compile failure rejects the restore.
+    let Ok(input_matcher) = PathRequestMatcher::compile(&input_requests) else {
+        return false;
+    };
+    let Ok(output_matcher) = PathRequestMatcher::compile(&output_requests) else {
+        return false;
+    };
     validation.restore.relative_paths().iter().all(|path| {
         let absolute = validation.package_path.join(path);
         !occupied.contains(&absolute)
-            && path_matches_resolve_requests(&absolute, &input_requests)
-                .is_ok_and(|matched| !matched)
-            && path_matches_resolve_requests(&absolute, &output_requests)
-                .is_ok_and(|matched| !matched)
+            && !input_matcher.matches_path(&absolute)
+            && !output_matcher.matches_path(&absolute)
     })
 }
 
