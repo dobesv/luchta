@@ -236,35 +236,99 @@ pub fn resolve_inputs_with_semantics(requests: &[ResolveRequest]) -> Result<Vec<
 /// cache-file restoration uses it while files are still staged, so an absent
 /// input/output glob cannot become overlapping only after the restore commits.
 pub fn path_matches_resolve_requests(path: &Path, requests: &[ResolveRequest]) -> Result<bool> {
-    let exclusions = Exclusions::compile(
-        requests
-            .iter()
-            .filter(|request| request.negated)
-            .map(|request| request.pattern.as_str()),
-    )?;
+    PathRequestMatcher::compile(requests).map(|matcher| matcher.matches_path(path))
+}
 
-    for request in requests.iter().filter(|request| !request.negated) {
-        let Ok(relative_path) = path.strip_prefix(&request.base_dir) else {
-            continue;
-        };
-        if exclusions.excludes(relative_path) {
-            continue;
-        }
-        let matches = match request.semantics {
-            InputSemantics::Literal => {
-                relative_path == Path::new(&luchta_glob::unescape_literal(&request.pattern))
-            }
-            InputSemantics::Wildcard => luchta_glob::build_path_glob(&request.pattern)
-                .map_err(CacheError::InvalidGlob)?
-                .compile_matcher()
-                .is_match(relative_path),
-        };
-        if matches {
-            return Ok(true);
+/// Compiled form of a task's expanded input [`ResolveRequest`]s, for callers
+/// that test many paths against one task's inputs.
+///
+/// Semantics are identical to [`path_matches_resolve_requests`] — same
+/// literal/wildcard handling, negations tested relative to each include's own
+/// base — but the exclusion set and every include matcher are compiled once
+/// instead of once per path.
+pub struct PathRequestMatcher {
+    /// One compiled non-negated request, anchored at its own base dir.
+    includes: Vec<CompiledInclude>,
+    /// Negated bodies, shared across every include base dir.
+    exclusions: Exclusions,
+}
+
+enum CompiledInclude {
+    Literal {
+        base_dir: PathBuf,
+        path: PathBuf,
+    },
+    Wildcard {
+        base_dir: PathBuf,
+        matcher: globset::GlobSet,
+    },
+}
+
+impl CompiledInclude {
+    fn base_dir(&self) -> &Path {
+        match self {
+            Self::Literal { base_dir, .. } | Self::Wildcard { base_dir, .. } => base_dir,
         }
     }
+}
 
-    Ok(false)
+impl PathRequestMatcher {
+    /// Compiles `requests` into a reusable matcher. The requests must already
+    /// be expanded (one entry per include/negation, per base dir) as produced
+    /// by the engine's `expand_input_patterns`.
+    pub fn compile(requests: &[ResolveRequest]) -> Result<Self> {
+        let exclusions = Exclusions::compile(
+            requests
+                .iter()
+                .filter(|request| request.negated)
+                .map(|request| request.pattern.as_str()),
+        )?;
+
+        let includes = requests
+            .iter()
+            .filter(|request| !request.negated)
+            .map(|request| {
+                Ok(match request.semantics {
+                    InputSemantics::Literal => CompiledInclude::Literal {
+                        base_dir: request.base_dir.clone(),
+                        path: PathBuf::from(luchta_glob::unescape_literal(&request.pattern)),
+                    },
+                    InputSemantics::Wildcard => CompiledInclude::Wildcard {
+                        base_dir: request.base_dir.clone(),
+                        matcher: luchta_glob::build_path_globset(&[request.pattern.as_str()])
+                            .map_err(CacheError::InvalidGlob)?,
+                    },
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(Self {
+            includes,
+            exclusions,
+        })
+    }
+
+    /// Tests whether an absolute path would be selected by the compiled
+    /// requests, including their global exclusions. Like normal resolution
+    /// this does not require the path to exist.
+    pub fn matches_path(&self, path: &Path) -> bool {
+        self.includes.iter().any(|include| {
+            let Ok(relative_path) = path.strip_prefix(include.base_dir()) else {
+                return false;
+            };
+            !self.exclusions.excludes(relative_path)
+                && match include {
+                    CompiledInclude::Literal { path, .. } => relative_path == path,
+                    CompiledInclude::Wildcard { matcher, .. } => matcher.is_match(relative_path),
+                }
+        })
+    }
+
+    /// Whether the compiled set contains at least one positive include.
+    /// A request list of only negations can never match a path.
+    pub fn has_includes(&self) -> bool {
+        !self.includes.is_empty()
+    }
 }
 
 /// Resolve pre-classified input [`ResolveRequest`]s, honoring [`ResolveOptions`].
@@ -1099,8 +1163,8 @@ mod tests {
         resolve_inputs_with_options, resolve_inputs_with_semantics, resolve_literal_request,
         resolve_outputs, resolve_outputs_with_options, resolve_wildcard_with_candidates,
         resolve_with, resolve_with_candidates, strip_suffix_components, walk_output_candidates,
-        CandidateLister, Exclusions, FileReader, FilesystemLister, ListingCache, ResolveOptions,
-        ResolveRequest, ResolvedBase, StdFs,
+        CandidateLister, Exclusions, FileReader, FilesystemLister, ListingCache,
+        PathRequestMatcher, ResolveOptions, ResolveRequest, ResolvedBase, StdFs,
     };
     use crate::FileEntry;
     use crate::Result;
@@ -2158,6 +2222,27 @@ mod tests {
         for pattern in ["src/*.ts", "src/?.ts", "src/[ab].ts", "src/{a,b}.ts"] {
             assert_eq!(classify_pattern(pattern), InputSemantics::Wildcard);
         }
+    }
+
+    #[test]
+    fn path_request_matcher_has_includes_reports_positive_includes() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+
+        // Only negations: no positive include, so nothing can ever match.
+        let negation_only = vec![ResolveRequest::new(root.clone(), "!src/**")];
+        let matcher = PathRequestMatcher::compile(&negation_only).unwrap();
+        assert!(!matcher.has_includes());
+        assert!(!matcher.matches_path(&root.join("src/a.ts")));
+
+        // A positive include alongside the negation.
+        let with_include = vec![
+            ResolveRequest::new(root.clone(), "!src/**/*.test.ts"),
+            ResolveRequest::new(root, "src/**"),
+        ];
+        assert!(PathRequestMatcher::compile(&with_include)
+            .unwrap()
+            .has_includes());
     }
 
     #[test]

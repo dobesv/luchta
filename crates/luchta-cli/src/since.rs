@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 use gix::bstr::BStr;
 use gix::status::index_worktree::BuiltinSubmoduleStatus;
 use gix::status::plumbing::{self, index_as_worktree::traits::SubmoduleStatus};
-use luchta_types::PackageName;
+use luchta_cache::PathRequestMatcher;
+use luchta_engine::{expand_input_patterns, TaskGraph};
+use luchta_types::{PackageName, TaskName};
 use luchta_workspace::{PackageGraph, PackageNode, WorkspaceError};
 use miette::Diagnostic;
 use thiserror::Error;
@@ -30,6 +32,10 @@ pub enum SinceError {
     Graph(String),
     #[error("Failed to locate workspace lockfile for --since: {0}")]
     LockfilePath(String),
+    #[error("Failed to expand task inputs for --since: {0}")]
+    InputExpansion(String),
+    #[error("Failed to match changed paths against task inputs: {0}")]
+    InputMatch(String),
 }
 
 impl From<WorkspaceError> for SinceError {
@@ -62,6 +68,12 @@ pub fn changed_paths_since(
 /// Accepts repo-relative paths from git and absolute paths from file watchers.
 /// `repo_root.join(path)` is used for normalization; Rust preserves absolute
 /// `path` unchanged when joined onto another path.
+///
+/// The root package is deliberately excluded: it would swallow every
+/// repo-root file (`README.md`, etc.) via `strip_prefix` and break the clean
+/// no-op on doc-only changes (issue #15, PR #91). Files outside workspace
+/// packages are instead matched against declared task inputs in
+/// [`declared_input_matches`], which runs as part of [`since_affected`].
 pub fn deepest_package_for_path<'a>(
     changed_path: &Path,
     repo_root: &Path,
@@ -96,15 +108,124 @@ pub fn affected_packages_from_paths(
         .map_err(SinceError::from)
 }
 
-pub fn affected_packages(
+/// Result of the `--since` change analysis.
+///
+/// `packages` holds every affected package including transitive dependents.
+/// The root-task sets classify top-level (`#task`) tasks: only tasks whose
+/// declared inputs expand to at least one positive include are subject to
+/// `--since` filtering — a changed file that matches one of their declared
+/// inputs puts the task in `affected_root_tasks`. Root tasks without declared
+/// inputs, or whose inputs expand to nothing positive, keep the historic bypass
+/// and always pass.
+#[derive(Debug, Default)]
+pub struct SinceAffected {
+    packages: HashSet<PackageName>,
+    affected_root_tasks: HashSet<TaskName>,
+    root_tasks_with_inputs: HashSet<TaskName>,
+}
+
+impl SinceAffected {
+    /// Full construction, as produced by [`since_affected`].
+    pub(crate) fn new(
+        packages: HashSet<PackageName>,
+        affected_root_tasks: HashSet<TaskName>,
+        root_tasks_with_inputs: HashSet<TaskName>,
+    ) -> Self {
+        Self {
+            packages,
+            affected_root_tasks,
+            root_tasks_with_inputs,
+        }
+    }
+
+    /// Package-only view, e.g. for the watch driver's per-event affected set,
+    /// which is computed from task-input dirty tracking alone and carries no
+    /// root-task analysis.
+    pub fn from_packages(packages: HashSet<PackageName>) -> Self {
+        Self {
+            packages,
+            ..Self::default()
+        }
+    }
+
+    pub fn packages(&self) -> &HashSet<PackageName> {
+        &self.packages
+    }
+
+    pub fn contains_package(&self, package: &PackageName) -> bool {
+        self.packages.contains(package)
+    }
+
+    pub fn contains_affected_root_task(&self, task: &TaskName) -> bool {
+        self.affected_root_tasks.contains(task)
+    }
+
+    /// Whether a top-level (`#task`) task passes the `--since` filter.
+    ///
+    /// Tasks without declared inputs — or whose inputs expand to no positive
+    /// include, so they can never match a change — keep the historic bypass and
+    /// are never filtered here. Tasks whose inputs do include something pass
+    /// only when a changed file matched one of them.
+    pub fn root_task_passes(&self, task: &TaskName) -> bool {
+        !self.root_tasks_with_inputs.contains(task) || self.contains_affected_root_task(task)
+    }
+}
+
+/// Full `--since` impact analysis: affected packages plus root-task matches.
+///
+/// Package affinity comes from changed files inside package directories (as
+/// [`affected_packages_from_paths`]) and additionally from changed files that
+/// match any task's declared inputs — this is what makes root-level files like
+/// `#tsconfig.base.json` or `scripts/**` affect their declaring tasks instead
+/// of being dropped on the floor.
+pub fn since_affected(
     workspace_root: &Path,
     repo_root: &Path,
     since_ref: &str,
     package_graph: &PackageGraph,
-) -> Result<HashSet<PackageName>, SinceError> {
+    task_graph: &TaskGraph,
+) -> Result<SinceAffected, SinceError> {
     let changed_paths = changed_paths_since(workspace_root, since_ref)?;
+    let mut changed_packages = packages_changed_by_paths_and_lockfile(
+        workspace_root,
+        repo_root,
+        since_ref,
+        package_graph,
+        &changed_paths,
+    )?;
+
+    let declared = declared_input_matches(
+        &changed_paths,
+        repo_root,
+        workspace_root,
+        package_graph,
+        task_graph,
+    )?;
+    changed_packages.extend(declared.input_matched_packages);
+
+    // Path-based changes already include dependents; expand again for the
+    // closure- and input-change seeds.
+    let packages = package_graph
+        .transitive_dependents_of(changed_packages)
+        .map_err(SinceError::from)?;
+    Ok(SinceAffected::new(
+        packages,
+        declared.affected_root_tasks,
+        declared.root_tasks_with_inputs,
+    ))
+}
+
+/// Path-to-package mapping plus the `yarn.lock` dependency-closure diff.
+/// The result still needs transitive-dependent expansion by the caller.
+fn packages_changed_by_paths_and_lockfile(
+    workspace_root: &Path,
+    repo_root: &Path,
+    since_ref: &str,
+    package_graph: &PackageGraph,
+    changed_paths: &HashSet<PathBuf>,
+) -> Result<HashSet<PackageName>, SinceError> {
     let mut changed_packages =
-        affected_packages_from_paths(&changed_paths, repo_root, package_graph)?;
+        affected_packages_from_paths(changed_paths, repo_root, package_graph)?;
 
     let lockfile_path = repo_relative_lockfile_path(workspace_root, repo_root)?;
     let repo = discover_repo(workspace_root)?;
@@ -115,6 +236,10 @@ pub fn affected_packages(
         .as_graph()
         .node_weights()
         .filter(|node| Some(&node.name) != package_graph.root_package());
+    // Note: no byte-equality fast path (e.g., base.blob == head.bytes) because
+    // identical malformed lockfiles at both base and head must select all
+    // candidates. The Failed → all rule in packages_with_changed_dep_closures
+    // runs first.
     changed_packages.extend(packages_with_changed_dep_closures(
         candidates,
         package_graph,
@@ -122,24 +247,119 @@ pub fn affected_packages(
         &head,
     ));
 
-    // Path-based changes already include dependents; expand again for the closure-change seeds.
-    // Note: no byte-equality fast path (e.g., base.blob == head.bytes) because
-    // identical malformed lockfiles at both base and head must select all candidates.
-    // The Failed → all rule in packages_with_changed_dep_closures runs first.
-    package_graph
-        .transitive_dependents_of(changed_packages)
-        .map_err(SinceError::from)
+    Ok(changed_packages)
+}
+
+/// Declared-input matching results: packages of non-root tasks whose inputs
+/// matched, root tasks whose inputs matched, and root tasks whose declared
+/// inputs subject them to `--since` filtering.
+#[derive(Default)]
+struct DeclaredInputMatches {
+    input_matched_packages: HashSet<PackageName>,
+    affected_root_tasks: HashSet<TaskName>,
+    root_tasks_with_inputs: HashSet<TaskName>,
+}
+
+/// Matches changed files against every task's declared (expanded) inputs.
+///
+/// A non-root task whose inputs match a changed file seeds its package into
+/// the affected set (transitive dependents are expanded by the caller); a
+/// root task's match lands in `affected_root_tasks`.
+///
+/// Tasks without declared inputs never match anything here; a changed file
+/// that maps to no package and matches no declared input affects nothing —
+/// this is what keeps undeclared root edits like `README.md` a no-op. With no
+/// changed paths, package tasks are skipped outright because nothing can
+/// match them; root tasks still expand, because whether their inputs resolve
+/// to any positive include decides whether they are filtered or keep the
+/// historic bypass.
+///
+/// Inputs are expanded with the engine's shared grammar (`#`, `pkg#`, `^`,
+/// `^^`, plain) and matched with the cache's [`PathRequestMatcher`], so
+/// negated patterns (`!...`) exclude files exactly as they do for cache
+/// hashing. A root task whose inputs expand to no positive include (only
+/// negations, or `^`/`^^` when the root has no upstream packages) can never
+/// match a change and keeps the historic bypass instead of being filtered out
+/// of every `--since` run.
+fn declared_input_matches(
+    changed_paths: &HashSet<PathBuf>,
+    repo_root: &Path,
+    workspace_root: &Path,
+    package_graph: &PackageGraph,
+    task_graph: &TaskGraph,
+) -> Result<DeclaredInputMatches, SinceError> {
+    let mut matches = DeclaredInputMatches::default();
+
+    // Git hands us repo-relative paths; joining the repo root yields the
+    // absolute paths the input requests (based in workspace/package dirs)
+    // strip their prefixes from. Hoisted so each path is joined once.
+    let absolute_paths: Vec<PathBuf> = changed_paths
+        .iter()
+        .map(|changed_path| repo_root.join(changed_path))
+        .collect();
+
+    for node in task_graph.nodes() {
+        let Some(definition) = task_graph.task_definition(&node.id) else {
+            continue;
+        };
+        if definition.inputs.is_empty() {
+            continue;
+        }
+
+        let task = &node.id;
+        // Package tasks only ever contribute matches, and with no changed
+        // paths nothing can match, so their expansion is skippable entirely.
+        // Root tasks must expand regardless (see the classification below).
+        if !task.is_root() && absolute_paths.is_empty() {
+            continue;
+        }
+
+        let requests = expand_input_patterns(
+            &definition.inputs,
+            &task.package,
+            package_graph,
+            workspace_root,
+        )
+        .map_err(|error| SinceError::InputExpansion(format!("task '{task}': {error}")))?;
+        let matcher = PathRequestMatcher::compile(&requests)
+            .map_err(|error| SinceError::InputMatch(format!("task '{task}': {error}")))?;
+
+        if task.is_root() {
+            // Classification comes from the expanded requests, not the raw
+            // pattern strings: `^` inputs on a root task do resolve to
+            // includes when the root package has upstreams. Only a root task
+            // with at least one positive include can ever match a change, so
+            // only those are filtered by `--since`; the rest keep the
+            // historic bypass.
+            if !matcher.has_includes() {
+                continue;
+            }
+            matches.root_tasks_with_inputs.insert(task.task.clone());
+        }
+
+        for absolute_path in &absolute_paths {
+            if !matcher.matches_path(absolute_path) {
+                continue;
+            }
+            if task.is_root() {
+                matches.affected_root_tasks.insert(task.task.clone());
+            } else {
+                matches.input_matched_packages.insert(task.package.clone());
+            }
+            break;
+        }
+    }
+
+    Ok(matches)
 }
 
 fn repo_relative_lockfile_path(
     workspace_root: &Path,
     repo_root: &Path,
 ) -> Result<PathBuf, SinceError> {
-    let workspace_root = workspace_root
-        .canonicalize()
+    let workspace_root = dunce::canonicalize(workspace_root)
         .map_err(|error| SinceError::LockfilePath(error.to_string()))?;
-    let repo_root = repo_root
-        .canonicalize()
+    let repo_root = dunce::canonicalize(repo_root)
         .map_err(|error| SinceError::LockfilePath(error.to_string()))?;
     workspace_root
         .strip_prefix(&repo_root)
@@ -372,20 +592,43 @@ fn map_head_error(_err: impl std::fmt::Display) -> SinceError {
 
 #[cfg(test)]
 mod tests {
-    use super::{affected_packages, affected_packages_from_paths, changed_paths_since, SinceError};
-    use std::collections::HashSet;
+    use super::{affected_packages_from_paths, changed_paths_since, since_affected, SinceError};
+    use std::collections::{HashMap, HashSet};
     use std::fs;
     use std::path::Path;
     use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use luchta_types::PackageName;
+    use luchta_engine::TaskGraph;
+    use luchta_types::{PackageName, TaskDefinition, TaskName};
     use luchta_workspace::{PackageGraph, PackageNode};
     use tempfile::TempDir;
 
     const PKG_A_JSON: &str = "{\n  \"name\": \"@repo/a\"\n}\n";
     const ROOT_PKG_JSON: &str = "{\n  \"name\": \"root\"\n}\n";
+
+    /// Package-level view of [`since_affected`] over an empty task graph: no
+    /// task declares inputs, so the result is purely the package analysis and
+    /// the production `since_affected` path is what the tests exercise.
+    fn affected_packages(
+        workspace_root: &Path,
+        repo_root: &Path,
+        since_ref: &str,
+        package_graph: &PackageGraph,
+    ) -> Result<HashSet<PackageName>, SinceError> {
+        let task_graph =
+            TaskGraph::build(package_graph, &HashMap::new()).expect("empty task graph");
+        Ok(since_affected(
+            workspace_root,
+            repo_root,
+            since_ref,
+            package_graph,
+            &task_graph,
+        )?
+        .packages()
+        .clone())
+    }
 
     #[test]
     fn unions_committed_staged_unstaged_and_untracked_changes() {
@@ -622,6 +865,326 @@ mod tests {
         let affected = affected_packages(repo.path(), repo.path(), &base_ref, &graph).unwrap();
 
         assert_eq!(affected, package_name_set(["@repo/nested"]));
+    }
+
+    /// Committed two-package workspace (`@repo/b` depends on `@repo/a`) with a
+    /// `tsconfig.base.json` at the repo root, returning the repo, its base ref,
+    /// and the package graph. Root files changed after this helper returns are
+    /// invisible to plain path-to-package mapping.
+    fn repo_with_root_file_workspace() -> (TestRepo, String, PackageGraph) {
+        let repo = TestRepo::new();
+        repo.write_file("packages/a/package.json", &package_json("@repo/a", &[]));
+        repo.write_file(
+            "packages/b/package.json",
+            &package_json("@repo/b", &["@repo/a"]),
+        );
+        repo.write_file("tsconfig.base.json", "{}\n");
+        repo.git_add_and_commit_all();
+        let base_ref = repo.head_commit();
+
+        let graph = package_graph(
+            repo.path(),
+            [("@repo/a", "packages/a"), ("@repo/b", "packages/b")],
+        );
+        (repo, base_ref, graph)
+    }
+
+    #[test]
+    fn since_affected_selects_package_with_declared_root_input_and_its_dependents() {
+        let (repo, base_ref, graph) = repo_with_root_file_workspace();
+        let pipeline = HashMap::from([(
+            TaskName::from("@repo/a#build"),
+            TaskDefinition {
+                inputs: vec!["#tsconfig.base.json".to_string()],
+                ..TaskDefinition::default()
+            },
+        )]);
+        let task_graph = TaskGraph::build(&graph, &pipeline).unwrap();
+
+        repo.write_file("tsconfig.base.json", "{\n  \"changed\": true\n}\n");
+
+        let affected =
+            since_affected(repo.path(), repo.path(), &base_ref, &graph, &task_graph).unwrap();
+
+        // `@repo/a` declares the root input; `@repo/b` depends on it and rides
+        // along through transitive-dependent expansion.
+        assert_eq!(
+            affected.packages(),
+            &package_name_set(["@repo/a", "@repo/b"])
+        );
+    }
+
+    #[test]
+    fn since_affected_selects_root_task_when_declared_inputs_match() {
+        let (repo, base_ref, graph) = repo_with_root_file_workspace();
+        let pipeline = HashMap::from([(
+            TaskName::from("#deploy"),
+            TaskDefinition {
+                inputs: vec!["scripts/**".to_string()],
+                ..TaskDefinition::default()
+            },
+        )]);
+        let task_graph = TaskGraph::build(&graph, &pipeline).unwrap();
+
+        repo.write_file("scripts/run.sh", "echo changed\n");
+
+        let affected =
+            since_affected(repo.path(), repo.path(), &base_ref, &graph, &task_graph).unwrap();
+
+        assert!(affected.packages().is_empty());
+        assert!(affected.contains_affected_root_task(&TaskName::from("deploy")));
+        assert!(affected.root_task_passes(&TaskName::from("deploy")));
+    }
+
+    #[test]
+    fn since_affected_excludes_root_task_when_declared_inputs_do_not_match() {
+        let (repo, base_ref, graph) = repo_with_root_file_workspace();
+        let pipeline = HashMap::from([(
+            TaskName::from("#deploy"),
+            TaskDefinition {
+                inputs: vec!["scripts/**".to_string()],
+                ..TaskDefinition::default()
+            },
+        )]);
+        let task_graph = TaskGraph::build(&graph, &pipeline).unwrap();
+
+        // Undeclared root file: matches no declared input anywhere.
+        repo.write_file("README.md", "root only change\n");
+
+        let affected =
+            since_affected(repo.path(), repo.path(), &base_ref, &graph, &task_graph).unwrap();
+
+        assert!(affected.packages().is_empty());
+        assert!(!affected.contains_affected_root_task(&TaskName::from("deploy")));
+        // The task declares inputs, so it is filtered instead of bypassing.
+        assert!(!affected.root_task_passes(&TaskName::from("deploy")));
+    }
+
+    #[test]
+    fn since_affected_respects_negated_root_task_inputs() {
+        let (repo, base_ref, graph) = repo_with_root_file_workspace();
+        let pipeline = HashMap::from([(
+            TaskName::from("#deploy"),
+            TaskDefinition {
+                inputs: vec!["scripts/**".to_string(), "!scripts/ignored/**".to_string()],
+                ..TaskDefinition::default()
+            },
+        )]);
+        let task_graph = TaskGraph::build(&graph, &pipeline).unwrap();
+
+        repo.write_file("scripts/ignored/tool.sh", "echo ignored\n");
+        let affected =
+            since_affected(repo.path(), repo.path(), &base_ref, &graph, &task_graph).unwrap();
+        assert!(!affected.contains_affected_root_task(&TaskName::from("deploy")));
+
+        repo.write_file("scripts/kept.sh", "echo kept\n");
+        let affected =
+            since_affected(repo.path(), repo.path(), &base_ref, &graph, &task_graph).unwrap();
+        assert!(affected.contains_affected_root_task(&TaskName::from("deploy")));
+    }
+
+    #[test]
+    fn since_affected_respects_negated_root_inputs_on_package_tasks() {
+        let (repo, base_ref, graph) = repo_with_root_file_workspace();
+        let pipeline = HashMap::from([(
+            TaskName::from("@repo/a#build"),
+            TaskDefinition {
+                inputs: vec!["#scripts/**".to_string(), "!scripts/ignored/**".to_string()],
+                ..TaskDefinition::default()
+            },
+        )]);
+        let task_graph = TaskGraph::build(&graph, &pipeline).unwrap();
+
+        repo.write_file("scripts/ignored/tool.sh", "echo ignored\n");
+        let affected =
+            since_affected(repo.path(), repo.path(), &base_ref, &graph, &task_graph).unwrap();
+        assert_eq!(affected.packages(), &HashSet::new());
+
+        repo.write_file("scripts/kept.sh", "echo kept\n");
+        let affected =
+            since_affected(repo.path(), repo.path(), &base_ref, &graph, &task_graph).unwrap();
+        assert_eq!(
+            affected.packages(),
+            &package_name_set(["@repo/a", "@repo/b"])
+        );
+    }
+
+    #[test]
+    fn root_task_with_negation_only_inputs_keeps_since_bypass() {
+        let (repo, base_ref, graph) = repo_with_root_file_workspace();
+        let pipeline = HashMap::from([(
+            TaskName::from("#deploy"),
+            TaskDefinition {
+                inputs: vec!["!scripts/**".to_string()],
+                ..TaskDefinition::default()
+            },
+        )]);
+        let task_graph = TaskGraph::build(&graph, &pipeline).unwrap();
+
+        repo.write_file("scripts/run.sh", "echo run\n");
+        let affected =
+            since_affected(repo.path(), repo.path(), &base_ref, &graph, &task_graph).unwrap();
+
+        // Excludes with nothing to exclude from can never match; the task
+        // keeps the historic bypass instead of never running under -T.
+        assert!(!affected.contains_affected_root_task(&TaskName::from("deploy")));
+        assert!(affected.root_task_passes(&TaskName::from("deploy")));
+    }
+
+    #[test]
+    fn root_task_with_upstream_only_inputs_keeps_since_bypass() {
+        let (repo, base_ref, graph) = repo_with_root_file_workspace();
+        let pipeline = HashMap::from([(
+            TaskName::from("#deploy"),
+            TaskDefinition {
+                inputs: vec!["^src/**".to_string()],
+                ..TaskDefinition::default()
+            },
+        )]);
+        let task_graph = TaskGraph::build(&graph, &pipeline).unwrap();
+
+        repo.write_file("README.md", "root only change\n");
+        let affected =
+            since_affected(repo.path(), repo.path(), &base_ref, &graph, &task_graph).unwrap();
+
+        // This fixture has no root package, so the root task's `^` inputs
+        // resolve to nothing and can never match; the task keeps the bypass.
+        // (A root package with workspace dependencies is covered by
+        // `root_task_upstream_inputs_resolve_when_root_package_has_workspace_deps`.)
+        assert!(!affected.contains_affected_root_task(&TaskName::from("deploy")));
+        assert!(affected.root_task_passes(&TaskName::from("deploy")));
+    }
+
+    #[test]
+    fn root_task_upstream_inputs_resolve_when_root_package_has_workspace_deps() {
+        let repo = TestRepo::new();
+        repo.write_file("package.json", &package_json("root", &["@repo/a"]));
+        repo.write_file("packages/a/package.json", &package_json("@repo/a", &[]));
+        repo.write_file(
+            "packages/b/package.json",
+            &package_json("@repo/b", &["@repo/a"]),
+        );
+        repo.git_add_and_commit_all();
+        let base_ref = repo.head_commit();
+
+        let graph = package_graph_with_root(
+            repo.path(),
+            "root",
+            [
+                ("root", "."),
+                ("@repo/a", "packages/a"),
+                ("@repo/b", "packages/b"),
+            ],
+        );
+        let pipeline = HashMap::from([(
+            TaskName::from("#deploy"),
+            TaskDefinition {
+                inputs: vec!["^src/**".to_string()],
+                ..TaskDefinition::default()
+            },
+        )]);
+        let task_graph = TaskGraph::build(&graph, &pipeline).unwrap();
+
+        repo.write_file("packages/a/src/index.ts", "export const changed = true;\n");
+        let affected =
+            since_affected(repo.path(), repo.path(), &base_ref, &graph, &task_graph).unwrap();
+        assert!(affected.contains_affected_root_task(&TaskName::from("deploy")));
+
+        repo.git_add_and_commit_all();
+        let base_ref = repo.head_commit();
+        repo.write_file("README.md", "root only change\n");
+        let affected =
+            since_affected(repo.path(), repo.path(), &base_ref, &graph, &task_graph).unwrap();
+        assert!(!affected.contains_affected_root_task(&TaskName::from("deploy")));
+        // The root package has @repo/a as an upstream, so `^` resolved to a
+        // positive include and the task is filtered like any declared-input
+        // root task instead of keeping the bypass.
+        assert!(!affected.root_task_passes(&TaskName::from("deploy")));
+    }
+
+    #[test]
+    fn root_task_with_specific_package_inputs_is_filtered_by_since() {
+        let (repo, base_ref, graph) = repo_with_root_file_workspace();
+        let pipeline = HashMap::from([(
+            TaskName::from("#deploy"),
+            TaskDefinition {
+                inputs: vec!["@repo/a#src/**".to_string()],
+                ..TaskDefinition::default()
+            },
+        )]);
+        let task_graph = TaskGraph::build(&graph, &pipeline).unwrap();
+
+        repo.write_file("packages/a/src/index.ts", "export const changed = true;\n");
+        let affected =
+            since_affected(repo.path(), repo.path(), &base_ref, &graph, &task_graph).unwrap();
+        assert!(affected.contains_affected_root_task(&TaskName::from("deploy")));
+
+        // Commit the change so the second scenario starts from a clean tree.
+        repo.git_add_and_commit_all();
+        let base_ref = repo.head_commit();
+        repo.write_file("README.md", "root only change\n");
+        let affected =
+            since_affected(repo.path(), repo.path(), &base_ref, &graph, &task_graph).unwrap();
+        assert!(!affected.contains_affected_root_task(&TaskName::from("deploy")));
+        // A positive `pkg#` input subjects the task to filtering: with no
+        // matching change it does NOT run under -T.
+        assert!(!affected.root_task_passes(&TaskName::from("deploy")));
+    }
+
+    #[test]
+    fn invalid_input_pattern_on_any_task_fails_since_with_task_id() {
+        let (repo, base_ref, graph) = repo_with_root_file_workspace();
+        // The invalid pattern sits on an otherwise unrelated package task.
+        let pipeline = HashMap::from([(
+            TaskName::from("@repo/b#build"),
+            TaskDefinition {
+                inputs: vec!["#".to_string()],
+                ..TaskDefinition::default()
+            },
+        )]);
+        let task_graph = TaskGraph::build(&graph, &pipeline).unwrap();
+
+        repo.write_file("packages/a/src/index.ts", "export const changed = true;\n");
+
+        let error =
+            since_affected(repo.path(), repo.path(), &base_ref, &graph, &task_graph).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("task '@repo/b#build'"),
+            "expected task id in error, got: {message}"
+        );
+        assert!(
+            message.contains("root input must include path"),
+            "expected pattern error in message, got: {message}"
+        );
+    }
+
+    #[test]
+    fn invalid_root_task_input_fails_since_even_when_nothing_changed() {
+        let (repo, base_ref, graph) = repo_with_root_file_workspace();
+        let pipeline = HashMap::from([(
+            TaskName::from("#deploy"),
+            TaskDefinition {
+                inputs: vec!["#".to_string()],
+                ..TaskDefinition::default()
+            },
+        )]);
+        let task_graph = TaskGraph::build(&graph, &pipeline).unwrap();
+
+        // Clean tree, no changed paths: root tasks still expand for the
+        // bypass-vs-filter classification, so the invalid pattern fails
+        // loudly instead of being silently skipped.
+        let error =
+            since_affected(repo.path(), repo.path(), &base_ref, &graph, &task_graph).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("task '#deploy'"),
+            "expected task id in error, got: {message}"
+        );
+        assert!(
+            message.contains("root input must include path"),
+            "expected pattern error in message, got: {message}"
+        );
     }
 
     #[test]

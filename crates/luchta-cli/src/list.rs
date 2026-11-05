@@ -9,7 +9,9 @@
 //! in ALL branches of `select_task_ids`:
 //!
 //! 1. Default scope (no filters): filters all nodes through `passes_since`
-//! 2. `-T` only: root tasks bypass `--since` (matches `run.rs:package_matches`)
+//! 2. `-T` only: root tasks filter through `passes_since` — undeclared root
+//!    tasks keep the historic bypass, root tasks with declared `inputs` pass
+//!    only when a changed file matched (matches `run.rs:package_matches`)
 //! 3. `-p` globs only: filters matched package names through `passes_since`
 //! 4. General case: validates against full graph (`since_affected: None`), then
 //!    post-filters returned ids through `passes_since`
@@ -21,8 +23,9 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
+use crate::since::SinceAffected;
 use luchta_engine::{PrunedTask, ResolveMode, TaskGraph};
-use luchta_types::{CacheConfig, DependsOn, EnvSpec, PackageName, TaskDefinition, TaskId};
+use luchta_types::{CacheConfig, DependsOn, EnvSpec, TaskDefinition, TaskId};
 use luchta_workspace::PackageGraph;
 use miette::{IntoDiagnostic, Result};
 use serde::Serialize;
@@ -63,11 +66,12 @@ pub async fn execute_list(
 
     let since_affected = if let Some(since_ref) = since.as_deref() {
         let repo_root = crate::since::discover_repo_root(workspace_root)?;
-        Some(crate::since::affected_packages(
+        Some(crate::since::since_affected(
             workspace_root,
             &repo_root,
             since_ref,
             &prepared.package_graph,
+            &prepared.task_graph,
         )?)
     } else {
         None
@@ -181,7 +185,7 @@ fn select_task_ids(
     task_graph: &TaskGraph,
     selection: &TaskSelection<'_>,
     pruned: &[PrunedTask],
-    since_affected: Option<&HashSet<PackageName>>,
+    since_affected: Option<&SinceAffected>,
 ) -> Result<HashSet<TaskId>> {
     if selection_uses_default_scope(selection) {
         return Ok(task_graph
@@ -195,6 +199,7 @@ fn select_task_ids(
         return Ok(task_graph
             .nodes()
             .filter(|node| node.id.is_root())
+            .filter(|node| passes_since(&node.id, since_affected))
             .map(|node| node.id.clone())
             .collect());
     }
@@ -234,8 +239,14 @@ fn select_task_ids(
         .collect())
 }
 
-fn passes_since(task_id: &TaskId, since_affected: Option<&HashSet<PackageName>>) -> bool {
-    task_id.is_root() || since_affected.is_none_or(|affected| affected.contains(&task_id.package))
+fn passes_since(task_id: &TaskId, since_affected: Option<&SinceAffected>) -> bool {
+    since_affected.is_none_or(|affected| {
+        if task_id.is_root() {
+            affected.root_task_passes(&task_id.task)
+        } else {
+            affected.contains_package(&task_id.package)
+        }
+    })
 }
 
 fn selection_uses_default_scope(selection: &TaskSelection<'_>) -> bool {

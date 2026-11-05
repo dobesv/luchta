@@ -38,6 +38,7 @@ use super::watcher::{WatchBatch, WatcherHandle};
 use crate::build_lock;
 use crate::cli::OutputMode;
 use crate::run::{CycleOutcome, RunCycleParams, TaskSelection};
+use crate::since::SinceAffected;
 
 /// Maximum number of changed file paths to list under `--show-changed-files`
 /// before collapsing the remainder into a count.
@@ -779,6 +780,10 @@ where
     context
         .ui
         .change_detected(&affected, &changed, context.session.repo_root().as_ref());
+    // Package-only view: the watch affected set comes from per-task input dirty
+    // tracking and dependency expansion, with no root-task input analysis, so
+    // every root task keeps its bypass here.
+    let since_affected = SinceAffected::from_packages(affected);
     let cycle_selection = context.selection.as_task_selection();
     let cache_dir = resolve_cache_dir(context.session.repo_root().as_ref());
     let Some(lock) =
@@ -800,7 +805,7 @@ where
     };
     run_cycle_with_status(
         context.session,
-        cycle_request(&cycle_selection, Some(&affected), context.config),
+        cycle_request(&cycle_selection, Some(&since_affected), context.config),
         context.active_cycle,
         cancel,
         context.ui,
@@ -851,7 +856,7 @@ fn expand_affected_with_dependents(
 
 fn cycle_request<'a>(
     selection: &'a TaskSelection<'a>,
-    affected: Option<&'a HashSet<PackageName>>,
+    affected: Option<&'a SinceAffected>,
     config: &WatchRunConfig,
 ) -> CycleRequest<'a> {
     CycleRequest {
@@ -938,7 +943,7 @@ struct WatchIterationContext<'a> {
 
 struct CycleRequest<'a> {
     selection: &'a TaskSelection<'a>,
-    affected: Option<&'a HashSet<PackageName>>,
+    affected: Option<&'a SinceAffected>,
     output: OutputMode,
     continue_on_failure: bool,
     no_cache: bool,

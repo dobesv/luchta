@@ -451,6 +451,190 @@ fn since_root_only_change_is_noop() {
     temp.close().unwrap();
 }
 
+/// Config where package `a`'s `build` declares a repo-root input;
+/// `b` depends on `a` and has no declared inputs.
+fn write_package_root_input_config(temp: &assert_fs::TempDir) {
+    let worker = write_selection_inspector_worker(temp);
+    write_task_config_with_named_worker(
+        temp,
+        "sh",
+        &worker,
+        "\"a#build\":{\"worker\":\"sh\",\"inputs\":[\"#tsconfig.base.json\"]},\
+         \"b#build\":{\"dependsOn\":[\"^build\"],\"worker\":\"sh\"}",
+    );
+}
+
+/// Config with a top-level `#build` that declares `scripts/**` as its inputs,
+/// plus ordinary package tasks (mirrors `write_top_level_luchta_config`).
+fn write_top_level_with_inputs_config(temp: &assert_fs::TempDir) {
+    let worker = write_selection_inspector_worker(temp);
+    write_task_config_with_named_worker(
+        temp,
+        "sh",
+        &worker,
+        "\"build\":{\"dependsOn\":[\"^build\"],\"worker\":\"sh\"},\
+         \"#build\":{\"worker\":\"sh\",\"inputs\":[\"scripts/**\"]},\
+         \"a#build\":{\"worker\":\"sh\"},\
+         \"b#build\":{\"dependsOn\":[\"^build\"],\"worker\":\"sh\"}",
+    );
+}
+
+fn assert_list(temp: &assert_fs::TempDir, args: &[&str]) -> assert_cmd::assert::Assert {
+    let mut cmd = AssertCommand::cargo_bin("luchta").unwrap();
+    cmd.env("NO_COLOR", "1")
+        .arg("list")
+        .args(args)
+        .arg("--workspace-root")
+        .arg(temp.path());
+    cmd.assert()
+}
+
+fn list_stdout(temp: &assert_fs::TempDir, args: &[&str]) -> String {
+    let result = assert_list(temp, args).success();
+    String::from_utf8(result.get_output().stdout.clone()).unwrap()
+}
+
+#[test]
+fn since_root_file_declared_as_package_task_input_selects_package_and_dependents() {
+    let temp = assert_fs::TempDir::new().unwrap();
+    setup_workspace(&temp);
+    write_package_root_input_config(&temp);
+
+    temp.child("tsconfig.base.json").write_str("{}\n").unwrap();
+
+    // Only the root file changed; `a` declares it as an input and `b` rides
+    // along as `a`'s transitive dependent.
+    assert_run(&temp, "build", &["--since", "HEAD", "--dry-run"])
+        .success()
+        .stdout(predicate::str::contains("a#build").and(predicate::str::contains("b#build")));
+
+    let result = assert_list(&temp, &["build", "--since", "HEAD", "--json"]).success();
+    let tasks: Vec<serde_json::Value> =
+        serde_json::from_slice(&result.get_output().stdout).unwrap();
+    let ids: Vec<&str> = tasks
+        .iter()
+        .map(|task| task["task_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["a#build", "b#build"]);
+
+    temp.close().unwrap();
+}
+
+#[test]
+fn since_negated_declared_input_keeps_root_change_a_noop() {
+    let temp = assert_fs::TempDir::new().unwrap();
+    setup_workspace(&temp);
+    let worker = write_selection_inspector_worker(&temp);
+    write_task_config_with_named_worker(
+        &temp,
+        "sh",
+        &worker,
+        "\"a#build\":{\"worker\":\"sh\",\"inputs\":[\"#scripts/**\",\"!scripts/ignored/**\"]},\
+         \"b#build\":{\"dependsOn\":[\"^build\"],\"worker\":\"sh\"}",
+    );
+
+    temp.child("scripts/ignored/tool.sh")
+        .write_str("echo ignored\n")
+        .unwrap();
+
+    assert_run(&temp, "build", &["--since", "HEAD", "--dry-run"])
+        .success()
+        .stdout(predicate::str::contains(
+            "No packages changed since HEAD; nothing to run.",
+        ));
+
+    temp.child("scripts/kept.sh")
+        .write_str("echo kept\n")
+        .unwrap();
+
+    assert_run(&temp, "build", &["--since", "HEAD", "--dry-run"])
+        .success()
+        .stdout(predicate::str::contains("a#build").and(predicate::str::contains("b#build")));
+
+    temp.close().unwrap();
+}
+
+#[test]
+fn top_level_task_with_declared_inputs_runs_when_its_inputs_change() {
+    let temp = assert_fs::TempDir::new().unwrap();
+    setup_workspace(&temp);
+    write_top_level_with_inputs_config(&temp);
+
+    temp.child("scripts/run.sh")
+        .write_str("echo run\n")
+        .unwrap();
+
+    // The root change matches `#build`'s declared inputs; no package changed,
+    // so the top-level task runs alone.
+    assert_run(&temp, "build", &["-T", "--since", "HEAD", "--dry-run"])
+        .success()
+        .stdout(
+            predicate::str::contains("#build")
+                .and(predicate::str::contains("a#build").not())
+                .and(predicate::str::contains("b#build").not()),
+        );
+
+    let stdout = list_stdout(&temp, &["-T", "--since", "HEAD"]);
+    assert!(stdout.contains("#build"));
+    assert!(!stdout.contains("a#build"));
+
+    temp.close().unwrap();
+}
+
+#[test]
+fn top_level_task_with_declared_inputs_is_filtered_when_unrelated_root_file_changes() {
+    let temp = assert_fs::TempDir::new().unwrap();
+    setup_workspace(&temp);
+    write_top_level_with_inputs_config(&temp);
+
+    temp.child("README.md")
+        .write_str("root only change\n")
+        .unwrap();
+
+    assert_run(&temp, "build", &["-T", "--since", "HEAD", "--dry-run"])
+        .success()
+        .stdout(
+            predicate::str::contains("matched no task affected by --since")
+                .and(predicate::str::contains("No packages changed since HEAD").not()),
+        );
+
+    let stdout = list_stdout(&temp, &["-T", "--since", "HEAD"]);
+    assert_eq!(stdout.trim(), "");
+
+    temp.close().unwrap();
+}
+
+#[test]
+fn top_level_task_with_negation_only_inputs_keeps_since_bypass() {
+    let temp = assert_fs::TempDir::new().unwrap();
+    setup_workspace(&temp);
+    let worker = write_selection_inspector_worker(&temp);
+    write_task_config_with_named_worker(
+        &temp,
+        "sh",
+        &worker,
+        "\"build\":{\"dependsOn\":[\"^build\"],\"worker\":\"sh\"},\
+         \"#build\":{\"worker\":\"sh\",\"inputs\":[\"!scripts/**\"]}",
+    );
+
+    temp.child("README.md")
+        .write_str("root only change\n")
+        .unwrap();
+
+    // Negation-only inputs can never positively match a change, so `#build`
+    // keeps the historic bypass and still runs under `-T --since`.
+    assert_run(&temp, "build", &["-T", "--since", "HEAD", "--dry-run"])
+        .success()
+        .stdout(
+            predicate::str::contains("#build")
+                .and(predicate::str::contains("a#build").not())
+                .and(predicate::str::contains("b#build").not())
+                .and(predicate::str::contains("nothing to run").not()),
+        );
+
+    temp.close().unwrap();
+}
+
 #[derive(Clone, Copy)]
 enum ExpectedTasks {
     None,
@@ -649,4 +833,52 @@ fn since_lockfile_uncommitted_transitive_change_selects_dependents() {
         false,
     );
     fixture.assert_selection(ExpectedTasks::AAndB);
+}
+
+#[test]
+fn top_level_task_declared_input_matches_with_relative_workspace_root() {
+    let temp = assert_fs::TempDir::new().unwrap();
+    setup_workspace(&temp);
+    write_top_level_with_inputs_config(&temp);
+
+    temp.child("scripts/run.sh")
+        .write_str("echo run\n")
+        .unwrap();
+
+    // A `../ws`-style relative workspace root, invoked from a sibling
+    // directory outside the workspace. Both tempdirs live in the same
+    // system temp root, so `..` reaches the workspace.
+    let cwd = assert_fs::TempDir::new().unwrap();
+    let relative_root = std::path::PathBuf::from("..").join(temp.path().file_name().unwrap());
+
+    let mut cmd = AssertCommand::cargo_bin("luchta").unwrap();
+    cmd.env("NO_COLOR", "1")
+        .current_dir(cwd.path())
+        .arg("run")
+        .arg("build")
+        .args(["-T", "--since", "HEAD", "--dry-run"])
+        .arg("--workspace-root")
+        .arg(&relative_root);
+    cmd.assert().success().stdout(
+        predicate::str::contains("#build")
+            .and(predicate::str::contains("a#build").not())
+            .and(predicate::str::contains("b#build").not()),
+    );
+
+    // list --since must see the same declared-input match through the
+    // relative root.
+    let mut list = AssertCommand::cargo_bin("luchta").unwrap();
+    list.env("NO_COLOR", "1")
+        .current_dir(cwd.path())
+        .arg("list")
+        .args(["-T", "--since", "HEAD"])
+        .arg("--workspace-root")
+        .arg(&relative_root);
+    let result = list.assert().success();
+    let stdout = String::from_utf8(result.get_output().stdout.clone()).unwrap();
+    assert!(stdout.contains("#build"), "expected #build in list output");
+    assert!(!stdout.contains("a#build"));
+
+    cwd.close().unwrap();
+    temp.close().unwrap();
 }
