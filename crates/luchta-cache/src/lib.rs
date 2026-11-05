@@ -22,7 +22,7 @@ pub use resolve::{
     combined_cache_files_hash, combined_inputs_hash, combined_outputs_hash,
     path_matches_resolve_requests, resolve_inputs, resolve_inputs_with_options,
     resolve_inputs_with_semantics, resolve_inputs_with_semantics_and_options, resolve_outputs,
-    resolve_outputs_with_options, ListingCache, ResolveOptions, ResolveRequest,
+    resolve_outputs_with_options, ListingCache, PathRequestMatcher, ResolveOptions, ResolveRequest,
 };
 pub use store::{
     resolve_cache_dir, task_cache_key, Cache, ReportInput, RunArtifacts, CACHE_DIR_ENV,

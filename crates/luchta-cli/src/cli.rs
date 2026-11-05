@@ -91,7 +91,8 @@ pub enum Commands {
         #[arg(long, value_name = "WEIGHT")]
         max_weight: Option<String>,
 
-        /// Only run tasks for packages changed since this git ref (plus their dependents).
+        /// Only run tasks for packages changed since this git ref (plus their dependents),
+        /// or tasks whose declared inputs matched a changed file.
         #[arg(long, value_name = "GIT_REF")]
         since: Option<String>,
 
@@ -255,7 +256,8 @@ pub enum Commands {
         #[arg(short = 'T', long = "top-level")]
         top_level: bool,
 
-        /// Only include tasks affected by changes since the given git ref (plus their dependents).
+        /// Only include tasks affected by changes since the given git ref (plus their
+        /// dependents), including tasks whose declared inputs matched a changed file.
         #[arg(long, value_name = "GIT_REF")]
         since: Option<String>,
 

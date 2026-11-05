@@ -36,6 +36,7 @@ use crate::cache_ctx::{
 };
 use crate::cli::OutputMode;
 use crate::progress::{ProgressOutput, ProgressReporter};
+use crate::since::SinceAffected;
 use crate::watch::registry::TaskWatchRegistry;
 use tokio_util::sync::CancellationToken;
 
@@ -80,7 +81,7 @@ pub(crate) struct SelectionCriteria<'a> {
     package_globs: &'a GlobSet,
     match_all_non_root_packages: bool,
     top_level: bool,
-    since_affected: Option<&'a HashSet<PackageName>>,
+    since_affected: Option<&'a SinceAffected>,
 }
 
 #[derive(Debug)]
@@ -131,8 +132,8 @@ pub(crate) fn analyze_tasks(prepared: &PreparedWorkspace, workspace_root: &Path)
 enum SinceSelection {
     /// No affected packages — caller should no-op with exit 0.
     NoOp,
-    /// Continue with optional affected-package filter (`None` when `--since` absent).
-    Proceed(Option<HashSet<PackageName>>),
+    /// Continue with optional since-impact filter (`None` when `--since` absent).
+    Proceed(Option<SinceAffected>),
 }
 
 #[derive(Deserialize)]
@@ -142,15 +143,39 @@ struct WorkspaceRootPackageJson {
 
 /// Resolves the workspace root directory.
 ///
-/// If `workspace_root` is explicitly provided (via `--workspace-root`), returns it as-is.
-/// Otherwise, walks upward from the current working directory using `Path::ancestors()`,
-/// looking for the first `package.json` with a non-None `workspaces` field.
+/// If `workspace_root` is explicitly provided (via `--workspace-root`), returns
+/// its canonicalized form, or the path unchanged when it does not exist — later
+/// stages report their own, more specific errors. Otherwise, walks upward from
+/// the current working directory using `Path::ancestors()`, looking for the
+/// first `package.json` with a non-None `workspaces` field.
 ///
 /// If no workspace `package.json` is found during the walk, falls back to the current
 /// working directory.
 pub fn resolve_workspace_root(workspace_root: Option<PathBuf>) -> Result<PathBuf> {
     if let Some(workspace_root) = workspace_root {
-        return Ok(workspace_root);
+        // Canonicalize explicit roots so every downstream consumer — config
+        // script spawn, workspace discovery, gix repo discovery, `--since`
+        // path matching — shares one absolute base. gix returns an absolute
+        // worktree base, so a relative root would mix absolute and relative
+        // bases and silently drop matches in `--since` filtering.
+        //
+        // `dunce` rather than `std::fs`: on Windows std returns a `\\?\`-
+        // prefixed verbatim path while gix-discover simplifies paths with
+        // dunce, so the two spellings would never share a prefix.
+        match dunce::canonicalize(&workspace_root) {
+            Ok(canonical) => return Ok(canonical),
+            // A workspace root that does not exist keeps its raw spelling;
+            // config loading and workspace discovery produce clearer errors.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(workspace_root)
+            }
+            Err(error) => {
+                return Err(miette::miette!(
+                    "failed to canonicalize workspace root {}: {error}",
+                    workspace_root.display()
+                ))
+            }
+        }
     }
 
     let cwd = std::env::current_dir().into_diagnostic()?;
@@ -295,7 +320,7 @@ pub(crate) struct RunContext {
     /// cycles, so a failed cycle must NOT call `shutdown_immediate()` (doing so
     /// would permanently poison the manager for the rest of the watch session).
     pub(crate) owns_worker_manager: bool,
-    pub(crate) since_affected: Option<HashSet<PackageName>>,
+    pub(crate) since_affected: Option<SinceAffected>,
     /// Global cache nonce from LuchtaConfig.cache.
     pub(crate) global_cache_nonce: Option<String>,
     /// Workspace root path.
@@ -320,7 +345,7 @@ pub(crate) enum CycleOutcome {
 /// Parameters for a single run cycle.
 pub(crate) struct RunCycleParams<'a> {
     pub selection: &'a TaskSelection<'a>,
-    pub since_affected: Option<&'a HashSet<PackageName>>,
+    pub since_affected: Option<&'a SinceAffected>,
     pub output: OutputMode,
     pub continue_on_failure: bool,
     pub no_cache: bool,
@@ -403,15 +428,19 @@ async fn prepare_run_context(
     };
 
     // Layer since resolution on top
-    let since_affected =
-        match resolve_since_selection(selection, workspace_root, &run.package_graph)? {
-            SinceSelection::NoOp => {
-                // No-op: shut down workers (session-owned) to avoid leak
-                run.worker_manager.shutdown().await;
-                return Ok(None);
-            }
-            SinceSelection::Proceed(set) => set,
-        };
+    let since_affected = match resolve_since_selection(
+        selection,
+        workspace_root,
+        &run.package_graph,
+        &run.task_graph,
+    )? {
+        SinceSelection::NoOp => {
+            // No-op: shut down workers (session-owned) to avoid leak
+            run.worker_manager.shutdown().await;
+            return Ok(None);
+        }
+        SinceSelection::Proceed(set) => set,
+    };
 
     // Set since_affected for one-shot run
     run.since_affected = since_affected;
@@ -745,10 +774,11 @@ pub async fn dry_run_tasks(workspace_root: &Path, selection: &TaskSelection<'_>)
         return Ok(());
     }
 
-    let since_affected = match resolve_since_selection(selection, workspace_root, &package_graph)? {
-        SinceSelection::NoOp => return Ok(()),
-        SinceSelection::Proceed(set) => set,
-    };
+    let since_affected =
+        match resolve_since_selection(selection, workspace_root, &package_graph, &task_graph)? {
+            SinceSelection::NoOp => return Ok(()),
+            SinceSelection::Proceed(set) => set,
+        };
 
     let tasks_to_run = collect_requested_subgraph(CollectSubgraphRequest {
         task_graph: &task_graph,
@@ -886,20 +916,27 @@ fn resolve_since_selection(
     selection: &TaskSelection<'_>,
     workspace_root: &Path,
     package_graph: &PackageGraph,
+    task_graph: &TaskGraph,
 ) -> Result<SinceSelection> {
     let Some(since_ref) = selection.since else {
         return Ok(SinceSelection::Proceed(None));
     };
 
     let repo_root = crate::since::discover_repo_root(workspace_root)?;
-    let affected =
-        crate::since::affected_packages(workspace_root, &repo_root, since_ref, package_graph)?;
-    // An empty affected set means no package changed since the ref. Normally
-    // that is a no-op, but top-level (`-T`) requests target workspace-root
-    // tasks which bypass the since filter entirely — those must still run.
-    // In that case proceed with the (empty) affected set so `package_matches`
-    // selects the root tasks and excludes every non-root task.
-    if affected.is_empty() && !selection.top_level {
+    let affected = crate::since::since_affected(
+        workspace_root,
+        &repo_root,
+        since_ref,
+        package_graph,
+        task_graph,
+    )?;
+    // An empty affected-package set means no package changed since the ref.
+    // That is a no-op unless top-level (`-T`) tasks are requested: root tasks
+    // without declared inputs always run under `-T`, and root tasks with
+    // declared inputs may match the changed files, so the run proceeds with
+    // the (possibly empty) package set and `package_matches` decides per task.
+    // Without `-T`, root tasks can never be goals, so nothing can run.
+    if affected.packages().is_empty() && !selection.top_level {
         println!(
             "{}",
             format!("No packages changed since {since_ref}; nothing to run.")
@@ -1075,7 +1112,7 @@ pub(crate) struct CollectSubgraphRequest<'a> {
     pub task_graph: &'a TaskGraph,
     pub selection: &'a TaskSelection<'a>,
     pub pruned: &'a [PrunedTask],
-    pub since_affected: Option<&'a HashSet<PackageName>>,
+    pub since_affected: Option<&'a SinceAffected>,
     pub expand_dependencies: bool,
 }
 
@@ -1209,16 +1246,18 @@ pub(crate) fn package_matches(task_id: &TaskId, criteria: &SelectionCriteria<'_>
         (false, true) => !is_root,
     };
 
-    // The `--since` filter is an additional intersection that applies only to
-    // non-root tasks: a non-root task is kept only if its package is in the
-    // affected set. Root/top-level tasks bypass this check entirely so that an
-    // aggregate root task still runs when the affected set is non-empty.
-    if is_root {
-        return base_match;
-    }
-    let passes_since = criteria
-        .since_affected
-        .is_none_or(|set| set.contains(&task_id.package));
+    // The `--since` filter is an additional intersection. A non-root task is
+    // kept only if its package is in the affected set. A root/top-level task
+    // is kept when it declares no inputs (historic bypass, so aggregate root
+    // tasks still run); a root task that declares inputs is kept only when one
+    // of those inputs matched a changed file.
+    let passes_since = criteria.since_affected.is_none_or(|affected| {
+        if is_root {
+            affected.root_task_passes(&task_id.task)
+        } else {
+            affected.contains_package(&task_id.package)
+        }
+    });
     base_match && passes_since
 }
 
@@ -1288,11 +1327,51 @@ fn report_unmatched_request(
         return Ok(());
     }
 
+    if let Some(since_note) = filtered_by_since_note(requested, criteria, available_nodes) {
+        println!("{}", since_note);
+        return Ok(());
+    }
+
     if let Some(hint) = wrong_scope_hint(requested, criteria, available_nodes) {
         bail!("{}", hint);
     }
 
     bail!("task '{}' not found in task graph", requested);
+}
+
+/// A literal request that exists in the graph but matched nothing only because
+/// `--since` excluded every occurrence: a clean "nothing to run" note, not a
+/// misleading "not found" or wrong-scope error. This is the `--since` analog of
+/// the resolution-prune note above and fires for package tasks (package not in
+/// the affected set) and root tasks with declared inputs that matched no change.
+fn filtered_by_since_note(
+    requested: &str,
+    criteria: &SelectionCriteria<'_>,
+    available_nodes: &[&TaskNode],
+) -> Option<String> {
+    criteria.since_affected?;
+    let without_since = SelectionCriteria {
+        task_globs: criteria.task_globs,
+        package_globs: criteria.package_globs,
+        match_all_non_root_packages: criteria.match_all_non_root_packages,
+        top_level: criteria.top_level,
+        since_affected: None,
+    };
+
+    let filtered = available_nodes.iter().any(|node| {
+        node.id.task.as_str() == requested
+            && package_matches(&node.id, &without_since)
+            && !package_matches(&node.id, criteria)
+    });
+    if !filtered {
+        return None;
+    }
+
+    let note_label =
+        "note:".if_supports_color(Stream::Stdout, |text| text.yellow().bold().to_string());
+    Some(format!(
+        "{note_label} task '{requested}' matched no task affected by --since; nothing to run"
+    ))
 }
 
 /// A bare request (no `-T`) matched nothing, yet the name exists as a top-level
@@ -2348,12 +2427,35 @@ mod tests {
             task_id: TaskId,
             top_level: bool,
             match_all_non_root_packages: bool,
-            since_affected: Option<HashSet<PackageName>>,
+            since_affected: Option<SinceAffected>,
             expected: bool,
         }
 
         let task_globs = build_globset(&["build".to_string()]).expect("task globs");
         let package_globs = build_globset(&[]).expect("package globs");
+
+        let affected_packages = |names: &[&str]| {
+            Some(SinceAffected::from_packages(
+                names.iter().map(|name| PackageName::from(*name)).collect(),
+            ))
+        };
+        // Root tasks that declare inputs are filtered by `--since`; a matched
+        // input puts them in the affected-root-task set.
+        let affected_with_root_task = |packages: &[&str], matched_root: bool| {
+            let affected_root_tasks = if matched_root {
+                HashSet::from([TaskName::from("build")])
+            } else {
+                HashSet::new()
+            };
+            Some(SinceAffected::new(
+                packages
+                    .iter()
+                    .map(|name| PackageName::from(*name))
+                    .collect(),
+                affected_root_tasks,
+                HashSet::from([TaskName::from("build")]),
+            ))
+        };
 
         let cases = [
             Case {
@@ -2361,7 +2463,7 @@ mod tests {
                 task_id: TaskId::new("@repo/app", "build"),
                 top_level: false,
                 match_all_non_root_packages: true,
-                since_affected: Some([PackageName::from("@repo/app")].into_iter().collect()),
+                since_affected: affected_packages(&["@repo/app"]),
                 expected: true,
             },
             Case {
@@ -2369,15 +2471,15 @@ mod tests {
                 task_id: TaskId::new("@repo/other", "build"),
                 top_level: false,
                 match_all_non_root_packages: true,
-                since_affected: Some([PackageName::from("@repo/app")].into_iter().collect()),
+                since_affected: affected_packages(&["@repo/app"]),
                 expected: false,
             },
             Case {
-                name: "root task should bypass since filter under -T",
+                name: "root task with undeclared inputs should bypass since filter under -T",
                 task_id: TaskId::new("//root", "build"),
                 top_level: true,
                 match_all_non_root_packages: true,
-                since_affected: Some([PackageName::from("@repo/app")].into_iter().collect()),
+                since_affected: affected_packages(&["@repo/app"]),
                 expected: true,
             },
             Case {
@@ -2387,6 +2489,22 @@ mod tests {
                 match_all_non_root_packages: true,
                 since_affected: None,
                 expected: true,
+            },
+            Case {
+                name: "root task with matched declared inputs should run under -T",
+                task_id: TaskId::new("//root", "build"),
+                top_level: true,
+                match_all_non_root_packages: true,
+                since_affected: affected_with_root_task(&["@repo/app"], true),
+                expected: true,
+            },
+            Case {
+                name: "root task with unmatched declared inputs should be excluded under -T",
+                task_id: TaskId::new("//root", "build"),
+                top_level: true,
+                match_all_non_root_packages: true,
+                since_affected: affected_with_root_task(&["@repo/app"], false),
+                expected: false,
             },
         ];
 
@@ -2521,11 +2639,85 @@ mod tests {
 
     #[test]
     fn resolve_workspace_root_returns_explicit_path_without_walk() {
-        let explicit = PathBuf::from("/tmp/explicit-workspace-root");
+        // A workspace root that does not exist is returned unchanged so the
+        // later stages report their own, more specific errors.
+        let temp_dir = tempfile::tempdir().expect("create tempdir");
+        let explicit = temp_dir.path().join("absent-workspace-root");
         let resolved =
             resolve_workspace_root(Some(explicit.clone())).expect("resolve explicit root");
 
         assert_eq!(resolved, explicit);
+    }
+
+    #[test]
+    fn resolve_workspace_root_keeps_relative_nonexistent_path() {
+        require_nextest();
+        let temp_dir = tempfile::tempdir().expect("create tempdir");
+        let relative = PathBuf::from("absent-workspace-root");
+        let original_cwd = std::env::current_dir().expect("read current dir");
+        std::env::set_current_dir(temp_dir.path()).expect("set cwd to tempdir");
+
+        let resolved =
+            resolve_workspace_root(Some(relative.clone())).expect("resolve relative root");
+
+        std::env::set_current_dir(&original_cwd).expect("restore current dir");
+        assert_eq!(resolved, relative);
+        assert!(
+            resolved.is_relative(),
+            "expected the raw relative path back, got {}",
+            resolved.display()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_workspace_root_errors_on_canonicalization_failure() {
+        use std::os::unix::fs::symlink;
+
+        // A symlink cycle fails canonicalization with an error other than
+        // NotFound, which must propagate instead of falling back to the raw
+        // path.
+        let temp_dir = tempfile::tempdir().expect("create tempdir");
+        let cycle = temp_dir.path().join("loop");
+        symlink(&cycle, &cycle).expect("create symlink cycle");
+
+        let error = resolve_workspace_root(Some(cycle.clone()))
+            .expect_err("symlink cycle must fail canonicalization");
+        let message = error.to_string();
+        assert!(
+            message.contains("failed to canonicalize workspace root"),
+            "expected a canonicalization error, got: {message}"
+        );
+        assert!(
+            message.contains(cycle.as_os_str().to_string_lossy().as_ref()),
+            "expected the path in the error, got: {message}"
+        );
+    }
+
+    #[test]
+    fn resolve_workspace_root_canonicalizes_existing_explicit_path() {
+        require_nextest();
+        let temp_dir = tempfile::tempdir().expect("create tempdir");
+        // Build a `../<name>`-style relative path to the tempdir from the
+        // system temp root, then resolve from a sibling tempdir outside the
+        // workspace.
+        let mut relative = PathBuf::from("..");
+        relative.push(temp_dir.path().file_name().expect("tempdir name"));
+        let original_cwd = std::env::current_dir().expect("read current dir");
+        let cwd = tempfile::TempDir::new().expect("create sibling cwd");
+        std::env::set_current_dir(cwd.path()).expect("set cwd to sibling dir");
+        let resolved = resolve_workspace_root(Some(relative)).expect("resolve relative root");
+        std::env::set_current_dir(&original_cwd).expect("restore current dir");
+
+        assert!(
+            resolved.is_absolute(),
+            "expected an absolute workspace root, got {}",
+            resolved.display()
+        );
+        assert_eq!(
+            resolved,
+            dunce::canonicalize(temp_dir.path()).expect("canonicalize")
+        );
     }
 
     #[test]
@@ -2830,7 +3022,7 @@ fn build_dispatch_context<'a>(inputs: BuildDispatchContext<'a>) -> DispatchConte
 fn prepare_cycle_resources(
     run: &RunContext,
     selection: &TaskSelection<'_>,
-    since_affected: Option<&HashSet<PackageName>>,
+    since_affected: Option<&SinceAffected>,
     output: OutputMode,
 ) -> Result<Option<(HashSet<TaskId>, Arc<ProgressReporter>, ExecutionResources)>> {
     let tasks_to_run = collect_requested_subgraph(CollectSubgraphRequest {
