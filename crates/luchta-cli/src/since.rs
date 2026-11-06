@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{hash_map::Entry, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use gix::bstr::BStr;
@@ -6,7 +6,7 @@ use gix::status::index_worktree::BuiltinSubmoduleStatus;
 use gix::status::plumbing::{self, index_as_worktree::traits::SubmoduleStatus};
 use luchta_cache::PathRequestMatcher;
 use luchta_engine::{expand_input_patterns, TaskGraph};
-use luchta_types::{PackageName, TaskName};
+use luchta_types::{PackageName, TaskDefinition, TaskId, TaskName};
 use luchta_workspace::{PackageGraph, PackageNode, WorkspaceError};
 use miette::Diagnostic;
 use thiserror::Error;
@@ -200,6 +200,7 @@ pub fn since_affected(
         workspace_root,
         package_graph,
         task_graph,
+        &changed_packages,
     )?;
     changed_packages.extend(declared.input_matched_packages);
 
@@ -260,7 +261,8 @@ struct DeclaredInputMatches {
     root_tasks_with_inputs: HashSet<TaskName>,
 }
 
-/// Matches changed files against every task's declared (expanded) inputs.
+/// Matches changed files against declared (expanded) inputs of tasks whose
+/// package is not already affected, plus all root tasks.
 ///
 /// A non-root task whose inputs match a changed file seeds its package into
 /// the affected set (transitive dependents are expanded by the caller); a
@@ -273,6 +275,13 @@ struct DeclaredInputMatches {
 /// match them; root tasks still expand, because whether their inputs resolve
 /// to any positive include decides whether they are filtered or keep the
 /// historic bypass.
+///
+/// `already_affected` includes path-mapped packages, their transitive dependents,
+/// and lockfile dependency-closure seeds. Package tasks are also skipped after
+/// an earlier task matches an input in the same package. Expansion and compile
+/// errors from package tasks are deferred until all tasks have been checked:
+/// they only fail the call if their package remains unaffected, regardless of
+/// task iteration order. Root-task errors still fail immediately.
 ///
 /// Inputs are expanded with the engine's shared grammar (`#`, `pkg#`, `^`,
 /// `^^`, plain) and matched with the cache's [`PathRequestMatcher`], so
@@ -287,8 +296,34 @@ fn declared_input_matches(
     workspace_root: &Path,
     package_graph: &PackageGraph,
     task_graph: &TaskGraph,
+    already_affected: &HashSet<PackageName>,
+) -> Result<DeclaredInputMatches, SinceError> {
+    let tasks = task_graph.nodes().filter_map(|node| {
+        task_graph
+            .task_definition(&node.id)
+            .map(|definition| (&node.id, definition))
+    });
+    declared_input_matches_for_tasks(
+        changed_paths,
+        repo_root,
+        workspace_root,
+        package_graph,
+        tasks,
+        already_affected,
+    )
+}
+
+fn declared_input_matches_for_tasks<'a>(
+    changed_paths: &HashSet<PathBuf>,
+    repo_root: &Path,
+    workspace_root: &Path,
+    package_graph: &PackageGraph,
+    tasks: impl IntoIterator<Item = (&'a TaskId, &'a TaskDefinition)>,
+    already_affected: &HashSet<PackageName>,
 ) -> Result<DeclaredInputMatches, SinceError> {
     let mut matches = DeclaredInputMatches::default();
+    let mut matchers = HashMap::new();
+    let mut input_errors = Vec::new();
 
     // Git hands us repo-relative paths; joining the repo root yields the
     // absolute paths the input requests (based in workspace/package dirs)
@@ -298,31 +333,36 @@ fn declared_input_matches(
         .map(|changed_path| repo_root.join(changed_path))
         .collect();
 
-    for node in task_graph.nodes() {
-        let Some(definition) = task_graph.task_definition(&node.id) else {
-            continue;
-        };
+    for (task, definition) in tasks {
         if definition.inputs.is_empty() {
             continue;
         }
 
-        let task = &node.id;
-        // Package tasks only ever contribute matches, and with no changed
-        // paths nothing can match, so their expansion is skippable entirely.
-        // Root tasks must expand regardless (see the classification below).
-        if !task.is_root() && absolute_paths.is_empty() {
+        // A package task can only add its own package, so checking an already
+        // affected package cannot change the result. Root tasks still need
+        // expansion for the bypass classification below, even with no changes.
+        if !task.is_root()
+            && (absolute_paths.is_empty()
+                || already_affected.contains(&task.package)
+                || matches.input_matched_packages.contains(&task.package))
+        {
             continue;
         }
 
-        let requests = expand_input_patterns(
-            &definition.inputs,
-            &task.package,
-            package_graph,
-            workspace_root,
-        )
-        .map_err(|error| SinceError::InputExpansion(format!("task '{task}': {error}")))?;
-        let matcher = PathRequestMatcher::compile(&requests)
-            .map_err(|error| SinceError::InputMatch(format!("task '{task}': {error}")))?;
+        let matcher = match matchers.entry((&task.package, definition.inputs.as_slice())) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                match compile_input_matcher(task, &definition.inputs, package_graph, workspace_root)
+                {
+                    Ok(matcher) => entry.insert(matcher),
+                    Err(error) if task.is_root() => return Err(error),
+                    Err(error) => {
+                        input_errors.push((task, error));
+                        continue;
+                    }
+                }
+            }
+        };
 
         if task.is_root() {
             // Classification comes from the expanded requests, not the raw
@@ -350,7 +390,32 @@ fn declared_input_matches(
         }
     }
 
+    // A later input match makes earlier errors in that package irrelevant.
+    // Choose by task id so errors in still-unaffected packages are stable too.
+    if let Some((_, error)) = input_errors
+        .into_iter()
+        .filter(|(task, _)| {
+            !already_affected.contains(&task.package)
+                && !matches.input_matched_packages.contains(&task.package)
+        })
+        .min_by_key(|(task, _)| task.to_string())
+    {
+        return Err(error);
+    }
+
     Ok(matches)
+}
+
+fn compile_input_matcher(
+    task: &TaskId,
+    inputs: &[String],
+    package_graph: &PackageGraph,
+    workspace_root: &Path,
+) -> Result<PathRequestMatcher, SinceError> {
+    let requests = expand_input_patterns(inputs, &task.package, package_graph, workspace_root)
+        .map_err(|error| SinceError::InputExpansion(format!("task '{task}': {error}")))?;
+    PathRequestMatcher::compile(&requests)
+        .map_err(|error| SinceError::InputMatch(format!("task '{task}': {error}")))
 }
 
 fn repo_relative_lockfile_path(
@@ -592,16 +657,19 @@ fn map_head_error(_err: impl std::fmt::Display) -> SinceError {
 
 #[cfg(test)]
 mod tests {
-    use super::{affected_packages_from_paths, changed_paths_since, since_affected, SinceError};
+    use super::{
+        affected_packages_from_paths, changed_paths_since, declared_input_matches,
+        declared_input_matches_for_tasks, since_affected, SinceError,
+    };
     use std::collections::{HashMap, HashSet};
     use std::fs;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use luchta_engine::TaskGraph;
-    use luchta_types::{PackageName, TaskDefinition, TaskName};
+    use luchta_types::{PackageName, TaskDefinition, TaskId, TaskName};
     use luchta_workspace::{PackageGraph, PackageNode};
     use tempfile::TempDir;
 
@@ -1144,7 +1212,8 @@ mod tests {
         )]);
         let task_graph = TaskGraph::build(&graph, &pipeline).unwrap();
 
-        repo.write_file("packages/a/src/index.ts", "export const changed = true;\n");
+        // No package is path-affected, so @repo/b's inputs must be checked.
+        repo.write_file("README.md", "root only change\n");
 
         let error =
             since_affected(repo.path(), repo.path(), &base_ref, &graph, &task_graph).unwrap_err();
@@ -1157,6 +1226,211 @@ mod tests {
             message.contains("root input must include path"),
             "expected pattern error in message, got: {message}"
         );
+    }
+
+    #[test]
+    fn invalid_input_pattern_in_already_affected_package_is_skipped() {
+        for changed_package in ["a", "b"] {
+            let (repo, base_ref, graph) = repo_with_root_file_workspace();
+            let pipeline = HashMap::from([(
+                TaskName::from("@repo/b#build"),
+                TaskDefinition {
+                    inputs: vec!["#".to_string()],
+                    ..TaskDefinition::default()
+                },
+            )]);
+            let task_graph = TaskGraph::build(&graph, &pipeline).unwrap();
+
+            // @repo/b is affected either directly or as @repo/a's dependent.
+            repo.write_file(
+                &format!("packages/{changed_package}/src/index.ts"),
+                "export const changed = true;\n",
+            );
+            let expected = if changed_package == "a" {
+                package_name_set(["@repo/a", "@repo/b"])
+            } else {
+                package_name_set(["@repo/b"])
+            };
+            let affected =
+                since_affected(repo.path(), repo.path(), &base_ref, &graph, &task_graph).unwrap();
+            assert_eq!(
+                affected.packages(),
+                &expected,
+                "changed package: {changed_package}"
+            );
+        }
+    }
+
+    #[test]
+    fn matching_task_suppresses_invalid_sibling_inputs_in_either_order() {
+        let (repo, _, graph) = repo_with_root_file_workspace();
+        let matching_task = TaskId::new("@repo/b", "build");
+        let invalid_task = TaskId::new("@repo/b", "invalid");
+        let matching_definition = TaskDefinition {
+            inputs: vec!["#tsconfig.base.json".to_string()],
+            ..TaskDefinition::default()
+        };
+        let changed_paths = HashSet::from([PathBuf::from("tsconfig.base.json")]);
+        let already_affected =
+            affected_packages_from_paths(&changed_paths, repo.path(), &graph).unwrap();
+        assert!(already_affected.is_empty());
+
+        // Exercise expansion and compilation failures, not harmless non-matches.
+        for invalid_input in ["#", "["] {
+            let invalid_definition = TaskDefinition {
+                inputs: vec![invalid_input.to_string()],
+                ..TaskDefinition::default()
+            };
+            let error = declared_input_matches_for_tasks(
+                &changed_paths,
+                repo.path(),
+                repo.path(),
+                &graph,
+                [(&invalid_task, &invalid_definition)],
+                &already_affected,
+            )
+            .err()
+            .expect("an unaffected package with only an invalid task must fail");
+            assert!(matches!(
+                (invalid_input, error),
+                ("#", SinceError::InputExpansion(_)) | ("[", SinceError::InputMatch(_))
+            ));
+
+            let invalid = (&invalid_task, &invalid_definition);
+            let matching = (&matching_task, &matching_definition);
+            // Explicit order avoids relying on TaskGraph's randomized HashMap.
+            for tasks in [[invalid, matching], [matching, invalid]] {
+                let matches = declared_input_matches_for_tasks(
+                    &changed_paths,
+                    repo.path(),
+                    repo.path(),
+                    &graph,
+                    tasks,
+                    &already_affected,
+                )
+                .unwrap();
+                assert_eq!(
+                    matches.input_matched_packages,
+                    package_name_set(["@repo/b"]),
+                    "input {invalid_input:?}, first task {}",
+                    tasks[0].0
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unaffected_package_input_errors_are_reported_by_task_id_in_any_order() {
+        let (repo, _, graph) = repo_with_root_file_workspace();
+        let ids = [
+            TaskId::new("@repo/a", "build"),
+            TaskId::new("@repo/a", "lint"),
+            TaskId::new("@repo/b", "build"),
+        ];
+        let definition = TaskDefinition {
+            inputs: vec!["#".to_string()],
+            ..TaskDefinition::default()
+        };
+        for order in [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ] {
+            let error = declared_input_matches_for_tasks(
+                &HashSet::from([PathBuf::from("README.md")]),
+                repo.path(),
+                repo.path(),
+                &graph,
+                order.map(|index| (&ids[index], &definition)),
+                &HashSet::new(),
+            )
+            .err()
+            .expect("unaffected packages must still report invalid inputs");
+            assert!(
+                error.to_string().contains("task '@repo/a#build'"),
+                "order {order:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn identical_inputs_are_cached_per_package_without_changing_matches() {
+        let (repo, _, graph) = repo_with_root_file_workspace();
+        let pipeline = ["build", "lint"]
+            .into_iter()
+            .map(|task| {
+                (
+                    TaskName::from(task),
+                    TaskDefinition {
+                        inputs: vec!["src/**".to_string()],
+                        ..TaskDefinition::default()
+                    },
+                )
+            })
+            .collect();
+        let task_graph = TaskGraph::build(&graph, &pipeline).unwrap();
+
+        // Unmatched tasks exercise cache hits rather than the affected-package
+        // shortcut. Matching tasks also exercise skipping a later same-package task.
+        for (path, expected) in [
+            ("README.md", HashSet::new()),
+            ("packages/a/src/index.ts", package_name_set(["@repo/a"])),
+            ("packages/b/src/index.ts", package_name_set(["@repo/b"])),
+        ] {
+            let matches = declared_input_matches(
+                &HashSet::from([PathBuf::from(path)]),
+                repo.path(),
+                repo.path(),
+                &graph,
+                &task_graph,
+                &HashSet::new(),
+            )
+            .unwrap();
+            assert_eq!(matches.input_matched_packages, expected, "{path}");
+        }
+    }
+
+    #[test]
+    fn cached_root_inputs_still_classify_each_task_and_distinct_input_list() {
+        let (repo, base_ref, graph) = repo_with_root_file_workspace();
+        let pipeline = [
+            ("#deploy", "tsconfig.base.json"),
+            ("#check", "tsconfig.base.json"),
+            ("#lint", "scripts/**"),
+        ]
+        .into_iter()
+        .map(|(task, input)| {
+            (
+                TaskName::from(task),
+                TaskDefinition {
+                    inputs: vec![input.to_string()],
+                    ..TaskDefinition::default()
+                },
+            )
+        })
+        .collect();
+        let task_graph = TaskGraph::build(&graph, &pipeline).unwrap();
+        repo.write_file("tsconfig.base.json", "{\"changed\": true}\n");
+        repo.write_file("packages/a/src/index.ts", "export const changed = true;\n");
+
+        let affected =
+            since_affected(repo.path(), repo.path(), &base_ref, &graph, &task_graph).unwrap();
+        assert_eq!(
+            affected.packages(),
+            &package_name_set(["@repo/a", "@repo/b"])
+        );
+        assert_eq!(
+            affected.root_tasks_with_inputs,
+            ["deploy", "check", "lint"].map(TaskName::from).into()
+        );
+        assert_eq!(
+            affected.affected_root_tasks,
+            ["deploy", "check"].map(TaskName::from).into()
+        );
+        assert!(!affected.root_task_passes(&TaskName::from("lint")));
     }
 
     #[test]
