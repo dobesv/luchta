@@ -2730,7 +2730,10 @@ mod tests {
         let resolved = resolve_workspace_root(None).expect("resolve fallback cwd");
 
         std::env::set_current_dir(&original_cwd).expect("restore current dir");
-        assert_eq!(resolved, temp_dir.path());
+        assert_eq!(
+            resolved,
+            temp_dir.path().canonicalize().expect("canonical tempdir")
+        );
     }
 
     #[test]
@@ -2753,7 +2756,12 @@ mod tests {
         let resolved = resolve_workspace_root(None).expect("resolve workspace root");
 
         std::env::set_current_dir(&original_cwd).expect("restore current dir");
-        assert_eq!(resolved, workspace_root);
+        assert_eq!(
+            resolved,
+            workspace_root
+                .canonicalize()
+                .expect("canonical workspace root")
+        );
     }
 
     #[test]
@@ -2779,7 +2787,12 @@ mod tests {
         let resolved = resolve_workspace_root(None).expect("resolve workspace root");
 
         std::env::set_current_dir(&original_cwd).expect("restore current dir");
-        assert_eq!(resolved, workspace_root);
+        assert_eq!(
+            resolved,
+            workspace_root
+                .canonicalize()
+                .expect("canonical workspace root")
+        );
     }
 }
 

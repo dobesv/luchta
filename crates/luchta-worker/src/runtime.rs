@@ -980,7 +980,7 @@ mod tests {
         // If stdin were an inherited pipe with no data, `cat` would block forever
         // and this test would hang — so a prompt, "count: 0" result proves the
         // detach.
-        let worker = Arc::new(TestWorker::new("printf 'count: %s\\n' \"$(cat | wc -c)\""));
+        let worker = Arc::new(TestWorker::new("printf 'count: %d\\n' \"$(cat | wc -c)\""));
         let request = WorkerRequest::new("job-1", "ignored");
         let (writer, reader) = writer_pair();
 

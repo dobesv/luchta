@@ -16,3 +16,6 @@ tokio = { workspace = true }
 thiserror = { workspace = true }
 libc = { workspace = true }
 luchta-types = { path = "../luchta-types" }
+
+[dev-dependencies]
+tempfile = { workspace = true }

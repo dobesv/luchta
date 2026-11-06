@@ -167,26 +167,41 @@ fn logs_filters_task_selection() {
             },
         ],
     });
-    assert_logs_case(LogsCase {
-        scenario: LogsScenario {
-            task_json: r#""app#fast":{"cache":{},"worker":"shell","inputs":["src.txt"],"outputs":["fast.txt"],"command":"echo fast > fast.txt"},"app#slow":{"cache":{},"worker":"shell","inputs":["src.txt"],"outputs":["slow.txt"],"command":"sleep 0.2 && echo slow > slow.txt"}"#,
-            extra_files: SINGLE_BUILD_FILES,
-        },
-        run_tasks: &["fast", "slow"],
-        args: &["--time-taken", "200"],
-        assertions: &[
-            LogAssertion {
-                needle: "slow",
-                present: true,
-                message: "expected slow task in output",
-            },
-            LogAssertion {
-                needle: "fast",
-                present: false,
-                message: "expected no fast task in output",
-            },
-        ],
+}
+
+#[test]
+fn logs_filters_time_taken_using_recorded_durations() {
+    use luchta_cache::{resolve_cache_dir, Cache, RunArtifacts};
+
+    let temp = setup_logs_workspace(LogsScenario {
+        task_json: r#""app#fast":{"cache":{},"worker":"shell","inputs":["src.txt"],"outputs":["fast.txt"],"command":"echo fast > fast.txt"},"app#slow":{"cache":{},"worker":"shell","inputs":["src.txt"],"outputs":["slow.txt"],"command":"echo slow > slow.txt"}"#,
+        extra_files: SINGLE_BUILD_FILES,
     });
+    let cache = Cache::open(&resolve_cache_dir(temp.path())).expect("open cache");
+    for (task, duration_ms) in [("fast", 100), ("slow", 300)] {
+        common::run_luchta(&temp, task).success();
+        let task_id = format!("app#{task}");
+        let mut record = cache.read(&task_id).expect("cached run record");
+        // The filter reads cached timestamps; scheduler delays are not its input.
+        record.end_unix_ms = record.start_unix_ms + duration_ms;
+        cache
+            .write(
+                &task_id,
+                RunArtifacts {
+                    record: &record,
+                    stdout: b"",
+                    stderr: b"",
+                    reports: &[],
+                },
+            )
+            .expect("write fixed-duration record");
+    }
+    let stdout = run_logs(&temp, &["--time-taken", "200"]);
+    assert!(stdout.contains("app#slow"), "missing slow task: {stdout}");
+    assert!(
+        !stdout.contains("app#fast"),
+        "unexpected fast task: {stdout}"
+    );
 }
 
 #[test]
