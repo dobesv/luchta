@@ -530,8 +530,13 @@ mod tests {
             let store = SnapshotStore::new((*reader_paths).clone());
             for _ in 0..200 {
                 let _ = store.load(commit_key);
-                let result = restore_blob(&reader_paths, &outputs_hash, &reader_package_dir)
-                    .expect("blob reader should tolerate missing blobs");
+                let result = restore_blob(
+                    &reader_paths,
+                    &outputs_hash,
+                    &reader_package_dir,
+                    &reader_package_dir.parent().unwrap().join(".luchta/tmp"),
+                )
+                .expect("blob reader should tolerate missing blobs");
                 assert!(matches!(
                     result,
                     crate::shared::BlobReadResult::Restored

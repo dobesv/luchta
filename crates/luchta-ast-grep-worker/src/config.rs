@@ -71,6 +71,13 @@ pub fn discover_config(cwd: &Path) -> Result<Option<DiscoveredConfig>, String> {
     }))
 }
 
+fn is_skippable_walk_error(error: &ignore::Error) -> bool {
+    error.depth().is_some_and(|depth| depth > 0)
+        && error
+            .io_error()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+}
+
 pub fn collect_source_files(
     cwd: &Path,
     config_dir: &Path,
@@ -90,8 +97,15 @@ pub fn collect_source_files(
 
     let mut files = Vec::new();
     for entry in builder.build() {
-        let entry =
-            entry.map_err(|error| format!("failed to walk workspace for sources: {error}"))?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) if is_skippable_walk_error(&error) => {
+                continue;
+            }
+            Err(error) => {
+                return Err(format!("failed to walk workspace for sources: {error}"));
+            }
+        };
         let path = entry.into_path();
         if path.is_dir() || resolve_language(&path, config_dir, language_globs).is_none() {
             continue;
@@ -225,12 +239,16 @@ fn collect_rule_files(rule_dir: &Path, rule_files: &mut Vec<PathBuf>) -> Result<
         .follow_links(true);
 
     for entry in builder.build() {
-        let entry = entry.map_err(|error| {
-            format!(
-                "failed to walk rule directory {}: {error}",
-                rule_dir.display()
-            )
-        })?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) if is_skippable_walk_error(&error) => continue,
+            Err(error) => {
+                return Err(format!(
+                    "failed to walk rule directory {}: {error}",
+                    rule_dir.display()
+                ));
+            }
+        };
         let path = entry.into_path();
         if path.is_file() && is_yaml_file(&path) {
             rule_files.push(path);
@@ -389,6 +407,19 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn collect_source_files_skips_dangling_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("tempdir");
+        fs::write(temp.path().join("source.ts"), "const value = 1;").expect("source");
+        symlink("missing-target", temp.path().join("dangling")).expect("dangling symlink");
+
+        let files = collect_source_files(temp.path(), temp.path(), &[]).expect("collect");
+        assert_eq!(files, vec![temp.path().join("source.ts")]);
+    }
+
     #[test]
     fn collect_source_files_skips_gitignored_dirs() {
         let temp = TempDir::new().expect("tempdir");
@@ -461,5 +492,59 @@ mod tests {
                     .replace('\\', "/")
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod vanished_walk_filter_tests {
+    use super::*;
+    use assert_fs::TempDir;
+
+    #[test]
+    fn source_walk_errors_for_missing_root() {
+        let temp = TempDir::new().expect("tempdir");
+        let missing = temp.path().join("missing");
+        assert!(collect_source_files(&missing, &missing, &[]).is_err());
+    }
+
+    #[test]
+    fn walk_error_filter_only_skips_nested_not_found() {
+        let root_error = ignore::Error::Io(std::io::Error::from(std::io::ErrorKind::NotFound));
+        assert!(!is_skippable_walk_error(&root_error));
+        let nested_not_found = ignore::Error::WithDepth {
+            depth: 1,
+            err: Box::new(ignore::Error::Io(std::io::Error::from(
+                std::io::ErrorKind::NotFound,
+            ))),
+        };
+        assert!(is_skippable_walk_error(&nested_not_found));
+        let nested_other = ignore::Error::WithDepth {
+            depth: 1,
+            err: Box::new(ignore::Error::Io(std::io::Error::from(
+                std::io::ErrorKind::PermissionDenied,
+            ))),
+        };
+        assert!(!is_skippable_walk_error(&nested_other));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod rule_walk_tests {
+    use super::collect_rule_files;
+    use assert_fs::TempDir;
+    use std::{fs, os::unix::fs::symlink};
+
+    #[test]
+    fn collect_rule_files_skips_dangling_symlink() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::write(
+            temp.path().join("rule.yml"),
+            "id: rule\nlanguage: TypeScript\nrule: x\n",
+        )
+        .expect("rule");
+        symlink("missing", temp.path().join("dangling.yml")).expect("symlink");
+        let mut paths = Vec::new();
+        collect_rule_files(temp.path(), &mut paths).expect("walk");
+        assert_eq!(paths, vec![temp.path().join("rule.yml")]);
     }
 }

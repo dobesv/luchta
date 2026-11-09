@@ -292,6 +292,13 @@ fn format_file(
     FileOutcome::Reformatted { relative }
 }
 
+fn is_skippable_walk_error(error: &ignore::Error) -> bool {
+    error.depth().is_some_and(|depth| depth > 0)
+        && error
+            .io_error()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+}
+
 pub(crate) fn collect_formattable_files(
     cwd: &Path,
     config_ignore_matcher: Option<&Gitignore>,
@@ -322,8 +329,15 @@ pub(crate) fn collect_formattable_files(
 
     let mut files = Vec::new();
     for entry in builder.build() {
-        let entry =
-            entry.map_err(|error| format!("failed to walk workspace for sources: {error}"))?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) if is_skippable_walk_error(&error) => {
+                continue;
+            }
+            Err(error) => {
+                return Err(format!("failed to walk workspace for sources: {error}"));
+            }
+        };
         let path = entry.into_path();
         if path.is_dir() || !is_formattable_path(&path) {
             continue;
@@ -381,7 +395,8 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::{
-        collect_formattable_files, format_file, is_formattable_path, FileOutcome, OxfmtWorker,
+        collect_formattable_files, format_file, is_formattable_path, is_skippable_walk_error,
+        FileOutcome, OxfmtWorker,
     };
     use crate::opts::OxfmtOpts;
     use assert_fs::TempDir;
@@ -399,6 +414,51 @@ mod tests {
             .collect::<Vec<_>>();
         out.sort();
         out
+    }
+
+    #[test]
+    fn collect_formattable_files_errors_for_missing_root() {
+        let temp = TempDir::new().expect("tempdir");
+        assert!(collect_formattable_files(&temp.path().join("missing"), None).is_err());
+        let error = ignore::Error::Io(std::io::Error::from(std::io::ErrorKind::NotFound));
+        assert!(!is_skippable_walk_error(&error));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collect_formattable_files_fails_on_permission_denied() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if std::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .is_ok_and(|out| out.stdout == b"0\n")
+        {
+            return;
+        }
+        let temp = TempDir::new().expect("tempdir");
+        let blocked = temp.path().join("blocked");
+        fs::create_dir(&blocked).expect("blocked dir");
+        fs::write(blocked.join("source.ts"), "source").expect("source");
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o000)).expect("permissions");
+        let result = collect_formattable_files(temp.path(), None);
+        fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700))
+            .expect("restore permissions");
+        assert!(result.is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collect_formattable_files_skips_dangling_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("tempdir");
+        let cwd = temp.path();
+        fs::write(cwd.join("source.ts"), "export const value = 1;").expect("source");
+        symlink("missing-target", cwd.join("dangling")).expect("dangling symlink");
+
+        let (files, _) = collect_formattable_files(cwd, None).expect("walk succeeds");
+        assert_eq!(relative_paths(cwd, files), vec!["source.ts"]);
     }
 
     #[test]

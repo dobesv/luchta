@@ -80,6 +80,13 @@ pub fn discover_config(cwd: &Path, config_override: Option<&Path>) -> Result<Loa
     })
 }
 
+fn is_skippable_walk_error(error: &ignore::Error) -> bool {
+    error.depth().is_some_and(|depth| depth > 0)
+        && error
+            .io_error()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+}
+
 pub fn collect_target_files(
     cwd: &Path,
     ignore_patterns: &[String],
@@ -101,6 +108,7 @@ pub fn collect_target_files(
                 }
                 WalkState::Continue
             }
+            Err(error) if is_skippable_walk_error(&error) => WalkState::Continue,
             Err(error) => {
                 let _ = tx.send(Err(format!(
                     "failed to walk workspace for sources: {error}"
@@ -131,8 +139,15 @@ pub fn has_target_files(
     let ignore_matcher = LintIgnoreMatcher::new(ignore_patterns, ignore_base, Vec::new());
     let (builder, warnings) = target_walk_builder(cwd);
     for entry in builder.build() {
-        let entry =
-            entry.map_err(|error| format!("failed to walk workspace for sources: {error}"))?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) if is_skippable_walk_error(&error) => {
+                continue;
+            }
+            Err(error) => {
+                return Err(format!("failed to walk workspace for sources: {error}"));
+            }
+        };
         if is_target_entry(&entry, &ignore_matcher) {
             return Ok((true, warnings));
         }
@@ -222,6 +237,31 @@ mod tests {
     use assert_fs::TempDir;
 
     use super::{collect_target_files, discover_config, has_target_files};
+
+    #[cfg(unix)]
+    #[test]
+    fn target_file_walks_skip_dangling_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("tempdir");
+        let cwd = temp.path();
+        fs::write(cwd.join("source.ts"), "const value = 1;").expect("source");
+        fs::create_dir_all(cwd.join("nested")).expect("nested");
+        fs::write(cwd.join("nested/one.ts"), "const one = 1;").expect("nested source");
+        fs::write(cwd.join("nested/two.js"), "const two = 2;").expect("nested source");
+        symlink("missing-target", cwd.join("dangling")).expect("dangling symlink");
+
+        let (files, _) = collect_target_files(cwd, &[], cwd).expect("collect");
+        assert_eq!(
+            files,
+            vec![
+                cwd.join("nested/one.ts"),
+                cwd.join("nested/two.js"),
+                cwd.join("source.ts")
+            ]
+        );
+        assert!(has_target_files(cwd, &[], cwd).expect("probe").0);
+    }
 
     #[test]
     fn collect_target_files_skips_gitignored_directory() {
@@ -418,5 +458,39 @@ mod tests {
                     .replace('\\', "/")
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod vanished_walk_filter_tests {
+    use super::*;
+    use assert_fs::TempDir;
+
+    #[test]
+    fn target_walk_errors_for_missing_root() {
+        let temp = TempDir::new().expect("tempdir");
+        let missing = temp.path().join("missing");
+        assert!(collect_target_files(&missing, &[], &missing).is_err());
+        assert!(has_target_files(&missing, &[], &missing).is_err());
+    }
+
+    #[test]
+    fn walk_error_filter_only_skips_nested_not_found() {
+        let root_error = ignore::Error::Io(std::io::Error::from(std::io::ErrorKind::NotFound));
+        assert!(!is_skippable_walk_error(&root_error));
+        let nested_not_found = ignore::Error::WithDepth {
+            depth: 1,
+            err: Box::new(ignore::Error::Io(std::io::Error::from(
+                std::io::ErrorKind::NotFound,
+            ))),
+        };
+        assert!(is_skippable_walk_error(&nested_not_found));
+        let nested_other = ignore::Error::WithDepth {
+            depth: 1,
+            err: Box::new(ignore::Error::Io(std::io::Error::from(
+                std::io::ErrorKind::PermissionDenied,
+            ))),
+        };
+        assert!(!is_skippable_walk_error(&nested_other));
     }
 }

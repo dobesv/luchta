@@ -260,6 +260,12 @@ impl MergedIndex {
 pub struct SharedCache {
     /// Resolved paths for the cache.
     paths: Arc<SharedCachePaths>,
+    /// Restore staging stays outside package trees, even with an external cache:
+    /// workers and cache candidate walks enumerate package dirs while restores
+    /// run, so staging inside a package can vanish mid-walk (#950), and staged
+    /// files must be excluded from glob/restore reconciliation (see
+    /// `is_package_relative_staging_path`).
+    staging_root: PathBuf,
     /// Bucket key this process writes its entries under: today's UTC date and
     /// a nonce-selected shard (see `discovery::write_bucket_key`).
     write_bucket_key: Option<String>,
@@ -459,7 +465,7 @@ impl SharedCache {
         day_window: usize,
         extras: OpenExtras<'_>,
     ) -> Option<Self> {
-        let _ = repo_root;
+        let staging_root = repo_root.join(".luchta/tmp");
         let cache_path = extras
             .cache_dir
             .map(|p| p.to_path_buf())
@@ -485,6 +491,7 @@ impl SharedCache {
 
         Some(Self {
             paths,
+            staging_root,
             write_bucket_key,
             day_window: day_window.max(discovery::MIN_SHARED_CACHE_DAY_WINDOW),
             snapshot_store,
@@ -508,13 +515,14 @@ impl SharedCache {
         day_window: usize,
         snapshot_store: SnapshotStore,
     ) -> Option<Self> {
-        let _ = repo_root;
+        let staging_root = repo_root.join(".luchta/tmp");
         let paths = snapshot_store.paths().clone();
 
         let write_bucket_key = Some(discovery::current_write_bucket_key());
 
         Some(Self {
             paths: Arc::new(paths),
+            staging_root,
             write_bucket_key,
             day_window: day_window.max(discovery::MIN_SHARED_CACHE_DAY_WINDOW),
             snapshot_store,
@@ -556,6 +564,7 @@ impl SharedCache {
                 &entry,
                 &paths,
                 &package_dir,
+                &self.staging_root,
                 #[cfg(unix)]
                 remote.as_ref(),
             )
@@ -579,6 +588,7 @@ impl SharedCache {
         entry: &SnapshotEntry,
         paths: &SharedCachePaths,
         package_dir: &Path,
+        staging_root: &Path,
         #[cfg(unix)] remote: Option<&RemoteSync>,
     ) -> Option<StagedCandidate> {
         if entry.duration_trusted && entry.duration_ms < min_store_duration_ms() {
@@ -592,6 +602,7 @@ impl SharedCache {
                 input_key,
                 paths,
                 package_dir,
+                staging_root,
                 #[cfg(unix)]
                 remote,
             );
@@ -615,6 +626,7 @@ impl SharedCache {
             input_key,
             paths,
             package_dir,
+            staging_root,
             #[cfg(unix)]
             remote,
         )
@@ -625,6 +637,7 @@ impl SharedCache {
         input_key: &[u8; 32],
         paths: &SharedCachePaths,
         package_dir: &Path,
+        staging_root: &Path,
         #[cfg(unix)] remote: Option<&RemoteSync>,
     ) -> Option<StagedCandidate> {
         let record: TaskRunRecord =
@@ -671,13 +684,14 @@ impl SharedCache {
             }
         }
 
-        let staged = match restore_outputs_staged(paths, &meta.outputs_hash, package_dir) {
-            Ok(BlobReadResultWithMeta::Restored(staged)) => staged,
-            Ok(BlobReadResultWithMeta::Missing) | Ok(BlobReadResultWithMeta::Corrupt) => {
-                return None
-            }
-            Err(_) => return None,
-        };
+        let staged =
+            match restore_outputs_staged(paths, &meta.outputs_hash, package_dir, staging_root) {
+                Ok(BlobReadResultWithMeta::Restored(staged)) => staged,
+                Ok(BlobReadResultWithMeta::Missing) | Ok(BlobReadResultWithMeta::Corrupt) => {
+                    return None
+                }
+                Err(_) => return None,
+            };
 
         Some(StagedCandidate {
             outputs_hash: meta.outputs_hash,
@@ -708,6 +722,7 @@ impl SharedCache {
             &entry,
             &self.paths,
             package_dir,
+            &self.staging_root,
             #[cfg(unix)]
             self.remote.as_ref(),
         )?;
@@ -1871,10 +1886,15 @@ mod tests {
             .prepare_restore(&input_key, &package_dir)
             .expect("restore should stage");
         assert_eq!(fs::read_to_string(&output_path).unwrap(), "live output");
+        let staging_root = temp_repo.path().join(".luchta/tmp");
+        assert_eq!(fs::read_dir(&staging_root).unwrap().count(), 1);
+        assert_eq!(fs::read_dir(&package_dir).unwrap().count(), 1);
 
         let (candidate, _) = prepared.into_parts();
         candidate.commit().unwrap();
         assert_eq!(fs::read_to_string(&output_path).unwrap(), "cached output");
+        assert_eq!(fs::read_dir(&staging_root).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(&package_dir).unwrap().count(), 1);
     }
 
     #[test]
@@ -1911,6 +1931,7 @@ mod tests {
             &entry,
             cache.paths(),
             &package_dir,
+            &cache.staging_root,
             #[cfg(unix)]
             None,
         )
@@ -1921,6 +1942,7 @@ mod tests {
             &entry,
             cache.paths(),
             &package_dir,
+            &cache.staging_root,
             #[cfg(unix)]
             None,
         )
