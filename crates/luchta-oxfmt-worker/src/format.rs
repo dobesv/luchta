@@ -10,7 +10,7 @@ use oxc_formatter_core::{
     DispatchRequest, DispatchResponse, FormatDispatcher, FormatSession, InputKind, SessionServices,
 };
 use oxc_formatter_css::{
-    CssFormatOptions, CssVariant, SingleQuote, TrailingCommas as CssTrailingCommas,
+    CssEmbeddedIn, CssFormatOptions, CssVariant, SingleQuote, TrailingCommas as CssTrailingCommas,
 };
 use oxc_span::SourceType;
 
@@ -44,20 +44,14 @@ pub fn format_path(
                 return Ok(DispatchResponse::PreserveOriginal);
             }
             // `${...}` interpolations reach the child as `` `PLACEHOLDER-N` ``
-            // markers, which parse only in the css-in-js mode. `oxc_formatter`'s
-            // CSS embed sites are the only senders and always tag the request
-            // with `CssInJsTemplate`, so this is the `allow_placeholders = true`
-            // that the pre-session `format_to_ir` hard-coded.
-            let template_placeholders = request
+            // markers, which parse only in the css-in-js mode. Translate the
+            // parent formatter's context into the CSS formatter's embed mode.
+            let embedded_in = request
                 .parent_context
-                .is_some_and(|context| context.downcast_ref::<CssInJsTemplate>().is_some());
-            match oxc_formatter_css::format_to_ir(
-                session,
-                request.text,
-                css_options,
-                template_placeholders,
-            ) {
-                Ok(embedded) => Ok(DispatchResponse::Formatted(embedded.into())),
+                .and_then(|context| context.downcast_ref::<CssInJsTemplate>())
+                .map(|_| CssEmbeddedIn::CssInJsTemplate);
+            match oxc_formatter_css::format_to_ir(session, request.text, css_options, embedded_in) {
+                Ok(embedded) => Ok(DispatchResponse::Formatted(embedded)),
                 // `format_to_ir` currently errors only when child CSS will not parse or a
                 // fragment contains front matter; both are deliberate preserve-as-is cases.
                 // `DispatchResponse` reserves `Result::Err` for operational/transport failures
@@ -145,7 +139,7 @@ mod tests {
     fn format_path_matches_oxfmt_cli_for_multiline_arrow_interpolation() {
         let path = Path::new("src/example.tsx");
         let input = "const Button = styled.button`color:red;${({ theme }) => css`display:flex;align-items:center;justify-content:space-between;`};padding:8px;`;\n";
-        let expected = "const Button = styled.button`\n  color: red;\n  ${({ theme }) =>\n    css`\n      display: flex;\n      align-items: center;\n      justify-content: space-between;\n    `}; padding: 8px;\n`;\n";
+        let expected = "const Button = styled.button`\n  color: red;\n  ${({ theme }) => css`\n    display: flex;\n    align-items: center;\n    justify-content: space-between;\n  `};padding: 8px;\n`;\n";
 
         let result = format_path(path, Path::new(""), input, &JsFormatOptions::default())
             .expect("format ok");

@@ -92,9 +92,11 @@ only when the task fails, so to assert what a script printed, give the task
 Nextest runs every test through the repository's hermetic environment wrapper
 in `.config/nextest.toml`. Host environment variables are removed unless they
 are runtime essentials, Cargo/nextest metadata, rustup's toolchain selection
-(`RUSTUP_TOOLCHAIN`, `RUSTUP_HOME`), dynamic-loader or coverage settings, or
-the explicit `LUCHTA_TEST_RCLONE` opt-in. The rustup variables matter because
-some CLI tests build worker binaries with `escargot`: without them the `rustc`
+(`RUSTUP_TOOLCHAIN`, `RUSTUP_HOME`), Cargo's cache location (`CARGO_HOME`),
+dynamic-loader or coverage settings, or the explicit `LUCHTA_TEST_RCLONE` opt-in.
+Keeping `CARGO_HOME` ensures offline metadata uses the outer build's cache.
+The rustup variables matter because some CLI tests build worker binaries with
+`escargot`: without them the `rustc`
 proxy obeys a `rust-toolchain.toml` shipped inside a dependency's registry
 source (the `pnp` crate pins an older release) and the build fails on CI. When a test suite needs
 a new ambient customization, add its exact variable to both wrapper scripts'
@@ -171,6 +173,10 @@ them as workflow artifacts instead of publishing a release.
 - **Renovate** (`renovate.json`) opens PRs for dependency and GitHub Actions
   updates. Minor/patch/digest/pin updates (including non-major Actions bumps)
   are flagged for automerge; major updates require manual review.
+- OXC Git dependencies and the allocator patch must share one revision. The
+  `oxc toolchain` Renovate group includes a custom regex manager because the
+  Cargo manager skips `[patch.crates-io]`; keep its matcher aligned with the
+  allocator entry in `Cargo.toml`.
 - **Mergify** (`.mergify.yml`) runs a squash merge queue named `main`. It
   auto-queues passing Renovate PRs and any PR labeled `automerge`. A batch only
   merges once every CI check is green. The `Check` job runs as a per-OS matrix

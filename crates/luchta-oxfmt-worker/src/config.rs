@@ -199,7 +199,7 @@ fn classify_not_applied_key(key: &str, value: Option<&Value>) -> NotAppliedDiagn
             }
         }
         // Silent: these only affect unsupported file types
-        "proseWrap" | "svelte" | "vueIndentScriptAndStyle" | "sortPackageJson" => {
+        "astro" | "proseWrap" | "svelte" | "vueIndentScriptAndStyle" | "sortPackageJson" => {
             NotAppliedDiagnostic::Silent
         }
         _ => NotAppliedDiagnostic::WarnNotApplied, // fallback for unknown keys
@@ -587,6 +587,7 @@ const KNOWN_SORT_IMPORTS_KEYS: &[&str] = &[
 /// cannot apply (e.g., options for file types luchta doesn't format, or app-layer
 /// post-processing).
 pub const KNOWN_NOT_APPLIED_OPTION_KEYS: &[&str] = &[
+    "astro",
     "embeddedLanguageFormatting",
     "insertFinalNewline",
     "proseWrap",
@@ -1308,16 +1309,21 @@ mod tests {
     }
 
     #[test]
-    fn svelte_silent_no_warning() {
-        let (_temp, loaded) = load_config_from_temp(r#"{"svelte":{"plugins":[]}}"#);
+    fn unsupported_framework_options_are_silent() {
+        for config in [
+            r#"{"svelte":{"plugins":[]}}"#,
+            r#"{"astro":{"plugins":[]}}"#,
+        ] {
+            let (_temp, loaded) = load_config_from_temp(config);
 
-        assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
-        // svelte is silent - only affects rejected file types
-        assert!(
-            loaded.unsupported_option_notices.is_empty(),
-            "{:?}",
-            loaded.unsupported_option_notices
-        );
+            assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+            // These options only affect file types the worker rejects.
+            assert!(
+                loaded.unsupported_option_notices.is_empty(),
+                "{:?}",
+                loaded.unsupported_option_notices
+            );
+        }
     }
 
     #[test]

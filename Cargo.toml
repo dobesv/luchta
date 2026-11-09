@@ -41,10 +41,10 @@ edition = "2021"
 version = "0.3.6"
 license = "MIT"
 authors = ["Luchta Contributors"]
-# Rust 1.96.0 required by oxc at pinned rev 7bf68f70c20f5329251f19be95076f6eab4fe396,
+# Rust 1.97.0 required by oxc at pinned rev 6bba2cb4925b7b618409bbde1e8488ca86b96255,
 # which is now the binding constraint. The registry crates oxc_sourcemap,
 # oxc_resolver and oxc-browserslist require >= 1.95.0.
-rust-version = "1.96.0"
+rust-version = "1.97.0"
 repository = "https://example.com/luchta"
 homepage = "https://example.com/luchta"
 description = "Rust monorepo build orchestration tool"
@@ -55,8 +55,10 @@ description = "Rust monorepo build orchestration tool"
 # allocator type mismatch. This patch forces the git `oxc_allocator` (same rev
 # as the other oxc crates) workspace-wide. Keep this rev in sync whenever the
 # oxc git rev is bumped.
+# Renovate's Cargo manager skips patches; the custom regex manager in
+# renovate.json tracks this entry as part of the OXC toolchain group.
 [patch.crates-io]
-oxc_allocator = { git = "https://github.com/oxc-project/oxc.git", rev = "7bf68f70c20f5329251f19be95076f6eab4fe396", package = "oxc_allocator" }
+oxc_allocator = { git = "https://github.com/oxc-project/oxc.git", rev = "6bba2cb4925b7b618409bbde1e8488ca86b96255", package = "oxc_allocator" }
 
 [workspace.dependencies]
 petgraph = "0.8.3"
@@ -98,8 +100,8 @@ notify-debouncer-full = "0.8.0-rc.2"
 # cmake, which we don't want to require of every build environment.
 mimalloc = "0.1.43"
 
-# oxc toolchain pinned to a single main rev 7bf68f70c20f5329251f19be95076f6eab4fe396
-# (tagged apps_v1.83.0 / oxlint_v1.83.0 / oxfmt_v0.68.0). Requires Rust >= 1.96.
+# oxc toolchain pinned to a single main rev 6bba2cb4925b7b618409bbde1e8488ca86b96255
+# (oxc 0.158.0). Requires Rust >= 1.97.
 # The git pin is mandatory, not a style choice: oxc_linter, oxc_formatter_core
 # and oxc_formatter_css are not published to crates.io at all, and every
 # published oxc_formatter version on crates.io is yanked. "Just use the
@@ -107,19 +109,19 @@ mimalloc = "0.1.43"
 #
 # Keep every oxc git dependency, including `[patch.crates-io]`, at one rev.
 # `xtask::tests::oxc_git_dependencies_share_one_revision` guards this.
-oxc_allocator = { git = "https://github.com/oxc-project/oxc.git", rev = "7bf68f70c20f5329251f19be95076f6eab4fe396" }
-oxc_parser = { git = "https://github.com/oxc-project/oxc.git", rev = "7bf68f70c20f5329251f19be95076f6eab4fe396" }
-oxc_semantic = { git = "https://github.com/oxc-project/oxc.git", rev = "7bf68f70c20f5329251f19be95076f6eab4fe396" }
-oxc_linter = { git = "https://github.com/oxc-project/oxc.git", rev = "7bf68f70c20f5329251f19be95076f6eab4fe396" }
-oxc_span = { git = "https://github.com/oxc-project/oxc.git", rev = "7bf68f70c20f5329251f19be95076f6eab4fe396" }
-oxc_syntax = { git = "https://github.com/oxc-project/oxc.git", rev = "7bf68f70c20f5329251f19be95076f6eab4fe396" }
-oxc_diagnostics = { git = "https://github.com/oxc-project/oxc.git", rev = "7bf68f70c20f5329251f19be95076f6eab4fe396" }
-oxc_transformer = { git = "https://github.com/oxc-project/oxc.git", rev = "7bf68f70c20f5329251f19be95076f6eab4fe396" }
-oxc_codegen = { git = "https://github.com/oxc-project/oxc.git", rev = "7bf68f70c20f5329251f19be95076f6eab4fe396" }
-oxc_sourcemap = "8.0.2"
-oxc_formatter = { git = "https://github.com/oxc-project/oxc.git", rev = "7bf68f70c20f5329251f19be95076f6eab4fe396" }
-oxc_formatter_core = { git = "https://github.com/oxc-project/oxc.git", rev = "7bf68f70c20f5329251f19be95076f6eab4fe396" }
-oxc_formatter_css = { git = "https://github.com/oxc-project/oxc.git", rev = "7bf68f70c20f5329251f19be95076f6eab4fe396", default-features = false }
+oxc_allocator = { git = "https://github.com/oxc-project/oxc.git", rev = "6bba2cb4925b7b618409bbde1e8488ca86b96255" }
+oxc_parser = { git = "https://github.com/oxc-project/oxc.git", rev = "6bba2cb4925b7b618409bbde1e8488ca86b96255" }
+oxc_semantic = { git = "https://github.com/oxc-project/oxc.git", rev = "6bba2cb4925b7b618409bbde1e8488ca86b96255" }
+oxc_linter = { git = "https://github.com/oxc-project/oxc.git", rev = "6bba2cb4925b7b618409bbde1e8488ca86b96255" }
+oxc_span = { git = "https://github.com/oxc-project/oxc.git", rev = "6bba2cb4925b7b618409bbde1e8488ca86b96255" }
+oxc_syntax = { git = "https://github.com/oxc-project/oxc.git", rev = "6bba2cb4925b7b618409bbde1e8488ca86b96255" }
+oxc_diagnostics = { git = "https://github.com/oxc-project/oxc.git", rev = "6bba2cb4925b7b618409bbde1e8488ca86b96255" }
+oxc_transformer = { git = "https://github.com/oxc-project/oxc.git", rev = "6bba2cb4925b7b618409bbde1e8488ca86b96255" }
+oxc_codegen = { git = "https://github.com/oxc-project/oxc.git", rev = "6bba2cb4925b7b618409bbde1e8488ca86b96255" }
+oxc_sourcemap = "9.0.0"
+oxc_formatter = { git = "https://github.com/oxc-project/oxc.git", rev = "6bba2cb4925b7b618409bbde1e8488ca86b96255" }
+oxc_formatter_core = { git = "https://github.com/oxc-project/oxc.git", rev = "6bba2cb4925b7b618409bbde1e8488ca86b96255" }
+oxc_formatter_css = { git = "https://github.com/oxc-project/oxc.git", rev = "6bba2cb4925b7b618409bbde1e8488ca86b96255", default-features = false }
 json-strip-comments = "3.1.1"
 serde-sarif = "0.8.0"
 url = "2.5.8"
