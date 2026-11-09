@@ -973,7 +973,13 @@ impl CandidateLister for GitTrackedInputLister {
         let mut paths = BTreeSet::new();
         let mut walker = WalkDir::new(base_dir).into_iter();
         while let Some(entry) = walker.next() {
-            let entry = entry?;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) if is_skippable_walkdir_error(&error) => {
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
             let path = entry.path();
 
             if path == git_dir || path.starts_with(git_dir) {
@@ -1024,6 +1030,14 @@ fn git_tracked_input_lister(
     Ok(GitTrackedInputLister::new(base_prefix, worktree_root))
 }
 
+fn is_skippable_walkdir_error(error: &walkdir::Error) -> bool {
+    is_skippable_walkdir_io_error(error.depth(), error.io_error())
+}
+
+fn is_skippable_walkdir_io_error(depth: usize, error: Option<&std::io::Error>) -> bool {
+    depth > 0 && error.is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+}
+
 struct FilesystemLister;
 
 impl CandidateLister for FilesystemLister {
@@ -1042,7 +1056,13 @@ impl CandidateLister for FilesystemLister {
                 continue;
             }
             for entry in WalkDir::new(&walk_root) {
-                let entry = entry?;
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(error) if is_skippable_walkdir_error(&error) => {
+                        continue;
+                    }
+                    Err(error) => return Err(error.into()),
+                };
                 if !entry.file_type().is_file() {
                     continue;
                 }
@@ -1060,7 +1080,13 @@ impl CandidateLister for FilesystemLister {
 fn walk_output_candidates(base_dir: &Path) -> Result<Vec<PathBuf>> {
     let mut paths = Vec::new();
     for entry in WalkDir::new(base_dir) {
-        let entry = entry?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) if is_skippable_walkdir_error(&error) => {
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
         if !entry.file_type().is_file() {
             continue;
         }
@@ -1158,7 +1184,8 @@ mod tests {
 
     use super::{
         cached_worktree_root, combined_inputs_hash, combined_outputs_hash, dedupe_and_sort_entries,
-        file_entry_from_path, path_matches_resolve_requests, prefix_union, prior_entries_by_path,
+        file_entry_from_path, is_skippable_walkdir_error, is_skippable_walkdir_io_error,
+        path_matches_resolve_requests, prefix_union, prior_entries_by_path,
         qualified_base_dir_prefix, resolve_file_entries, resolve_inputs,
         resolve_inputs_with_options, resolve_inputs_with_semantics, resolve_literal_request,
         resolve_outputs, resolve_outputs_with_options, resolve_wildcard_with_candidates,
@@ -1168,6 +1195,33 @@ mod tests {
     };
     use crate::FileEntry;
     use crate::Result;
+
+    #[test]
+    fn output_walks_error_when_root_is_missing() {
+        let temp = TempDir::new().unwrap();
+        let missing = temp.path().join("missing");
+        assert!(walk_output_candidates(&missing).is_err());
+        assert!(FilesystemLister
+            .list(temp.path(), Some(&[PathBuf::from("missing")]))
+            .is_ok());
+    }
+
+    #[test]
+    fn walkdir_not_found_is_skippable_only_below_root() {
+        let temp = TempDir::new().unwrap();
+        let missing_root = temp.path().join("gone");
+        let root_error = walkdir::WalkDir::new(&missing_root)
+            .into_iter()
+            .next()
+            .unwrap()
+            .unwrap_err();
+        assert!(!is_skippable_walkdir_error(&root_error));
+        let not_found = std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert!(is_skippable_walkdir_io_error(1, Some(&not_found)));
+        assert!(!is_skippable_walkdir_io_error(0, Some(&not_found)));
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert!(!is_skippable_walkdir_io_error(1, Some(&denied)));
+    }
 
     #[test]
     fn listing_cache_reuses_walks_within_run_and_fresh_cache_rewalks() {

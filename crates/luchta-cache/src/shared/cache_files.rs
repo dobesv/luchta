@@ -38,7 +38,7 @@ impl PreparedCacheFiles {
     /// staging directory rather than pre-existing local cache state.
     #[must_use]
     pub fn is_staged_path(&self, path: &Path) -> bool {
-        self.staged.contains_package_relative_path(path)
+        self.staged.is_package_relative_staging_path(path)
     }
 }
 
@@ -114,10 +114,12 @@ pub fn stage_cache_file_blob(
     paths: &SharedCachePaths,
     state_hash: &[u8; 32],
     target: CacheFileRestoreTarget<'_>,
+    staging_root: &Path,
 ) -> io::Result<CacheFileReadResult> {
     let staged = match restore_file_blob_staged_with_size_cap(
         &cache_file_blob_path(paths, state_hash),
         target.package_dir,
+        staging_root,
         Some(target.size_cap_bytes),
     )? {
         BlobReadResultWithMeta::Restored(staged) => staged,
@@ -237,6 +239,7 @@ impl SharedCache {
                 patterns: request.patterns,
                 size_cap_bytes: self.size_cap_bytes,
             },
+            &self.staging_root,
         ) {
             Ok(CacheFileReadResult::Staged(staged)) => Some(staged),
             Ok(CacheFileReadResult::Missing | CacheFileReadResult::Corrupt) => None,
@@ -374,6 +377,7 @@ mod tests {
                 patterns: &patterns,
                 size_cap_bytes: 1_000,
             },
+            &temp.path().join(".luchta/tmp"),
         )
         .unwrap() else {
             panic!("cache files should stage");
@@ -383,7 +387,12 @@ mod tests {
             [PathBuf::from("cache/a.bin"), PathBuf::from("cache/b.bin")]
         );
         assert!(!destination.join("cache").exists());
+        assert_eq!(fs::read_dir(&destination).unwrap().count(), 0);
+        let staging_root = temp.path().join(".luchta/tmp");
+        assert_eq!(fs::read_dir(&staging_root).unwrap().count(), 1);
         staged.commit().unwrap();
+        assert_eq!(fs::read_dir(&staging_root).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(&destination).unwrap().count(), 1);
         assert_eq!(fs::read(destination.join("cache/a.bin")).unwrap(), b"a");
         assert_eq!(fs::read(destination.join("cache/b.bin")).unwrap(), b"b");
         assert!(!destination.join("cache/tmp/ignored.bin").exists());
@@ -420,6 +429,7 @@ mod tests {
                     patterns: &["expected.bin".to_owned()],
                     size_cap_bytes: 1_000,
                 },
+                &temp.path().join(".luchta/tmp"),
             )
             .unwrap(),
             CacheFileReadResult::Corrupt
@@ -435,6 +445,7 @@ mod tests {
                     patterns: &["other.bin".to_owned()],
                     size_cap_bytes: 1_000,
                 },
+                &temp.path().join(".luchta/tmp"),
             )
             .unwrap(),
             CacheFileReadResult::Missing
@@ -489,6 +500,7 @@ mod tests {
                     patterns: &["cache.bin".to_owned()],
                     size_cap_bytes: 4,
                 },
+                &temp.path().join(".luchta/tmp"),
             )
             .unwrap(),
             CacheFileReadResult::Corrupt
@@ -504,10 +516,15 @@ mod tests {
                     patterns: &["cache.bin".to_owned()],
                     size_cap_bytes: 10,
                 },
+                &temp.path().join(".luchta/tmp"),
             )
             .unwrap(),
             CacheFileReadResult::Corrupt
         ));
         assert!(fs::read_dir(&destination).unwrap().next().is_none());
+        assert!(fs::read_dir(temp.path().join(".luchta/tmp"))
+            .unwrap()
+            .next()
+            .is_none());
     }
 }

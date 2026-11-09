@@ -36,6 +36,7 @@ pub fn restore_blob(
     paths: &SharedCachePaths,
     outputs_hash: &[u8; 32],
     package_dir: &Path,
+    staging_root: &Path,
 ) -> io::Result<BlobReadResult> {
     let blob_path = blob_path(paths, outputs_hash);
     let compressed = match File::open(&blob_path) {
@@ -46,9 +47,7 @@ pub fn restore_blob(
         Err(error) => return Err(error),
     };
 
-    let staging_dir = tempfile::Builder::new()
-        .prefix("blob-restore-")
-        .tempdir_in(package_dir)?;
+    let staging_dir = create_restore_staging_dir(staging_root, package_dir, "blob-restore-")?;
 
     // No half-extracted poisoning: unpack whole archive into isolated temp dir
     // first, then move validated files into package tree only after full success.
@@ -100,9 +99,99 @@ fn extract_blob_to_staging(
     Ok(())
 }
 
+fn ensure_restore_staging_ignored(staging_root: &Path) -> io::Result<()> {
+    use crate::store::{GITIGNORE_CONTENTS, GITIGNORE_FILE_NAME};
+
+    let parent = staging_root
+        .parent()
+        .ok_or_else(|| io::Error::other("staging root has no parent"))?;
+    let gitignore_path = parent.join(GITIGNORE_FILE_NAME);
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&gitignore_path)
+    {
+        Ok(mut file) => file.write_all(GITIGNORE_CONTENTS.as_bytes()),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            let existing = fs::read(&gitignore_path)?;
+            let last_rule = existing
+                .split(|byte| *byte == b'\n')
+                .rev()
+                .map(|line| line.trim_ascii())
+                .find(|line| !line.is_empty());
+            if existing == GITIGNORE_CONTENTS.as_bytes() || last_rule == Some(b"/tmp/".as_slice()) {
+                return Ok(());
+            }
+            // Preserve user rules; the narrow final rule also overrides an
+            // earlier negation that could expose live restore files.
+            let mut file = fs::OpenOptions::new().append(true).open(gitignore_path)?;
+            if !existing.ends_with(b"\n") {
+                file.write_all(b"\n")?;
+            }
+            file.write_all(b"/tmp/\n")
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn create_restore_staging_dir(
+    staging_root: &Path,
+    package_dir: &Path,
+    prefix: &str,
+) -> io::Result<TempDir> {
+    let preferred = || {
+        fs::create_dir_all(staging_root)?;
+        ensure_restore_staging_ignored(staging_root)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+
+            if fs::metadata(staging_root)?.dev() != fs::metadata(package_dir)?.dev() {
+                return Err(io::ErrorKind::CrossesDevices.into());
+            }
+        }
+        tempfile::Builder::new()
+            .prefix(prefix)
+            .tempdir_in(staging_root)
+    };
+    // A read-only repo or a package on another filesystem must still restore.
+    preferred().or_else(|_| {
+        tempfile::Builder::new()
+            .prefix(prefix)
+            .tempdir_in(package_dir)
+    })
+}
+
+fn rename_restored_file(source: &Path, target: &Path) -> io::Result<()> {
+    match fs::rename(source, target) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::CrossesDevices => {
+            // A nested mount can differ from the package's device. Copy into
+            // destination-local staging, then rename so readers never see a
+            // partially copied output. The archive was fully validated already.
+            let parent = target
+                .parent()
+                .ok_or_else(|| io::Error::other("output has no parent"))?;
+            let staging = tempfile::Builder::new()
+                .prefix("blob-restore-")
+                .tempdir_in(parent)?;
+            let staged_file = staging.path().join("output");
+            fs::copy(source, &staged_file)?;
+            fs::rename(staged_file, target)?;
+            // The output is committed. Cleanup must not turn that success
+            // into an error or omit the target from written_paths.
+            let _ = fs::remove_file(source);
+            drop(staging);
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn apply_staging_dir(staging_dir: TempDir, package_dir: &Path) -> io::Result<()> {
     move_tree(staging_dir.path(), package_dir)?;
-    staging_dir.close()
+    drop(staging_dir);
+    Ok(())
 }
 
 fn move_tree(from_dir: &Path, to_dir: &Path) -> io::Result<()> {
@@ -115,7 +204,7 @@ fn move_tree(from_dir: &Path, to_dir: &Path) -> io::Result<()> {
         if file_type.is_dir() {
             fs::create_dir_all(&target_path)?;
             move_tree(&source_path, &target_path)?;
-            fs::remove_dir(&source_path)?;
+            let _ = fs::remove_dir(&source_path);
             continue;
         }
 
@@ -123,7 +212,7 @@ fn move_tree(from_dir: &Path, to_dir: &Path) -> io::Result<()> {
             fs::create_dir_all(parent)?;
         }
 
-        fs::rename(&source_path, &target_path)?;
+        rename_restored_file(&source_path, &target_path)?;
     }
 
     Ok(())
@@ -612,7 +701,13 @@ echo hi
         let restore_package_dir = temp_dir.path().join("pkg-restore");
         fs::create_dir_all(&restore_package_dir).unwrap();
 
-        let restore_result = restore_blob(&paths, &outputs_hash, &restore_package_dir).unwrap();
+        let restore_result = restore_blob(
+            &paths,
+            &outputs_hash,
+            &restore_package_dir,
+            &temp_dir.path().join(".luchta/tmp"),
+        )
+        .unwrap();
         assert_eq!(restore_result, BlobReadResult::Restored);
         assert_eq!(
             fs::read(restore_package_dir.join("dist/out.txt")).unwrap(),
@@ -640,7 +735,13 @@ echo hi
         let cache_dir = temp_dir.path().join("shared-cache");
         let paths = open_shared_paths(&cache_dir).unwrap();
 
-        let result = restore_blob(&paths, &[31_u8; 32], &package_dir).unwrap();
+        let result = restore_blob(
+            &paths,
+            &[31_u8; 32],
+            &package_dir,
+            &temp_dir.path().join(".luchta/tmp"),
+        )
+        .unwrap();
 
         assert_eq!(result, BlobReadResult::Missing);
         assert_eq!(read_tree_paths(&package_dir), Vec::<PathBuf>::new());
@@ -657,10 +758,20 @@ echo hi
 
         fs::write(blob_path(&paths, &outputs_hash), b"not a zstd tar blob").unwrap();
 
-        let result = restore_blob(&paths, &outputs_hash, &package_dir).unwrap();
+        let result = restore_blob(
+            &paths,
+            &outputs_hash,
+            &package_dir,
+            &temp_dir.path().join(".luchta/tmp"),
+        )
+        .unwrap();
 
         assert_eq!(result, BlobReadResult::Corrupt);
         assert_eq!(read_tree_paths(&package_dir), Vec::<PathBuf>::new());
+        assert!(fs::read_dir(temp_dir.path().join(".luchta/tmp"))
+            .unwrap()
+            .next()
+            .is_none());
     }
 
     #[test]
@@ -682,8 +793,13 @@ echo hi
         let archive_paths = list_entries(&blob_path).unwrap();
         assert_eq!(archive_paths, vec![PathBuf::from("../evil.txt")]);
 
-        let error =
-            restore_blob(&paths, &outputs_hash, &package_dir).expect_err("escape must error");
+        let error = restore_blob(
+            &paths,
+            &outputs_hash,
+            &package_dir,
+            &temp_dir.path().join(".luchta/tmp"),
+        )
+        .expect_err("escape must error");
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(!temp_dir.path().join("evil.txt").exists());
@@ -920,21 +1036,24 @@ pub fn restore_blob_with_meta(
     paths: &SharedCachePaths,
     outputs_hash: &[u8; 32],
     package_dir: &Path,
+    staging_root: &Path,
 ) -> io::Result<BlobReadResultWithMeta<StagedRestore>> {
     let blob_path = blob_path(paths, outputs_hash);
-    restore_file_blob_staged(&blob_path, package_dir)
+    restore_file_blob_staged(&blob_path, package_dir, staging_root)
 }
 
 pub(crate) fn restore_file_blob_staged(
     blob_path: &Path,
     package_dir: &Path,
+    staging_root: &Path,
 ) -> io::Result<BlobReadResultWithMeta<StagedRestore>> {
-    restore_file_blob_staged_with_size_cap(blob_path, package_dir, None)
+    restore_file_blob_staged_with_size_cap(blob_path, package_dir, staging_root, None)
 }
 
 pub(crate) fn restore_file_blob_staged_with_size_cap(
     blob_path: &Path,
     package_dir: &Path,
+    staging_root: &Path,
     size_cap_bytes: Option<u64>,
 ) -> io::Result<BlobReadResultWithMeta<StagedRestore>> {
     let compressed = match File::open(blob_path) {
@@ -945,9 +1064,7 @@ pub(crate) fn restore_file_blob_staged_with_size_cap(
         Err(error) => return Err(error),
     };
 
-    let staging_dir = tempfile::Builder::new()
-        .prefix("blob-restore-meta-")
-        .tempdir_in(package_dir)?;
+    let staging_dir = create_restore_staging_dir(staging_root, package_dir, "blob-restore-meta-")?;
 
     match extract_blob_with_meta_to_staging(
         compressed,
@@ -957,7 +1074,7 @@ pub(crate) fn restore_file_blob_staged_with_size_cap(
     ) {
         Ok(meta) => Ok(BlobReadResultWithMeta::Restored(StagedRestore {
             meta,
-            staging_dir,
+            staging_dir: Some(staging_dir),
             package_dir: package_dir.to_path_buf(),
         })),
         Err(RestoreError::Corrupt) => Ok(BlobReadResultWithMeta::Corrupt),
@@ -974,8 +1091,9 @@ pub fn restore_outputs_staged(
     paths: &SharedCachePaths,
     outputs_hash: &[u8; 32],
     package_dir: &Path,
+    staging_root: &Path,
 ) -> io::Result<BlobReadResultWithMeta<StagedRestore>> {
-    restore_blob_with_meta(paths, outputs_hash, package_dir)
+    restore_blob_with_meta(paths, outputs_hash, package_dir, staging_root)
 }
 
 /// A staged restore that holds extracted files in a temp directory.
@@ -986,16 +1104,13 @@ pub fn restore_outputs_staged(
 #[derive(Debug)]
 pub struct StagedRestore {
     pub meta: MetaFiles,
-    staging_dir: TempDir,
+    staging_dir: Option<TempDir>,
     package_dir: PathBuf,
 }
 
 impl StagedRestore {
     /// A staged restore holding no files. Commits to an empty path list.
     pub fn empty(package_dir: &Path) -> io::Result<Self> {
-        let staging_dir = tempfile::Builder::new()
-            .prefix("blob-restore-empty-")
-            .tempdir_in(package_dir)?;
         Ok(Self {
             meta: MetaFiles {
                 stdout: Vec::new(),
@@ -1003,31 +1118,37 @@ impl StagedRestore {
                 record: Vec::new(),
                 reports: Vec::new(),
             },
-            staging_dir,
+            staging_dir: None,
             package_dir: package_dir.to_path_buf(),
         })
     }
 
     /// Move all non-meta files from staging into the package directory.
     /// Returns absolute destination paths written into the package directory.
-    /// After this call, the staging directory is cleaned up.
+    /// Staging cleanup is best-effort once outputs are committed.
     pub fn commit(self) -> io::Result<Vec<PathBuf>> {
-        let written_paths = match move_non_meta_files(self.staging_dir.path(), &self.package_dir) {
+        let Some(staging_dir) = self.staging_dir else {
+            return Ok(Vec::new());
+        };
+        let written_paths = match move_non_meta_files(staging_dir.path(), &self.package_dir) {
             Ok(written_paths) => written_paths,
             Err(error) => return Err(io::Error::new(error.source.kind(), error.source)),
         };
-        self.staging_dir.close()?;
+        drop(staging_dir);
         Ok(written_paths)
     }
 
     /// Discard this restore without modifying the package directory.
     /// The staging directory is cleaned up.
     pub fn discard(self) -> io::Result<()> {
-        self.staging_dir.close()
+        self.staging_dir.map_or(Ok(()), TempDir::close)
     }
 
     pub(crate) fn relative_file_paths(&self) -> io::Result<Vec<PathBuf>> {
-        let mut paths = walkdir::WalkDir::new(self.staging_dir.path())
+        let Some(staging_dir) = &self.staging_dir else {
+            return Ok(Vec::new());
+        };
+        let mut paths = walkdir::WalkDir::new(staging_dir.path())
             .min_depth(1)
             .into_iter()
             .filter_map(|entry| match entry {
@@ -1039,7 +1160,7 @@ impl StagedRestore {
                 let entry = entry?;
                 entry
                     .path()
-                    .strip_prefix(self.staging_dir.path())
+                    .strip_prefix(staging_dir.path())
                     .map(Path::to_path_buf)
                     .map_err(io::Error::other)
             })
@@ -1049,11 +1170,14 @@ impl StagedRestore {
     }
 
     pub(crate) fn cache_files_hash(&self) -> io::Result<[u8; 32]> {
+        let Some(staging_dir) = &self.staging_dir else {
+            return Ok(crate::combined_cache_files_hash(&[]));
+        };
         let entries = self
             .relative_file_paths()?
             .into_iter()
             .map(|path| {
-                let absolute = self.staging_dir.path().join(&path);
+                let absolute = staging_dir.path().join(&path);
                 let metadata = fs::metadata(&absolute)?;
                 Ok(crate::FileEntry {
                     path: path.to_string_lossy().replace('\\', "/"),
@@ -1068,10 +1192,12 @@ impl StagedRestore {
         Ok(crate::combined_cache_files_hash(&entries))
     }
 
-    pub(crate) fn contains_package_relative_path(&self, path: &Path) -> bool {
-        self.package_dir
-            .join(path)
-            .starts_with(self.staging_dir.path())
+    /// Excludes private staged files from local state reconciliation when
+    /// staging is inside the root package or uses package-local fallback.
+    pub(crate) fn is_package_relative_staging_path(&self, path: &Path) -> bool {
+        self.staging_dir
+            .as_ref()
+            .is_some_and(|staging_dir| self.package_dir.join(path).starts_with(staging_dir.path()))
     }
 }
 
@@ -1281,10 +1407,7 @@ fn move_non_meta_files(from_dir: &Path, to_dir: &Path) -> Result<Vec<PathBuf>, M
                     });
                 }
             }
-            fs::remove_dir(&source_path).map_err(|source| MoveOutputsError {
-                source,
-                written_paths: written_paths.clone(),
-            })?;
+            let _ = fs::remove_dir(&source_path);
             continue;
         }
 
@@ -1295,7 +1418,7 @@ fn move_non_meta_files(from_dir: &Path, to_dir: &Path) -> Result<Vec<PathBuf>, M
             })?;
         }
 
-        fs::rename(&source_path, &target_path).map_err(|source| MoveOutputsError {
+        rename_restored_file(&source_path, &target_path).map_err(|source| MoveOutputsError {
             source,
             written_paths: written_paths.clone(),
         })?;
@@ -1377,3 +1500,7 @@ mod restore_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "blob_staging_tests.rs"]
+mod staging_tests;

@@ -106,6 +106,7 @@ variables through.
 - **Error Types:** Library errors should be clear and descriptive using `thiserror`.
 - **Async Traits:** Use native stable `async fn` in traits where possible (refer to `luchta-engine` for specific patterns).
 - **Worker reports**: Workers can attach reports via the `report` JSONL message. These are stored verbatim in the task cache and can be retrieved raw via `luchta logs --file <NAME>`. Native pretty-printing in `luchta logs` supports `application/sarif+json` and `application/vnd.ctrf+json` (dispatch by MIME type).
+- **Workspace walks must tolerate vanished entries:** Directory walks over user workspaces/package trees (`ignore` in the workers, `walkdir` in `luchta-cache`) skip `NotFound` errors for entries below the walk root (depth > 0) and still fail on a missing root or any other error. Transient dirs such as shared-cache restore staging, plus dangling symlinks under `follow_links(true)`, vanish mid-walk and must not abort the walk (#950). Follow the `is_skippable_walk_error` / `is_skippable_walkdir_error` helper pattern in the existing walkers and add a dangling-symlink test.
 
 ## Changeset Files
 
