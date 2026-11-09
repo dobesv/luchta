@@ -35,12 +35,10 @@ mod tests {
         );
     }
 
-    /// The wrapper must keep rustup's toolchain selection: tests that build
-    /// other crates with cargo otherwise let a dependency's own
-    /// `rust-toolchain.toml` pick the compiler.
+    /// Nested Cargo commands need the outer cache and toolchain selection.
     #[cfg(unix)]
     #[test]
-    fn hermetic_wrapper_keeps_rustup_toolchain_and_strips_the_rest() {
+    fn hermetic_wrapper_keeps_cargo_cache_and_toolchain_and_strips_the_rest() {
         let wrapper = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../scripts/nextest-hermetic.sh");
         let output = std::process::Command::new("sh")
@@ -48,6 +46,8 @@ mod tests {
             .arg("env")
             .env("RUSTUP_TOOLCHAIN", "probe-toolchain")
             .env("RUSTUP_HOME", "/probe/rustup")
+            .env("CARGO_HOME", "/probe/cargo")
+            .env("CARGO_UNLISTED_PROBE", "leaked")
             .env("LUCHTA_HERMETIC_LEAK_PROBE", "leaked")
             .output()
             .expect("run the hermetic wrapper");
@@ -65,6 +65,8 @@ mod tests {
             env.lines().any(|l| l == "RUSTUP_HOME=/probe/rustup"),
             "{env}"
         );
+        assert!(env.lines().any(|l| l == "CARGO_HOME=/probe/cargo"), "{env}");
+        assert!(!env.contains("CARGO_UNLISTED_PROBE"), "{env}");
         assert!(!env.contains("LUCHTA_HERMETIC_LEAK_PROBE"), "{env}");
     }
 }

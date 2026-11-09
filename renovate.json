@@ -23,6 +23,33 @@
       "matchManagers": ["github-actions"],
       "matchUpdateTypes": ["minor", "patch", "digest", "pin"],
       "automerge": true
+    },
+    {
+      "description": "Update the OXC toolchain and allocator patch together to keep Git revisions and shared types compatible",
+      "matchManagers": ["cargo", "custom.regex"],
+      "matchPackageNames": [
+        "https://github.com/oxc-project/oxc.git",
+        "/^oxc[_-]/"
+      ],
+      "groupName": "oxc toolchain",
+      "groupSlug": "oxc-toolchain",
+      "separateMajorMinor": false,
+      "separateMinorPatch": false
+    }
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Track the OXC allocator patch, which the Cargo manager does not extract",
+      "managerFilePatterns": [
+        "/^Cargo\\.toml$/"
+      ],
+      "matchStrings": [
+        "\\[patch\\.crates-io\\]\\s+oxc_allocator = \\{ git = \"https://github\\.com/oxc-project/oxc\\.git\", rev = \"(?<currentDigest>[a-f0-9]{40})\""
+      ],
+      "depNameTemplate": "oxc_allocator patch",
+      "packageNameTemplate": "https://github.com/oxc-project/oxc.git",
+      "datasourceTemplate": "git-refs"
     }
   ]
 }

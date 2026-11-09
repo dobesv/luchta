@@ -33,8 +33,9 @@ for HERMETIC_ENV_ENTRY in $(env); do
             ;;
 
         # Cargo and nextest inject per-test metadata and binary paths. Dynamic
-        # loader variables are required for linked test artifacts.
-        CARGO | CARGO_MANIFEST_DIR | CARGO_PKG_* | CARGO_BIN_EXE_* | CARGO_TARGET_TMPDIR | NEXTEST | NEXTEST_RUN_ID | NEXTEST_PROFILE | NEXTEST_VERSION | NEXTEST_WORKSPACE_ROOT | NEXTEST_BIN_EXE_* | NEXTEST_LD_* | NEXTEST_DYLD_* | LD_* | DYLD_*)
+        # loader variables are required for linked test artifacts. Keep the
+        # active Cargo cache for offline metadata and nested crate builds.
+        CARGO | CARGO_HOME | CARGO_MANIFEST_DIR | CARGO_PKG_* | CARGO_BIN_EXE_* | CARGO_TARGET_TMPDIR | NEXTEST | NEXTEST_RUN_ID | NEXTEST_PROFILE | NEXTEST_VERSION | NEXTEST_WORKSPACE_ROOT | NEXTEST_BIN_EXE_* | NEXTEST_LD_* | NEXTEST_DYLD_* | LD_* | DYLD_*)
             ;;
 
         # Tests that build another crate with cargo (escargot) must keep the
