@@ -356,12 +356,6 @@ dependencies = [
 
 [[package]]
 name = "bitflags"
-version = "1.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bef38d45163c2f1dde094a7dfd33ccf595c92905c8f8f4fdc18d06fb1037718a"
-
-[[package]]
-name = "bitflags"
 version = "2.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
@@ -755,37 +749,6 @@ checksum = "bef552e6f588e446098f6ba40d89ac146c8c7b64aade83c051ee00bb5d2bc18d"
 dependencies = [
  "serde",
  "uuid",
-]
-
-[[package]]
-name = "defmt"
-version = "1.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e2953bfe4f93bbd20cc71198842756f77d161884c99ebbabc41d80231ded88d1"
-dependencies = [
- "bitflags 1.3.2",
- "defmt-macros",
-]
-
-[[package]]
-name = "defmt-macros"
-version = "1.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bad9c72e7ca2137e0dc3813245a0d282fd6daad32fd800af018306a9169b5fe8"
-dependencies = [
- "defmt-parser",
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
-name = "defmt-parser"
-version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "10d60334b3b2e7c9d91ef8150abfb6fa4c1c39ebbcf4a81c2e346aad939fee3e"
-dependencies = [
- "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -1333,7 +1296,7 @@ version = "0.19.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6f6af5321bfd3711a279d6b244d58532ba1cfabf9eb6374791f19929d8970082"
 dependencies = [
- "bitflags 2.13.2",
+ "bitflags",
  "bstr",
  "gix-path",
  "libc",
@@ -1479,7 +1442,7 @@ version = "0.27.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b417cf515fd8c91468b578071f76d6cba716f8a1eccd853906bff4908b2c1413"
 dependencies = [
- "bitflags 2.13.2",
+ "bitflags",
  "bstr",
  "gix-features",
  "gix-path",
@@ -1537,7 +1500,7 @@ version = "0.55.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "632e16cb48b0e88a747e106924cb2765194105d8070a7a961b0d080ed806c632"
 dependencies = [
- "bitflags 2.13.2",
+ "bitflags",
  "bstr",
  "filetime",
  "fnv",
@@ -1686,7 +1649,7 @@ version = "0.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c92e44c63ba53bb55aa88ee48847664beae9446417621582fb14dfc69b2f8c72"
 dependencies = [
- "bitflags 2.13.2",
+ "bitflags",
  "bstr",
  "gix-attributes",
  "gix-config-value",
@@ -1764,7 +1727,7 @@ version = "0.49.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4577b864c3e134697e91564553e43230c2e401bb1bcc51cfa998edca21c95078"
 dependencies = [
- "bitflags 2.13.2",
+ "bitflags",
  "bstr",
  "gix-commitgraph",
  "gix-date",
@@ -1799,7 +1762,7 @@ version = "0.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "af4fe6c152c1d50aea36f299825702cd37e303307832fec1d0fdd5844e47ce2f"
 dependencies = [
- "bitflags 2.13.2",
+ "bitflags",
  "gix-path",
  "libc",
  "windows-sys 0.61.2",
@@ -1900,7 +1863,7 @@ version = "0.61.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9af3503668739f4de5dba57fe15cfd9adc443b08bcbbf195e5de16b648872245"
 dependencies = [
- "bitflags 2.13.2",
+ "bitflags",
  "gix-commitgraph",
  "gix-date",
  "gix-hash",
@@ -2010,7 +1973,7 @@ version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0bf760ebf69878d9fd8f110c89703d90ce35095324d1f1edcb595c63945ee757"
 dependencies = [
- "bitflags 2.13.2",
+ "bitflags",
  "ignore",
  "walkdir",
 ]
@@ -2439,7 +2402,7 @@ version = "0.11.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4cc00ea907cab49550b7da656f80ebb97be1b997d931fbcd28d39734e17ce592"
 dependencies = [
- "bitflags 2.13.2",
+ "bitflags",
  "inotify-sys",
  "libc",
 ]
@@ -2514,11 +2477,10 @@ dependencies = [
 
 [[package]]
 name = "jiff"
-version = "0.2.37"
+version = "0.2.41"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ab1baf72f08796de0260609515130699b890ac25f30e610ad894bc5856cafdb"
+checksum = "fcefdcefac59ac8f8401852e3427d55610481fc41e6625c39bac62d2d771623a"
 dependencies = [
- "defmt",
  "jiff-core",
  "jiff-static",
  "jiff-tzdb-platform",
@@ -2531,19 +2493,18 @@ dependencies = [
 
 [[package]]
 name = "jiff-core"
-version = "0.1.1"
+version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5e52fe76043ccecc9005d2305ebaadf7d7fc0cc89ca6baa10a94d6bc68c7128c"
+checksum = "77a24020db0ee88d1c681d677681bd31f9f4ea189a455425223d52ce4f1508aa"
 dependencies = [
- "defmt",
  "log",
 ]
 
 [[package]]
 name = "jiff-static"
-version = "0.2.37"
+version = "0.2.41"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "378268a1116ad67ae6228701118ac9f491d78fda38a40a1f1a9e1348de6f7212"
+checksum = "203edf9b0ce4083ec8fbf4adc823eac89768ea994b4953fc0dab1b90083234dd"
 dependencies = [
  "jiff-core",
  "proc-macro2",
@@ -2630,7 +2591,7 @@ version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "07293a4e297ac234359b510362495713f75ea345d5307140414f20c69ffeb087"
 dependencies = [
- "bitflags 2.13.2",
+ "bitflags",
  "libc",
 ]
 
@@ -3303,7 +3264,7 @@ version = "9.0.0-rc.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7768eb7201a1964d8eb10224e850df046ab584ee3c3d26e340a993d81f748148"
 dependencies = [
- "bitflags 2.13.2",
+ "bitflags",
  "inotify",
  "kqueue",
  "libc",
@@ -3337,7 +3298,7 @@ version = "2.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "42b8cfee0e339a0337359f3c88165702ac6e600dc01c0cc9579a92d62b08477a"
 dependencies = [
- "bitflags 2.13.2",
+ "bitflags",
 ]
 
 [[package]]
@@ -3404,7 +3365,7 @@ version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2a180dd8642fa45cdb7dd721cd4c11b1cadd4929ce112ebd8b9f5803cc79d536"
 dependencies = [
- "bitflags 2.13.2",
+ "bitflags",
 ]
 
 [[package]]
@@ -3528,7 +3489,7 @@ name = "oxc_ast"
 version = "0.158.0"
 source = "git+https://github.com/oxc-project/oxc.git?rev=696acfa7e3f71732c7fd2cca3e8dc303e18195cd#696acfa7e3f71732c7fd2cca3e8dc303e18195cd"
 dependencies = [
- "bitflags 2.13.2",
+ "bitflags",
  "oxc_allocator",
  "oxc_ast_macros",
  "oxc_data_structures",
@@ -3567,7 +3528,7 @@ name = "oxc_cfg"
 version = "0.158.0"
 source = "git+https://github.com/oxc-project/oxc.git?rev=696acfa7e3f71732c7fd2cca3e8dc303e18195cd#696acfa7e3f71732c7fd2cca3e8dc303e18195cd"
 dependencies = [
- "bitflags 2.13.2",
+ "bitflags",
  "itertools",
  "oxc_index",
  "oxc_syntax",
@@ -3580,7 +3541,7 @@ name = "oxc_codegen"
 version = "0.158.0"
 source = "git+https://github.com/oxc-project/oxc.git?rev=696acfa7e3f71732c7fd2cca3e8dc303e18195cd#696acfa7e3f71732c7fd2cca3e8dc303e18195cd"
 dependencies = [
- "bitflags 2.13.2",
+ "bitflags",
  "cow-utils",
  "oxc_allocator",
  "oxc_ast",
@@ -3784,7 +3745,7 @@ name = "oxc_linter"
 version = "1.93.0"
 source = "git+https://github.com/oxc-project/oxc.git?rev=696acfa7e3f71732c7fd2cca3e8dc303e18195cd#696acfa7e3f71732c7fd2cca3e8dc303e18195cd"
 dependencies = [
- "bitflags 2.13.2",
+ "bitflags",
  "constcat",
  "convert_case",
  "cow-utils",
@@ -3851,7 +3812,7 @@ name = "oxc_parser"
 version = "0.158.0"
 source = "git+https://github.com/oxc-project/oxc.git?rev=696acfa7e3f71732c7fd2cca3e8dc303e18195cd#696acfa7e3f71732c7fd2cca3e8dc303e18195cd"
 dependencies = [
- "bitflags 2.13.2",
+ "bitflags",
  "cow-utils",
  "memchr",
  "num-bigint 0.5.1",
@@ -3896,7 +3857,7 @@ name = "oxc_regular_expression"
 version = "0.158.0"
 source = "git+https://github.com/oxc-project/oxc.git?rev=696acfa7e3f71732c7fd2cca3e8dc303e18195cd#696acfa7e3f71732c7fd2cca3e8dc303e18195cd"
 dependencies = [
- "bitflags 2.13.2",
+ "bitflags",
  "oxc_allocator",
  "oxc_ast_macros",
  "oxc_diagnostics",
@@ -4016,7 +3977,7 @@ name = "oxc_syntax"
 version = "0.158.0"
 source = "git+https://github.com/oxc-project/oxc.git?rev=696acfa7e3f71732c7fd2cca3e8dc303e18195cd#696acfa7e3f71732c7fd2cca3e8dc303e18195cd"
 dependencies = [
- "bitflags 2.13.2",
+ "bitflags",
  "cow-utils",
  "nonmax",
  "oxc_allocator",
@@ -4655,7 +4616,7 @@ version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed2bf2547551a7053d6fdfafda3f938979645c44812fbfcda098faae3f1a362d"
 dependencies = [
- "bitflags 2.13.2",
+ "bitflags",
 ]
 
 [[package]]
@@ -4773,7 +4734,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "891efababe418670775f199f0d233d84843c227a0949a883ce15b37c78d6629d"
 dependencies = [
- "bitflags 2.13.2",
+ "bitflags",
  "errno",
  "libc",
  "linux-raw-sys",
@@ -5453,7 +5414,7 @@ version = "29.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2839d2cf4e611b944438c304ec59396221b3db4580acd172fcd70522bb450ee9"
 dependencies = [
- "bitflags 2.13.2",
+ "bitflags",
  "is-macro",
  "num-bigint 0.4.8",
  "once_cell",
@@ -5728,7 +5689,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "792e76393e193a2f924a4349d37c56264edc09bc4e0cef996e750a39f4f6ce7c"
 dependencies = [
  "arrayvec",
- "bitflags 2.13.2",
+ "bitflags",
  "indexmap",
  "num-bigint 0.4.8",
  "num_cpus",
@@ -5762,7 +5723,7 @@ version = "45.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77d78327c5435b241272b5899b7a0013cc095334302d556b7ef6a55f5e44fc23"
 dependencies = [
- "bitflags 2.13.2",
+ "bitflags",
  "compact_str 0.7.1",
  "either",
  "num-bigint 0.4.8",
@@ -5844,7 +5805,7 @@ version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9c576fb9c0cf62046f6b56961ffe216f032a018f9914f2a942ae1263371377ee"
 dependencies = [
- "bitflags 2.13.2",
+ "bitflags",
  "is-macro",
  "swc_atoms",
  "swc_common",
@@ -5991,7 +5952,7 @@ checksum = "fc97833b8f0c89b580828c06a450cfd6c325e52e732d8a080b92ebcd952e8735"
 dependencies = [
  "Inflector",
  "anyhow",
- "bitflags 2.13.2",
+ "bitflags",
  "indexmap",
  "is-macro",
  "path-clean",
