@@ -785,7 +785,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -869,7 +869,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2436,7 +2436,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi",
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4738,7 +4738,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5238,9 +5238,9 @@ checksum = "b7401a30af6cb5818bb64852270bb722533397edcfc7344954a38f420819ece2"
 
 [[package]]
 name = "swc"
-version = "78.0.0"
+version = "78.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9cd23de665561dbafccb4148fb3db8f3a825f3a336c4811c2b2b92fe81233447"
+checksum = "c9eab6e4551d2ad8a8ab74e0636a02433c3aba23c7dbaa87952d9ae12dbddca0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -5395,9 +5395,9 @@ dependencies = [
 
 [[package]]
 name = "swc_core"
-version = "80.0.0"
+version = "80.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "70b5a734517d41c333bd9747f4fffa3547f431c0287b8ddc800e9fbb827ecaa1"
+checksum = "123419c05c582b488e2c597cddce57ef90517718d9fcf67b6c4e9fbd77965cc1"
 dependencies = [
  "swc",
  "swc_allocator",
@@ -5685,9 +5685,9 @@ dependencies = [
 
 [[package]]
 name = "swc_ecma_minifier"
-version = "61.0.8"
+version = "61.0.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "792e76393e193a2f924a4349d37c56264edc09bc4e0cef996e750a39f4f6ce7c"
+checksum = "b3979dd11994ac775604d468e8dfa9bdf026a01d6a8177b935d4faace31245bf"
 dependencies = [
  "arrayvec",
  "bitflags",
@@ -5720,9 +5720,9 @@ dependencies = [
 
 [[package]]
 name = "swc_ecma_parser"
-version = "45.1.4"
+version = "45.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "77d78327c5435b241272b5899b7a0013cc095334302d556b7ef6a55f5e44fc23"
+checksum = "a4af66bb9a4cbd2a600b41c2592e27b7947b7e30aa6918d321f987f9e0ff63f5"
 dependencies = [
  "bitflags",
  "compact_str 0.7.1",
@@ -5975,9 +5975,9 @@ dependencies = [
 
 [[package]]
 name = "swc_ecma_transforms_optimization"
-version = "52.0.1"
+version = "52.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "30670a4362543593b2bcc59a86d060b3ececc637c18adc92cf3f72845f84849f"
+checksum = "81534b978cee37ec7e8055fe04f32c195c82450eac2e3751f9629df7cbe7d69a"
 dependencies = [
  "bytes-str",
  "dashmap",
@@ -6265,7 +6265,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6275,7 +6275,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "230a1b821ccbd75b185820a1f1ff7b14d21da1e442e22c0863ea5f08771a8874"
 dependencies = [
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7072,7 +7072,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
