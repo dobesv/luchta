@@ -2967,6 +2967,29 @@ name = "luchta-test-support"
 version = "0.3.7"
 
 [[package]]
+name = "luchta-tsrs-worker"
+version = "0.3.7"
+dependencies = [
+ "luchta-lockfile-version",
+ "luchta-test-support",
+ "luchta-worker",
+ "luchta-yarn-env",
+ "mimalloc",
+ "pnp",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tsrs_ast",
+ "tsrs_compiler",
+ "tsrs_core",
+ "tsrs_diagnostics",
+ "tsrs_module",
+ "tsrs_tsoptions",
+ "tsrs_vfs",
+ "zip",
+]
+
+[[package]]
 name = "luchta-types"
 version = "0.3.7"
 dependencies = [
@@ -5072,6 +5095,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
+name = "smallbitvec"
+version = "2.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9b0e903ee191d8f7a8fbf0d712c3a1699d19e04ceba5ad1eb673053c7d938a09"
+
+[[package]]
 name = "smallvec"
 version = "1.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6776,6 +6805,301 @@ name = "try-lock"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
+
+[[package]]
+name = "tsrs_ast"
+version = "0.23.0"
+source = "git+https://github.com/oxc-project/tsrs.git?rev=cb2d7948f3686cba8448963a5147b0840bb53e5e#cb2d7948f3686cba8448963a5147b0840bb53e5e"
+dependencies = [
+ "bitflags",
+ "hashbrown 0.17.1",
+ "memchr",
+ "rustc-hash",
+ "tsrs_core",
+ "tsrs_diagnostics",
+ "tsrs_spanmap",
+]
+
+[[package]]
+name = "tsrs_astnav"
+version = "0.23.0"
+source = "git+https://github.com/oxc-project/tsrs.git?rev=cb2d7948f3686cba8448963a5147b0840bb53e5e#cb2d7948f3686cba8448963a5147b0840bb53e5e"
+dependencies = [
+ "tsrs_ast",
+ "tsrs_core",
+ "tsrs_scanner",
+]
+
+[[package]]
+name = "tsrs_binder"
+version = "0.23.0"
+source = "git+https://github.com/oxc-project/tsrs.git?rev=cb2d7948f3686cba8448963a5147b0840bb53e5e#cb2d7948f3686cba8448963a5147b0840bb53e5e"
+dependencies = [
+ "bitflags",
+ "rustc-hash",
+ "tsrs_ast",
+ "tsrs_core",
+ "tsrs_diagnostics",
+ "tsrs_scanner",
+]
+
+[[package]]
+name = "tsrs_checker"
+version = "0.23.0"
+source = "git+https://github.com/oxc-project/tsrs.git?rev=cb2d7948f3686cba8448963a5147b0840bb53e5e#cb2d7948f3686cba8448963a5147b0840bb53e5e"
+dependencies = [
+ "bitflags",
+ "hashbrown 0.17.1",
+ "rustc-hash",
+ "smallbitvec",
+ "smallvec",
+ "tsrs_ast",
+ "tsrs_astnav",
+ "tsrs_binder",
+ "tsrs_core",
+ "tsrs_diagnostics",
+ "tsrs_module",
+ "tsrs_modulespecifiers",
+ "tsrs_parser",
+ "tsrs_printer",
+ "tsrs_pseudochecker",
+ "tsrs_scanner",
+ "tsrs_tsoptions",
+ "xxhash-rust",
+]
+
+[[package]]
+name = "tsrs_compiler"
+version = "0.23.0"
+source = "git+https://github.com/oxc-project/tsrs.git?rev=cb2d7948f3686cba8448963a5147b0840bb53e5e#cb2d7948f3686cba8448963a5147b0840bb53e5e"
+dependencies = [
+ "rayon",
+ "rustc-hash",
+ "tsrs_ast",
+ "tsrs_binder",
+ "tsrs_checker",
+ "tsrs_contentmapper",
+ "tsrs_core",
+ "tsrs_declarations",
+ "tsrs_diagnostics",
+ "tsrs_module",
+ "tsrs_modulespecifiers",
+ "tsrs_parser",
+ "tsrs_printer",
+ "tsrs_scanner",
+ "tsrs_sourcemap",
+ "tsrs_spanmap",
+ "tsrs_transformers",
+ "tsrs_tsoptions",
+ "tsrs_vfs",
+]
+
+[[package]]
+name = "tsrs_contentmapper"
+version = "0.23.0"
+source = "git+https://github.com/oxc-project/tsrs.git?rev=cb2d7948f3686cba8448963a5147b0840bb53e5e#cb2d7948f3686cba8448963a5147b0840bb53e5e"
+dependencies = [
+ "rustc-hash",
+ "tsrs_ast",
+ "tsrs_core",
+ "tsrs_diagnostics",
+ "tsrs_ipc",
+ "tsrs_parser",
+ "tsrs_spanmap",
+ "tsrs_tsoptions",
+ "xxhash-rust",
+]
+
+[[package]]
+name = "tsrs_core"
+version = "0.23.0"
+source = "git+https://github.com/dobesv/tsrs.git?rev=b16b8c00e7a3cb3b33727d488df76fb26d7fd5da#b16b8c00e7a3cb3b33727d488df76fb26d7fd5da"
+dependencies = [
+ "dragonbox_ecma",
+ "hashbrown 0.17.1",
+ "icu_normalizer",
+ "indexmap",
+ "libc",
+ "memchr",
+ "num-bigint 0.5.1",
+ "num-traits",
+ "rustc-hash",
+ "simdutf8",
+ "unicode-id-start",
+]
+
+[[package]]
+name = "tsrs_declarations"
+version = "0.23.0"
+source = "git+https://github.com/oxc-project/tsrs.git?rev=cb2d7948f3686cba8448963a5147b0840bb53e5e#cb2d7948f3686cba8448963a5147b0840bb53e5e"
+dependencies = [
+ "rustc-hash",
+ "tsrs_ast",
+ "tsrs_checker",
+ "tsrs_core",
+ "tsrs_diagnostics",
+ "tsrs_modulespecifiers",
+ "tsrs_printer",
+ "tsrs_scanner",
+ "tsrs_transformers",
+ "tsrs_tsoptions",
+]
+
+[[package]]
+name = "tsrs_diagnostics"
+version = "0.23.0"
+source = "git+https://github.com/oxc-project/tsrs.git?rev=cb2d7948f3686cba8448963a5147b0840bb53e5e#cb2d7948f3686cba8448963a5147b0840bb53e5e"
+dependencies = [
+ "rustc-hash",
+]
+
+[[package]]
+name = "tsrs_ipc"
+version = "0.23.0"
+source = "git+https://github.com/oxc-project/tsrs.git?rev=cb2d7948f3686cba8448963a5147b0840bb53e5e#cb2d7948f3686cba8448963a5147b0840bb53e5e"
+dependencies = [
+ "rustc-hash",
+ "tsrs_core",
+]
+
+[[package]]
+name = "tsrs_module"
+version = "0.23.0"
+source = "git+https://github.com/oxc-project/tsrs.git?rev=cb2d7948f3686cba8448963a5147b0840bb53e5e#cb2d7948f3686cba8448963a5147b0840bb53e5e"
+dependencies = [
+ "bitflags",
+ "hashbrown 0.17.1",
+ "rustc-hash",
+ "tsrs_ast",
+ "tsrs_core",
+ "tsrs_diagnostics",
+ "tsrs_vfs",
+]
+
+[[package]]
+name = "tsrs_modulespecifiers"
+version = "0.23.0"
+source = "git+https://github.com/oxc-project/tsrs.git?rev=cb2d7948f3686cba8448963a5147b0840bb53e5e#cb2d7948f3686cba8448963a5147b0840bb53e5e"
+dependencies = [
+ "regex",
+ "rustc-hash",
+ "tsrs_ast",
+ "tsrs_core",
+ "tsrs_module",
+ "tsrs_tsoptions",
+]
+
+[[package]]
+name = "tsrs_parser"
+version = "0.23.0"
+source = "git+https://github.com/oxc-project/tsrs.git?rev=cb2d7948f3686cba8448963a5147b0840bb53e5e#cb2d7948f3686cba8448963a5147b0840bb53e5e"
+dependencies = [
+ "bitflags",
+ "rustc-hash",
+ "tsrs_ast",
+ "tsrs_core",
+ "tsrs_diagnostics",
+ "tsrs_scanner",
+]
+
+[[package]]
+name = "tsrs_printer"
+version = "0.23.0"
+source = "git+https://github.com/oxc-project/tsrs.git?rev=cb2d7948f3686cba8448963a5147b0840bb53e5e#cb2d7948f3686cba8448963a5147b0840bb53e5e"
+dependencies = [
+ "bitflags",
+ "rustc-hash",
+ "tsrs_ast",
+ "tsrs_core",
+ "tsrs_scanner",
+ "tsrs_sourcemap",
+]
+
+[[package]]
+name = "tsrs_pseudochecker"
+version = "0.23.0"
+source = "git+https://github.com/oxc-project/tsrs.git?rev=cb2d7948f3686cba8448963a5147b0840bb53e5e#cb2d7948f3686cba8448963a5147b0840bb53e5e"
+dependencies = [
+ "tsrs_ast",
+ "tsrs_core",
+]
+
+[[package]]
+name = "tsrs_scanner"
+version = "0.23.0"
+source = "git+https://github.com/oxc-project/tsrs.git?rev=cb2d7948f3686cba8448963a5147b0840bb53e5e#cb2d7948f3686cba8448963a5147b0840bb53e5e"
+dependencies = [
+ "bitflags",
+ "memchr",
+ "rustc-hash",
+ "tsrs_ast",
+ "tsrs_core",
+ "tsrs_diagnostics",
+]
+
+[[package]]
+name = "tsrs_sourcemap"
+version = "0.23.0"
+source = "git+https://github.com/oxc-project/tsrs.git?rev=cb2d7948f3686cba8448963a5147b0840bb53e5e#cb2d7948f3686cba8448963a5147b0840bb53e5e"
+dependencies = [
+ "rustc-hash",
+ "tsrs_ast",
+ "tsrs_core",
+ "tsrs_scanner",
+]
+
+[[package]]
+name = "tsrs_spanmap"
+version = "0.23.0"
+source = "git+https://github.com/oxc-project/tsrs.git?rev=cb2d7948f3686cba8448963a5147b0840bb53e5e#cb2d7948f3686cba8448963a5147b0840bb53e5e"
+dependencies = [
+ "bitflags",
+ "tsrs_core",
+]
+
+[[package]]
+name = "tsrs_transformers"
+version = "0.23.0"
+source = "git+https://github.com/oxc-project/tsrs.git?rev=cb2d7948f3686cba8448963a5147b0840bb53e5e#cb2d7948f3686cba8448963a5147b0840bb53e5e"
+dependencies = [
+ "bitflags",
+ "rustc-hash",
+ "tsrs_ast",
+ "tsrs_binder",
+ "tsrs_checker",
+ "tsrs_core",
+ "tsrs_printer",
+ "tsrs_scanner",
+ "tsrs_tsoptions",
+]
+
+[[package]]
+name = "tsrs_tsoptions"
+version = "0.23.0"
+source = "git+https://github.com/oxc-project/tsrs.git?rev=cb2d7948f3686cba8448963a5147b0840bb53e5e#cb2d7948f3686cba8448963a5147b0840bb53e5e"
+dependencies = [
+ "rustc-hash",
+ "tsrs_ast",
+ "tsrs_core",
+ "tsrs_diagnostics",
+ "tsrs_module",
+ "tsrs_parser",
+ "tsrs_scanner",
+ "tsrs_vfs",
+ "xxhash-rust",
+]
+
+[[package]]
+name = "tsrs_vfs"
+version = "0.23.0"
+source = "git+https://github.com/oxc-project/tsrs.git?rev=cb2d7948f3686cba8448963a5147b0840bb53e5e#cb2d7948f3686cba8448963a5147b0840bb53e5e"
+dependencies = [
+ "bitflags",
+ "rayon",
+ "rustc-hash",
+ "rustix",
+ "tsrs_core",
+]
 
 [[package]]
 name = "typed-builder"

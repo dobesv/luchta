@@ -31,6 +31,7 @@ members = [
     "crates/luchta-ast-grep-worker",
     "crates/luchta-oxlint-worker",
     "crates/luchta-oxc-transform-worker",
+    "crates/luchta-tsrs-worker",
     "crates/luchta-swc-transform-worker",
     "crates/luchta-oxfmt-worker",
     "xtask",
@@ -41,10 +42,10 @@ edition = "2021"
 version = "0.3.7"
 license = "MIT"
 authors = ["Luchta Contributors"]
-# Rust 1.97.0 required by oxc at pinned rev 6bba2cb4925b7b618409bbde1e8488ca86b96255,
-# which is now the binding constraint. The registry crates oxc_sourcemap,
-# oxc_resolver and oxc-browserslist require >= 1.95.0.
-rust-version = "1.97.0"
+# Rust 1.99 required by tsrs at pinned rev cb2d7948f3686cba8448963a5147b0840bb53e5e,
+# which is the binding constraint. OXC at pinned rev
+# fa492d66e0df5d88ef68cf4c20d40f676611e547 requires Rust >= 1.97.0.
+rust-version = "1.99"
 repository = "https://example.com/luchta"
 homepage = "https://example.com/luchta"
 description = "Rust monorepo build orchestration tool"
@@ -59,6 +60,12 @@ description = "Rust monorepo build orchestration tool"
 # renovate.json tracks this entry as part of the OXC toolchain group.
 [patch.crates-io]
 oxc_allocator = { git = "https://github.com/oxc-project/oxc.git", rev = "fa492d66e0df5d88ef68cf4c20d40f676611e547", package = "oxc_allocator" }
+
+# tsrs_core pins unicode-id-start =1.1.2, but SWC requires ^1.2.0. This fork
+# relaxes that constraint; identifiers may include newer Unicode 16/17 characters.
+# Rebase the fork on the upstream revision below whenever tsrs is bumped.
+[patch."https://github.com/oxc-project/tsrs.git"]
+tsrs_core = { git = "https://github.com/dobesv/tsrs.git", rev = "b16b8c00e7a3cb3b33727d488df76fb26d7fd5da" }
 
 [workspace.dependencies]
 petgraph = "0.8.3"
@@ -103,7 +110,7 @@ notify-debouncer-full = "0.8.0-rc.2"
 # cmake, which we don't want to require of every build environment.
 mimalloc = "0.1.43"
 
-# oxc toolchain pinned to a single main rev 6bba2cb4925b7b618409bbde1e8488ca86b96255
+# oxc toolchain pinned to a single main rev fa492d66e0df5d88ef68cf4c20d40f676611e547
 # (oxc 0.158.0). Requires Rust >= 1.97.
 # The git pin is mandatory, not a style choice: oxc_linter, oxc_formatter_core
 # and oxc_formatter_css are not published to crates.io at all, and every
@@ -128,6 +135,15 @@ oxc_formatter_css = { git = "https://github.com/oxc-project/oxc.git", rev = "fa4
 json-strip-comments = "3.1.1"
 serde-sarif = "0.8.0"
 url = "2.5.8"
+
+# tsrs crates are unpublished. Keep all crates at this exact upstream revision.
+tsrs_ast = { git = "https://github.com/oxc-project/tsrs.git", rev = "cb2d7948f3686cba8448963a5147b0840bb53e5e" }
+tsrs_compiler = { git = "https://github.com/oxc-project/tsrs.git", rev = "cb2d7948f3686cba8448963a5147b0840bb53e5e" }
+tsrs_core = { git = "https://github.com/oxc-project/tsrs.git", rev = "cb2d7948f3686cba8448963a5147b0840bb53e5e" }
+tsrs_diagnostics = { git = "https://github.com/oxc-project/tsrs.git", rev = "cb2d7948f3686cba8448963a5147b0840bb53e5e" }
+tsrs_module = { git = "https://github.com/oxc-project/tsrs.git", rev = "cb2d7948f3686cba8448963a5147b0840bb53e5e" }
+tsrs_tsoptions = { git = "https://github.com/oxc-project/tsrs.git", rev = "cb2d7948f3686cba8448963a5147b0840bb53e5e" }
+tsrs_vfs = { git = "https://github.com/oxc-project/tsrs.git", rev = "cb2d7948f3686cba8448963a5147b0840bb53e5e" }
 
 # swc pinned exact — SWC breaks public API on minor bumps. See plan note a394e139 (probe).
 swc_core = { version = "=80.0.1", features = ["base_module", "common", "ecma_ast", "ecma_parser", "ecma_helpers_inline"] }

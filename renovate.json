@@ -8,6 +8,19 @@
   "automerge": false,
   "packageRules": [
     {
+      "description": "Update the tsrs toolchain together; each bump needs the dobesv/tsrs fork rebased and the [patch] rev updated",
+      "matchManagers": ["cargo"],
+      "matchPackageNames": [
+        "https://github.com/oxc-project/tsrs.git",
+        "/^tsrs_/"
+      ],
+      "groupName": "tsrs toolchain",
+      "groupSlug": "tsrs-toolchain",
+      "separateMajorMinor": false,
+      "separateMinorPatch": false,
+      "prBodyNotes": ["Rebase the dobesv/tsrs fork on this upstream revision and update the [patch] rev in Cargo.toml before merging."]
+    },
+    {
       "description": "Update the OXC toolchain and allocator patch together to keep Git revisions and shared types compatible",
       "matchManagers": ["cargo", "custom.regex"],
       "matchPackageNames": [

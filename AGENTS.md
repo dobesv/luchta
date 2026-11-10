@@ -18,7 +18,7 @@ Luchta is a Cargo workspace with the following crate layout:
 
 ## Key Architectural Decisions
 Agents must respect these fundamental design choices:
-- **Runtime:** Uses `tokio` for async I/O-bound process spawning. **Rayon is explicitly excluded.**
+- **Runtime:** Uses `tokio` for async I/O-bound process spawning. **Rayon is explicitly excluded** from Luchta's own code. Dependencies may run their own rayon pools internally (tsrs's type checkers do); that's fine, don't "fix" it.
 - **Concurrency Model:** Implements **weight-based concurrency** using `tokio::sync::Semaphore::acquire_many_owned(weight)`.
 - **Graph Logic:** Uses `petgraph::DiGraph` and `petgraph::algo::toposort` for cycle detection.
 - **Dual-Graph Separation:** Maintains separate **Package Graph** (package topology) and **Task Graph** (task execution units).
@@ -46,7 +46,12 @@ cargo xtask build-worker --target <triple>                  # Build the Go-based
 **CodeScene must be all green.** `cs delta` must report no new code-health
 problems (no degrading functions, no new code smells) before the work is
 considered done. A red or degrading CodeScene result is a blocker — fix the
-flagged code, do not merge around it.
+flagged code, do not merge around it. The one exception: when a flagged
+function shape is fixed by an upstream trait signature you implement (e.g.
+`tsrs_module::Resolver`'s five-argument methods), use a per-function
+`@codescene(disable:"<exact smell name>")` comment directly above the function
+and name the fixed signature in the comment — don't reshape the trait impl to
+appease the metric.
 
 **Do not ignore clippy warnings.** Treat every warning as an error; CI runs
 `cargo clippy -- -D warnings`.
@@ -191,9 +196,17 @@ them as workflow artifacts instead of publishing a release.
   `oxc toolchain` Renovate group includes a custom regex manager because the
   Cargo manager skips `[patch.crates-io]`; keep its matcher aligned with the
   allocator entry in `Cargo.toml`.
+- The tsrs crates follow the same pin discipline with one extra moving part:
+  all tsrs deps share one upstream git rev, and `tsrs_core` is redirected to
+  the dobesv/tsrs fork through a `[patch]` entry in the root `Cargo.toml`.
+  Renovate groups tsrs bumps, but neither Renovate nor Mergify merges them
+  automatically. Before merging, rebase the fork onto the new upstream rev and
+  update the `[patch]` rev. The pin guard doesn't check that the fork is based
+  on the upstream rev. The `xtask` test `tsrs_git_dependencies_share_one_revision`
+  checks both rev sets.
 - **Mergify** (`.mergify.yml`) runs a squash merge queue named `main`. It
-  auto-queues every Renovate PR (any update type, majors included) and any PR
-  labeled `automerge`. A batch only
+  auto-queues every Renovate PR (any update type, majors included), except
+  `renovate/tsrs-toolchain`, and any PR labeled `automerge`. A batch only
   merges once every CI check is green. The `Check` job runs as a per-OS matrix
   (ubuntu/windows/macos, and also runs clippy), producing `Check (<os>)`
   check-runs; alongside `Test` and `Format` (the job names in

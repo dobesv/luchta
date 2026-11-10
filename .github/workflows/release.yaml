@@ -191,6 +191,7 @@ jobs:
           luchta-tsc-worker
           luchta-oxlint-worker
           luchta-oxc-transform-worker
+          luchta-tsrs-worker
           luchta-swc-transform-worker
           luchta-oxfmt-worker
           luchta-ast-grep-worker
@@ -220,6 +221,7 @@ jobs:
         printf '' | "$rel/luchta-tsc-worker$ext"
         printf '' | "$rel/luchta-oxlint-worker$ext"
         printf '' | "$rel/luchta-oxc-transform-worker$ext"
+        printf '' | "$rel/luchta-tsrs-worker$ext"
         printf '' | "$rel/luchta-swc-transform-worker$ext"
         printf '' | "$rel/luchta-oxfmt-worker$ext"
         printf '' | "$rel/luchta-ast-grep-worker$ext"

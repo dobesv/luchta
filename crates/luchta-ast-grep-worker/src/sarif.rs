@@ -6,14 +6,14 @@ pub fn build_sarif(findings: &[Finding]) -> Result<String, String> {
     let entries: Vec<SarifFinding> = findings
         .iter()
         .map(|finding| SarifFinding {
-            rule_id: if finding.rule_id.is_empty() {
+            rule_id: Some(if finding.rule_id.is_empty() {
                 "ast-grep-rule".to_owned()
             } else {
                 finding.rule_id.clone()
-            },
+            }),
             level: map_level(&finding.severity),
             message: finding.message.clone(),
-            uri: finding.relative_uri.clone(),
+            uri: Some(finding.relative_uri.clone()),
             start_line: finding.start_line,
             start_column: finding.start_column,
             end_line: Some(finding.end_line),

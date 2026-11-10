@@ -72,7 +72,7 @@ If you prefer to install manually, download the appropriate archive for your pla
 
 ### From source
 
-To build and install Luchta from source, you will need the Rust toolchain and Go 1.26+ (for the TypeScript worker).
+To build and install Luchta from source, you will need the Rust toolchain (workspace MSRV is 1.99) and Go 1.26+ (for the TypeScript worker).
 
 ```bash
 # Ensure submodules are initialized
@@ -1052,6 +1052,37 @@ Reports are recorded in the task metadata and can be viewed via `luchta logs`.
 Standard worker binaries are resolved via `PATH`. They ship inside each release archive alongside the `luchta` binary. Add the extraction directory to your `PATH` so Luchta can locate them.
 
 - **luchta-tsc-worker** is a high-performance TypeScript/tsc worker built from an in-tree vendored and patched [TypeScript](https://github.com/microsoft/TypeScript) (see [Patch Maintenance](#patch-maintenance) above).
+
+  ##### luchta-tsrs-worker (experimental)
+
+  `luchta-tsrs-worker` is an alternative in-process TypeScript worker written in Rust. It embeds `oxc-project/tsrs`, a Rust port of `tsgo` targeting TypeScript 7.1.0-beta. It is experimental and opt-in.
+
+  To switch from `luchta-tsc-worker`, configure `workers.tsc` in your `luchta-config.*`:
+
+  ```typescript
+  workers: {
+    tsc: 'luchta-tsrs-worker',
+  }
+  ```
+
+  When wrapping the worker with `luchta-yarn-filter`, pass it after `--`:
+
+  ```typescript
+  workers: {
+    tsc: 'luchta-yarn-filter -- luchta-tsrs-worker',
+  }
+  ```
+
+  **Yarn PnP support:** Supports `.pnp.cjs` manifests (both inline and split data) and reads packages directly from zip archives in `.yarn/cache`. Manifests are cached across tasks and reloaded when files change.
+
+  **Known divergences from `luchta-tsc-worker`:**
+  - Diagnostic formatting follows TypeScript 7.1.0-beta rather than the Go worker's vendored compiler commit, so diagnostic wording and category labels may differ slightly.
+  - Identifiers accept Unicode 16 and 17 characters (tsrs uses relaxed `unicode-id-start` tables).
+  - PnP config resolution resolves valid bare package `extends` clauses (including inside zip archives), but missing bare config extends targets fall back to ancestor directory lookups instead of failing immediately at parse time; a typo'd bare `extends` silently takes the same fallback path.
+  - Optional peer dependencies without explicit peer requests are not filtered out of package identity keys.
+  - Declaration emit can report TS2883 ("inferred type ... cannot be named") where `luchta-tsc-worker` succeeds:
+    (a) an exported inferred type references a package listed only in `devDependencies` (TypeScript 7.1 excludes `devDependencies` when deciding which packages a declaration may import; the Go worker's older compiler doesn't), and
+    (b) under PnP, an inferred type needs a package the workspace doesn't declare itself (the Go worker emits an import that consumers can't resolve). Fix: add an explicit type annotation or declare the dependency.
 - **luchta-ast-grep-worker** scans source files in-process using the custom rules in `sgconfig.yml`. Inline `ast-grep-ignore` comments have the same next-line, same-line, file-level, and rule-specific suppression semantics as the ast-grep CLI, and suppressed matches are also excluded from `--fix`.
 - **luchta-yarn-worker** runs `package.json` scripts for Yarn Plug'n'Play
   projects. The task's `command` is the script name (defaulting to the task
