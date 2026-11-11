@@ -87,7 +87,7 @@ libc = "0.2.155"
 windows-sys = "0.61"
 tokio-stream = "0.1"
 tokio-util = { version = "0.7", features = ["codec"] }
-sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
+sysinfo = { version = "0.40.0", default-features = false, features = ["system"] }
 zstd = "0.14.0"
 tar = "0.4.44"
 dirs = "7.0.0"
