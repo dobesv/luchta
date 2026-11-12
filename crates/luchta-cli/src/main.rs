@@ -20,6 +20,7 @@ mod reports;
 mod rss;
 mod run;
 mod since;
+mod tool_versions;
 mod watch;
 mod why;
 

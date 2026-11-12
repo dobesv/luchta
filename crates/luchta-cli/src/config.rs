@@ -305,8 +305,14 @@ fn classify_spawn<T>(result: io::Result<T>) -> SpawnAttempt<T> {
 
 fn spawn_config_script(workspace_root: &Path, config_path: &Path) -> io::Result<Child> {
     let mut command = Command::new(config_path);
+    configure_config_script_command(&mut command, workspace_root);
+    command.spawn()
+}
+
+fn configure_config_script_command(command: &mut Command, workspace_root: &Path) {
     command
         .current_dir(workspace_root)
+        .env("LUCHTA_VERSION", env!("CARGO_PKG_VERSION"))
         .stdout(Stdio::piped())
         // Keep script stderr visible live by teeing piped stderr to process stderr while retaining a
         // bounded tail for diagnostics. Direct inherit would hide context in CI/remote failures.
@@ -314,8 +320,6 @@ fn spawn_config_script(workspace_root: &Path, config_path: &Path) -> io::Result<
 
     #[cfg(unix)]
     command.process_group(0);
-
-    command.spawn()
 }
 
 fn config_timeout() -> Duration {
@@ -635,6 +639,43 @@ echo '{"tasks":{"build":{"dependsOn":["^build"],"weight":2}},"concurrency":{"max
         assert_eq!(config.concurrency.max_weight, 10);
         assert_eq!(config.tasks["build"].weight, 2);
         assert_eq!(config.tasks["build"].depends_on.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn passes_luchta_version_to_config_script_overriding_inherited_value() {
+        let temp = tempdir().expect("tempdir");
+        let script = temp.path().join("luchta-config.sh");
+        fs::write(&script, "#!/bin/sh\nprintf '%s' \"$LUCHTA_VERSION\"\n").expect("write script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o755))
+                .expect("make script executable");
+        }
+
+        let mut command = super::Command::new(&script);
+        command.env("LUCHTA_VERSION", "bogus");
+        super::configure_config_script_command(&mut command, temp.path());
+
+        let output = super::spawn_with_retry(
+            || command.spawn(),
+            super::RetryConfig {
+                retries: super::EXECUTE_CONFIG_ETXTBSY_RETRIES,
+                backoff: super::EXECUTE_CONFIG_ETXTBSY_BACKOFF,
+                execute_error: || format!("failed to execute config script {}", script.display()),
+                exhausted_error: || format!("failed to execute config script {}", script.display()),
+            },
+        )
+        .await
+        .expect("spawn config script")
+        .wait_with_output()
+        .await
+        .expect("wait for config script");
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).expect("version should be UTF-8"),
+            env!("CARGO_PKG_VERSION")
+        );
     }
 
     #[tokio::test]

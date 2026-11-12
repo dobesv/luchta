@@ -304,6 +304,17 @@ mod tests {
     }
 
     #[test]
+    fn task_spec_hash_ignores_since_tool_declarations() {
+        for tool_version in [None, Some("swc_core=80.0.0".to_owned())] {
+            let mut task = sample_task_definition();
+            task.tool_version = tool_version;
+            let baseline = task_spec_hash(&task, None);
+            task.tools = vec!["luchta".to_owned(), "nodejs".to_owned()];
+            assert_eq!(baseline, task_spec_hash(&task, None));
+        }
+    }
+
+    #[test]
     fn task_spec_hash_changes_when_cache_file_declaration_changes() {
         for tool_version in [None, Some("swc_core=80.0.0".to_owned())] {
             let mut task = sample_task_definition();
@@ -754,6 +765,7 @@ mod tests {
             worker: Some("node".to_owned()),
             cache: Some(CacheConfig::default()),
             inputs: vec!["src/**/*.ts".to_owned(), "package.json".to_owned()],
+            tools: Vec::new(),
             outputs: vec!["dist/**".to_owned()],
             cache_files: Vec::new(),
             dependencies: vec!["**/*".to_string()],

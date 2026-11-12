@@ -224,6 +224,17 @@ pub struct TaskDefinition {
     /// Significant input paths or globs relative to workspace/package context.
     #[serde(default)]
     pub inputs: Vec<String>,
+    /// Names of workspace-root `.tool-versions` entries used for `--since`
+    /// selection. Version-based like `dependencies`, not file contents like
+    /// `inputs`; these exact names do not change dependency cache hashing.
+    ///
+    /// Kept a separate field rather than a `tool:`-style `dependencies`
+    /// pattern (issue #1090): assigning `dependencies` replaces its
+    /// conservative `["**/*"]` default, so a tool entry there would silently
+    /// drop npm-dependency cache hashing, and `dependencies` globs match npm
+    /// package names, which tool names like `node` collide with.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<String>,
     /// Output paths or globs produced by task for cache restore.
     #[serde(default)]
     pub outputs: Vec<String>,
@@ -268,6 +279,7 @@ impl TaskDefinition {
             worker: None,
             cache: None,
             inputs: Vec::new(),
+            tools: Vec::new(),
             outputs: Vec::new(),
             cache_files: Vec::new(),
             dependencies: default_dependencies(),
@@ -322,6 +334,7 @@ impl Default for TaskDefinition {
             worker: None,
             cache: None,
             inputs: Vec::new(),
+            tools: Vec::new(),
             outputs: Vec::new(),
             cache_files: Vec::new(),
             dependencies: default_dependencies(),
@@ -943,6 +956,29 @@ mod tests {
         assert!(task.outputs.is_empty());
         assert_eq!(task.dependencies, vec!["**/*".to_string()]);
         assert_eq!(task.env, BTreeMap::new());
+    }
+
+    #[test]
+    fn task_definition_tools_round_trips_without_changing_dependencies() {
+        let task: TaskDefinition =
+            serde_json::from_str(r#"{"tools":["luchta","nodejs"]}"#).unwrap();
+        assert_eq!(task.tools, ["luchta", "nodejs"]);
+        assert_eq!(task.dependencies, ["**/*"]);
+        let serialized = serde_json::to_value(&task).unwrap();
+        assert_eq!(serialized["tools"], serde_json::json!(["luchta", "nodejs"]));
+        assert_eq!(
+            serde_json::from_value::<TaskDefinition>(serialized).unwrap(),
+            task
+        );
+    }
+
+    #[test]
+    fn task_definition_empty_tools_are_omitted() {
+        for json in [r#"{}"#, r#"{"tools":[]}"#] {
+            let task: TaskDefinition = serde_json::from_str(json).unwrap();
+            assert!(task.tools.is_empty());
+            assert!(serde_json::to_value(&task).unwrap().get("tools").is_none());
+        }
     }
 
     #[test]

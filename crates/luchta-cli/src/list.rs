@@ -283,6 +283,7 @@ fn format_non_default_fields(task_def: &TaskDefinition) -> Vec<(String, String)>
         ));
     }
     push_nonempty_string_list(&mut fields, "inputs", &task_def.inputs);
+    push_nonempty_string_list(&mut fields, "tools", &task_def.tools);
     push_nonempty_string_list(&mut fields, "outputs", &task_def.outputs);
     push_nonempty_string_list(&mut fields, "cacheFiles", &task_def.cache_files);
     if task_def.dependencies != ["**/*"] {
@@ -408,6 +409,7 @@ mod tests {
                 cache_nonce: Some("abc".to_string()),
             }),
             inputs: vec!["src/**/*".to_string()],
+            tools: vec!["luchta".to_string()],
             outputs: vec!["dist/**/*".to_string()],
             cache_files: vec![".eslintcache".to_string()],
             dependencies: vec!["left-pad".to_string(), "react".to_string()],
@@ -424,6 +426,7 @@ mod tests {
                 ("weight".to_string(), "2".to_string()),
                 ("depends_on".to_string(), "[lint, pkg#build]".to_string()),
                 ("inputs".to_string(), "[src/**/*]".to_string()),
+                ("tools".to_string(), "[luchta]".to_string()),
                 ("outputs".to_string(), "[dist/**/*]".to_string()),
                 ("cacheFiles".to_string(), "[.eslintcache]".to_string()),
                 ("dependencies".to_string(), "[left-pad, react]".to_string(),),
