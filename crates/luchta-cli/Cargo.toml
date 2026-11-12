@@ -59,7 +59,7 @@ windows-sys = { workspace = true, features = [
 [dev-dependencies]
 assert_cmd = { workspace = true }
 assert_fs = { workspace = true }
-escargot = "0.5"
+escargot = "1.0"
 luchta-test-support = { path = "../luchta-test-support" }
 luchta-yarn-env = { path = "../luchta-yarn-env", features = ["test-fixture"] }
 predicates = { workspace = true }
