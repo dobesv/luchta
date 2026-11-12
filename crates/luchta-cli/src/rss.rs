@@ -417,9 +417,10 @@ mod platform {
     /// Linux walks `/proc` directly (see the sibling module). Platforms without
     /// `/proc` — macOS and Windows — enumerate the process table via `sysinfo`
     /// and follow parent links instead. Returns `None` when `root_pid` is not a
-    /// live process, matching the Linux implementation's contract.
+    /// live process, matching the Linux implementation's contract, and also
+    /// when `sysinfo` cannot open the process table.
     pub(super) fn process_tree_rss_bytes_for(root_pid: u32) -> Option<u64> {
-        let mut sys = System::new();
+        let mut sys = System::new().ok()?;
         sys.refresh_processes_specifics(
             ProcessesToUpdate::All,
             true,

@@ -171,14 +171,17 @@ them as workflow artifacts instead of publishing a release.
 ## Dependency Updates & Auto-merge
 
 - **Renovate** (`renovate.json`) opens PRs for dependency and GitHub Actions
-  updates. Minor/patch/digest/pin updates (including non-major Actions bumps)
-  are flagged for automerge; major updates require manual review.
+  updates but never merges them; its own `automerge` stays off. With it on,
+  Renovate merged #1017 two minutes after rebasing it, before CI had started on
+  the new commit, after Mergify had already dequeued that PR for a failing macOS
+  check. Merging is left to Mergify, which waits for the CI checks.
 - OXC Git dependencies and the allocator patch must share one revision. The
   `oxc toolchain` Renovate group includes a custom regex manager because the
   Cargo manager skips `[patch.crates-io]`; keep its matcher aligned with the
   allocator entry in `Cargo.toml`.
 - **Mergify** (`.mergify.yml`) runs a squash merge queue named `main`. It
-  auto-queues passing Renovate PRs and any PR labeled `automerge`. A batch only
+  auto-queues every Renovate PR (any update type, majors included) and any PR
+  labeled `automerge`. A batch only
   merges once every CI check is green. The `Check` job runs as a per-OS matrix
   (ubuntu/windows/macos, and also runs clippy), producing `Check (<os>)`
   check-runs; alongside `Test` and `Format` (the job names in
