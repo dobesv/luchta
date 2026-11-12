@@ -77,7 +77,7 @@ blake3 = "1.5.1"
 pnp = "0.12.12"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 gix = { version = "0.87.1", default-features = false, features = ["dirwalk", "status", "revision", "blob-diff", "sha1"] }
-bincode = { version = "2.0.1", features = ["serde"] }
+bincode = { version = "3.0.0", features = ["serde"] }
 yarn-lock-parser = "0.14.0"
 assert_cmd = "2.0.14"
 assert_fs = "1.1.1"
