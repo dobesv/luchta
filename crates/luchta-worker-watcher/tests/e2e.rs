@@ -6,7 +6,6 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use assert_cmd::cargo::cargo_bin;
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -47,14 +46,14 @@ impl Harness {
             WatchGlob::Absolute(glob) => tempdir.path().join(glob).display().to_string(),
         };
 
-        let child = std::process::Command::new(cargo_bin("luchta-worker-watcher"))
+        let child = std::process::Command::new(env!("CARGO_BIN_EXE_luchta-worker-watcher"))
             .current_dir(tempdir.path())
             .arg("--watch")
             .arg(watch_arg)
             .arg("--debounce-ms")
             .arg(DEBOUNCE_MS.to_string())
             .arg("--")
-            .arg(cargo_bin("mock-worker-delegate"))
+            .arg(env!("CARGO_BIN_EXE_mock-worker-delegate"))
             .env("MOCK_DELAY_MS", mock_delay_ms.to_string())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

@@ -9,7 +9,6 @@ use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use assert_cmd::cargo::CommandCargoExt;
 use luchta_engine::{WorkerMessage, WorkerRequest};
 use serde_json::Value;
 
@@ -19,7 +18,7 @@ fn run_line(request: WorkerRequest) -> String {
 }
 
 fn run_worker(input: &str) -> (Vec<Value>, String) {
-    let mut command = Command::cargo_bin("luchta-yarn-worker").expect("binary exists");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_luchta-yarn-worker"));
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

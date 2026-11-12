@@ -7,7 +7,6 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use assert_cmd::cargo::CommandCargoExt;
 use luchta_engine::{WorkerMessage, WorkerRequest};
 use luchta_yarn_env::test_fixture::{FixtureOptions, PnpFixture};
 use serde_json::Value;
@@ -110,7 +109,7 @@ fn run_job(fixture: &PnpFixture, scenario: Scenario) -> JobOutcome {
         serde_json::to_string(&WorkerMessage::Run(request)).unwrap()
     );
 
-    let mut worker = Command::cargo_bin("luchta-yarn-worker").expect("binary exists");
+    let mut worker = Command::new(env!("CARGO_BIN_EXE_luchta-yarn-worker"));
     worker
         .args(scenario.mode.worker_args())
         .current_dir(&fixture.root)

@@ -56,7 +56,6 @@ mimalloc = { workspace = true, features = ["local_dynamic_tls"] }
 luchta-lockfile-version = { path = "../luchta-lockfile-version" }
 
 [dev-dependencies]
-assert_cmd = { workspace = true }
 assert_fs = { workspace = true }
 luchta-engine = { path = "../luchta-engine" }
 serde_json = { workspace = true }

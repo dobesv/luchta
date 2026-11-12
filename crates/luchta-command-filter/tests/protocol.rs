@@ -1,7 +1,6 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-use assert_cmd::cargo::cargo_bin;
 use serde_json::Value;
 
 fn resolve_message(id: &str) -> String {
@@ -34,7 +33,7 @@ fn run_filter(
     argv.push("-c".to_owned());
     argv.push(delegate_script.to_owned());
 
-    let mut child = Command::new(cargo_bin("luchta-command-filter"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_luchta-command-filter"))
         .args(argv)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -95,7 +94,7 @@ fn resolve_prunes_when_predicate_exits_nonzero_without_spawning_delegate() {
         sentinel_path.display()
     );
 
-    let mut child = Command::new(cargo_bin("luchta-command-filter"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_luchta-command-filter"))
         .args(["sh", "-c", "exit 1", "--", "sh", "-c", &delegate_script])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

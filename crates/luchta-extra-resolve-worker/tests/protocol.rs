@@ -2,7 +2,6 @@ use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
-use assert_cmd::cargo::cargo_bin;
 use serde_json::{json, Value};
 
 const CONCURRENCY_GATE_MAX_ATTEMPTS: usize = 500;
@@ -177,7 +176,7 @@ fn run_worker(resolve_argv: &[String], delegate_argv: &[String], input_lines: &[
     argv.push("--".to_owned());
     argv.extend(delegate_argv.iter().cloned());
 
-    let mut child = Command::new(cargo_bin("luchta-extra-resolve-worker"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_luchta-extra-resolve-worker"))
         .args(argv)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

@@ -2,7 +2,6 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use assert_cmd::cargo::CommandCargoExt;
 use luchta_worker::{ResolveMode, ResolveTask, WorkerMessage, WorkerRequest};
 use serde_json::Value;
 use tempfile::TempDir;
@@ -81,7 +80,7 @@ fn run_worker(
     delegate_command: &[String],
     input: &str,
 ) -> (std::process::ExitStatus, Vec<Value>, String) {
-    let mut command = Command::cargo_bin("luchta-lazy-worker").expect("binary exists");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_luchta-lazy-worker"));
     command
         .arg("--")
         .args(delegate_command)

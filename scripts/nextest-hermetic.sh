@@ -35,6 +35,9 @@ for HERMETIC_ENV_ENTRY in $(env); do
         # Cargo and nextest inject per-test metadata and binary paths. Dynamic
         # loader variables are required for linked test artifacts. Keep the
         # active Cargo cache for offline metadata and nested crate builds.
+        # Where /bin/sh is dash (Ubuntu, CI), hyphenated names such as
+        # CARGO_BIN_EXE_luchta-bash-worker are gone before this loop runs,
+        # so tests read those paths with the compile-time env! (see AGENTS.md).
         CARGO | CARGO_HOME | CARGO_MANIFEST_DIR | CARGO_PKG_* | CARGO_BIN_EXE_* | CARGO_TARGET_TMPDIR | NEXTEST | NEXTEST_RUN_ID | NEXTEST_PROFILE | NEXTEST_VERSION | NEXTEST_WORKSPACE_ROOT | NEXTEST_BIN_EXE_* | NEXTEST_LD_* | NEXTEST_DYLD_* | LD_* | DYLD_*)
             ;;
 
