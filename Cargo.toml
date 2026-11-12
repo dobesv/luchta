@@ -87,6 +87,9 @@ libc = "0.2.155"
 windows-sys = "0.61"
 tokio-stream = "0.1"
 tokio-util = { version = "0.7", features = ["codec"] }
+# Only luchta-cli's macOS/Windows process-tree RSS walk (src/rss.rs) calls
+# sysinfo; Linux reads /proc. A breaking bump passes every Linux build and test
+# and fails only CI's `Check (macos-latest)` and `Check (windows-latest)`.
 sysinfo = { version = "0.40.0", default-features = false, features = ["system"] }
 zstd = "0.14.0"
 tar = "0.4.44"

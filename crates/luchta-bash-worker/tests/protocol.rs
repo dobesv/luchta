@@ -9,7 +9,6 @@ use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use assert_cmd::cargo::CommandCargoExt;
 use luchta_engine::{ResolveMode, ResolveTask, WorkerMessage, WorkerRequest};
 use serde_json::Value;
 
@@ -23,7 +22,7 @@ fn resolve_line(resolve: ResolveTask) -> String {
 }
 
 fn run_worker(input: &str) -> (Vec<Value>, String) {
-    let mut command = Command::cargo_bin("luchta-bash-worker").expect("binary exists");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_luchta-bash-worker"));
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

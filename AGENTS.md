@@ -103,6 +103,18 @@ a new ambient customization, add its exact variable to both wrapper scripts'
 allowlists and cover that behavior with a test; do not allow all `LUCHTA_*`
 variables through.
 
+Integration tests must not look up binaries at runtime by a hyphenated name.
+The Unix wrapper runs under `/bin/sh`, which is dash on Ubuntu, and dash drops
+any environment variable whose name contains `-`, so a runtime
+`CARGO_BIN_EXE_luchta-bash-worker` never reaches the test. assert_cmd's runtime
+`cargo_bin()` then falls back to searching beside the test executable, and
+since Rust 1.100 changed Cargo's build-dir layout that search fails too. For a
+binary in the test's own package, use the compile-time
+`env!("CARGO_BIN_EXE_<name>")`; for another package's binary, build it with
+`escargot` (see `yarn_worker_bin()` in `crates/luchta-cli/tests/common/mod.rs`).
+To reproduce the CI layout on an older toolchain, set
+`CARGO_BUILD_BUILD_DIR` to a directory outside the target dir.
+
 ## Conventions
 - **No `target/`:** Never commit `target/` directories.
 - **Error Types:** Library errors should be clear and descriptive using `thiserror`.
@@ -171,14 +183,17 @@ them as workflow artifacts instead of publishing a release.
 ## Dependency Updates & Auto-merge
 
 - **Renovate** (`renovate.json`) opens PRs for dependency and GitHub Actions
-  updates. Minor/patch/digest/pin updates (including non-major Actions bumps)
-  are flagged for automerge; major updates require manual review.
+  updates but never merges them; its own `automerge` stays off. With it on,
+  Renovate merged #1017 two minutes after rebasing it, before CI had started on
+  the new commit, after Mergify had already dequeued that PR for a failing macOS
+  check. Merging is left to Mergify, which waits for the CI checks.
 - OXC Git dependencies and the allocator patch must share one revision. The
   `oxc toolchain` Renovate group includes a custom regex manager because the
   Cargo manager skips `[patch.crates-io]`; keep its matcher aligned with the
   allocator entry in `Cargo.toml`.
 - **Mergify** (`.mergify.yml`) runs a squash merge queue named `main`. It
-  auto-queues passing Renovate PRs and any PR labeled `automerge`. A batch only
+  auto-queues every Renovate PR (any update type, majors included) and any PR
+  labeled `automerge`. A batch only
   merges once every CI check is green. The `Check` job runs as a per-OS matrix
   (ubuntu/windows/macos, and also runs clippy), producing `Check (<os>)`
   check-runs; alongside `Test` and `Format` (the job names in

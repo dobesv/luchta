@@ -5,7 +5,6 @@ use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use assert_cmd::cargo::CommandCargoExt;
 use luchta_engine::{ResolveMode, ResolveTask, WorkerMessage, WorkerRequest};
 use serde_json::Value;
 use tempfile::tempdir;
@@ -38,7 +37,7 @@ fn run_worker_full(
     repo_root: Option<&Path>,
     envs: &[(&str, &str)],
 ) -> (Vec<Value>, String) {
-    let mut command = Command::cargo_bin("luchta-ast-grep-worker").expect("binary path");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_luchta-ast-grep-worker"));
     if let Some(repo_root) = repo_root {
         command.current_dir(repo_root);
     }

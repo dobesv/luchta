@@ -2693,7 +2693,6 @@ dependencies = [
 name = "luchta-ast-grep-worker"
 version = "0.3.7"
 dependencies = [
- "assert_cmd",
  "assert_fs",
  "ast-grep-config",
  "ast-grep-core",
@@ -2716,7 +2715,6 @@ dependencies = [
 name = "luchta-bash-worker"
 version = "0.3.7"
 dependencies = [
- "assert_cmd",
  "luchta-engine",
  "luchta-worker",
  "serde_json",
@@ -2802,7 +2800,6 @@ dependencies = [
 name = "luchta-command-filter"
 version = "0.3.7"
 dependencies = [
- "assert_cmd",
  "luchta-worker",
  "serde_json",
  "tempfile",
@@ -2834,7 +2831,6 @@ dependencies = [
 name = "luchta-extra-resolve-worker"
 version = "0.3.7"
 dependencies = [
- "assert_cmd",
  "luchta-worker",
  "serde_json",
  "tempfile",
@@ -2866,7 +2862,6 @@ dependencies = [
 name = "luchta-lazy-worker"
 version = "0.3.7"
 dependencies = [
- "assert_cmd",
  "luchta-worker",
  "serde_json",
  "tempfile",
@@ -2931,7 +2926,6 @@ dependencies = [
 name = "luchta-oxlint-worker"
 version = "0.3.7"
 dependencies = [
- "assert_cmd",
  "assert_fs",
  "ignore",
  "luchta-engine",
@@ -2998,7 +2992,6 @@ dependencies = [
 name = "luchta-worker-watcher"
 version = "0.3.7"
 dependencies = [
- "assert_cmd",
  "globset",
  "luchta-glob",
  "luchta-test-support",
@@ -3056,7 +3049,6 @@ dependencies = [
 name = "luchta-yarn-worker"
 version = "0.3.7"
 dependencies = [
- "assert_cmd",
  "luchta-engine",
  "luchta-worker",
  "luchta-yarn-env",
