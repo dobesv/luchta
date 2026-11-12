@@ -3,27 +3,10 @@
   "extends": [
     "config:recommended"
   ],
+  "description": "Renovate only opens PRs; Mergify (.mergify.yml) merges them. Keep Renovate's own automerge off: with it on, Renovate merged #1017 two minutes after rebasing it, before CI had run on the new commit, and main broke on macOS and Windows.",
   "semanticCommits": "enabled",
   "automerge": false,
-  "automergeType": "pr",
-  "platformAutomerge": true,
   "packageRules": [
-    {
-      "description": "Automerge minor and patch updates",
-      "matchUpdateTypes": ["minor", "patch", "digest", "pin"],
-      "automerge": true
-    },
-    {
-      "description": "Do not automerge major updates",
-      "matchUpdateTypes": ["major"],
-      "automerge": false
-    },
-    {
-      "description": "Automerge non-major GitHub Actions updates",
-      "matchManagers": ["github-actions"],
-      "matchUpdateTypes": ["minor", "patch", "digest", "pin"],
-      "automerge": true
-    },
     {
       "description": "Update the OXC toolchain and allocator patch together to keep Git revisions and shared types compatible",
       "matchManagers": ["cargo", "custom.regex"],

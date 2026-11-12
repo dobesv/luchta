@@ -6,7 +6,6 @@ use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use assert_cmd::cargo::CommandCargoExt;
 use luchta_engine::{ResolveMode, ResolveTask, WorkerMessage, WorkerRequest};
 use serde_json::Value;
 use tempfile::tempdir;
@@ -31,7 +30,7 @@ fn run_worker_in(repo_root: &Path, input: &str) -> (Vec<Value>, String) {
 }
 
 fn run_worker_full(input: &str, repo_root: Option<&Path>) -> (Vec<Value>, String) {
-    let mut command = Command::cargo_bin("luchta-oxlint-worker").expect("binary path");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_luchta-oxlint-worker"));
     if let Some(repo_root) = repo_root {
         command.current_dir(repo_root);
     }

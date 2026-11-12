@@ -11,11 +11,9 @@ use assert_fs::prelude::*;
 
 mod common;
 
-use common::{git_commit_all, init_git, write_executable, write_fake_yarn, WorkspaceBuilder};
-
-fn yarn_worker_bin() -> PathBuf {
-    assert_cmd::cargo::cargo_bin("luchta-yarn-worker")
-}
+use common::{
+    git_commit_all, init_git, write_executable, write_fake_yarn, yarn_worker_bin, WorkspaceBuilder,
+};
 
 fn path_with_prepend(bin_dir: &Path) -> String {
     format!(

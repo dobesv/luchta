@@ -356,10 +356,23 @@ pub fn run_luchta_top_level(temp: &assert_fs::TempDir, task: &str) -> assert_cmd
 }
 
 /// Absolute path to built `luchta-yarn-worker` binary.
+///
+/// The binary belongs to another package, so Cargo provides no
+/// `CARGO_BIN_EXE_` variable for it. Build it with escargot, which reads
+/// the path from Cargo's JSON output; guessing it from this test's own
+/// location breaks on Cargo's build-dir layout (Rust 1.100+).
 pub fn yarn_worker_bin() -> PathBuf {
     static BIN: OnceLock<PathBuf> = OnceLock::new();
-    BIN.get_or_init(|| assert_cmd::cargo::cargo_bin("luchta-yarn-worker"))
-        .clone()
+    BIN.get_or_init(|| {
+        escargot::CargoBuild::new()
+            .bin("luchta-yarn-worker")
+            .package("luchta-yarn-worker")
+            .run()
+            .expect("build luchta-yarn-worker")
+            .path()
+            .to_path_buf()
+    })
+    .clone()
 }
 
 /// Prepend test bin dir to PATH.
