@@ -13,6 +13,7 @@ use thiserror::Error;
 
 use crate::cache_ctx::{load_lockfile_state, parse_lockfile_content, LockfileState};
 use crate::dep_closure_diff::packages_with_changed_dep_closures;
+use crate::tool_versions::{tool_version_changes_from_tree, ToolVersionChanges};
 
 #[derive(Debug, Error, Diagnostic)]
 pub enum SinceError {
@@ -32,6 +33,8 @@ pub enum SinceError {
     Graph(String),
     #[error("Failed to locate workspace lockfile for --since: {0}")]
     LockfilePath(String),
+    #[error("Failed to read tool versions for --since: {0}")]
+    ToolVersions(String),
     #[error("Failed to expand task inputs for --since: {0}")]
     InputExpansion(String),
     #[error("Failed to match changed paths against task inputs: {0}")]
@@ -114,8 +117,9 @@ pub fn affected_packages_from_paths(
 /// The root-task sets classify top-level (`#task`) tasks: only tasks whose
 /// declared inputs expand to at least one positive include are subject to
 /// `--since` filtering — a changed file that matches one of their declared
-/// inputs puts the task in `affected_root_tasks`. Root tasks without declared
-/// inputs, or whose inputs expand to nothing positive, keep the historic bypass
+/// inputs, or a changed declared tool version, puts the task in
+/// `affected_root_tasks`. Root tasks without declared inputs, or whose inputs
+/// expand to nothing positive, keep the historic bypass
 /// and always pass.
 #[derive(Debug, Default)]
 pub struct SinceAffected {
@@ -194,7 +198,11 @@ pub fn since_affected(
         &changed_paths,
     )?;
 
-    let declared = declared_input_matches(
+    let tool_matches =
+        declared_tool_matches_since(workspace_root, repo_root, since_ref, task_graph)?;
+    changed_packages.extend(tool_matches.packages);
+
+    let mut declared = declared_input_matches(
         &changed_paths,
         repo_root,
         workspace_root,
@@ -203,9 +211,10 @@ pub fn since_affected(
         &changed_packages,
     )?;
     changed_packages.extend(declared.input_matched_packages);
+    declared.affected_root_tasks.extend(tool_matches.root_tasks);
 
     // Path-based changes already include dependents; expand again for the
-    // closure- and input-change seeds.
+    // closure-, tool-, and input-change seeds.
     let packages = package_graph
         .transitive_dependents_of(changed_packages)
         .map_err(SinceError::from)?;
@@ -214,6 +223,75 @@ pub fn since_affected(
         declared.affected_root_tasks,
         declared.root_tasks_with_inputs,
     ))
+}
+
+fn declared_tool_matches_since(
+    workspace_root: &Path,
+    repo_root: &Path,
+    since_ref: &str,
+    task_graph: &TaskGraph,
+) -> Result<DeclaredToolMatches, SinceError> {
+    // Repositories without tool declarations don't opt into reading this file.
+    if !task_graph
+        .nodes()
+        .filter_map(|node| task_graph.task_definition(&node.id))
+        .any(|definition| !definition.tools.is_empty())
+    {
+        return Ok(DeclaredToolMatches::default());
+    }
+    let workspace_root = dunce::canonicalize(workspace_root)
+        .map_err(|error| SinceError::ToolVersions(error.to_string()))?;
+    let repo_root = dunce::canonicalize(repo_root)
+        .map_err(|error| SinceError::ToolVersions(error.to_string()))?;
+    let workspace_relative = workspace_root
+        .strip_prefix(&repo_root)
+        .map_err(|error| SinceError::ToolVersions(error.to_string()))?;
+    let repo = discover_repo(&workspace_root)?;
+    let base_tree = resolve_ref_tree(&repo, since_ref)?;
+    let tools = tool_version_changes_from_tree(&base_tree, workspace_relative, &workspace_root)
+        .map_err(|error| SinceError::ToolVersions(error.to_string()))?;
+    Ok(declared_tool_matches(task_graph, &tools))
+}
+
+#[derive(Default)]
+struct DeclaredToolMatches {
+    packages: HashSet<PackageName>,
+    root_tasks: HashSet<TaskName>,
+}
+
+/// Tool changes seed packages just like lockfile changes. Root tasks are kept
+/// separate so their existing input-based filtering and bypass stay unchanged.
+fn declared_tool_matches(
+    task_graph: &TaskGraph,
+    tools: &ToolVersionChanges,
+) -> DeclaredToolMatches {
+    let mut matches = DeclaredToolMatches::default();
+    let mut warned = HashSet::new();
+    for node in task_graph.nodes() {
+        let Some(definition) = task_graph.task_definition(&node.id) else {
+            continue;
+        };
+        for name in &definition.tools {
+            if !tools.head.contains_key(name) && warned.insert(name) {
+                eprintln!(
+                    "warning: declared tool '{name}' is missing from workspace-root .tool-versions"
+                );
+            }
+        }
+        if !definition
+            .tools
+            .iter()
+            .any(|name| tools.changed.contains(name))
+        {
+            continue;
+        }
+        if node.id.is_root() {
+            matches.root_tasks.insert(node.id.task.clone());
+        } else {
+            matches.packages.insert(node.id.package.clone());
+        }
+    }
+    matches
 }
 
 /// Path-to-package mapping plus the `yarn.lock` dependency-closure diff.

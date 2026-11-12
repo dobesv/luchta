@@ -882,3 +882,262 @@ fn top_level_task_declared_input_matches_with_relative_workspace_root() {
     cwd.close().unwrap();
     temp.close().unwrap();
 }
+
+struct ToolVersionsSinceFixture {
+    temp: assert_fs::TempDir,
+}
+
+impl ToolVersionsSinceFixture {
+    fn new(tasks: &str) -> Self {
+        let temp = setup();
+        add_third_package(&temp);
+        let worker = write_selection_inspector_worker(&temp);
+        write_task_config_with_named_worker(&temp, "sh", &worker, tasks);
+        temp.child("scripts/run.sh")
+            .write_str("echo unchanged\n")
+            .unwrap();
+        temp.child(".tool-versions")
+            .write_str("luchta 0.3.6\nrust 1.98.1\n")
+            .unwrap();
+        git_commit_all(temp.path(), "tool version baseline");
+        Self { temp }
+    }
+
+    fn change_versions(&self, versions: &str) {
+        self.temp
+            .child(".tool-versions")
+            .write_str(versions)
+            .unwrap();
+        assert_eq!(
+            git_stdout(&self.temp, &["status", "--porcelain"]),
+            "M .tool-versions"
+        );
+    }
+
+    fn bump_luchta(&self) {
+        self.change_versions("luchta 0.3.7\nrust 1.98.1\n");
+    }
+
+    fn assert_selected(&self, tasks: &[&str], expected: &[&str]) {
+        let result =
+            assert_run_tasks(&self.temp, tasks, &["--since", "HEAD", "--dry-run"]).success();
+        let stdout = std::str::from_utf8(&result.get_output().stdout).unwrap();
+        let mut actual: Vec<_> = stdout
+            .lines()
+            .filter_map(|line| line.strip_prefix("  "))
+            .filter_map(|line| line.split_whitespace().next())
+            .collect();
+        actual.sort_unstable();
+        assert_eq!(actual, expected, "{stdout}");
+        let mut args = tasks.to_vec();
+        args.extend(["--since", "HEAD", "--json"]);
+        let result = assert_list(&self.temp, &args).success();
+        let listed: Vec<serde_json::Value> =
+            serde_json::from_slice(&result.get_output().stdout).unwrap();
+        let ids: Vec<_> = listed
+            .iter()
+            .map(|task| task["task_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, expected);
+    }
+
+    fn assert_ran_in_packages(&self, tasks: &[&str], expected: &[&str]) {
+        assert_run_tasks(&self.temp, tasks, &["--since", "HEAD"]).success();
+        for package in ["a", "b", "c"] {
+            for task in tasks {
+                let id = format!("{package}#{task}");
+                let marker = self.temp.child(format!("packages/{package}/ran-{task}"));
+                assert_eq!(
+                    marker.path().exists(),
+                    expected.contains(&id.as_str()),
+                    "{id}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn since_tool_version_bump_selects_declaring_packages_in_run_and_list() {
+    let fixture = ToolVersionsSinceFixture::new(
+        r#""build":{"worker":"sh","command":"touch ran-build","tools":["luchta"]}"#,
+    );
+    fixture.bump_luchta();
+    let expected = ["a#build", "b#build", "c#build"];
+    fixture.assert_selected(&["build"], &expected);
+    fixture.assert_ran_in_packages(&["build"], &expected);
+}
+
+#[test]
+fn since_later_duplicate_tool_version_change_is_noop() {
+    let fixture = ToolVersionsSinceFixture::new(
+        r#""build":{"worker":"sh","command":"touch ran-build","tools":["luchta"]}"#,
+    );
+    fixture.change_versions("luchta 0.3.6\nluchta 0.3.7\nrust 1.98.1\n");
+    git_commit_all(fixture.temp.path(), "duplicate tool baseline");
+    fixture.change_versions("luchta 0.3.6\nluchta 0.3.8\nrust 1.98.1\n");
+    fixture.assert_selected(&["build"], &[]);
+}
+
+#[test]
+fn since_first_duplicate_tool_version_change_selects_declaring_packages() {
+    let fixture = ToolVersionsSinceFixture::new(
+        r#""build":{"worker":"sh","command":"touch ran-build","tools":["luchta"]}"#,
+    );
+    fixture.change_versions("luchta 0.3.6\nluchta 0.3.7\nrust 1.98.1\n");
+    git_commit_all(fixture.temp.path(), "duplicate tool baseline");
+    fixture.change_versions("luchta 0.3.7\nluchta 0.3.7\nrust 1.98.1\n");
+    fixture.assert_selected(&["build"], &["a#build", "b#build", "c#build"]);
+}
+
+#[test]
+fn since_tool_version_bump_without_declarations_is_noop() {
+    let fixture =
+        ToolVersionsSinceFixture::new(r#""build":{"worker":"sh","command":"touch ran-build"}"#);
+    fixture.bump_luchta();
+    fixture.assert_selected(&["build"], &[]);
+    assert_run(&fixture.temp, "build", &["--since", "HEAD"])
+        .success()
+        .stdout(predicate::str::contains(
+            "No packages changed since HEAD; nothing to run.",
+        ));
+}
+
+#[test]
+fn since_unrelated_tool_version_bump_is_noop() {
+    let fixture = ToolVersionsSinceFixture::new(
+        r#""build":{"worker":"sh","command":"touch ran-build","tools":["luchta"]}"#,
+    );
+    fixture.change_versions("luchta 0.3.6\nrust 1.99.1\n");
+    fixture.assert_selected(&["build"], &[]);
+}
+
+#[test]
+fn since_tool_bump_selects_root_task_with_unchanged_inputs_only_when_declared() {
+    let fixture = ToolVersionsSinceFixture::new(
+        r##""#build":{"worker":"sh","command":"touch ran-build","inputs":["scripts/**"],"tools":["luchta"]},
+           "#lint":{"worker":"sh","command":"touch ran-lint","inputs":["scripts/**"]}"##,
+    );
+    fixture.bump_luchta();
+    let listed = assert_list(
+        &fixture.temp,
+        &["-T", "build", "lint", "--since", "HEAD", "--json"],
+    )
+    .success();
+    let tasks: Vec<serde_json::Value> =
+        serde_json::from_slice(&listed.get_output().stdout).unwrap();
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0]["task_id"], "#build");
+    assert_run_tasks(
+        &fixture.temp,
+        &["build", "lint"],
+        &["-T", "--since", "HEAD"],
+    )
+    .success();
+    assert!(fixture.temp.child("ran-build").path().exists());
+    assert!(!fixture.temp.child("ran-lint").path().exists());
+}
+
+#[test]
+fn since_unchanged_tools_do_not_remove_root_task_without_inputs_bypass() {
+    let fixture = ToolVersionsSinceFixture::new(
+        r##""#build":{"worker":"sh","command":"touch ran-build","tools":["luchta"]}"##,
+    );
+    // Clean tree and unchanged tools still preserve the historic -T bypass.
+    assert_run(&fixture.temp, "build", &["-T", "--since", "HEAD"]).success();
+    assert!(fixture.temp.child("ran-build").path().exists());
+}
+
+#[test]
+fn since_tool_declaration_override_selects_package_siblings_and_dependents() {
+    let fixture = ToolVersionsSinceFixture::new(
+        r#""build":{"worker":"sh","command":"touch ran-build"},
+           "a#build":{"worker":"sh","command":"touch ran-build","tools":["luchta"]},
+           "lint":{"worker":"sh","command":"touch ran-lint"}"#,
+    );
+    fixture.bump_luchta();
+    let expected = ["a#build", "a#lint", "b#build", "b#lint"];
+    fixture.assert_selected(&["build", "lint"], &expected);
+    fixture.assert_ran_in_packages(&["build", "lint"], &expected);
+}
+
+#[test]
+fn since_missing_tool_warns_once_per_name_and_does_not_fail_run() {
+    let fixture = ToolVersionsSinceFixture::new(
+        r#""build":{"worker":"sh","command":"touch ran-build","tools":["lucta","lucta"]},
+           "lint":{"worker":"sh","command":"touch ran-lint","tools":["lucta"]}"#,
+    );
+    fixture
+        .temp
+        .child("packages/a/source.ts")
+        .write_str("changed\n")
+        .unwrap();
+    let result =
+        assert_run_tasks(&fixture.temp, &["build", "lint"], &["--since", "HEAD"]).success();
+    let stderr = std::str::from_utf8(&result.get_output().stderr).unwrap();
+    let warning = "warning: declared tool 'lucta' is missing from workspace-root .tool-versions";
+    assert_eq!(stderr.matches(warning).count(), 1, "{stderr}");
+    assert!(fixture.temp.child("packages/a/ran-build").path().exists());
+    assert!(fixture.temp.child("packages/b/ran-lint").path().exists());
+    assert!(!fixture.temp.child("packages/c/ran-build").path().exists());
+}
+
+#[test]
+fn since_package_override_can_remove_global_tool_declarations() {
+    let fixture = ToolVersionsSinceFixture::new(
+        r#""build":{"worker":"sh","command":"touch ran-build","tools":["luchta"]},
+           "c#build":{"worker":"sh","command":"touch ran-build","tools":[]}"#,
+    );
+    fixture.bump_luchta();
+    fixture.assert_selected(&["build"], &["a#build", "b#build"]);
+}
+
+#[test]
+fn since_non_utf8_tool_versions_fail_with_file_path_on_either_side() {
+    for invalid_base in [false, true] {
+        let fixture =
+            ToolVersionsSinceFixture::new(r#""build":{"worker":"sh","tools":["luchta"]}"#);
+        let path = fixture.temp.child(".tool-versions");
+        std::fs::write(path.path(), b"luchta \xff\n").unwrap();
+        if invalid_base {
+            git_commit_all(fixture.temp.path(), "invalid tool version baseline");
+            path.write_str("luchta 0.3.7\n").unwrap();
+        }
+        assert_run(&fixture.temp, "build", &["--since", "HEAD", "--dry-run"])
+            .failure()
+            .stderr(predicate::str::contains(".tool-versions"));
+    }
+}
+
+#[test]
+fn since_ignores_non_utf8_tool_versions_without_tool_declarations() {
+    for invalid_base in [false, true] {
+        let fixture = ToolVersionsSinceFixture::new(r#""build":{"worker":"sh"}"#);
+        let path = fixture.temp.child(".tool-versions");
+        std::fs::write(path.path(), b"luchta \xff\n").unwrap();
+        if invalid_base {
+            git_commit_all(fixture.temp.path(), "unused invalid tool version baseline");
+            path.write_str("luchta 0.3.7\n").unwrap();
+        }
+        fixture
+            .temp
+            .child("packages/a/source.ts")
+            .write_str("changed\n")
+            .unwrap();
+        fixture.assert_selected(&["build"], &["a#build", "b#build"]);
+    }
+}
+
+#[test]
+fn since_ignores_tool_versions_directory_with_empty_tool_declarations() {
+    let fixture = ToolVersionsSinceFixture::new(r#""build":{"worker":"sh","tools":[]}"#);
+    let path = fixture.temp.child(".tool-versions");
+    std::fs::remove_file(path.path()).unwrap();
+    std::fs::create_dir(path.path()).unwrap();
+    fixture
+        .temp
+        .child("packages/a/source.ts")
+        .write_str("changed\n")
+        .unwrap();
+    fixture.assert_selected(&["build"], &["a#build", "b#build"]);
+}

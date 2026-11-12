@@ -331,7 +331,25 @@ archives to the GitHub Release. The Release workflow can also be run on demand
 
 Luchta is configured via an executable script at the workspace root matching `luchta-config.*` (e.g., `.ts`, `.js`, `.sh`, `.py`). 
 
-The script **must** have a shebang line and print its configuration to `stdout` as a JSON object with `camelCase` fields. Luchta executes the script directly and parses this JSON to load the pipeline definition.
+The script **must** have a shebang line and print its configuration to `stdout` as a JSON object with `camelCase` fields. Luchta executes the script directly and parses this JSON to load the pipeline definition. It sets `LUCHTA_VERSION` to its own version in the config script's environment, overriding any inherited value.
+
+To keep builds reproducible, pin `luchta` in the workspace-root `.tool-versions` file. Config can reject a mismatch before loading tasks:
+
+```typescript
+import { readFileSync } from "node:fs";
+
+const toolVersions = readFileSync(new URL(".tool-versions", import.meta.url), "utf8");
+const luchtaPin = toolVersions
+  .split(/\r?\n/)
+  .map((line) => line.split("#", 1)[0].trim())
+  .map((line) => line.split(/\s+/))
+  .find(([name, version]) => name === "luchta" && version)?.[1];
+
+if (luchtaPin && luchtaPin !== process.env.LUCHTA_VERSION) {
+  console.error(`.tool-versions pins luchta ${luchtaPin}, but running luchta is ${process.env.LUCHTA_VERSION}`);
+  process.exit(1);
+}
+```
 
 Example `luchta-config.ts`:
 ```typescript
@@ -374,6 +392,8 @@ interface TaskDefinition {
   cache?: CacheConfig;
   /** Relative input paths/globs. */
   inputs?: string[];
+  /** Exact .tool-versions entry names whose version changes select this task under --since. */
+  tools?: string[];
   /** Relative output paths/globs. */
   outputs?: string[];
   /** Relative cost for the weighted scheduler. Defaults to 1. */
@@ -471,6 +491,7 @@ The top-level `tasks` map defines the pipeline. Each task may set:
   execute this task. The named worker **must** be defined or the run fails.
 - `cache`: opt-in build cache. Provide an object (e.g. `cache: {}`) to enable change-detection skips for successful prior runs; omit the field to disable. Set the `nonce` field (e.g. `cache: { nonce: "v1" }`) to force-bust this task's cache. See [Cache Nonce](#cache-nonce-force-busting-stale-cache) for details.
 - `inputs`: relative input paths/globs, including `!` exclusions. Glob patterns are resolved against the git-tracked file listing, so `.gitignore` is respected; literal (non-glob) paths are hashed directly and are included even when git-ignored. See [Input Pattern Prefixes](#input-pattern-prefixes) and [Glob Syntax](#glob-syntax).
+- `tools`: exact names of entries in the workspace-root `.tool-versions`, e.g. `tools: ["luchta", "nodejs"]`. Defaults to `[]`. Like `dependencies`, this is version-based, not a file-content input. Under `--since`, changed versions select the declaring task's package (and its transitive dependents), or the declaring top-level task. This field doesn't replace `dependencies` or change cache hashing. A missing entry warns once per name and doesn't fail the run.
 - `outputs`: relative output paths/globs, including `!` exclusions. These are checked on disk, so missing/deleted outputs invalidate cache entries even if ignored by git. See [Glob Syntax](#glob-syntax).
 - `dependencies`: optional filter for external package dependencies (from `yarn.lock`). Reuses the [Input Pattern Prefixes](#input-pattern-prefixes) grammar (`^`, `^^`, `pkg#`, `#`, globs). Its globs match dependency **names**, so they follow [Name globs](#name-globs-are-different).
     - **Default:** `["**/*"]` (conservative; includes all package dependencies).
@@ -573,7 +594,7 @@ The `tasks` map defines how tasks are applied across the workspace:
 - `luchta run build`: Runs package `build` tasks. Top-level tasks are never included.
 - `luchta run -T build` (or `--top-level`): Runs the top-level `#build` task.
 - `luchta run -p <PATTERN> build`: Selects tasks by package **name** (not path). Supports glob wildcards (e.g. `@repo/*`, `pkg-*`). Repeatable.
-- `luchta run --since <GIT_REF> build`: Restricts goal tasks to packages changed since `GIT_REF`, plus their transitive dependents — and to tasks whose declared `inputs` matched a changed file.
+- `luchta run --since <GIT_REF> build`: Restricts goal tasks to packages changed since `GIT_REF`, plus their transitive dependents, including changes matched by declared `inputs` or `tools`.
 - `luchta run 'test*'`: Task arguments also support glob wildcards (e.g. `test:*`, `build*`). Package and task patterns match **names**, so they follow [Name globs](#name-globs-are-different), not the path-glob rules used by `inputs` and `outputs`.
 - `luchta run -T -p app build`: Runs both `@repo/app#build` and the top-level `#build` task (`-T` is additive to `-p`).
 - `luchta run --continue build`: Keep building after a failure — independent tasks still run; only the failed task's transitive dependents are skipped. Exits non-zero if anything failed.
@@ -582,7 +603,26 @@ Luchta uses a **Goal-not-filter** selection model. Filters select the entry-poin
 
 `--since <GIT_REF>` checks for package-folder changes from committed history (`GIT_REF..HEAD`), staged changes, unstaged changes, and untracked files that are not gitignored. A package also counts as changed when `yarn.lock` changes the resolved version, resolution, or checksum of anything in its transitive external dependency closure (including devDependencies), compared between the base ref's tree and the working tree. An unreadable or unparseable lockfile at the base ref or in the working tree selects all non-root packages. The affected set is `changed packages ∪ transitive dependents`, then normal dependency expansion still runs prerequisites needed by those goals. If no packages are affected, `luchta run` exits 0 immediately and prints that nothing will run — **unless** top-level mode (`-T`) is requested.
 
-Changed files outside every workspace package are matched against each task's declared `inputs` (with the same pattern grammar and `!` negations the build cache uses): a match on a package task's inputs marks that package (and its dependents) affected, so root files like `#tsconfig.base.json` now invalidate the tasks that declare them. A match on a top-level `#task`'s inputs marks that task affected. Consequently, a top-level task that declares `inputs` is filtered by `--since` like package tasks — it runs only when one of its inputs changed — while a top-level task without declared inputs keeps the historic bypass and always runs under `-T`, regardless of whether the affected set is empty or non-empty. A top-level task whose inputs expand to no positive include — only `!` negations, or `^`/`^^` patterns when the workspace root has no upstream packages — also keeps the bypass; when the root `package.json` is a named package with workspace dependencies, `^`/`^^` inputs do resolve and the task is filtered normally. Root edits that match no declared input anywhere (e.g. an undeclared `README.md`) remain a clean no-op.
+Changed files outside every workspace package are matched against each task's declared `inputs` (with the same pattern grammar and `!` negations the build cache uses): a match on a package task's inputs marks that package (and its dependents) affected, so root files like `#tsconfig.base.json` now invalidate the tasks that declare them. A match on a top-level `#task`'s inputs marks that task affected. Consequently, a top-level task that declares `inputs` is filtered by `--since` like package tasks — it runs only when one of its inputs or declared tool versions changed — while a top-level task without declared inputs keeps the historic bypass and always runs under `-T`, regardless of whether the affected set is empty or non-empty. A top-level task whose inputs expand to no positive include — only `!` negations, or `^`/`^^` patterns when the workspace root has no upstream packages — also keeps the bypass; when the root `package.json` is a named package with workspace dependencies, `^`/`^^` inputs do resolve and the task is filtered normally. Root edits that match no declared input anywhere (e.g. an undeclared `README.md`) remain a clean no-op.
+
+When any task declares a non-empty `tools` list, `--since` also compares the workspace-root `.tool-versions` at `GIT_REF` with the working-tree file. With no tool declarations, `--since` skips these reads and doesn't validate the file for tool-version selection. If any entry named by a task's `tools` list changes, that task's package and its transitive dependents are selected. All tasks in those packages pass the `--since` filter, including siblings that don't declare `tools`; cache checks still apply. A declaring top-level task is selected directly. `luchta list --since` uses the same selection. Versions are opaque tokens: changing any fallback version or their order, adding an entry, or removing one counts as a change. Comments, whitespace, and a leading UTF-8 BOM don't. For duplicate tool names, the first entry wins; later entries are ignored. An absent file is an empty entry map. When the comparison is enabled, existing files on both sides must be regular UTF-8 files; symlinks, directories, and non-UTF-8 content are errors naming the path. A declared name missing from the working-tree file warns once per name without failing the command.
+
+To re-select formatters, linters, transforms, or tsc tasks when upgrading bundled workers, pin the release in the workspace-root `.tool-versions`:
+
+```text
+luchta 0.3.7
+```
+
+Then opt those tasks into version-based selection in `luchta-config.*`:
+
+```ts
+tasks: {
+  format: { worker: "oxfmt", tools: ["luchta"] },
+  lint: { worker: "oxlint", tools: ["luchta"] },
+}
+```
+
+A `luchta 0.3.6` → `luchta 0.3.7` bump now selects their packages under `luchta run format lint --since main`, even with no source changes. Keep the `LUCHTA_VERSION` pin check from the [config example](#usage-sketch) to reject a running binary that doesn't match the pin. These are separate checks: `tools` controls `--since` selection, while the config enforces the running version. `tools` doesn't add `.tool-versions` to cache hashes; worker-reported tool versions already invalidate cached results once tasks are selected. If a worker does not report `tool_version`, `--since` selects the task but its cache key is unchanged, so a cache-enabled task can reuse old outputs. To bust the cache reliably, pass the parsed pin (such as `luchtaPin`) to [`cache.nonce`](#cache-nonce-force-busting-stale-cache) or an [`env`](#environment-variables) `value`. Listing `"#.tool-versions"` in [`inputs`](#input-pattern-prefixes) only works if the worker preserves declared inputs instead of replacing them at resolve time. Tool-version selection applies to `--since`, not watch mode.
 
 Additional targeting rules:
 - **AND Logic**: Filters across dimensions are combined, including `--since` (e.g. `-p pkg --since main build` matches goals where package name matches `pkg`, task name matches `build`, and package is in affected set).
