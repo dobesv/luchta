@@ -333,23 +333,44 @@ Luchta is configured via an executable script at the workspace root matching `lu
 
 The script **must** have a shebang line and print its configuration to `stdout` as a JSON object with `camelCase` fields. Luchta executes the script directly and parses this JSON to load the pipeline definition. It sets `LUCHTA_VERSION` to its own version in the config script's environment, overriding any inherited value.
 
-To keep builds reproducible, pin `luchta` in the workspace-root `.tool-versions` file. Config can reject a mismatch before loading tasks:
+To keep builds reproducible, pin `luchta` in the workspace-root `.tool-versions` file (for example, `luchta 0.3.8`). For tasks that require strict version equality, such as bundled formatters and linters, attach an uncached prerequisite:
 
 ```typescript
-import { readFileSync } from "node:fs";
+const config = {
+  workers: {
+    bash: { command: "luchta-bash-worker" },
+    oxfmt: { command: "luchta-oxfmt-worker" },
+    oxlint: { command: "luchta-oxlint-worker" },
+  },
+  tasks: {
+    "#check-luchta-version": {
+      worker: "bash",
+      command: 'grep -Fx -- "luchta $LUCHTA_VERSION" .tool-versions',
+      env: { LUCHTA_VERSION: { value: process.env.LUCHTA_VERSION } },
+    },
+    format: {
+      worker: "oxfmt",
+      tools: ["luchta"],
+      dependsOn: ["#check-luchta-version"],
+      cache: {},
+    },
+    lint: {
+      worker: "oxlint",
+      tools: ["luchta"],
+      dependsOn: ["#check-luchta-version"],
+      cache: {},
+    },
+  },
+};
 
-const toolVersions = readFileSync(new URL(".tool-versions", import.meta.url), "utf8");
-const luchtaPin = toolVersions
-  .split(/\r?\n/)
-  .map((line) => line.split("#", 1)[0].trim())
-  .map((line) => line.split(/\s+/))
-  .find(([name, version]) => name === "luchta" && version)?.[1];
-
-if (luchtaPin && luchtaPin !== process.env.LUCHTA_VERSION) {
-  console.error(`.tool-versions pins luchta ${luchtaPin}, but running luchta is ${process.env.LUCHTA_VERSION}`);
-  process.exit(1);
-}
+console.log(JSON.stringify(config));
 ```
+
+`grep -Fx` requires an exact canonical line: `luchta 0.3.8` matches, while `luchta 0.3.80` does not. Keep that line free of inline comments, extra whitespace, or fallback versions. Capturing the injected `LUCHTA_VERSION` in `env.value` preserves the identity of the binary that loaded the config.
+
+The prerequisite omits `cache` so every protected run checks the pin, even after a successful cached run. It omits `inputs` so it remains runnable as a top-level prerequisite under `--since`.
+
+A mismatch fails the prerequisite and blocks its dependents; graph queries such as `luchta list` and unrelated build tasks remain available. This lets CI use a newer binary to build baseline screenshots from an older revision. Avoid aborting config evaluation on a mismatch: that blocks every command that loads the config. Older revisions with an eager assertion retain that behavior until their baseline includes the updated config.
 
 Example `luchta-config.ts`:
 ```typescript
@@ -610,19 +631,31 @@ When any task declares a non-empty `tools` list, `--since` also compares the wor
 To re-select formatters, linters, transforms, or tsc tasks when upgrading bundled workers, pin the release in the workspace-root `.tool-versions`:
 
 ```text
-luchta 0.3.7
+luchta 0.3.8
 ```
 
-Then opt those tasks into version-based selection in `luchta-config.*`:
+Then opt those tasks into version-based selection in `luchta-config.*` and attach the uncached `#check-luchta-version` prerequisite from the [Usage Sketch](#usage-sketch):
 
 ```ts
 tasks: {
-  format: { worker: "oxfmt", tools: ["luchta"] },
-  lint: { worker: "oxlint", tools: ["luchta"] },
+  format: {
+    worker: "oxfmt",
+    tools: ["luchta"],
+    dependsOn: ["#check-luchta-version"],
+    cache: {},
+  },
+  lint: {
+    worker: "oxlint",
+    tools: ["luchta"],
+    dependsOn: ["#check-luchta-version"],
+    cache: {},
+  },
 }
 ```
 
-A `luchta 0.3.6` → `luchta 0.3.7` bump now selects their packages under `luchta run format lint --since main`, even with no source changes. Keep the `LUCHTA_VERSION` pin check from the [config example](#usage-sketch) to reject a running binary that doesn't match the pin. These are separate checks: `tools` controls `--since` selection, while the config enforces the running version. `tools` doesn't add `.tool-versions` to cache hashes; worker-reported tool versions already invalidate cached results once tasks are selected. If a worker does not report `tool_version`, `--since` selects the task but its cache key is unchanged, so a cache-enabled task can reuse old outputs. To bust the cache reliably, pass the parsed pin (such as `luchtaPin`) to [`cache.nonce`](#cache-nonce-force-busting-stale-cache) or an [`env`](#environment-variables) `value`. Listing `"#.tool-versions"` in [`inputs`](#input-pattern-prefixes) only works if the worker preserves declared inputs instead of replacing them at resolve time. Tool-version selection applies to `--since`, not watch mode.
+A `luchta 0.3.7` → `luchta 0.3.8` bump now selects their packages under `luchta run format lint --since main`, even with no source changes. `tools` controls `--since` selection, while the prerequisite enforces the running version only when protected tasks execute. Keep the prerequisite free of `cache` and `inputs` so a previous success cannot hide a mismatch and `--since` can still run it. Graph queries and unrelated tasks can run with a different pin.
+
+`tools` doesn't add `.tool-versions` to cache hashes; worker-reported tool versions already invalidate cached results once tasks are selected. If a worker does not report `tool_version`, `--since` selects the task but its cache key is unchanged, so a cache-enabled task can reuse old outputs. To bust the cache reliably, read the pinned version from `.tool-versions` in the config script and pass it to [`cache.nonce`](#cache-nonce-force-busting-stale-cache) or an [`env`](#environment-variables) `value`. Listing `"#.tool-versions"` in [`inputs`](#input-pattern-prefixes) only works if the worker preserves declared inputs instead of replacing them at resolve time. Tool-version selection applies to `--since`, not watch mode.
 
 Additional targeting rules:
 - **AND Logic**: Filters across dimensions are combined, including `--since` (e.g. `-p pkg --since main build` matches goals where package name matches `pkg`, task name matches `build`, and package is in affected set).
