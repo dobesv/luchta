@@ -8,13 +8,15 @@ pub fn build_sarif(findings: &[WrappedDiagnostic]) -> Result<String, String> {
     let entries: Vec<SarifFinding> = findings
         .iter()
         .map(|finding| SarifFinding {
-            rule_id: finding
-                .rule_id
-                .clone()
-                .unwrap_or_else(|| "oxlint-diagnostic".to_owned()),
+            rule_id: Some(
+                finding
+                    .rule_id
+                    .clone()
+                    .unwrap_or_else(|| "oxlint-diagnostic".to_owned()),
+            ),
             level: map_level(&finding.severity),
             message: finding.message.clone(),
-            uri: finding.relative_uri.clone(),
+            uri: Some(finding.relative_uri.clone()),
             start_line: finding.start_line,
             start_column: finding.start_column,
             end_line: None,

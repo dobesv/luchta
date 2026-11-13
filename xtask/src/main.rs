@@ -859,7 +859,7 @@ mod tests {
                 if table
                     .get("git")
                     .and_then(toml::Value::as_str)
-                    .map(|git| git.trim_end_matches('/').trim_end_matches(".git"))
+                    .map(normalize_git_url)
                     == Some("https://github.com/oxc-project/oxc")
                 {
                     let rev = table
@@ -898,10 +898,7 @@ mod tests {
         let mut revisions = BTreeMap::<String, BTreeSet<String>>::new();
 
         for manifest in workspace_manifests(repo_root) {
-            let contents = std::fs::read_to_string(&manifest)
-                .unwrap_or_else(|error| panic!("failed to read {}: {error}", manifest.display()));
-            let document = toml::from_str::<toml::Value>(&contents)
-                .unwrap_or_else(|error| panic!("failed to parse {}: {error}", manifest.display()));
+            let document = read_manifest(&manifest);
             collect_oxc_git_revs(&document, &manifest, repo_root, &mut revisions);
         }
 
@@ -919,6 +916,230 @@ mod tests {
             revisions.len(),
             1,
             "expected exactly one oxc git dependency rev across workspace Cargo.toml files; found:\n{revisions_by_file}"
+        );
+    }
+
+    const TSRS_URL: &str = "https://github.com/oxc-project/tsrs.git";
+    const TSRS_FORK_URL: &str = "https://github.com/dobesv/tsrs.git";
+
+    fn read_manifest(manifest: &Path) -> toml::Value {
+        let contents = std::fs::read_to_string(manifest)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", manifest.display()));
+        toml::from_str(&contents)
+            .unwrap_or_else(|error| panic!("failed to parse {}: {error}", manifest.display()))
+    }
+
+    fn visit_dependency_tables(value: &toml::Value, visit: &mut impl FnMut(&str, &toml::Table)) {
+        match value {
+            toml::Value::Table(table) => {
+                for (name, nested) in table {
+                    if let Some(dependency) = nested.as_table() {
+                        visit(name, dependency);
+                    }
+                    visit_dependency_tables(nested, visit);
+                }
+            }
+            toml::Value::Array(array) => {
+                for nested in array {
+                    visit_dependency_tables(nested, visit);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn exact_tsrs_revision(dependency: &toml::Table) -> &str {
+        assert!(
+            dependency.get("branch").is_none(),
+            "tsrs dependency must not use branch: {dependency:?}"
+        );
+        assert!(
+            dependency.get("tag").is_none(),
+            "tsrs dependency must not use tag: {dependency:?}"
+        );
+        let rev = dependency
+            .get("rev")
+            .and_then(toml::Value::as_str)
+            .unwrap_or_else(|| panic!("tsrs dependency has no string `rev`: {dependency:?}"));
+        assert!(
+            rev.len() == 40 && rev.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "tsrs dependency must use full SHA rev, found {rev:?}"
+        );
+        rev
+    }
+
+    fn normalize_git_url(git: &str) -> &str {
+        git.trim_end_matches('/').trim_end_matches(".git")
+    }
+
+    fn collect_tsrs_git_revs(
+        value: &toml::Value,
+        manifest: &Path,
+        repo_root: &Path,
+        revisions: &mut BTreeMap<String, BTreeSet<String>>,
+    ) {
+        visit_dependency_tables(value, &mut |name, dependency| {
+            if !name.starts_with("tsrs_")
+                || dependency
+                    .get("git")
+                    .and_then(toml::Value::as_str)
+                    .map(normalize_git_url)
+                    != Some(normalize_git_url(TSRS_URL))
+            {
+                return;
+            }
+            let rev = exact_tsrs_revision(dependency);
+            let relative = manifest.strip_prefix(repo_root).unwrap_or(manifest);
+            revisions
+                .entry(rev.to_owned())
+                .or_default()
+                .insert(relative.display().to_string());
+        });
+    }
+
+    fn collect_tsrs_patch_revs(document: &toml::Value, revisions: &mut BTreeSet<String>) {
+        let Some(patches) = document.get("patch") else {
+            return;
+        };
+        visit_dependency_tables(patches, &mut |name, dependency| {
+            if !name.starts_with("tsrs_") {
+                return;
+            }
+            assert_eq!(
+                dependency.get("git").and_then(toml::Value::as_str),
+                Some(TSRS_FORK_URL),
+                "tsrs patch must use the fork: {name}"
+            );
+            revisions.insert(exact_tsrs_revision(dependency).to_owned());
+        });
+    }
+
+    fn assert_root_tsrs_patch(document: &toml::Value) {
+        let entry = document
+            .get("patch")
+            .and_then(|patch| patch.get(TSRS_URL))
+            .and_then(|patch| patch.get("tsrs_core"))
+            .and_then(toml::Value::as_table)
+            .expect("root Cargo.toml must patch tsrs_core");
+        assert_eq!(
+            entry.get("git").and_then(toml::Value::as_str),
+            Some(TSRS_FORK_URL)
+        );
+        exact_tsrs_revision(entry);
+    }
+
+    #[test]
+    fn tsrs_git_dependencies_share_one_revision() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask manifest directory has a parent");
+        assert_root_tsrs_patch(&read_manifest(&repo_root.join("Cargo.toml")));
+        let mut revisions = BTreeMap::<String, BTreeSet<String>>::new();
+        let mut fork_revisions = BTreeSet::new();
+
+        for manifest in workspace_manifests(repo_root) {
+            let document = read_manifest(&manifest);
+            collect_tsrs_git_revs(&document, &manifest, repo_root, &mut revisions);
+            collect_tsrs_patch_revs(&document, &mut fork_revisions);
+        }
+        assert_eq!(
+            revisions.len(),
+            1,
+            "expected exactly one upstream tsrs git dependency rev, found {revisions:?}"
+        );
+        assert_eq!(
+            fork_revisions.len(),
+            1,
+            "all tsrs patches must share one fork rev, found {fork_revisions:?}"
+        );
+    }
+
+    #[test]
+    fn tsrs_revision_guards_reject_unpinned_dependencies() {
+        for pin in [
+            "branch = 'main'",
+            "tag = 'v1'",
+            "rev = 'abc'",
+            "rev = 'zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz'",
+            "rev = 42",
+            "rev = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', branch = 'main'",
+            "rev = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', tag = 'v1'",
+        ] {
+            let upstream: toml::Value = toml::from_str(&format!(
+                "[workspace.dependencies]\ntsrs_ast = {{ git = 'https://github.com/oxc-project/tsrs/', {pin} }}"
+            ))
+            .expect("parse upstream fixture");
+            assert!(
+                std::panic::catch_unwind(|| {
+                    collect_tsrs_git_revs(
+                        &upstream,
+                        Path::new("Cargo.toml"),
+                        Path::new(""),
+                        &mut BTreeMap::new(),
+                    );
+                })
+                .is_err(),
+                "upstream accepted {pin}"
+            );
+
+            let patch: toml::Value = toml::from_str(&format!(
+                "[patch.'{TSRS_URL}']\ntsrs_ast = {{ git = '{TSRS_FORK_URL}', {pin} }}"
+            ))
+            .expect("parse patch fixture");
+            assert!(
+                std::panic::catch_unwind(|| {
+                    collect_tsrs_patch_revs(&patch, &mut BTreeSet::new());
+                })
+                .is_err(),
+                "fork patch accepted {pin}"
+            );
+        }
+    }
+
+    #[test]
+    fn collect_tsrs_git_revs_retains_differing_revisions() {
+        let document: toml::Value = toml::from_str(&format!(
+            r#"
+            [workspace.dependencies]
+            tsrs_ast = {{ git = '{TSRS_URL}', rev = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' }}
+            tsrs_core = {{ git = 'https://github.com/oxc-project/tsrs', rev = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' }}
+            [target.'cfg(unix)'.dependencies]
+            tsrs_vfs = {{ git = 'https://github.com/oxc-project/tsrs/', rev = 'cccccccccccccccccccccccccccccccccccccccc' }}
+            "#
+        ))
+        .expect("parse");
+        let mut revisions = BTreeMap::new();
+        collect_tsrs_git_revs(
+            &document,
+            Path::new("Cargo.toml"),
+            Path::new(""),
+            &mut revisions,
+        );
+        assert_eq!(
+            revisions.len(),
+            3,
+            "different upstream revisions must not collapse"
+        );
+    }
+
+    #[test]
+    fn collect_tsrs_patch_revs_checks_all_patch_sources() {
+        let document: toml::Value = toml::from_str(&format!(
+            r#"
+            [patch.'{TSRS_URL}']
+            tsrs_core = {{ git = '{TSRS_FORK_URL}', rev = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' }}
+            tsrs_ast = {{ git = '{TSRS_FORK_URL}', rev = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' }}
+            [patch.crates-io]
+            tsrs_vfs = {{ git = '{TSRS_FORK_URL}', rev = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' }}
+            "#
+        )).expect("parse");
+        assert_root_tsrs_patch(&document);
+        let mut revisions = BTreeSet::new();
+        collect_tsrs_patch_revs(&document, &mut revisions);
+        assert_eq!(
+            revisions.len(),
+            2,
+            "different fork revisions must not collapse"
         );
     }
 

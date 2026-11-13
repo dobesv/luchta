@@ -1,0 +1,41 @@
+[package]
+name = "luchta-tsrs-worker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description.workspace = true
+
+[dependencies]
+luchta-worker = { path = "../luchta-worker" }
+luchta-yarn-env = { path = "../luchta-yarn-env" }
+pnp = { workspace = true }
+tokio = { workspace = true }
+tsrs_ast = { workspace = true }
+tsrs_compiler = { workspace = true }
+tsrs_core = { workspace = true }
+tsrs_diagnostics = { workspace = true }
+tsrs_module = { workspace = true }
+tsrs_tsoptions = { workspace = true }
+tsrs_vfs = { workspace = true }
+
+# Match the other in-process workers' allocator and target gates.
+[target.'cfg(not(any(target_os = "linux", target_os = "freebsd", target_arch = "arm", target_arch = "riscv64", target_family = "wasm")))'.dependencies]
+mimalloc = { workspace = true }
+
+[target.'cfg(all(target_os = "linux", not(target_arch = "arm"), not(target_arch = "riscv64")))'.dependencies]
+mimalloc = { workspace = true, features = ["local_dynamic_tls"] }
+
+[build-dependencies]
+luchta-lockfile-version = { path = "../luchta-lockfile-version" }
+
+[dev-dependencies]
+luchta-lockfile-version = { path = "../luchta-lockfile-version" }
+luchta-test-support = { path = "../luchta-test-support" }
+luchta-yarn-env = { path = "../luchta-yarn-env", features = ["test-fixture"] }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+zip = { workspace = true }

@@ -23,14 +23,15 @@ impl SarifLevel {
     }
 }
 
-/// One diagnostic to render as a SARIF result. `end_line`/`end_column` are
-/// optional; when `None` they are omitted from the region object.
+/// One diagnostic to render as a SARIF result. A missing `rule_id` is omitted.
+/// `uri: None` omits the location (and ignores positions) for global diagnostics.
+/// Missing `end_line`/`end_column` values are omitted from the region object.
 #[derive(Debug, Clone)]
 pub struct SarifFinding {
-    pub rule_id: String,
+    pub rule_id: Option<String>,
     pub level: SarifLevel,
     pub message: String,
-    pub uri: String,
+    pub uri: Option<String>,
     pub start_line: usize,
     pub start_column: usize,
     pub end_line: Option<usize>,
@@ -61,14 +62,18 @@ struct SarifTool<'a> {
 #[serde(rename_all = "camelCase")]
 struct SarifDriver<'a> {
     name: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    information_uri: Option<&'a str>,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SarifResult {
-    rule_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rule_id: Option<String>,
     level: &'static str,
     message: SarifMessage,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     locations: Vec<SarifLocation>,
 }
 
@@ -109,6 +114,15 @@ struct SarifRegion {
 /// Serialize `findings` as a SARIF 2.1.0 log with a single run whose driver
 /// name is `tool_name`.
 pub fn build_sarif(tool_name: &str, findings: &[SarifFinding]) -> Result<String, String> {
+    build_sarif_with_information_uri(tool_name, None, findings)
+}
+
+/// Build a report with an optional link identifying the diagnostic tool.
+pub fn build_sarif_with_information_uri(
+    tool_name: &str,
+    information_uri: Option<&str>,
+    findings: &[SarifFinding],
+) -> Result<String, String> {
     let results = findings
         .iter()
         .map(|finding| SarifResult {
@@ -117,19 +131,21 @@ pub fn build_sarif(tool_name: &str, findings: &[SarifFinding]) -> Result<String,
             message: SarifMessage {
                 text: finding.message.clone(),
             },
-            locations: vec![SarifLocation {
-                physical_location: SarifPhysicalLocation {
-                    artifact_location: SarifArtifactLocation {
-                        uri: finding.uri.clone(),
+            locations: finding
+                .uri
+                .iter()
+                .map(|uri| SarifLocation {
+                    physical_location: SarifPhysicalLocation {
+                        artifact_location: SarifArtifactLocation { uri: uri.clone() },
+                        region: SarifRegion {
+                            start_line: finding.start_line,
+                            start_column: finding.start_column,
+                            end_line: finding.end_line,
+                            end_column: finding.end_column,
+                        },
                     },
-                    region: SarifRegion {
-                        start_line: finding.start_line,
-                        start_column: finding.start_column,
-                        end_line: finding.end_line,
-                        end_column: finding.end_column,
-                    },
-                },
-            }],
+                })
+                .collect(),
         })
         .collect();
 
@@ -138,7 +154,10 @@ pub fn build_sarif(tool_name: &str, findings: &[SarifFinding]) -> Result<String,
         schema: SARIF_SCHEMA,
         runs: vec![SarifRun {
             tool: SarifTool {
-                driver: SarifDriver { name: tool_name },
+                driver: SarifDriver {
+                    name: tool_name,
+                    information_uri,
+                },
             },
             results,
         }],
@@ -154,15 +173,63 @@ mod tests {
 
     fn finding(end: Option<(usize, usize)>) -> SarifFinding {
         SarifFinding {
-            rule_id: "no-console".to_owned(),
+            rule_id: Some("no-console".to_owned()),
             level: SarifLevel::Error,
             message: "no console".to_owned(),
-            uri: "packages/app/src/index.ts".to_owned(),
+            uri: Some("packages/app/src/index.ts".to_owned()),
             start_line: 1,
             start_column: 1,
             end_line: end.map(|(line, _)| line),
             end_column: end.map(|(_, col)| col),
         }
+    }
+
+    #[test]
+    fn global_finding_omits_location_and_missing_rule_id() {
+        let mut entry = finding(None);
+        entry.uri = None;
+        entry.rule_id = None;
+        let sarif = build_sarif("tsrs", &[entry]).expect("sarif");
+        let json: Value = serde_json::from_str(&sarif).expect("json");
+        let result = &json["runs"][0]["results"][0];
+        assert!(result.get("locations").is_none());
+        assert!(result.get("ruleId").is_none());
+        assert_eq!(result["message"]["text"], "no console");
+    }
+
+    #[test]
+    fn explicit_empty_rule_and_uri_keep_existing_behavior() {
+        let mut entry = finding(None);
+        entry.rule_id = Some(String::new());
+        entry.uri = Some(String::new());
+        let sarif = build_sarif("oxlint", &[entry]).expect("sarif");
+        let json: Value = serde_json::from_str(&sarif).expect("json");
+        let result = &json["runs"][0]["results"][0];
+        assert_eq!(result["ruleId"], "");
+        assert_eq!(
+            result["locations"][0]["physicalLocation"]["artifactLocation"]["uri"],
+            ""
+        );
+    }
+
+    #[test]
+    fn information_uri_is_optional() {
+        let sarif = super::build_sarif_with_information_uri(
+            "tsrs",
+            Some("https://github.com/dobesv/luchta"),
+            &[],
+        )
+        .expect("sarif");
+        let json: Value = serde_json::from_str(&sarif).expect("json");
+        assert_eq!(
+            json["runs"][0]["tool"]["driver"]["informationUri"],
+            "https://github.com/dobesv/luchta"
+        );
+        let sarif = build_sarif("oxlint", &[]).expect("sarif");
+        let json: Value = serde_json::from_str(&sarif).expect("json");
+        assert!(json["runs"][0]["tool"]["driver"]
+            .get("informationUri")
+            .is_none());
     }
 
     #[test]
