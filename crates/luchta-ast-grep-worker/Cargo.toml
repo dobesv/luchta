@@ -24,7 +24,7 @@ globset = { workspace = true }
 indexmap = { version = "2", features = ["serde"] }
 # Pinned exact: ast-grep is pre-1.0; breaks between minor versions.
 ast-grep-core = "=0.43.0"
-ast-grep-config = "=0.43.0"
+ast-grep-config = "=0.51.2"
 ast-grep-language = "=0.43.0"
 
 # mimalloc as the global allocator — see luchta-oxlint-worker/Cargo.toml for
