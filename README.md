@@ -1071,7 +1071,7 @@ To solve this, a worker may return `tool_version: Some(String)` in its resolve-t
 - **How to report in Rust workers:**
   Add `luchta-lockfile-version` to `[build-dependencies]`. In `build.rs`, call `luchta_lockfile_version::emit_and_read("<crate-name>")` to read the version or git rev from `Cargo.lock`, set `cargo::rustc-env=LUCHTA_TOOL_VERSION=...`, and read it at resolve time via `env!("LUCHTA_TOOL_VERSION").to_owned()`. For workers embedding multiple tools, sort the pairs by name and join with commas (e.g. `styled_components=18.0.0,swc_core=80.0.0`).
 - **How to report in Go workers:**
-  Inject the tool or submodule commit SHA at build time via `-ldflags -X` (e.g. `-X 'github.com/microsoft/TypeScript/tsc/internal/luchta.LuchtaToolVersion=<sha>'`), then emit it in the resolve response.
+  Inject the tool or submodule commit SHA at build time via `-ldflags -X` (e.g. `-X 'github.com/microsoft/TypeScript/tsc/internal/luchta.LuchtaToolVersion=<sha>'`), then emit it in the resolve response. The tsc worker appends `-luchta.<workerRevision>` to this SHA. Bump `workerRevision` in `tsc/internal/luchta/protocol.go` (in `patches/luchta.patch`) when worker changes require cache invalidation without an upstream commit change.
 - **When NOT to use:**
   Workers whose output depends only on declared task inputs or `package.json` dependencies (like `luchta-yarn-worker`) do not need this. Package-dependency filtering already handles cache invalidation for them.
 - **Observability:**
