@@ -2691,7 +2691,7 @@ dependencies = [
 
 [[package]]
 name = "luchta-ast-grep-worker"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "assert_fs",
  "ast-grep-config",
@@ -2713,7 +2713,7 @@ dependencies = [
 
 [[package]]
 name = "luchta-bash-worker"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "luchta-engine",
  "luchta-worker",
@@ -2723,7 +2723,7 @@ dependencies = [
 
 [[package]]
 name = "luchta-cache"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "bincode",
  "blake3",
@@ -2751,7 +2751,7 @@ dependencies = [
 
 [[package]]
 name = "luchta-cli"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "arc-swap",
  "assert_cmd",
@@ -2798,7 +2798,7 @@ dependencies = [
 
 [[package]]
 name = "luchta-command-filter"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "luchta-worker",
  "serde_json",
@@ -2808,7 +2808,7 @@ dependencies = [
 
 [[package]]
 name = "luchta-engine"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "futures",
  "libc",
@@ -2829,7 +2829,7 @@ dependencies = [
 
 [[package]]
 name = "luchta-extra-resolve-worker"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "luchta-worker",
  "serde_json",
@@ -2839,7 +2839,7 @@ dependencies = [
 
 [[package]]
 name = "luchta-file-exists-filter"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "assert_cmd",
  "globset",
@@ -2853,14 +2853,14 @@ dependencies = [
 
 [[package]]
 name = "luchta-glob"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "globset",
 ]
 
 [[package]]
 name = "luchta-lazy-worker"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "luchta-worker",
  "serde_json",
@@ -2870,11 +2870,11 @@ dependencies = [
 
 [[package]]
 name = "luchta-lockfile-version"
-version = "0.3.8"
+version = "0.3.9"
 
 [[package]]
 name = "luchta-lockfiles"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "serde",
  "serde_norway",
@@ -2884,7 +2884,7 @@ dependencies = [
 
 [[package]]
 name = "luchta-oxc-transform-worker"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "assert_fs",
  "luchta-lockfile-version",
@@ -2904,7 +2904,7 @@ dependencies = [
 
 [[package]]
 name = "luchta-oxfmt-worker"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "assert_fs",
  "ignore",
@@ -2924,7 +2924,7 @@ dependencies = [
 
 [[package]]
 name = "luchta-oxlint-worker"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "assert_fs",
  "ignore",
@@ -2949,7 +2949,7 @@ dependencies = [
 
 [[package]]
 name = "luchta-swc-transform-worker"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "assert_fs",
  "luchta-lockfile-version",
@@ -2964,11 +2964,11 @@ dependencies = [
 
 [[package]]
 name = "luchta-test-support"
-version = "0.3.8"
+version = "0.3.9"
 
 [[package]]
 name = "luchta-tsrs-worker"
-version = "0.3.7"
+version = "0.3.9"
 dependencies = [
  "luchta-lockfile-version",
  "luchta-test-support",
@@ -2991,7 +2991,7 @@ dependencies = [
 
 [[package]]
 name = "luchta-types"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "serde",
  "serde_json",
@@ -3000,7 +3000,7 @@ dependencies = [
 
 [[package]]
 name = "luchta-worker"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "libc",
  "luchta-types",
@@ -3013,7 +3013,7 @@ dependencies = [
 
 [[package]]
 name = "luchta-worker-watcher"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "globset",
  "luchta-glob",
@@ -3029,7 +3029,7 @@ dependencies = [
 
 [[package]]
 name = "luchta-workspace"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "globset",
  "luchta-glob",
@@ -3044,7 +3044,7 @@ dependencies = [
 
 [[package]]
 name = "luchta-yarn-env"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "blake3",
  "libc",
@@ -3059,7 +3059,7 @@ dependencies = [
 
 [[package]]
 name = "luchta-yarn-filter"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "assert_cmd",
  "luchta-worker",
@@ -3070,7 +3070,7 @@ dependencies = [
 
 [[package]]
 name = "luchta-yarn-worker"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "luchta-engine",
  "luchta-worker",
@@ -7700,7 +7700,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "clap",
  "serde",
