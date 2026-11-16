@@ -130,8 +130,10 @@ Repetitive project tasks live in the `xtask` crate, run through the
 ```bash
 cargo xtask install          # Install all workspace binary crates (including the Go worker)
 cargo xtask build-worker     # Build the TypeScript Go worker standalone (requires Go 1.26+)
+cargo xtask quality          # Fail on rustqual findings a change adds or makes worse
+cargo xtask rustqual <path>  # Run the pinned rustqual with the workspace's settings
 ```
-This discovers every workspace member with a binary target via `cargo
+`install` discovers every workspace member with a binary target via `cargo
 metadata` and runs `cargo install --path` for each, so it stays correct as
 crates are added. `install` also builds the Go worker for the host and
 places `luchta-tsc-worker` in the cargo bin directory alongside the Rust
@@ -277,11 +279,15 @@ cargo build --workspace
 cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
 cargo nextest run --workspace --stress-count=5
-cs delta origin/HEAD   # CodeScene — must be all green
+cargo xtask quality    # rustqual: no new or worse findings
 ```
 
-The CodeScene `cs delta` check **must be all green** (no new code-health
-problems) for a change to be considered done.
+`cargo xtask quality` runs [rustqual](https://github.com/SaschaOnTour/rustqual)
+on the change and on its merge base with `origin/HEAD`, and fails on any
+finding the change adds or makes worse. Existing findings don't count against
+a change. rustqual is pinned in `xtask/rustqual` and built on first use, and
+its settings are in `rustqual.toml`. See `AGENTS.md` for how to read and
+suppress findings.
 
 ### Releasing
 

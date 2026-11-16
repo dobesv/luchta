@@ -1,0 +1,12 @@
+# Settings for rustqual (https://github.com/SaschaOnTour/rustqual), which
+# `cargo xtask quality` runs on a change and on its merge base, failing on
+# findings the change adds or makes worse. The workspace's existing findings
+# are not a to-do list. Unset keys keep rustqual's defaults; the full list is
+# in its book/reference-configuration.md.
+
+# Test code gets more room than production code. Integration tests set up
+# workspaces, fixtures and worker processes inline, and splitting them up only
+# to meet a length limit makes it harder to see what each one checks.
+[tests]
+max_function_lines = 120
+file_length = 1000

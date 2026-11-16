@@ -15,6 +15,8 @@ Luchta is a Cargo workspace with the following crate layout:
 - `crates/luchta-cache`: Filesystem-backed build cache, hashing, and skip logic (`thiserror`, filesystem records, no embedded DB).
 - `crates/luchta-yarn-env`: Computes the environment Yarn Berry injects when running a script (bin shims, `NODE_OPTIONS`, `npm_*`) from the PnP manifest via the `pnp` crate; `luchta-yarn-worker` uses it for direct execution. Its `test-fixture` feature exposes `PnpFixture`, a synthetic PnP project builder for other crates' tests.
 - `xtask`: Project automation crate (standard Rust `xtask` pattern), run via the `cargo xtask` alias.
+  `xtask/rustqual` pins the rustqual version `cargo xtask quality` builds; it is
+  its own workspace, not a member of this one. `rustqual.toml` holds its settings.
 
 ## Key Architectural Decisions
 Agents must respect these fundamental design choices:
@@ -38,20 +40,13 @@ cargo fmt --all                                          # Auto-format (rustup u
 cargo clippy --workspace --all-targets -- -D warnings    # Lint — treat warnings as errors
 cargo nextest run --workspace                            # Run all tests via nextest
 cargo nextest run --workspace --stress-count=5           # Repeat 5x to catch flaky tests
-cs delta origin/HEAD                                     # CodeScene quality analysis of branch changes
+cargo xtask quality                                      # Fail on rustqual findings the change adds or makes worse
 cargo xtask install                                      # Install all workspace binary crates locally
 cargo xtask build-worker --target <triple>                  # Build the Go-based TypeScript worker
 ```
 
-**CodeScene must be all green.** `cs delta` must report no new code-health
-problems (no degrading functions, no new code smells) before the work is
-considered done. A red or degrading CodeScene result is a blocker — fix the
-flagged code, do not merge around it. The one exception: when a flagged
-function shape is fixed by an upstream trait signature you implement (e.g.
-`tsrs_module::Resolver`'s five-argument methods), use a per-function
-`@codescene(disable:"<exact smell name>")` comment directly above the function
-and name the fixed signature in the comment — don't reshape the trait impl to
-appease the metric.
+**Don't add rustqual findings or make existing ones worse.** A failing
+`cargo xtask quality` is a blocker: fix the flagged code, don't merge around it.
 
 **Do not ignore clippy warnings.** Treat every warning as an error; CI runs
 `cargo clippy -- -D warnings`.
@@ -119,6 +114,56 @@ binary in the test's own package, use the compile-time
 `escargot` (see `yarn_worker_bin()` in `crates/luchta-cli/tests/common/mod.rs`).
 To reproduce the CI layout on an older toolchain, set
 `CARGO_BUILD_BUILD_DIR` to a directory outside the target dir.
+
+### Code quality gate
+
+`cargo xtask quality` runs [rustqual](https://github.com/SaschaOnTour/rustqual)
+on the working tree, uncommitted and untracked files included, and on its merge
+base with `origin/HEAD` (or `--base <rev>`), and fails on every finding the
+change added or made worse. The workspace's existing findings (about 1,650
+when the gate was added) are not a to-do list, and the gate ignores them.
+Findings are matched by file, category and function rather than by line, and
+follow a renamed file. "Worse" means a bigger number on a finding both sides
+have: a longer function, higher complexity, deeper nesting, more parameters or
+more `unwrap`s. A file already over the length limit may grow; only crossing
+the limit counts. Apart from
+fetching rustqual's crates for its first build, it needs no network access and
+no license, so it runs inside the sandbox.
+
+rustqual is pinned in `xtask/rustqual/Cargo.toml` and its lockfile, so nothing
+needs installing; the first run builds it, which takes about a minute. Its
+settings live in `rustqual.toml`, and both sides of the comparison use the
+working tree's copy, so changing a setting never fails the gate by itself.
+`cargo xtask rustqual <path> --verbose` runs the same binary with the same
+settings to show what is behind a finding, and `--suggestions` adds refactoring
+hints for logic-plus-calls (`iosp`) violations.
+
+rustqual's IOSP rule wants each function either to contain logic (`if`,
+`match`, loops, arithmetic) or to call other functions of this workspace, not
+both. It resolves calls by name, so a method call such as `.len()` or `.find()`
+counts when any function in the workspace shares that name. Closures and
+iterator chains don't count as logic, so a loop that calls helpers can usually
+become an iterator chain, or the logic can move into a helper of its own.
+
+Fix what the gate reports. When a finding is deliberate, suppress it with a
+comment on the line above the item: `// qual:allow(iosp) — <reason>` for a
+logic-plus-calls violation, and `// qual:allow(<dimension>, <target>) reason:
+"<reason>"` for anything else, where the target names the kind of finding and a
+metric target pins its ceiling (`max_function_lines=80`).
+`cargo xtask rustqual --explain allow` lists the targets. `// qual:api` and
+`// qual:test_helper` mark a function used only from outside its crate or only
+from tests, which rustqual otherwise reports as dead code. Trait impls aren't
+counted against the parameter limit, so an upstream trait's wide signature
+(`tsrs_module::Resolver`) needs no suppression.
+
+rustqual treats only an exact `#[cfg(test)]` as test code. A module gated with
+`#[cfg(all(test, unix))]` or `#[cfg(all(test, feature = "oxc"))]` is analysed
+as production code, so its helpers' `unwrap`s, magic numbers and test-only
+calls are reported. Write that gate as two attributes, `#[cfg(test)]` and
+`#[cfg(unix)]`, which compile the same.
+
+The `Code quality` CI job runs the gate on pull requests and annotates the diff
+with what it finds. It is advisory: `.mergify.yml` doesn't require it.
 
 ## Conventions
 - **No `target/`:** Never commit `target/` directories.
@@ -204,6 +249,12 @@ them as workflow artifacts instead of publishing a release.
   update the `[patch]` rev. The pin guard doesn't check that the fork is based
   on the upstream rev. The `xtask` test `tsrs_git_dependencies_share_one_revision`
   checks both rev sets.
+- Renovate also bumps the rustqual pin in `xtask/rustqual/Cargo.toml`, and
+  Mergify merges that PR like any other. The `xtask` test
+  `a_revision_compared_with_itself_passes` builds the pinned rustqual and
+  parses its report, so a release that breaks either fails `Test`. A release
+  that only adds rules makes the next `cargo xtask quality` report nothing new,
+  because both sides of the comparison run the same binary.
 - **Mergify** (`.mergify.yml`) runs a squash merge queue named `main`. It
   auto-queues every Renovate PR (any update type, majors included), except
   `renovate/tsrs-toolchain`, and any PR labeled `automerge`. A batch only

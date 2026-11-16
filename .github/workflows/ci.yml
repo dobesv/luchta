@@ -142,3 +142,35 @@ jobs:
 
       - name: Check formatting
         run: cargo fmt --all -- --check
+
+  # Fails a pull request that adds rustqual findings or makes existing ones
+  # worse (`cargo xtask quality`; AGENTS.md, "Code quality gate"). It is
+  # advisory: .mergify.yml doesn't require it.
+  quality:
+    name: Code quality
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          # A pull request checks out a merge commit whose first parent is the
+          # base branch's tip: the base to compare with.
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # The pinned rustqual isn't a workspace member and builds into a target
+      # directory of its own (xtask/rustqual/Cargo.toml). rust-cache reads the
+      # path after `->` relative to the workspace before it.
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            xtask/rustqual -> ../../target/rustqual
+
+      - name: Compare rustqual findings with the base
+        run: cargo xtask quality --base HEAD^1

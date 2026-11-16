@@ -68,7 +68,6 @@ impl<'h> PnpResolver<'h> {
 }
 
 impl Resolver for PnpResolver<'_> {
-    // @codescene(disable:"Excess Number of Function Arguments") Signature fixed by upstream tsrs_module::Resolver.
     fn resolve_module_name(
         &self,
         module_name: &str,
@@ -103,7 +102,6 @@ impl Resolver for PnpResolver<'_> {
         Ok((self.filter_module(module_name, &issuer, result), trace))
     }
 
-    // @codescene(disable:"Excess Number of Function Arguments") Signature fixed by upstream tsrs_module::Resolver.
     fn resolve_type_reference_directive(
         &self,
         name: &str,

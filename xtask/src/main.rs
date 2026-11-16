@@ -6,6 +6,8 @@ use std::process::{Command, ExitCode, Stdio};
 use clap::{Args, Parser, Subcommand};
 use serde::Deserialize;
 
+mod quality;
+
 /// Project automation tasks for the Luchta workspace.
 #[derive(Debug, Parser)]
 #[command(name = "xtask", about = "Luchta project automation tasks", long_about = None, version)]
@@ -22,6 +24,14 @@ enum XtaskCommand {
     ListReleaseBins,
     /// Build Go TypeScript worker into target output directory.
     BuildWorker(BuildWorkerArgs),
+    /// Fail on rustqual findings a change adds or makes worse.
+    ///
+    /// Compares the working tree (or --head) with its merge base, using the
+    /// settings in rustqual.toml for both. The first run builds rustqual.
+    Quality(quality::QualityArgs),
+    /// Run the pinned rustqual with the workspace's settings.
+    #[command(disable_help_flag = true)]
+    Rustqual(quality::RustqualArgs),
 }
 
 #[derive(Debug, Args)]
@@ -40,6 +50,8 @@ fn main() -> ExitCode {
         XtaskCommand::Install => install_bins(),
         XtaskCommand::ListReleaseBins => list_release_bins(),
         XtaskCommand::BuildWorker(args) => build_worker(args),
+        XtaskCommand::Quality(args) => quality::quality(args),
+        XtaskCommand::Rustqual(args) => quality::rustqual(args),
     }
 }
 
@@ -192,8 +204,8 @@ fn host_target_triple() -> Result<String, String> {
         .ok_or_else(|| "failed to find host triple in rustc -vV output".to_string())
 }
 
-/// Builds a `git` command scoped to `vendor_dir` via `-C`, with the
-/// environment variables that can override `-C` stripped.
+/// Builds a `git` command scoped to `dir` via `-C`, with the environment
+/// variables that can override `-C` stripped.
 ///
 /// Git itself sets `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, and
 /// `GIT_COMMON_DIR` on child processes in ordinary situations (running from
@@ -202,10 +214,11 @@ fn host_target_triple() -> Result<String, String> {
 /// repository, worktree, or index than the one we just named.
 /// `reset_vendor_worktree` runs `checkout .` and `clean -fd`, so under the
 /// wrong worktree that silently deletes files that were never meant to be
-/// touched. Stripping these here makes `-C vendor_dir` authoritative for
-/// every git invocation in this file, without touching any other inherited
-/// environment variable.
-fn git_command(vendor_dir: &Path) -> Command {
+/// touched. Stripping these here makes `-C dir` authoritative for every git
+/// invocation in this crate, without touching any other inherited
+/// environment variable. A caller that sets one of them again afterwards,
+/// as `cargo xtask quality` does with a throwaway `GIT_INDEX_FILE`, wins.
+fn git_command(dir: &Path) -> Command {
     let mut command = Command::new("git");
     command
         .env_remove("GIT_DIR")
@@ -213,7 +226,7 @@ fn git_command(vendor_dir: &Path) -> Command {
         .env_remove("GIT_INDEX_FILE")
         .env_remove("GIT_COMMON_DIR")
         .arg("-C")
-        .arg(vendor_dir);
+        .arg(dir);
     command
 }
 
