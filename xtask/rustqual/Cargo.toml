@@ -1,0 +1,19 @@
+# Pins the rustqual that `cargo xtask quality` and `cargo xtask rustqual`
+# build and run, the way a devDependency pins a JavaScript tool: the version
+# is here and in this directory's Cargo.lock, so nobody installs it by hand and
+# Renovate keeps it current. The empty [workspace] keeps it out of the Luchta
+# workspace, whose builds, lints and tests never compile it.
+[package]
+name = "luchta-rustqual"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[[bin]]
+name = "rustqual"
+path = "src/main.rs"
+
+[dependencies]
+rustqual = "=1.8.3"
