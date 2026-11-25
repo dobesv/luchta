@@ -28,7 +28,7 @@ use luchta_cache::shared::{
 use luchta_cache::{
     combined_cache_files_hash, combined_inputs_hash, decide_shared_restore, resolve_outputs,
     task_cache_key, CurrentState, FileEntry, ReportInput, RunArtifacts, RunReason,
-    SCHEMA_VERSION_V5,
+    SCHEMA_VERSION_V6,
 };
 use luchta_types::EnvSpec;
 use luchta_worker::BUILTIN_PASSTHROUGH_ENV;
@@ -752,7 +752,7 @@ fn assemble_run_record(
         .unwrap_or(1);
 
     Box::new(TaskRunRecord {
-        schema_version: SCHEMA_VERSION_V5,
+        schema_version: SCHEMA_VERSION_V6,
         task_spec_hash: cache_ctx.task_spec_hash,
         input_patterns: patterns.input_patterns.clone(),
         inputs,
@@ -1806,7 +1806,7 @@ mod tests {
 
     use crate::cli::OutputMode;
     use crate::progress::ProgressReporter;
-    use luchta_cache::{decide, FileDelta, ReportInput, RunReason, SCHEMA_VERSION_V5};
+    use luchta_cache::{decide, FileDelta, ReportInput, RunReason, SCHEMA_VERSION_V6};
     use luchta_engine::CollectedReport;
     use std::sync::atomic::AtomicBool;
 
@@ -2082,7 +2082,7 @@ mod tests {
             }
         };
 
-        assert_eq!(record.schema_version, SCHEMA_VERSION_V5);
+        assert_eq!(record.schema_version, SCHEMA_VERSION_V6);
         assert_eq!(record.run_reason, Some(run_reason));
     }
 
@@ -2418,7 +2418,7 @@ mod tests {
         let hydrated = cache
             .read(&task_id.to_string())
             .expect("hydrated record should exist");
-        assert_eq!(hydrated.schema_version, SCHEMA_VERSION_V5);
+        assert_eq!(hydrated.schema_version, SCHEMA_VERSION_V6);
         assert_eq!(hydrated.run_reason, Some(RunReason::SharedCacheHit));
     }
 

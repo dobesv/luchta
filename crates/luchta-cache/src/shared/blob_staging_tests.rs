@@ -149,6 +149,85 @@ fn legacy_restore_staging_uses_repository_tmp() {
     assert!(directory_names(&staging_root).is_empty());
 }
 
+#[test]
+fn outputs_only_restore_ignores_genuine_legacy_embedded_metadata() {
+    let root = tempfile::tempdir().unwrap();
+    let paths = crate::shared::open_shared_paths(&root.path().join("cache")).unwrap();
+    let package_dir = root.path().join("package");
+    let staging_root = root.path().join("staging");
+    fs::create_dir(&package_dir).unwrap();
+    let outputs_hash = [4; 32];
+    let archive = include_bytes!("../../tests/fixtures/legacy-bincode/embedded-meta.tar.zst");
+    let path = blob_path(&paths, &outputs_hash);
+    fs::write(&path, archive).unwrap();
+
+    // The metadata-capturing path still validates the obsolete report name.
+    assert!(matches!(
+        restore_blob_with_meta(&paths, &outputs_hash, &package_dir, &staging_root).unwrap(),
+        BlobReadResultWithMeta::Corrupt
+    ));
+    let BlobReadResultWithMeta::Restored(staged) =
+        restore_outputs_staged(&paths, &outputs_hash, &package_dir, &staging_root).unwrap()
+    else {
+        panic!("expected staged outputs from the legacy archive");
+    };
+    assert!(staged.meta.stdout.is_empty());
+    assert!(staged.meta.stderr.is_empty());
+    assert!(staged.meta.record.is_empty());
+    assert!(staged.meta.reports.is_empty());
+    staged.commit().unwrap();
+    assert_eq!(fs::read(package_dir.join("dist/main.js")).unwrap(), b"v1");
+    assert!(!package_dir.join(".luchta-meta").exists());
+    assert_eq!(fs::read(path).unwrap(), archive);
+}
+
+#[test]
+fn blob_with_meta_round_trips_postcard_record_and_reports() {
+    let root = tempfile::tempdir().unwrap();
+    let paths = crate::shared::open_shared_paths(&root.path().join("cache")).unwrap();
+    let source = root.path().join("source");
+    let destination = root.path().join("destination");
+    fs::create_dir(&source).unwrap();
+    fs::create_dir(&destination).unwrap();
+    fs::write(source.join("out.txt"), b"output").unwrap();
+    let record = crate::shared::tests::sample_record(true, 200);
+    let meta = MetaFiles {
+        stdout: b"stdout".to_vec(),
+        stderr: b"stderr".to_vec(),
+        record: crate::serialization::encode(&record).unwrap(),
+        reports: vec![ReportInput {
+            filename: "lint.txt".to_owned(),
+            // The embedded format stores only the report filename and content.
+            mime_type: String::new(),
+            content: "report".to_owned(),
+        }],
+    };
+    let hash = [8; 32];
+    write_blob_with_meta(
+        &paths,
+        &hash,
+        &source,
+        &[PathBuf::from("out.txt")],
+        1_000_000,
+        &meta,
+    )
+    .unwrap();
+    let BlobReadResultWithMeta::Restored(staged) =
+        restore_blob_with_meta(&paths, &hash, &destination, &root.path().join("staging")).unwrap()
+    else {
+        panic!("expected staged outputs and metadata");
+    };
+    assert_eq!(
+        crate::record::decode_record(&staged.meta.record),
+        Some(record)
+    );
+    assert_eq!(staged.meta.stdout, meta.stdout);
+    assert_eq!(staged.meta.stderr, meta.stderr);
+    assert_eq!(staged.meta.reports, meta.reports);
+    staged.commit().unwrap();
+    assert_eq!(fs::read(destination.join("out.txt")).unwrap(), b"output");
+}
+
 // /dev/shm gives Linux CI an unprivileged second filesystem. Other platforms
 // still exercise staging selection and normal commits above.
 #[cfg(target_os = "linux")]

@@ -16,7 +16,15 @@ pub const SCHEMA_VERSION_V4: u32 = 4;
 /// matched with `literal_separator` semantics (`*` no longer crosses `/`) and
 /// support `!` negation. V4 records were hashed against a wider input set, so
 /// reusing them could skip a task whose real inputs changed.
+// qual:api
 pub const SCHEMA_VERSION_V5: u32 = 5;
+/// Sixth schema version: Postcard storage, isolated from previous records.
+pub const SCHEMA_VERSION_V6: u32 = 6;
+
+pub(crate) fn decode_record(bytes: &[u8]) -> Option<TaskRunRecord> {
+    let record: TaskRunRecord = crate::serialization::decode(bytes).ok()?;
+    (record.schema_version == SCHEMA_VERSION_V6).then_some(record)
+}
 
 /// Serialized cache metadata for one task execution.
 ///

@@ -74,7 +74,7 @@ fn build_connector_record(task_id: &TaskId, ctx: &DecisionContext) -> Option<Tas
     let now_unix_ms = now_unix_ms();
 
     Some(TaskRunRecord {
-        schema_version: SCHEMA_VERSION_V5,
+        schema_version: SCHEMA_VERSION_V6,
         task_spec_hash: current.task_spec_hash,
         input_patterns: task_def.inputs.clone(),
         inputs,

@@ -4,12 +4,13 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use crate::record::{TaskRunRecord, SCHEMA_VERSION_V5};
-use crate::serialization::bincode_config;
+use crate::record::{decode_record, TaskRunRecord};
+use crate::serialization::encode;
 use crate::shared::atomic_write;
 use crate::{CacheError, Result};
 
-const META_FILE_NAME: &str = "meta.bincode";
+pub(crate) const META_FILE_NAME: &str = "meta.postcard";
+const LEGACY_META_FILE_NAME: &str = "meta.bincode";
 const STDOUT_FILE_NAME: &str = "stdout.log";
 const STDERR_FILE_NAME: &str = "stderr.log";
 const TMP_SUFFIX: &str = ".tmp";
@@ -52,10 +53,7 @@ impl Cache {
     #[must_use]
     pub fn read(&self, task_id: &str) -> Option<TaskRunRecord> {
         let bytes = fs::read(self.task_dir(task_id).join(META_FILE_NAME)).ok()?;
-        let (record, _): (TaskRunRecord, usize) =
-            bincode::serde::decode_from_slice(&bytes, bincode_config()).ok()?;
-        // Only accept V5 records. Older versions -> clean cache miss.
-        (record.schema_version == SCHEMA_VERSION_V5).then_some(record)
+        decode_record(&bytes)
     }
 
     pub fn write(&self, task_id: &str, artifacts: RunArtifacts<'_>) -> Result<()> {
@@ -73,8 +71,7 @@ impl Cache {
             atomic_write(&task_dir.join(&report.filename), report.content.as_bytes())?;
         }
 
-        let encoded = bincode::serde::encode_to_vec(artifacts.record, bincode_config())
-            .map_err(CacheError::SerializeRecord)?;
+        let encoded = encode(artifacts.record).map_err(CacheError::SerializeRecord)?;
         atomic_write(&task_dir.join(STDOUT_FILE_NAME), artifacts.stdout)?;
         atomic_write(&task_dir.join(STDERR_FILE_NAME), artifacts.stderr)?;
         atomic_write(&task_dir.join(META_FILE_NAME), &encoded)?;
@@ -117,6 +114,7 @@ pub(crate) fn is_valid_report_filename(filename: &str) -> bool {
         && !filename.contains('\\')
         && !filename.contains("..")
         && filename != META_FILE_NAME
+        && filename != LEGACY_META_FILE_NAME
         && filename != STDOUT_FILE_NAME
         && filename != STDERR_FILE_NAME
 }
@@ -231,10 +229,9 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::record::SCHEMA_VERSION_V5;
     use crate::record::{
         FileEntry, ReportMeta, SCHEMA_VERSION_V1, SCHEMA_VERSION_V2, SCHEMA_VERSION_V3,
-        SCHEMA_VERSION_V4,
+        SCHEMA_VERSION_V4, SCHEMA_VERSION_V5, SCHEMA_VERSION_V6,
     };
 
     #[test]
@@ -365,60 +362,64 @@ mod tests {
             Cache::open(&temp_dir.path().join(LUCHTA_DIR_NAME).join(CACHE_DIR_NAME)).unwrap();
         let task_dir = cache.task_dir("pkg#build");
         fs::create_dir_all(&task_dir).unwrap();
-        fs::write(task_dir.join(META_FILE_NAME), b"not-bincode").unwrap();
+        fs::write(task_dir.join(META_FILE_NAME), b"not Postcard").unwrap();
 
         assert_eq!(cache.read("pkg#build"), None);
     }
 
     #[test]
-    fn v1_meta_returns_none_instead_of_panicking() {
-        assert_previous_schema_record_is_cache_miss("pkg#build", sample_v1_record());
-    }
-
-    #[test]
-    fn v2_meta_returns_none_instead_of_panicking() {
-        assert_previous_schema_record_is_cache_miss("pkg#build", sample_v2_record());
-    }
-
-    #[test]
-    fn v3_shape_meta_returns_none_instead_of_panicking() {
-        assert_previous_schema_record_is_cache_miss("pkg#build", sample_v3_record());
-    }
-
-    #[test]
-    fn v3_version_field_is_rejected() {
-        let temp_dir = tempdir().unwrap();
-        let cache =
-            Cache::open(&temp_dir.path().join(LUCHTA_DIR_NAME).join(CACHE_DIR_NAME)).unwrap();
-        let task_dir = cache.task_dir("pkg#build");
+    fn mismatched_schema_is_rejected() {
+        let temp = tempdir().unwrap();
+        let cache = Cache::open(temp.path()).unwrap();
+        let task_id = "pkg#build";
+        let task_dir = cache.task_dir(task_id);
         fs::create_dir_all(&task_dir).unwrap();
-
         let mut record = sample_record();
-        record.schema_version = SCHEMA_VERSION_V3;
-        let encoded = bincode::serde::encode_to_vec(&record, bincode_config()).unwrap();
-        fs::write(task_dir.join(META_FILE_NAME), encoded).unwrap();
 
-        assert_eq!(cache.read("pkg#build"), None);
+        for version in [
+            SCHEMA_VERSION_V1,
+            SCHEMA_VERSION_V2,
+            SCHEMA_VERSION_V3,
+            SCHEMA_VERSION_V4,
+            SCHEMA_VERSION_V5,
+            SCHEMA_VERSION_V6 + 1,
+        ] {
+            record.schema_version = version;
+            fs::write(task_dir.join(META_FILE_NAME), encode(&record).unwrap()).unwrap();
+            assert_eq!(
+                cache.read(task_id),
+                None,
+                "unexpected hit for schema {version}"
+            );
+        }
     }
 
     #[test]
-    fn v4_version_field_is_rejected() {
-        let temp_dir = tempdir().unwrap();
-        let cache =
-            Cache::open(&temp_dir.path().join(LUCHTA_DIR_NAME).join(CACHE_DIR_NAME)).unwrap();
-        let task_dir = cache.task_dir("pkg#build");
+    fn legacy_local_record_is_ignored_and_preserved() {
+        let temp = tempdir().unwrap();
+        let cache = Cache::open(temp.path()).unwrap();
+        let task_id = "pkg#build";
+        let task_dir = cache.task_dir(task_id);
         fs::create_dir_all(&task_dir).unwrap();
+        let legacy_path = task_dir.join(LEGACY_META_FILE_NAME);
+        let legacy = include_bytes!("../tests/fixtures/legacy-bincode/meta.bincode");
+        fs::write(&legacy_path, legacy).unwrap();
+        assert_eq!(cache.read(task_id), None);
 
-        // V4 records were hashed with the old glob semantics, where `*` crossed
-        // directory separators. Their input sets are wider than what the same
-        // patterns resolve to now, so reusing them would skip tasks whose real
-        // inputs changed.
-        let mut record = sample_record();
-        record.schema_version = SCHEMA_VERSION_V4;
-        let encoded = bincode::serde::encode_to_vec(&record, bincode_config()).unwrap();
-        fs::write(task_dir.join(META_FILE_NAME), encoded).unwrap();
-
-        assert_eq!(cache.read("pkg#build"), None);
+        let record = sample_record();
+        cache
+            .write(
+                task_id,
+                RunArtifacts {
+                    record: &record,
+                    stdout: b"",
+                    stderr: b"",
+                    reports: &[],
+                },
+            )
+            .unwrap();
+        assert_eq!(cache.read(task_id), Some(record));
+        assert_eq!(fs::read(legacy_path).unwrap(), legacy);
     }
 
     #[test]
@@ -471,6 +472,12 @@ mod tests {
     }
 
     #[test]
+    fn report_validator_reserves_both_record_names() {
+        assert!(!is_valid_report_filename("meta.bincode"));
+        assert!(!is_valid_report_filename("meta.postcard"));
+    }
+
+    #[test]
     fn invalid_report_filename_rejected() {
         let temp_dir = tempdir().unwrap();
         let cache =
@@ -517,7 +524,7 @@ mod tests {
             .unwrap();
 
         let task_dir = cache.task_dir("pkg#build");
-        fs::write(task_dir.join("meta.bincode.tmp"), b"fresh").unwrap();
+        fs::write(task_dir.join("meta.postcard.tmp"), b"fresh").unwrap();
         fs::write(task_dir.join("stdout.log.tmp"), b"fresh").unwrap();
         fs::write(task_dir.join("stderr.log.tmp"), b"fresh").unwrap();
 
@@ -532,7 +539,7 @@ mod tests {
             files,
             vec![
                 META_FILE_NAME.to_string(),
-                "meta.bincode.tmp".to_string(),
+                "meta.postcard.tmp".to_string(),
                 STDERR_FILE_NAME.to_string(),
                 "stderr.log.tmp".to_string(),
                 STDOUT_FILE_NAME.to_string(),
@@ -549,7 +556,7 @@ mod tests {
         fs::create_dir_all(&task_dir).unwrap();
 
         let max_age = Duration::from_secs(60);
-        let stale = task_dir.join("meta.bincode.tmp");
+        let stale = task_dir.join("meta.postcard.tmp");
         let fresh = task_dir.join("stdout.log.tmp");
         let regular = task_dir.join(STDERR_FILE_NAME);
         fs::write(&stale, b"stale").unwrap();
@@ -627,51 +634,30 @@ mod tests {
     }
 
     #[test]
-    fn read_returns_none_for_previous_schema_record() {
-        assert_previous_schema_record_is_cache_miss("pkg#build", sample_v1_record());
-    }
-
-    #[test]
-    fn read_returns_none_for_truncated_or_garbage_meta() {
+    fn read_returns_none_for_truncated_or_trailing_meta() {
         let temp_dir = tempdir().unwrap();
-        let cache =
-            Cache::open(&temp_dir.path().join(LUCHTA_DIR_NAME).join(CACHE_DIR_NAME)).unwrap();
-        let task_dir = cache.root.join(task_cache_key("pkg#build"));
+        let cache = Cache::open(temp_dir.path()).unwrap();
+        let task_dir = cache.task_dir("pkg#build");
         fs::create_dir_all(&task_dir).unwrap();
+        let meta_path = task_dir.join(META_FILE_NAME);
 
-        fs::write(task_dir.join(META_FILE_NAME), b"not bincode at all").unwrap();
+        let mut bytes = encode(&sample_record()).unwrap();
+        fs::write(&meta_path, &bytes[..bytes.len() - 1]).unwrap();
         assert_eq!(cache.read("pkg#build"), None);
-
-        let bytes = bincode::serde::encode_to_vec(sample_record(), bincode_config()).unwrap();
-        fs::write(task_dir.join(META_FILE_NAME), &bytes[..bytes.len() / 2]).unwrap();
+        bytes.push(0);
+        fs::write(&meta_path, &bytes).unwrap();
         assert_eq!(cache.read("pkg#build"), None);
-    }
-
-    fn assert_previous_schema_record_is_cache_miss<T>(task_id: &str, previous_record: T)
-    where
-        T: serde::Serialize,
-    {
-        let temp_dir = tempdir().unwrap();
-        let cache =
-            Cache::open(&temp_dir.path().join(LUCHTA_DIR_NAME).join(CACHE_DIR_NAME)).unwrap();
-        let task_dir = cache.root.join(task_cache_key(task_id));
-        fs::create_dir_all(&task_dir).unwrap();
-
-        let bytes = bincode::serde::encode_to_vec(&previous_record, bincode_config()).unwrap();
-        fs::write(task_dir.join(META_FILE_NAME), bytes).unwrap();
-
-        assert_eq!(cache.read(task_id), None);
     }
 
     fn sample_record() -> TaskRunRecord {
         TaskRunRecord {
-            schema_version: SCHEMA_VERSION_V5,
+            schema_version: SCHEMA_VERSION_V6,
             task_spec_hash: [1; 32],
             input_patterns: vec!["src/**/*.ts".to_string()],
             inputs: vec![FileEntry {
                 path: "src/main.ts".to_string(),
                 size: 42,
-                mtime_ns: 111,
+                mtime_ns: -(1_i128 << 70),
                 hash: [2; 32],
                 absent: false,
             }],
@@ -679,7 +665,7 @@ mod tests {
             outputs: vec![FileEntry {
                 path: "dist/main.js".to_string(),
                 size: 84,
-                mtime_ns: 222,
+                mtime_ns: 1_i128 << 72,
                 hash: [3; 32],
                 absent: false,
             }],
@@ -727,191 +713,6 @@ mod tests {
                 },
             ],
             ..sample_record()
-        }
-    }
-
-    #[derive(serde::Serialize)]
-    struct V1TaskRunRecord {
-        schema_version: u32,
-        task_spec_hash: [u8; 32],
-        input_patterns: Vec<String>,
-        inputs: Vec<FileEntry>,
-        output_patterns: Vec<String>,
-        outputs: Vec<FileEntry>,
-        detected_input_patterns: bool,
-        detected_output_patterns: bool,
-        outputs_hash: [u8; 32],
-        env_hash: [u8; 32],
-        pkg_dep_hash: [u8; 32],
-        dep_outputs: BTreeMap<String, [u8; 32]>,
-        exit_status: i32,
-        succeeded: bool,
-        start_unix_ms: u64,
-        end_unix_ms: u64,
-    }
-
-    #[derive(serde::Serialize)]
-    struct V2TaskRunRecord {
-        schema_version: u32,
-        task_spec_hash: [u8; 32],
-        input_patterns: Vec<String>,
-        inputs: Vec<FileEntry>,
-        output_patterns: Vec<String>,
-        outputs: Vec<FileEntry>,
-        detected_input_patterns: bool,
-        detected_output_patterns: bool,
-        outputs_hash: [u8; 32],
-        env_hash: [u8; 32],
-        pkg_dep_hash: [u8; 32],
-        dep_outputs: BTreeMap<String, [u8; 32]>,
-        exit_status: i32,
-        succeeded: bool,
-        start_unix_ms: u64,
-        end_unix_ms: u64,
-        reports: Vec<ReportMeta>,
-    }
-
-    #[derive(serde::Serialize)]
-    struct V3TaskRunRecord {
-        schema_version: u32,
-        task_spec_hash: [u8; 32],
-        input_patterns: Vec<String>,
-        inputs: Vec<FileEntry>,
-        output_patterns: Vec<String>,
-        outputs: Vec<FileEntry>,
-        detected_input_patterns: bool,
-        detected_output_patterns: bool,
-        outputs_hash: [u8; 32],
-        env_hash: [u8; 32],
-        pkg_dep_hash: [u8; 32],
-        dep_outputs: BTreeMap<String, [u8; 32]>,
-        exit_status: i32,
-        succeeded: bool,
-        start_unix_ms: u64,
-        end_unix_ms: u64,
-        reports: Vec<ReportMeta>,
-        cache_nonce: Option<String>,
-    }
-
-    fn sample_inputs() -> Vec<FileEntry> {
-        vec![FileEntry {
-            path: "src/main.ts".to_string(),
-            size: 42,
-            mtime_ns: 111,
-            hash: [12; 32],
-            absent: false,
-        }]
-    }
-
-    fn sample_outputs() -> Vec<FileEntry> {
-        vec![FileEntry {
-            path: "dist/main.js".to_string(),
-            size: 84,
-            mtime_ns: 222,
-            hash: [13; 32],
-            absent: false,
-        }]
-    }
-
-    fn sample_dep_outputs() -> BTreeMap<String, [u8; 32]> {
-        BTreeMap::from([("dep#build".to_string(), [17; 32])])
-    }
-
-    fn sample_reports_meta() -> Vec<ReportMeta> {
-        vec![ReportMeta {
-            filename: "summary.md".to_string(),
-            mime_type: "text/markdown".to_string(),
-        }]
-    }
-
-    /// Shared base builder for legacy schema fixtures.
-    /// Returns data that can be used to construct any legacy record type.
-    fn base_fixture_data() -> BaseFixtureData {
-        BaseFixtureData {
-            input_patterns: vec!["src/**/*.ts".to_string()],
-            inputs: sample_inputs(),
-            output_patterns: vec!["dist/**/*.js".to_string()],
-            outputs: sample_outputs(),
-            dep_outputs: sample_dep_outputs(),
-            reports: sample_reports_meta(),
-        }
-    }
-
-    struct BaseFixtureData {
-        input_patterns: Vec<String>,
-        inputs: Vec<FileEntry>,
-        output_patterns: Vec<String>,
-        outputs: Vec<FileEntry>,
-        dep_outputs: BTreeMap<String, [u8; 32]>,
-        reports: Vec<ReportMeta>,
-    }
-
-    fn sample_v2_record() -> V2TaskRunRecord {
-        let base = base_fixture_data();
-        V2TaskRunRecord {
-            schema_version: SCHEMA_VERSION_V2,
-            task_spec_hash: [11; 32],
-            input_patterns: base.input_patterns,
-            inputs: base.inputs,
-            output_patterns: base.output_patterns,
-            outputs: base.outputs,
-            detected_input_patterns: true,
-            detected_output_patterns: true,
-            outputs_hash: [14; 32],
-            env_hash: [15; 32],
-            pkg_dep_hash: [16; 32],
-            dep_outputs: base.dep_outputs,
-            exit_status: 0,
-            succeeded: true,
-            start_unix_ms: 1_000,
-            end_unix_ms: 2_000,
-            reports: base.reports,
-        }
-    }
-
-    fn sample_v3_record() -> V3TaskRunRecord {
-        let base = base_fixture_data();
-        V3TaskRunRecord {
-            schema_version: SCHEMA_VERSION_V3,
-            task_spec_hash: [11; 32],
-            input_patterns: base.input_patterns,
-            inputs: base.inputs,
-            output_patterns: base.output_patterns,
-            outputs: base.outputs,
-            detected_input_patterns: true,
-            detected_output_patterns: true,
-            outputs_hash: [14; 32],
-            env_hash: [15; 32],
-            pkg_dep_hash: [16; 32],
-            dep_outputs: base.dep_outputs,
-            exit_status: 0,
-            succeeded: true,
-            start_unix_ms: 1_000,
-            end_unix_ms: 2_000,
-            reports: base.reports,
-            cache_nonce: Some("nonce-v1".to_string()),
-        }
-    }
-
-    fn sample_v1_record() -> V1TaskRunRecord {
-        let base = base_fixture_data();
-        V1TaskRunRecord {
-            schema_version: SCHEMA_VERSION_V1,
-            task_spec_hash: [1; 32],
-            input_patterns: base.input_patterns,
-            inputs: base.inputs,
-            output_patterns: base.output_patterns,
-            outputs: base.outputs,
-            detected_input_patterns: true,
-            detected_output_patterns: true,
-            outputs_hash: [4; 32],
-            env_hash: [5; 32],
-            pkg_dep_hash: [6; 32],
-            dep_outputs: BTreeMap::from([("dep#build".to_string(), [7; 32])]),
-            exit_status: 0,
-            succeeded: true,
-            start_unix_ms: 1_000,
-            end_unix_ms: 2_000,
         }
     }
 }

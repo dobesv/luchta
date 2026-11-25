@@ -883,6 +883,7 @@ use crate::store::ReportInput;
 pub struct MetaFiles {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
+    /// Postcard-encoded task run record, stored verbatim in `meta.postcard`.
     pub record: Vec<u8>,
     pub reports: Vec<ReportInput>,
 }
@@ -893,8 +894,9 @@ pub struct MetaFiles {
 /// - All output files from `rel_output_paths`
 /// - `.luchta-meta/stdout.log`
 /// - `.luchta-meta/stderr.log`
-/// - `.luchta-meta/meta.bincode`
+/// - `.luchta-meta/meta.postcard`
 /// - `.luchta-meta/reports/<filename>`
+// qual:api
 pub fn write_blob_with_meta(
     paths: &SharedCachePaths,
     outputs_hash: &[u8; 32],
@@ -990,7 +992,7 @@ pub fn write_blob_with_meta(
             )?;
         }
 
-        // meta.bincode
+        // meta.postcard
         if !meta.record.is_empty() {
             let mut header = tar::Header::new_gnu();
             header.set_size(meta.record.len() as u64);
@@ -1032,22 +1034,26 @@ pub fn write_blob_with_meta(
 /// The `StagedRestore` contains the meta files and a staging directory with
 /// the output files, but does NOT move them into `package_dir` until
 /// `commit()` is called. This allows validation before restoration.
+// qual:api
 pub fn restore_blob_with_meta(
     paths: &SharedCachePaths,
     outputs_hash: &[u8; 32],
     package_dir: &Path,
     staging_root: &Path,
 ) -> io::Result<BlobReadResultWithMeta<StagedRestore>> {
-    let blob_path = blob_path(paths, outputs_hash);
-    restore_file_blob_staged(&blob_path, package_dir, staging_root)
+    restore_staged_blob(
+        &blob_path(paths, outputs_hash),
+        package_dir,
+        staging_root,
+        None,
+        MetadataMode::Capture,
+    )
 }
 
-pub(crate) fn restore_file_blob_staged(
-    blob_path: &Path,
-    package_dir: &Path,
-    staging_root: &Path,
-) -> io::Result<BlobReadResultWithMeta<StagedRestore>> {
-    restore_file_blob_staged_with_size_cap(blob_path, package_dir, staging_root, None)
+#[derive(Clone, Copy)]
+enum MetadataMode {
+    Capture,
+    Ignore,
 }
 
 pub(crate) fn restore_file_blob_staged_with_size_cap(
@@ -1055,6 +1061,23 @@ pub(crate) fn restore_file_blob_staged_with_size_cap(
     package_dir: &Path,
     staging_root: &Path,
     size_cap_bytes: Option<u64>,
+) -> io::Result<BlobReadResultWithMeta<StagedRestore>> {
+    restore_staged_blob(
+        blob_path,
+        package_dir,
+        staging_root,
+        size_cap_bytes,
+        MetadataMode::Capture,
+    )
+}
+
+// qual:allow(iosp) — Distinguish a missing archive from I/O failure before creating staging; keep the staging directory alive through extraction.
+fn restore_staged_blob(
+    blob_path: &Path,
+    package_dir: &Path,
+    staging_root: &Path,
+    size_cap_bytes: Option<u64>,
+    mode: MetadataMode,
 ) -> io::Result<BlobReadResultWithMeta<StagedRestore>> {
     let compressed = match File::open(blob_path) {
         Ok(file) => file,
@@ -1066,11 +1089,12 @@ pub(crate) fn restore_file_blob_staged_with_size_cap(
 
     let staging_dir = create_restore_staging_dir(staging_root, package_dir, "blob-restore-meta-")?;
 
-    match extract_blob_with_meta_to_staging(
+    match extract_staged_blob(
         compressed,
         package_dir,
         staging_dir.path(),
         size_cap_bytes,
+        mode,
     ) {
         Ok(meta) => Ok(BlobReadResultWithMeta::Restored(StagedRestore {
             meta,
@@ -1085,15 +1109,21 @@ pub(crate) fn restore_file_blob_staged_with_size_cap(
 /// Restore an outputs-only blob into a staging directory.
 ///
 /// Blobs written by older clients still carry a `.luchta-meta/` directory.
-/// Its contents are ignored here — `entries/<input_key>` is authoritative —
-/// and `move_non_meta_files` filters it out on commit.
+/// Skip it without collecting any metadata. The snapshot's inline metadata
+/// or its `entries/<input_key>.postcard` fallback is authoritative.
 pub fn restore_outputs_staged(
     paths: &SharedCachePaths,
     outputs_hash: &[u8; 32],
     package_dir: &Path,
     staging_root: &Path,
 ) -> io::Result<BlobReadResultWithMeta<StagedRestore>> {
-    restore_blob_with_meta(paths, outputs_hash, package_dir, staging_root)
+    restore_staged_blob(
+        &blob_path(paths, outputs_hash),
+        package_dir,
+        staging_root,
+        None,
+        MetadataMode::Ignore,
+    )
 }
 
 /// A staged restore that holds extracted files in a temp directory.
@@ -1282,11 +1312,13 @@ impl ExtractedMetaFiles {
     }
 }
 
-fn extract_blob_with_meta_to_staging(
+// qual:allow(iosp) — A tar entry borrows the archive; classify and consume it before reading the next header.
+fn extract_staged_blob(
     compressed: File,
     package_dir: &Path,
     staging_dir: &Path,
     size_cap_bytes: Option<u64>,
+    mode: MetadataMode,
 ) -> Result<MetaFiles, RestoreError> {
     let decoder = zstd::Decoder::new(compressed).map_err(|_| RestoreError::Corrupt)?;
     let mut archive = Archive::new(decoder);
@@ -1300,44 +1332,58 @@ fn extract_blob_with_meta_to_staging(
         let entry_path = entry.path().map_err(|_| RestoreError::Corrupt)?;
         let entry_path = entry_path.into_owned();
 
-        if meta.capture(&mut entry, &entry_path)? {
+        let is_metadata = match mode {
+            MetadataMode::Capture => meta.capture(&mut entry, &entry_path)?,
+            MetadataMode::Ignore => entry_path.starts_with(META_DIR_NAME),
+        };
+        if is_metadata {
             continue;
         }
 
-        // Regular output file
         let relative_path = validate_entry_path(package_dir, &entry_path)?;
-        let target_path = staging_dir.join(&relative_path);
-
-        if entry.header().entry_type().is_dir() {
-            fs::create_dir_all(&target_path)?;
+        if matches!(mode, MetadataMode::Ignore) && relative_path.starts_with(META_DIR_NAME) {
+            // validate_entry_path normalizes `.` and `..` before staging.
             continue;
         }
-
-        if !entry.header().entry_type().is_file() {
-            return Err(RestoreError::Corrupt);
-        }
-
-        let entry_size = entry.header().size().map_err(|_| RestoreError::Corrupt)?;
-        add_extracted_output_bytes(&mut output_bytes, entry_size, size_cap_bytes)?;
-
-        if let Some(parent) = target_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
-        let mut output = File::create(&target_path)?;
-        io::copy(&mut entry, &mut output).map_err(|_| RestoreError::Corrupt)?;
-
-        #[cfg(unix)]
-        {
-            let mode = entry.header().mode().map_err(|_| RestoreError::Corrupt)?;
-            fs::set_permissions(&target_path, fs::Permissions::from_mode(mode))?;
-        }
+        stage_output_entry(
+            &mut entry,
+            &staging_dir.join(relative_path),
+            &mut output_bytes,
+            size_cap_bytes,
+        )?;
     }
 
-    // Outputs-only blobs (the current format, see write_outputs_blob) carry no
-    // .luchta-meta at all — that is not corruption, just an entry whose record,
-    // stdout, and stderr live in entries/<input_key> instead.
     Ok(meta.into_meta_files())
+}
+
+fn stage_output_entry<R: Read>(
+    entry: &mut tar::Entry<'_, R>,
+    target_path: &Path,
+    output_bytes: &mut u64,
+    size_cap_bytes: Option<u64>,
+) -> Result<(), RestoreError> {
+    if entry.header().entry_type().is_dir() {
+        fs::create_dir_all(target_path)?;
+        return Ok(());
+    }
+    if !entry.header().entry_type().is_file() {
+        return Err(RestoreError::Corrupt);
+    }
+
+    let entry_size = entry.header().size().map_err(|_| RestoreError::Corrupt)?;
+    add_extracted_output_bytes(output_bytes, entry_size, size_cap_bytes)?;
+    if let Some(parent) = target_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let mut output = File::create(target_path)?;
+    io::copy(entry, &mut output).map_err(|_| RestoreError::Corrupt)?;
+    #[cfg(unix)]
+    {
+        let mode = entry.header().mode().map_err(|_| RestoreError::Corrupt)?;
+        fs::set_permissions(target_path, fs::Permissions::from_mode(mode))?;
+    }
+    Ok(())
 }
 
 fn add_extracted_output_bytes(

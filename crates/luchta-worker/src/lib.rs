@@ -208,7 +208,10 @@ pub fn is_valid_report_filename(name: &str) -> bool {
         return false;
     }
 
-    !matches!(name, "stdout.log" | "stderr.log" | "meta.bincode")
+    !matches!(
+        name,
+        "stdout.log" | "stderr.log" | "meta.bincode" | "meta.postcard"
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -862,6 +865,7 @@ mod tests {
             "stdout.log",
             "stderr.log",
             "meta.bincode",
+            "meta.postcard",
         ] {
             assert!(!is_valid_report_filename(name), "expected invalid: {name}");
         }

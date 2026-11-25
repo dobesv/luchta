@@ -145,7 +145,7 @@ fn cache_write_read_report_byte_exact() {
 fn test_record_with_reports() -> luchta_cache::TaskRunRecord {
     use std::collections::BTreeMap;
     luchta_cache::TaskRunRecord {
-        schema_version: luchta_cache::SCHEMA_VERSION_V5,
+        schema_version: luchta_cache::SCHEMA_VERSION_V6,
         task_spec_hash: [1u8; 32],
         input_patterns: vec!["src/**/*.ts".to_string()],
         inputs: vec![],
@@ -177,9 +177,7 @@ fn test_record_with_reports() -> luchta_cache::TaskRunRecord {
 }
 
 #[test]
-fn cache_v1_schema_returns_none() {
-    // V1 schema (without reports field) should return None (cache miss)
-    // Use the cache module's inline test approach - write corrupted bytes
+fn cache_corrupt_postcard_record_returns_none() {
     use luchta_cache::{Cache, CACHE_DIR_NAME, LUCHTA_DIR_NAME};
     use std::fs;
     use tempfile::tempdir;
@@ -189,21 +187,16 @@ fn cache_v1_schema_returns_none() {
     let task_dir = cache.task_dir("pkg#build");
     fs::create_dir_all(&task_dir).unwrap();
 
-    // Write plain text that will fail bincode decode - this simulates V1/any decode error
-    fs::write(task_dir.join("meta.bincode"), b"not-valid-bincode").unwrap();
+    fs::write(task_dir.join("meta.postcard"), b"not-valid-postcard").unwrap();
 
-    // Reading corrupted/V1 should return None (no panic)
-    assert!(
-        cache.read("pkg#build").is_none(),
-        "V1/corrupted schema should return None"
-    );
+    assert!(cache.read("pkg#build").is_none());
 }
 
 /// A minimal current-schema record for tests that only exercise report writing.
 fn minimal_record(reports: Vec<luchta_cache::ReportMeta>) -> luchta_cache::TaskRunRecord {
     use std::collections::BTreeMap;
     luchta_cache::TaskRunRecord {
-        schema_version: luchta_cache::SCHEMA_VERSION_V5,
+        schema_version: luchta_cache::SCHEMA_VERSION_V6,
         task_spec_hash: [1u8; 32],
         input_patterns: vec![],
         inputs: vec![],
@@ -328,7 +321,7 @@ fn cache_rejects_reserved_filename() {
     let record = minimal_record(vec![]);
 
     // Try to write with reserved filename
-    for reserved_name in ["stdout.log", "stderr.log", "meta.bincode"] {
+    for reserved_name in ["stdout.log", "stderr.log", "meta.bincode", "meta.postcard"] {
         let reports = vec![ReportInput {
             filename: reserved_name.to_string(),
             mime_type: "text/plain".to_string(),

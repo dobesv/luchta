@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use luchta_cache::shared::RestoredHit;
-use luchta_cache::{Cache, ReportInput, RunArtifacts, RunReason, SCHEMA_VERSION_V5};
+use luchta_cache::{Cache, ReportInput, RunArtifacts, RunReason, SCHEMA_VERSION_V6};
 use luchta_types::TaskId;
 
 use crate::progress::ProgressOutput;
@@ -20,7 +20,7 @@ pub(super) fn hydrate_local_cache(
 ) {
     let cache_key = task_id.to_string();
     let mut record = hit.record.clone();
-    record.schema_version = SCHEMA_VERSION_V5;
+    record.schema_version = SCHEMA_VERSION_V6;
     record.run_reason = Some(RunReason::SharedCacheHit);
     let reports: Vec<ReportInput> = hit
         .record

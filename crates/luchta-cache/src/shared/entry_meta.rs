@@ -13,12 +13,12 @@ use serde::{Deserialize, Serialize};
 
 use super::atomicio::atomic_write;
 use super::SharedCachePaths;
-use crate::serialization::bincode_config;
+use crate::serialization::{decode, encode};
 use crate::store::ReportInput;
 
 /// Schema version for the on-disk entry meta object.
-pub const ENTRY_META_SCHEMA_VERSION: u32 = 1;
-/// Maximum compressed entry metadata size embedded directly in a schema-v3
+pub const ENTRY_META_SCHEMA_VERSION: u32 = 2;
+/// Maximum compressed entry metadata size embedded directly in a
 /// snapshot. Larger entries retain the fallback `entries/` object.
 pub const INLINE_ENTRY_META_MAX_BYTES: usize = 16 * 1024;
 /// Maximum resident size of metadata retained inline in the merged snapshot
@@ -27,7 +27,7 @@ pub const INLINE_ENTRY_META_MAX_BYTES: usize = 16 * 1024;
 pub(crate) const INLINE_ENTRY_META_MAX_RESIDENT_BYTES: usize = 1024 * 1024;
 
 const ENTRY_META_ZSTD_LEVEL: i32 = 3;
-const ENTRY_META_FILE_EXTENSION: &str = "bin";
+pub(crate) const ENTRY_META_FILE_EXTENSION: &str = "postcard";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EntryReport {
@@ -52,7 +52,7 @@ pub struct EntryMeta {
     /// blob was ever written. Restore must not stat/pull a blob that will
     /// never exist.
     pub has_outputs: bool,
-    /// Bincode-encoded `TaskRunRecord`.
+    /// Postcard-encoded `TaskRunRecord`.
     pub record: Vec<u8>,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
@@ -90,6 +90,14 @@ pub enum EntryMetaWriteResult {
     AlreadyExists,
 }
 
+impl EntryMeta {
+    pub(super) fn decode_record(&self) -> Option<crate::TaskRunRecord> {
+        (self.schema_version == ENTRY_META_SCHEMA_VERSION)
+            .then_some(self.record.as_slice())
+            .and_then(crate::record::decode_record)
+    }
+}
+
 impl From<&ReportInput> for EntryReport {
     fn from(value: &ReportInput) -> Self {
         Self {
@@ -112,15 +120,19 @@ impl From<EntryReport> for ReportInput {
 
 #[must_use]
 pub fn entry_meta_path(paths: &SharedCachePaths, input_key: &[u8; 32]) -> PathBuf {
-    paths.entries_dir.join(format!(
-        "{}.{ENTRY_META_FILE_EXTENSION}",
-        blake3::Hash::from(*input_key).to_hex()
-    ))
+    paths.entries_dir.join(entry_meta_filename(input_key))
 }
 
-/// Encode meta to its on-disk representation: bincode, then zstd.
+pub(crate) fn entry_meta_filename(input_key: &[u8; 32]) -> String {
+    format!(
+        "{}.{ENTRY_META_FILE_EXTENSION}",
+        blake3::Hash::from(*input_key).to_hex()
+    )
+}
+
+/// Encode meta to its on-disk representation: Postcard, then zstd.
 pub fn encode_entry_meta(meta: &EntryMeta) -> io::Result<Vec<u8>> {
-    let raw = bincode::serde::encode_to_vec(meta, bincode_config()).map_err(io::Error::other)?;
+    let raw = encode(meta).map_err(io::Error::other)?;
     zstd::encode_all(raw.as_slice(), ENTRY_META_ZSTD_LEVEL)
 }
 
@@ -150,12 +162,8 @@ pub fn write_entry_meta(
 pub fn read_entry_meta(paths: &SharedCachePaths, input_key: &[u8; 32]) -> Option<EntryMeta> {
     let bytes = fs::read(entry_meta_path(paths, input_key)).ok()?;
     let raw = zstd::decode_all(bytes.as_slice()).ok()?;
-    let (meta, _) =
-        bincode::serde::decode_from_slice::<EntryMeta, _>(&raw, bincode_config()).ok()?;
-    if meta.schema_version != ENTRY_META_SCHEMA_VERSION {
-        return None;
-    }
-    Some(meta)
+    let meta: EntryMeta = decode(&raw).ok()?;
+    (meta.schema_version == ENTRY_META_SCHEMA_VERSION).then_some(meta)
 }
 
 #[cfg(test)]
@@ -205,8 +213,50 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let paths = open_shared_paths(temp.path()).unwrap();
         let input_key = [4; 32];
-        std::fs::write(entry_meta_path(&paths, &input_key), b"not bincode").unwrap();
+        std::fs::write(entry_meta_path(&paths, &input_key), b"not zstd").unwrap();
         assert!(read_entry_meta(&paths, &input_key).is_none());
+    }
+
+    #[test]
+    fn entry_meta_misses_on_truncation_trailing_bytes_or_schema_mismatch() {
+        let temp = TempDir::new().unwrap();
+        let paths = open_shared_paths(temp.path()).unwrap();
+        let input_key = [4; 32];
+        let path = entry_meta_path(&paths, &input_key);
+        let mut meta = sample_meta();
+        meta.schema_version = ENTRY_META_SCHEMA_VERSION - 1;
+        fs::write(&path, encode_entry_meta(&meta).unwrap()).unwrap();
+        assert!(read_entry_meta(&paths, &input_key).is_none());
+
+        let mut raw = encode(&sample_meta()).unwrap();
+        write_raw_entry(&path, &raw[..raw.len() - 1]);
+        assert!(read_entry_meta(&paths, &input_key).is_none());
+        raw.push(0);
+        write_raw_entry(&path, &raw);
+        assert!(read_entry_meta(&paths, &input_key).is_none());
+    }
+
+    fn write_raw_entry(path: &std::path::Path, raw: &[u8]) {
+        fs::write(path, zstd::encode_all(raw, ENTRY_META_ZSTD_LEVEL).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn legacy_entry_cannot_block_a_write_at_the_same_key() {
+        let temp = TempDir::new().unwrap();
+        let paths = open_shared_paths(temp.path()).unwrap();
+        let input_key = [3; 32];
+        let legacy_path = entry_meta_path(&paths, &input_key).with_extension("bin");
+        let legacy = include_bytes!("../../tests/fixtures/legacy-bincode/entry.bin");
+        fs::write(&legacy_path, legacy).unwrap();
+        assert!(read_entry_meta(&paths, &input_key).is_none());
+
+        let meta = sample_meta();
+        assert_eq!(
+            write_entry_meta(&paths, &input_key, &meta).unwrap(),
+            EntryMetaWriteResult::Written
+        );
+        assert_eq!(read_entry_meta(&paths, &input_key), Some(meta));
+        assert_eq!(fs::read(legacy_path).unwrap(), legacy);
     }
 
     #[test]

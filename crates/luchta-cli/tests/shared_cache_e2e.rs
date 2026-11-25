@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 
 use assert_cmd::Command;
 use assert_fs::prelude::*;
+use luchta_cache::{Cache, RunReason, SCHEMA_VERSION_V6};
 
 mod common;
 
@@ -178,7 +179,7 @@ fn non_cacheable_task_stays_out_of_shared_cache_but_writes_local_record() {
         .join(".luchta")
         .join("cache")
         .join(blake3::hash("app#pkgbuild".as_bytes()).to_hex().as_str());
-    assert!(cache_dir.join("meta.bincode").exists());
+    assert!(cache_dir.join("meta.postcard").exists());
     assert!(cache_dir.join("stdout.log").exists());
     assert!(cache_dir.join("stderr.log").exists());
 
@@ -315,39 +316,7 @@ fn fast_task_skips_shared_cache_store() {
         .assert()
         .success();
 
-    let blobs_dir = shared_cache_dir.path().join("blobs");
-    let snapshots_dir = shared_cache_dir.path().join("snapshots");
-
-    if blobs_dir.exists() {
-        let blob_count = std::fs::read_dir(&blobs_dir)
-            .unwrap()
-            .filter(|e| {
-                e.as_ref()
-                    .ok()
-                    .map(|e| e.file_name().to_string_lossy().ends_with(".tar.zst"))
-                    .unwrap_or(false)
-            })
-            .count();
-        assert_eq!(blob_count, 0, "fast task should not store blob");
-    }
-
-    if snapshots_dir.exists() {
-        // Count .bincode files, excluding .lock sidecar files
-        let snapshot_count = std::fs::read_dir(&snapshots_dir)
-            .unwrap()
-            .filter(|e| {
-                e.as_ref()
-                    .ok()
-                    .map(|e| {
-                        let file_name = e.file_name();
-                        let name = file_name.to_string_lossy();
-                        name.ends_with(".bincode") && !name.ends_with(".lock")
-                    })
-                    .unwrap_or(false)
-            })
-            .count();
-        assert_eq!(snapshot_count, 0, "fast task should not store snapshot");
-    }
+    assert_no_shared_outputs(shared_cache_dir.path(), "fast task");
 
     assert!(
         temp.child(".luchta/cache").path().exists(),
@@ -396,42 +365,7 @@ fn cross_package_output_skips_shared_cache() {
         .assert()
         .success();
 
-    let blobs_dir = shared_cache_dir.path().join("blobs");
-    let snapshots_dir = shared_cache_dir.path().join("snapshots");
-
-    if blobs_dir.exists() {
-        let blob_count = std::fs::read_dir(&blobs_dir)
-            .unwrap()
-            .filter(|e| {
-                e.as_ref()
-                    .ok()
-                    .map(|e| e.file_name().to_string_lossy().ends_with(".tar.zst"))
-                    .unwrap_or(false)
-            })
-            .count();
-        assert_eq!(blob_count, 0, "cross-package task should not store blob");
-    }
-
-    if snapshots_dir.exists() {
-        // Count .bincode files, excluding .lock sidecar files
-        let snapshot_count = std::fs::read_dir(&snapshots_dir)
-            .unwrap()
-            .filter(|e| {
-                e.as_ref()
-                    .ok()
-                    .map(|e| {
-                        let file_name = e.file_name();
-                        let name = file_name.to_string_lossy();
-                        name.ends_with(".bincode") && !name.ends_with(".lock")
-                    })
-                    .unwrap_or(false)
-            })
-            .count();
-        assert_eq!(
-            snapshot_count, 0,
-            "cross-package task should not store snapshot"
-        );
-    }
+    assert_no_shared_outputs(shared_cache_dir.path(), "cross-package outputs");
 
     assert!(
         temp.child(".luchta/cache").path().exists(),
@@ -524,15 +458,42 @@ fn shared_cache_hit_restores_reports_into_local_cache_and_logs_file() {
 #[test]
 fn e2e_cross_build_shared_cache_hit() {
     let shared_cache_dir = tempfile::tempdir().unwrap();
+    let temp = shared_counter_workspace();
+    let mut build = shared_counter_build(temp.path(), shared_cache_dir.path());
 
+    build.assert().success();
+    temp.child("packages/app/counter.txt").assert("1\n");
+    assert!(
+        !snapshot_shard_paths(&shared_cache_dir.path().join("snapshots")).is_empty(),
+        "first build should store snapshot"
+    );
+    assert!(
+        shared_blob_count(shared_cache_dir.path()) > 0,
+        "first build should store blob"
+    );
+
+    // Keep the shared cache, but force the second build past local lookup.
+    std::fs::remove_dir_all(temp.child(".luchta/cache").path()).unwrap();
+    let second = build.assert().success();
+    let second_stdout = std::str::from_utf8(&second.get_output().stdout).unwrap();
+    temp.child("packages/app/counter.txt").assert("1\n");
+    assert_shared_counter_hit(temp.path(), second_stdout);
+
+    let third = counter_build(temp.path()).assert().success();
+    let third_stdout = std::str::from_utf8(&third.get_output().stdout).unwrap();
+    assert!(
+        third_stdout.contains("✔ 1 ⏩ 1") && !third_stdout.contains("📥"),
+        "third build should be a local skip, not a shared hit, stdout was:\n{third_stdout}"
+    );
+}
+
+/// One-package workspace with a cached `app#pkgbuild` counter task from the
+/// given task JSON.
+fn counter_workspace(task_json: &str) -> assert_fs::TempDir {
     let temp = assert_fs::TempDir::new().unwrap();
 
     write_root_workspace(&temp);
-    // Task with sleep to ensure duration > 100ms for shared cache eligibility
-    write_counter_task_config(
-        &temp,
-        r#""app#pkgbuild":{"cache":{},"worker":"shell","inputs":["src.txt"],"outputs":["counter.txt"],"command":"sleep 0.15 && count=$(cat counter.txt 2>/dev/null || echo 0); count=$((count+1)); echo $count > counter.txt"}"#,
-    );
+    write_counter_task_config(&temp, task_json);
     temp.child("packages/app/src.txt")
         .write_str("one\n")
         .unwrap();
@@ -547,65 +508,33 @@ fn e2e_cross_build_shared_cache_hit() {
         )
         .unwrap();
     init_git(&temp);
+    temp
+}
 
-    // First build with shared cache enabled
+fn shared_counter_workspace() -> assert_fs::TempDir {
+    // Task with sleep to ensure duration > 100ms for shared cache eligibility
+    counter_workspace(
+        r#""app#pkgbuild":{"cache":{},"worker":"shell","inputs":["src.txt"],"outputs":["counter.txt"],"command":"sleep 0.15 && count=$(cat counter.txt 2>/dev/null || echo 0); count=$((count+1)); echo $count > counter.txt"}"#,
+    )
+}
+
+fn counter_build(root: &Path) -> Command {
     let mut cmd = Command::cargo_bin("luchta").unwrap();
     cmd.arg("run")
         .arg("pkgbuild")
         .arg("--workspace-root")
-        .arg(temp.path())
-        .env("LUCHTA_SHARED_CACHE", "1")
-        .env(
-            "LUCHTA_SHARED_CACHE_DIR",
-            shared_cache_dir.path().to_str().unwrap(),
-        )
-        .assert()
-        .success();
+        .arg(root);
+    cmd
+}
 
-    // Counter should be "1" after first build
-    temp.child("packages/app/counter.txt").assert("1\n");
+fn shared_counter_build(root: &Path, cache: &Path) -> Command {
+    let mut cmd = counter_build(root);
+    cmd.env("LUCHTA_SHARED_CACHE", "1")
+        .env("LUCHTA_SHARED_CACHE_DIR", cache);
+    cmd
+}
 
-    let blobs_dir = shared_cache_dir.path().join("blobs");
-    let snapshots_dir = shared_cache_dir.path().join("snapshots");
-
-    let snapshot_count = snapshot_shard_paths(&snapshots_dir).len();
-    assert!(snapshot_count > 0, "first build should store snapshot");
-
-    let blob_count = std::fs::read_dir(&blobs_dir)
-        .unwrap()
-        .filter(|e| {
-            e.as_ref()
-                .ok()
-                .map(|e| e.file_name().to_string_lossy().ends_with(".tar.zst"))
-                .unwrap_or(false)
-        })
-        .count();
-    assert!(blob_count > 0, "first build should store blob");
-
-    // Wipe local cache only (keep shared cache)
-    std::fs::remove_dir_all(temp.child(".luchta/cache").path()).unwrap();
-
-    // Second build should restore from shared cache (counter unchanged)
-    let second = Command::cargo_bin("luchta")
-        .unwrap()
-        .arg("run")
-        .arg("pkgbuild")
-        .arg("--workspace-root")
-        .arg(temp.path())
-        .env("LUCHTA_SHARED_CACHE", "1")
-        .env(
-            "LUCHTA_SHARED_CACHE_DIR",
-            shared_cache_dir.path().to_str().unwrap(),
-        )
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let second_stdout = String::from_utf8(second).unwrap();
-
-    temp.child("packages/app/counter.txt").assert("1\n");
-
+fn assert_shared_counter_hit(root: &Path, second_stdout: &str) {
     assert!(
         second_stdout.contains("📥 1"),
         "second build should report shared hit stats, stdout was:\n{second_stdout}"
@@ -615,32 +544,12 @@ fn e2e_cross_build_shared_cache_hit() {
         "second build should not count a shared hit as skipped, stdout was:\n{second_stdout}"
     );
 
-    assert!(
-        temp.child(".luchta/cache").path().exists(),
-        "local cache should be hydrated after shared cache hit"
-    );
-
-    let third = Command::cargo_bin("luchta")
+    let hydrated = Cache::open(&root.join(".luchta/cache"))
         .unwrap()
-        .arg("run")
-        .arg("pkgbuild")
-        .arg("--workspace-root")
-        .arg(temp.path())
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let third_stdout = String::from_utf8(third).unwrap();
-
-    assert!(
-        third_stdout.contains("✔ 1 ⏩ 1"),
-        "third build should still report skip total, stdout was:\n{third_stdout}"
-    );
-    assert!(
-        !third_stdout.contains("📥"),
-        "third build should be local skip, not shared, stdout was:\n{third_stdout}"
-    );
+        .read("app#pkgbuild")
+        .expect("shared hit should hydrate a readable local record");
+    assert_eq!(hydrated.schema_version, SCHEMA_VERSION_V6);
+    assert_eq!(hydrated.run_reason, Some(RunReason::SharedCacheHit));
 }
 
 /// Test: cross-worktree hit (different absolute repo path).
@@ -1221,7 +1130,31 @@ fn over_size_cap_task_not_cached() {
     // The key invariant: no blob was written for over-size output
 }
 
-/// Recursively list snapshot shard files under snapshots/<YYYYMMDD>-<shard>/*.bincode.
+fn shared_blob_count(cache_root: &Path) -> usize {
+    let blobs_dir = cache_root.join("blobs");
+    if !blobs_dir.exists() {
+        return 0;
+    }
+    std::fs::read_dir(blobs_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap())
+        .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tar.zst"))
+        .count()
+}
+
+fn assert_no_shared_outputs(cache_root: &Path, reason: &str) {
+    assert_eq!(
+        shared_blob_count(cache_root),
+        0,
+        "{reason}: unexpected blob"
+    );
+    assert!(
+        snapshot_shard_paths(&cache_root.join("snapshots")).is_empty(),
+        "{reason}: unexpected snapshot shard"
+    );
+}
+
+/// Recursively list snapshot shard files under snapshots/<YYYYMMDD>-<shard>/*.postcard.
 fn snapshot_shard_paths(root: &Path) -> Vec<PathBuf> {
     let mut shards = Vec::new();
     collect_snapshot_shards(root, &mut shards);
@@ -1244,7 +1177,7 @@ fn collect_snapshot_shards(path: &Path, shards: &mut Vec<PathBuf>) {
         let Some(ext) = entry_path.extension().and_then(|ext| ext.to_str()) else {
             continue;
         };
-        if ext != "bincode" {
+        if ext != "postcard" {
             continue;
         }
 
@@ -1291,4 +1224,198 @@ fn clone_repo_to(source: &Path, dest: &Path) {
         .status()
         .expect("git clone");
     assert!(status.success(), "git clone failed");
+}
+
+// === Legacy bincode cache isolation ===
+//
+// The Postcard migration (#349) changed every storage identity: the local
+// record `meta.bincode` became `meta.postcard` (record schema 6), shared
+// entries became `entries/<input_key>.postcard` (entry schema 2), and snapshot
+// shards became `<shard_id>.postcard` (snapshot schema 5). Cache keys were
+// re-encoded too, so this build never looks up any pre-Postcard entry key.
+// The fixtures below are the genuine pre-change bytes captured at 905b038
+// (see crates/luchta-cache/tests/fixtures/legacy-bincode/README.md for
+// provenance and checksums).
+
+const LEGACY_RECORD: &[u8] =
+    include_bytes!("../../luchta-cache/tests/fixtures/legacy-bincode/meta.bincode");
+const LEGACY_ENTRY: &[u8] =
+    include_bytes!("../../luchta-cache/tests/fixtures/legacy-bincode/entry.bin");
+const LEGACY_SHARD: &[u8] =
+    include_bytes!("../../luchta-cache/tests/fixtures/legacy-bincode/shard.bincode");
+const LEGACY_SIDECAR: &[u8] = b"subsumed shard ids\n";
+
+/// Counter workspace whose execution probe lives outside the task outputs.
+/// `run-count.txt` at the workspace root counts actual executions across
+/// builds, while the declared output `counter.txt` is what the caches store
+/// and restore. A restored build leaves `run-count.txt` untouched.
+fn legacy_probe_workspace() -> assert_fs::TempDir {
+    counter_workspace(
+        r#""app#pkgbuild":{"cache":{},"worker":"shell","inputs":["src.txt"],"outputs":["counter.txt"],"command":"sleep 0.15 && count=$(cat ../../run-count.txt 2>/dev/null || echo 0); count=$((count+1)); echo $count > ../../run-count.txt; echo $count > counter.txt"}"#,
+    )
+}
+
+fn legacy_probe_build(root: &Path, cache: &Path) -> Command {
+    let mut cmd = Command::cargo_bin("luchta").unwrap();
+    cmd.arg("run")
+        .arg("pkgbuild")
+        .arg("--workspace-root")
+        .arg(root)
+        .env("LUCHTA_SHARED_CACHE", "1")
+        .env("LUCHTA_SHARED_CACHE_DIR", cache);
+    cmd
+}
+
+/// Write a genuine schema-5 `meta.bincode` record into the task's local
+/// record directory — the exact path a pre-Postcard client used. Returns the
+/// legacy file's path.
+fn seed_legacy_local_record(root: &Path, task_id: &str) -> PathBuf {
+    let record_dir = root
+        .join(".luchta")
+        .join("cache")
+        .join(blake3::hash(task_id.as_bytes()).to_hex().as_str());
+    std::fs::create_dir_all(&record_dir).unwrap();
+    let legacy_path = record_dir.join("meta.bincode");
+    std::fs::write(&legacy_path, LEGACY_RECORD).unwrap();
+    legacy_path
+}
+
+/// Seed genuine legacy `.bincode` shards and obsolete `.merged` sidecars into
+/// every snapshot bucket the next build reads, plus a legacy `.bin` entry
+/// object in `entries/`. Returns every seeded path for later checks.
+fn seed_legacy_shared_artifacts(shared_root: &Path) -> Vec<(PathBuf, &'static [u8])> {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let mut seeded = Vec::new();
+
+    for bucket in luchta_cache::shared::bucket_keys_for(
+        now_ms,
+        luchta_cache::shared::DEFAULT_SHARED_CACHE_DAY_WINDOW,
+    ) {
+        let bucket_dir = shared_root.join("snapshots").join(&bucket);
+        std::fs::create_dir_all(&bucket_dir).unwrap();
+        for (suffix, bytes) in [(".bincode", LEGACY_SHARD), (".merged", LEGACY_SIDECAR)] {
+            let path = bucket_dir.join(format!("legacy-{bucket}{suffix}"));
+            std::fs::write(&path, bytes).unwrap();
+            seeded.push((path, bytes));
+        }
+    }
+
+    let entries_dir = shared_root.join("entries");
+    std::fs::create_dir_all(&entries_dir).unwrap();
+    let legacy_entry = entries_dir.join("deadbeef.bin");
+    std::fs::write(&legacy_entry, LEGACY_ENTRY).unwrap();
+    seeded.push((legacy_entry, LEGACY_ENTRY));
+
+    seeded
+}
+
+fn assert_legacy_files_unchanged(seeded: &[(PathBuf, &'static [u8])]) {
+    for (path, bytes) in seeded {
+        assert_eq!(
+            std::fs::read(path).unwrap(),
+            *bytes,
+            "legacy cache file must stay in place byte-identical: {}",
+            path.display()
+        );
+    }
+}
+
+/// Test: genuine pre-Postcard cache files never block the Postcard cache, and
+/// three distinct outcomes are each proven with the old files still in place:
+///
+/// 1. **Distinct execution:** a first build against a seeded legacy local
+///    record and legacy shard/entry files executes the task, produces
+///    outputs, and writes new-format artifacts — the legacy files are misses,
+///    not crashes and not skips.
+/// 2. **Shared restore without a local record:** a fresh checkout whose only
+///    local record is the ignored legacy `meta.bincode` restores outputs from
+///    the shared cache. No readable local record exists there, so a local hit
+///    cannot mask a shared-restore failure.
+/// 3. **Local skip:** the next build in that checkout skips on the hydrated
+///    new-format record, with every legacy artifact still byte-identical.
+#[test]
+fn legacy_bincode_files_do_not_block_execution_shared_hit_or_local_skip() {
+    let shared_cache_dir = tempfile::tempdir().unwrap();
+    let worktree_a = legacy_probe_workspace();
+
+    let legacy_local_a = seed_legacy_local_record(worktree_a.path(), "app#pkgbuild");
+    let mut seeded_a = vec![(legacy_local_a.clone(), LEGACY_RECORD)];
+    seeded_a.extend(seed_legacy_shared_artifacts(shared_cache_dir.path()));
+
+    // 1. Distinct execution: runs, writes new artifacts, keeps old files.
+    let first = legacy_probe_build(worktree_a.path(), shared_cache_dir.path())
+        .assert()
+        .success();
+    let first_stdout = std::str::from_utf8(&first.get_output().stdout).unwrap();
+    assert!(
+        first_stdout.contains("✔ 1")
+            && !first_stdout.contains("⏩")
+            && !first_stdout.contains("📥"),
+        "first build must execute the task, stdout was:\n{first_stdout}"
+    );
+    worktree_a.child("run-count.txt").assert("1\n");
+    worktree_a.child("packages/app/counter.txt").assert("1\n");
+
+    assert!(
+        legacy_local_a
+            .parent()
+            .unwrap()
+            .join("meta.postcard")
+            .is_file(),
+        "new-format record must be written next to the legacy one"
+    );
+    assert!(
+        !snapshot_shard_paths(&shared_cache_dir.path().join("snapshots")).is_empty(),
+        "first build should store a new-format snapshot shard"
+    );
+    assert!(
+        shared_blob_count(shared_cache_dir.path()) > 0,
+        "first build should store an output blob"
+    );
+    assert_legacy_files_unchanged(&seeded_a);
+
+    // 2. Shared restore from a fresh checkout with no local record.
+    let worktree_b = assert_fs::TempDir::new().unwrap();
+    clone_repo_to(worktree_a.path(), worktree_b.path());
+    assert!(
+        !worktree_b.child(".luchta").path().exists(),
+        "fresh checkout should start with no local cache"
+    );
+    let legacy_local_b = seed_legacy_local_record(worktree_b.path(), "app#pkgbuild");
+
+    let second = legacy_probe_build(worktree_b.path(), shared_cache_dir.path())
+        .assert()
+        .success();
+    let second_stdout = String::from_utf8_lossy(&second.get_output().stdout).into_owned();
+    assert_shared_counter_hit(worktree_b.path(), &second_stdout);
+    assert!(
+        !worktree_b.child("run-count.txt").path().exists(),
+        "shared hit must restore rather than execute; run-count probe absent, stdout was:\n{second_stdout}"
+    );
+    worktree_b.child("packages/app/counter.txt").assert("1\n");
+
+    // 3. Local skip on the hydrated record, legacy files still in place.
+    let third = legacy_probe_build(worktree_b.path(), shared_cache_dir.path())
+        .assert()
+        .success();
+    let third_stdout = String::from_utf8_lossy(&third.get_output().stdout).into_owned();
+    assert!(
+        third_stdout.contains("✔ 1 ⏩ 1") && !third_stdout.contains("📥"),
+        "third build should be a local skip, not a shared hit, stdout was:\n{third_stdout}"
+    );
+    assert!(
+        !worktree_b.child("run-count.txt").path().exists(),
+        "local skip must not execute the task"
+    );
+    worktree_b.child("packages/app/counter.txt").assert("1\n");
+
+    assert_eq!(
+        std::fs::read(&legacy_local_b).unwrap(),
+        LEGACY_RECORD,
+        "fresh checkout's legacy record must stay byte-identical"
+    );
+    assert_legacy_files_unchanged(&seeded_a);
 }

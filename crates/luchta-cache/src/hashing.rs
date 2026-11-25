@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, fs::File, io::Read, path::Path};
 use luchta_types::{DependsOn, EnvSpec, TaskDefinition};
 use serde::Serialize;
 
-use crate::serialization::bincode_config;
+use crate::serialization::{encode, EncodeError};
 
 pub fn blake3_file(path: &Path) -> crate::Result<[u8; 32]> {
     let mut file = File::open(path)?;
@@ -23,21 +23,10 @@ pub fn blake3_file(path: &Path) -> crate::Result<[u8; 32]> {
 
 #[must_use]
 pub fn task_spec_hash(task_def: &TaskDefinition, nonce: Option<&str>) -> [u8; 32] {
-    let spec = TaskSpecHashInput {
-        command: task_def.command.as_deref(),
-        worker: task_def.worker.as_deref(),
-        weight: task_def.weight,
-        depends_on: &task_def.depends_on,
-        cache_enabled: task_def.cache_enabled(),
-        inputs: &task_def.inputs,
-        outputs: &task_def.outputs,
-        nonce,
-    };
-    let bytes = bincode::serde::encode_to_vec(spec, bincode_config())
-        .expect("task spec canonical bincode serialization should succeed");
+    let bytes = task_spec_bytes(task_def, nonce)
+        .expect("task spec canonical Postcard serialization should succeed");
     if task_def.cache_files.is_empty() && task_def.tool_version.is_none() {
-        // Keep optional hash extensions outside the bincode struct so their
-        // absence preserves existing cache keys.
+        // Optional extensions do not affect the base-only preimage when absent.
         return *blake3::hash(&bytes).as_bytes();
     }
 
@@ -45,9 +34,9 @@ pub fn task_spec_hash(task_def: &TaskDefinition, nonce: Option<&str>) -> [u8; 32
     if task_def.cache_files.is_empty() {
         hasher.update(&bytes);
     } else {
-        // Preserve the cache-files-only stream, including its leading domain tag.
-        let cache_files = bincode::serde::encode_to_vec(&task_def.cache_files, bincode_config())
-            .expect("cache file declaration canonical bincode serialization should succeed");
+        // Keep the cache-files frame separate from the base task fields.
+        let cache_files = encode(&task_def.cache_files)
+            .expect("cache file declaration canonical Postcard serialization should succeed");
         hasher.update(b"luchta-cache:task-spec-cache-files:v1");
         hasher.update(&(bytes.len() as u64).to_le_bytes());
         hasher.update(&bytes);
@@ -63,8 +52,31 @@ pub fn task_spec_hash(task_def: &TaskDefinition, nonce: Option<&str>) -> [u8; 32
     *hasher.finalize().as_bytes()
 }
 
+fn task_spec_bytes(task_def: &TaskDefinition, nonce: Option<&str>) -> Result<Vec<u8>, EncodeError> {
+    let spec = TaskSpecHashInput {
+        command: task_def.command.as_deref(),
+        worker: task_def.worker.as_deref(),
+        weight: task_def.weight,
+        depends_on: &task_def.depends_on,
+        cache_enabled: task_def.cache_enabled(),
+        inputs: &task_def.inputs,
+        outputs: &task_def.outputs,
+        nonce,
+    };
+    encode(&spec)
+}
+
 #[must_use]
-pub fn env_hash<F>(env: &BTreeMap<String, EnvSpec>, mut resolver: F) -> [u8; 32]
+pub fn env_hash<F>(env: &BTreeMap<String, EnvSpec>, resolver: F) -> [u8; 32]
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    let bytes = env_bytes(env, resolver)
+        .expect("significant environment canonical Postcard serialization should succeed");
+    *blake3::hash(&bytes).as_bytes()
+}
+
+fn env_bytes<F>(env: &BTreeMap<String, EnvSpec>, mut resolver: F) -> Result<Vec<u8>, EncodeError>
 where
     F: FnMut(&str) -> Option<String>,
 {
@@ -80,22 +92,22 @@ where
         })
         .collect::<Vec<_>>();
 
-    let bytes = bincode::serde::encode_to_vec(&pairs, bincode_config())
-        .expect("significant environment canonical bincode serialization should succeed");
-
-    *blake3::hash(&bytes).as_bytes()
+    encode(&pairs)
 }
 
 #[must_use]
 pub fn pkg_dep_hash(pairs: &[(String, String)]) -> [u8; 32] {
+    let bytes = pkg_dep_bytes(pairs)
+        .expect("package dependency canonical Postcard serialization should succeed");
+    *blake3::hash(&bytes).as_bytes()
+}
+
+fn pkg_dep_bytes(pairs: &[(String, String)]) -> Result<Vec<u8>, EncodeError> {
     let mut canonical_pairs = pairs.to_vec();
     canonical_pairs.sort_unstable();
     canonical_pairs.dedup();
 
-    let bytes = bincode::serde::encode_to_vec(&canonical_pairs, bincode_config())
-        .expect("package dependency canonical bincode serialization should succeed");
-
-    *blake3::hash(&bytes).as_bytes()
+    encode(&canonical_pairs)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -114,10 +126,7 @@ struct TaskSpecHashInput<'a> {
     // Cache nonce belongs in task_spec_hash, not env_hash: unlike env, this is
     // cache-control with no opt-out semantics, so any supplied value must always
     // invalidate task-spec identity. See docs/hash-boundary-task-spec-vs-separate
-    // for prior art on why env stays tracked separately by env_hash. Adding this
-    // Option also changes bincode layout even for None because Option serializes a
-    // discriminant byte, so on-disk hashes invalidate once on upgrade; accepted by
-    // plan decision.
+    // for prior art on why env stays tracked separately by env_hash.
     nonce: Option<&'a str>,
 }
 
@@ -134,9 +143,11 @@ enum ResolvedEnvValue {
 }
 
 #[cfg(test)]
+mod golden_tests;
+
+#[cfg(test)]
 mod tests {
-    use super::{blake3_file, env_hash, pkg_dep_hash, task_spec_hash, TaskSpecHashInput};
-    use crate::serialization::bincode_config;
+    use super::{blake3_file, env_hash, pkg_dep_hash, task_spec_hash};
     use std::{collections::BTreeMap, fs};
 
     use luchta_types::{
@@ -267,43 +278,6 @@ mod tests {
     }
 
     #[test]
-    fn empty_cache_files_preserve_the_legacy_task_hash() {
-        let task = sample_task_definition();
-        assert!(task.cache_files.is_empty());
-        assert!(task.tool_version.is_none());
-
-        for nonce in [None, Some("global=legacy")] {
-            let bytes = legacy_task_spec_bytes(&task, nonce);
-            assert_eq!(
-                task_spec_hash(&task, nonce),
-                *blake3::hash(&bytes).as_bytes()
-            );
-        }
-    }
-
-    #[test]
-    fn cache_files_without_tool_version_preserve_the_legacy_task_hash() {
-        let mut task = sample_task_definition();
-        task.cache_files = vec![".eslintcache".to_owned(), ".babel-cache/**".to_owned()];
-        assert!(task.tool_version.is_none());
-
-        for nonce in [None, Some("global=legacy")] {
-            let bytes = legacy_task_spec_bytes(&task, nonce);
-            let cache_files =
-                bincode::serde::encode_to_vec(&task.cache_files, bincode_config()).unwrap();
-            // Keep the pre-tool-version byte stream independent of task_spec_hash.
-            let mut hasher = blake3::Hasher::new();
-            hasher.update(b"luchta-cache:task-spec-cache-files:v1");
-            hasher.update(&(bytes.len() as u64).to_le_bytes());
-            hasher.update(&bytes);
-            hasher.update(&(cache_files.len() as u64).to_le_bytes());
-            hasher.update(&cache_files);
-
-            assert_eq!(task_spec_hash(&task, nonce), *hasher.finalize().as_bytes());
-        }
-    }
-
-    #[test]
     fn task_spec_hash_ignores_since_tool_declarations() {
         for tool_version in [None, Some("swc_core=80.0.0".to_owned())] {
             let mut task = sample_task_definition();
@@ -391,31 +365,6 @@ mod tests {
             task.command = Some("pnpm run test".to_owned());
             assert_ne!(baseline, task_spec_hash(&task, None));
         }
-    }
-
-    #[test]
-    fn task_spec_hash_without_nonce_is_deterministic() {
-        let task = sample_task_definition();
-        let first = task_spec_hash(&task, None);
-        let second = task_spec_hash(&task, None);
-
-        assert_eq!(first, second);
-    }
-
-    #[test]
-    fn task_spec_hash_without_nonce_matches_pinned_regression_value() {
-        let task = sample_task_definition();
-
-        // Pinned after cacheNonce feature landed. Value changed once at feature
-        // introduction because bincode encodes Option with discriminant byte even
-        // for None, so future changes here should be deliberate.
-        assert_eq!(
-            task_spec_hash(&task, None),
-            [
-                201, 120, 202, 56, 231, 47, 51, 49, 237, 176, 254, 210, 159, 66, 141, 128, 16, 179,
-                43, 250, 104, 128, 87, 241, 7, 85, 210, 63, 25, 128, 83, 172,
-            ]
-        );
     }
 
     #[test]
@@ -693,49 +642,7 @@ mod tests {
         assert_ne!(baseline, changed);
     }
 
-    #[test]
-    fn pkg_dep_hash_is_deterministic_for_identical_input() {
-        let pairs = vec![
-            ("react".to_owned(), "18.2.0".to_owned()),
-            ("vite".to_owned(), "5.4.0".to_owned()),
-        ];
-
-        assert_eq!(pkg_dep_hash(&pairs), pkg_dep_hash(&pairs));
-    }
-
-    #[test]
-    fn pkg_dep_hash_normalizes_unsorted_and_duplicate_input() {
-        let unsorted = vec![
-            ("vite".to_owned(), "5.4.0".to_owned()),
-            ("react".to_owned(), "18.2.0".to_owned()),
-            ("react".to_owned(), "18.2.0".to_owned()),
-        ];
-        let sorted = vec![
-            ("react".to_owned(), "18.2.0".to_owned()),
-            ("vite".to_owned(), "5.4.0".to_owned()),
-        ];
-
-        assert_eq!(pkg_dep_hash(&unsorted), pkg_dep_hash(&sorted));
-    }
-
-    fn legacy_task_spec_bytes(task: &TaskDefinition, nonce: Option<&str>) -> Vec<u8> {
-        bincode::serde::encode_to_vec(
-            TaskSpecHashInput {
-                command: task.command.as_deref(),
-                worker: task.worker.as_deref(),
-                weight: task.weight,
-                depends_on: &task.depends_on,
-                cache_enabled: task.cache_enabled(),
-                inputs: &task.inputs,
-                outputs: &task.outputs,
-                nonce,
-            },
-            bincode_config(),
-        )
-        .unwrap()
-    }
-
-    fn sample_task_definition() -> TaskDefinition {
+    pub(super) fn sample_task_definition() -> TaskDefinition {
         let mut env = BTreeMap::new();
         env.insert(
             "NODE_ENV".to_owned(),
