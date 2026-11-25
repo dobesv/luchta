@@ -77,7 +77,7 @@ use store_request::StoreTiming;
 use tokio::task::JoinSet;
 
 use crate::record::TaskRunRecord;
-use crate::serialization::bincode_config;
+use crate::serialization::encode;
 
 /// Reserved prefix for metadata files inside blobs.
 /// Tasks faster than this aren't worth a shared-cache round trip: the store,
@@ -132,7 +132,7 @@ fn store_preflight(
 pub const META_DIR_NAME: &str = ".luchta-meta";
 pub const META_STDOUT_FILE_NAME: &str = "stdout.log";
 pub const META_STDERR_FILE_NAME: &str = "stderr.log";
-pub const META_RECORD_FILE_NAME: &str = "meta.bincode";
+pub const META_RECORD_FILE_NAME: &str = crate::store::META_FILE_NAME;
 
 /// Result of a successful cache restore.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -218,8 +218,8 @@ pub enum StoreOutcome {
 }
 
 /// Merged index from all candidate snapshots, built lazily on first access.
-/// First writer wins for differing output hashes. Same-output schema-v3/v4
-/// data can enrich a legacy observation with inline metadata and trusted timing.
+/// First writer wins for differing output hashes. Observations of the same
+/// outputs can enrich each other with inline metadata and trusted timing.
 #[derive(Debug, Clone)]
 pub struct MergedIndex {
     entries: HashMap<String, SnapshotEntry>,
@@ -326,7 +326,7 @@ pub struct SharedCache {
     /// It is *not* invisible across a run that never reaches its flush: a
     /// process killed after `finish_store`/`refresh_entry` but before
     /// `flush_pending_entries` leaves this map's entries un-merged forever
-    /// — their blobs and `entries/*.bin` are already on disk (and, for
+    /// — their blobs and `entries/*.postcard` are already on disk (and, for
     /// stores, already enqueued for the remote), but no shard ever points at
     /// them, so a later run treats them as a miss and redoes the work. This
     /// is an accepted tradeoff, not an oversight: it already applied to
@@ -399,7 +399,7 @@ impl Drop for SharedCache {
         // unwinding and cancellation is not something to depend on. But a
         // call site that forgets `flush_pending_entries` otherwise fails
         // completely silently: every store still reports
-        // `StoreOutcome::Stored`, the blobs and `entries/*.bin` are all
+        // `StoreOutcome::Stored`, the blobs and `entries/*.postcard` are all
         // there, and no shard points at any of them, so the next run misses
         // on all of it. One line makes that diagnosable.
         let pending = self
@@ -581,7 +581,7 @@ impl SharedCache {
 
     /// Stage a single entry, returning a candidate for validation.
     ///
-    /// Uses inline v3 metadata when available, otherwise fetches the fallback
+    /// Uses inline metadata when available, otherwise fetches the fallback
     /// `entries/<input_key>` object. It pulls and stages the outputs blob only
     /// when the metadata says one exists; staging never mutates package files.
     fn stage_entry(
@@ -640,11 +640,7 @@ impl SharedCache {
         staging_root: &Path,
         #[cfg(unix)] remote: Option<&RemoteSync>,
     ) -> Option<StagedCandidate> {
-        let record: TaskRunRecord =
-            match bincode::serde::decode_from_slice(&meta.record, bincode_config()) {
-                Ok((record, _)) => record,
-                Err(_) => return None,
-            };
+        let record = meta.decode_record()?;
 
         let reports: Vec<crate::store::ReportInput> = meta
             .reports
@@ -976,8 +972,7 @@ impl SharedCache {
         }
 
         // Prepare per-entry meta. Keyed by input_key, never by outputs_hash.
-        let meta_record = bincode::serde::encode_to_vec(request.record, bincode_config())
-            .map_err(io::Error::other)?;
+        let meta_record = encode(request.record).map_err(io::Error::other)?;
 
         // `has_outputs` is provisional here — the size-cap estimate below
         // doesn't depend on its value (encoding a bool costs the same byte
@@ -1214,7 +1209,7 @@ impl SharedCache {
     }
 
     /// Records an entry on a shared-cache hit for a later batched merge, and
-    /// immediately advances `entries/<input_key>.bin`'s mtime.
+    /// immediately advances `entries/<input_key>.postcard`'s mtime.
     ///
     /// Without this, a stable entry written once falls out of the day window
     /// a few days later (every build then misses it, rebuilds, and rewrites
@@ -1324,8 +1319,8 @@ impl SharedCache {
 mod tests {
     #[path = "helpers.rs"]
     mod helpers;
-    #[path = "schema_v2.rs"]
-    mod schema_v2;
+    #[path = "metadata_formats.rs"]
+    mod metadata_formats;
 
     use super::*;
     use crate::record::FileEntry;
@@ -1386,7 +1381,7 @@ mod tests {
     pub(crate) fn sample_record(succeeded: bool, duration_ms: u64) -> TaskRunRecord {
         let start = 1_000_000_000_000_u64;
         TaskRunRecord {
-            schema_version: crate::record::SCHEMA_VERSION_V5,
+            schema_version: crate::record::SCHEMA_VERSION_V6,
             task_spec_hash: [1; 32],
             input_patterns: vec!["src/**/*.ts".to_string()],
             inputs: vec![],
@@ -1898,7 +1893,7 @@ mod tests {
     }
 
     #[test]
-    fn trusted_fast_entries_are_filtered_but_legacy_duration_is_allowed() {
+    fn trusted_fast_entries_are_filtered_but_untrusted_duration_is_allowed() {
         let temp_repo = TempDir::new().unwrap();
         setup_git_repo(temp_repo.path());
         create_commit(temp_repo.path());
@@ -1918,7 +1913,7 @@ mod tests {
             schema_version: ENTRY_META_SCHEMA_VERSION,
             outputs_hash: [0; 32],
             has_outputs: false,
-            record: bincode::serde::encode_to_vec(&record, bincode_config()).unwrap(),
+            record: encode(&record).unwrap(),
             stdout: Vec::new(),
             stderr: Vec::new(),
             reports: Vec::new(),
@@ -1946,7 +1941,7 @@ mod tests {
             #[cfg(unix)]
             None,
         )
-        .expect("legacy duration must not filter a fallback restore");
+        .expect("untrusted duration must not filter an inline restore");
         candidate.discard().unwrap();
     }
 
@@ -2410,12 +2405,9 @@ mod tests {
 
     #[test]
     fn legacy_blob_with_embedded_meta_restores_outputs_only() {
-        // Blobs written by pre-Task-4 clients still embed a `.luchta-meta/`
-        // directory (see `write_blob_with_meta`). Restore must still extract
-        // their output files correctly, and must not leak that embedded meta
-        // into the restored package directory: `entries/<input_key>` is
-        // authoritative for the record/stdout/stderr, and
-        // `move_non_meta_files` filters `.luchta-meta` out on commit.
+        // A real pre-Postcard archive contains both a bincode record and a
+        // report named meta.postcard. Outputs-only restore must ignore both,
+        // including the report name that would fail today's validation.
         let temp_repo = TempDir::new().unwrap();
         setup_git_repo(temp_repo.path());
         create_commit(temp_repo.path());
@@ -2428,10 +2420,6 @@ mod tests {
             Some(temp_cache.path()),
         )
         .unwrap();
-
-        let package_dir = temp_repo.path().join("pkg");
-        fs::create_dir_all(package_dir.join("dist")).unwrap();
-        fs::write(package_dir.join("dist/main.js"), "v1").unwrap();
 
         let input_key = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32], [5; 32]);
         let record = sample_record(true, 200);
@@ -2452,22 +2440,8 @@ mod tests {
         let write_key = cache.write_bucket_key().unwrap().to_string();
         cache.snapshot_store.merge_entry(&write_key, entry);
 
-        // Legacy blob: meta embedded via write_blob_with_meta (pre-Task-2 format).
-        let meta = MetaFiles {
-            stdout: b"stdout v1".to_vec(),
-            stderr: b"stderr v1".to_vec(),
-            record: bincode::serde::encode_to_vec(&record, bincode_config()).unwrap(),
-            reports: vec![],
-        };
-        write_blob_with_meta(
-            &cache.paths,
-            &[7; 32],
-            &package_dir,
-            &[PathBuf::from("dist/main.js")],
-            1_000_000,
-            &meta,
-        )
-        .unwrap();
+        let old_blob = include_bytes!("../../tests/fixtures/legacy-bincode/embedded-meta.tar.zst");
+        fs::write(blob_path(&cache.paths, &[7; 32]), old_blob).unwrap();
 
         // entries/<input_key> is what the two-phase restore path actually
         // reads; the meta embedded in the blob above is ignored.
@@ -2478,9 +2452,9 @@ mod tests {
                 schema_version: ENTRY_META_SCHEMA_VERSION,
                 outputs_hash: [7; 32],
                 has_outputs: true,
-                record: meta.record.clone(),
-                stdout: meta.stdout.clone(),
-                stderr: meta.stderr.clone(),
+                record: encode(&record).unwrap(),
+                stdout: b"fallback stdout".to_vec(),
+                stderr: b"fallback stderr".to_vec(),
                 reports: vec![],
             },
         )
@@ -2496,7 +2470,13 @@ mod tests {
             .commit()
             .expect("commit should succeed");
 
-        assert_legacy_restore(&hit, &written_paths, &restore_dir);
+        assert_eq!(hit.record, record);
+        assert_eq!(hit.stdout, b"fallback stdout");
+        assert_eq!(hit.stderr, b"fallback stderr");
+        assert!(hit.reports.is_empty());
+        assert_eq!(written_paths, [restore_dir.join("dist/main.js")]);
+        assert_eq!(fs::read(restore_dir.join("dist/main.js")).unwrap(), b"v1");
+        assert!(!restore_dir.join(META_DIR_NAME).exists());
     }
 
     fn write_snapshot_fixture(snapshot_dir: &Path, commit: &str, entry: SnapshotEntry) {
@@ -2504,13 +2484,10 @@ mod tests {
         snapshot
             .entries
             .insert(input_key_hex(entry.input_key), entry);
-        let encoded = bincode::serde::encode_to_vec(
-            &snapshot,
-            crate::shared::snapshot::snapshot_bincode_config(),
-        )
-        .unwrap();
+        let raw = encode(&snapshot).unwrap();
+        let encoded = zstd::encode_all(raw.as_slice(), 3).unwrap();
         fs::create_dir_all(snapshot_dir.join(commit)).unwrap();
-        fs::write(snapshot_dir.join(commit).join("a.bincode"), encoded).unwrap();
+        fs::write(snapshot_dir.join(commit).join("a.postcard"), encoded).unwrap();
     }
 
     #[test]
@@ -2644,11 +2621,7 @@ mod tests {
                     schema_version: ENTRY_META_SCHEMA_VERSION,
                     outputs_hash: [0; 32],
                     has_outputs: false,
-                    record: bincode::serde::encode_to_vec(
-                        sample_record(true, 200),
-                        bincode_config(),
-                    )
-                    .unwrap(),
+                    record: encode(&sample_record(true, 200)).unwrap(),
                     stdout: b"old-stdout".to_vec(),
                     stderr: Vec::new(),
                     reports: Vec::new(),
@@ -2858,7 +2831,10 @@ mod tests {
         assert!(!restore_dir.join(".luchta-meta").exists());
         assert!(!restore_dir.join(".luchta-meta/stdout.log").exists());
         assert!(!restore_dir.join(".luchta-meta/stderr.log").exists());
-        assert!(!restore_dir.join(".luchta-meta/meta.bincode").exists());
+        assert!(!restore_dir
+            .join(META_DIR_NAME)
+            .join(META_RECORD_FILE_NAME)
+            .exists());
     }
 
     #[test]
@@ -3308,19 +3284,6 @@ mod tests {
         }
     }
 
-    fn assert_legacy_restore(hit: &RestoredHit, written_paths: &[PathBuf], restore_dir: &Path) {
-        assert!(
-            hit.stdout == b"stdout v1"
-                && written_paths == [restore_dir.join("dist/main.js")]
-                && fs::read(restore_dir.join("dist/main.js")).unwrap() == b"v1",
-            "legacy restore must preserve fallback logs, output paths, and output contents"
-        );
-        assert!(
-            !restore_dir.join(".luchta-meta").exists(),
-            "embedded legacy meta must be filtered out on commit"
-        );
-    }
-
     #[test]
     fn merged_index_drops_inline_meta_over_resident_budget() {
         let outputs_hash = [9; 32];
@@ -3394,7 +3357,7 @@ mod tests {
 
     #[test]
     fn a_shared_hit_advances_the_entry_meta_mtime() {
-        // gc_entries_dir ages out entries/*.bin by mtime and a hit does not
+        // gc_entries_dir ages out entries/*.postcard by mtime and a hit does not
         // rewrite the file, so without this an entry in active use has its
         // meta deleted while its index key stays live.
         let temp_repo = TempDir::new().unwrap();
@@ -3580,7 +3543,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let dir = temp.path().join("20260808-01");
         fs::create_dir_all(&dir).unwrap();
-        let shard = dir.join("existing.bincode");
+        let shard = dir.join("existing.postcard");
         fs::write(&shard, b"real shard").unwrap();
 
         ensure_cache_dir(&dir).expect("an existing directory is not an error");

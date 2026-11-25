@@ -12,7 +12,7 @@ use luchta_cache::{
     resolve_inputs, resolve_outputs,
     shared::snapshot::{combined_dep_outputs_hash, derive_input_key},
     task_spec_hash, Cache, CurrentState, Decision, DecisionResult, FileEntry, FileStateResolver,
-    RunArtifacts, RunReason, TaskRunRecord, SCHEMA_VERSION_V5,
+    RunArtifacts, RunReason, TaskRunRecord, SCHEMA_VERSION_V6,
 };
 use luchta_engine::{
     PackageResolveInfo, ResolveMode, ResolveResult, ResolveTask, TaskGraph, TaskResolver,
@@ -42,15 +42,17 @@ async fn unchanged_tool_version_hits_local_and_shared_cache() {
 }
 
 #[tokio::test]
-async fn omitted_tool_version_preserves_legacy_hash_and_cache_hits() {
+async fn omitted_tool_version_uses_base_postcard_hash_and_hits_caches() {
     let hash = assert_unchanged_version_is_cached(None).await;
 
-    // Pinned using pre-tool_version task_spec_hash (pre-feature baseline spec hash), not the current hasher.
+    // Independently built Postcard preimage for the resolved task, without a
+    // tool-version frame: compile, mock, weight 1, no deps, cache enabled,
+    // one input, one output, and no nonce.
     assert_eq!(
         hash,
         [
-            109, 79, 136, 181, 230, 171, 58, 59, 238, 192, 86, 254, 84, 124, 42, 162, 253, 165,
-            148, 156, 252, 52, 50, 79, 38, 77, 238, 67, 218, 246, 107, 145,
+            152, 190, 23, 67, 227, 125, 127, 103, 77, 118, 13, 207, 66, 129, 197, 229, 250, 146,
+            231, 202, 17, 171, 40, 175, 100, 136, 24, 62, 136, 236, 100, 227,
         ]
     );
 }
@@ -202,7 +204,7 @@ impl Workspace {
         assert!(!inputs[0].absent && !outputs[0].absent);
 
         TaskRunRecord {
-            schema_version: SCHEMA_VERSION_V5,
+            schema_version: SCHEMA_VERSION_V6,
             task_spec_hash: current.task_spec_hash,
             input_patterns: current.declared_input_patterns.to_vec(),
             inputs,

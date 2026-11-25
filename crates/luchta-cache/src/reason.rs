@@ -82,10 +82,10 @@ impl fmt::Display for RunReason {
 #[cfg(test)]
 mod tests {
     use super::{FileDelta, RunReason};
-    use bincode::config;
+    use crate::serialization::{decode, encode};
 
     #[test]
-    fn run_reason_bincode_round_trip_all_variants() {
+    fn run_reason_postcard_round_trip_all_variants() {
         let reasons = vec![
             RunReason::NoPriorRecord,
             RunReason::PriorFailed,
@@ -142,13 +142,8 @@ mod tests {
         ];
 
         for reason in reasons {
-            let config = config::standard()
-                .with_fixed_int_encoding()
-                .with_little_endian();
-            let encoded = bincode::serde::encode_to_vec(&reason, config).unwrap();
-            let (decoded, consumed): (RunReason, usize) =
-                bincode::serde::decode_from_slice(&encoded, config).unwrap();
-            assert_eq!(consumed, encoded.len());
+            let encoded = encode(&reason).unwrap();
+            let decoded: RunReason = decode(&encoded).unwrap();
             assert_eq!(decoded, reason);
             assert!(!reason.summary().is_empty());
             assert!(!reason.to_string().is_empty());

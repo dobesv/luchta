@@ -16,7 +16,7 @@ pub use luchta_types::{classify_pattern, InputSemantics};
 pub use reason::{FileDelta, RunReason};
 pub use record::{
     FileEntry, ReportMeta, TaskRunRecord, SCHEMA_VERSION_V1, SCHEMA_VERSION_V2, SCHEMA_VERSION_V3,
-    SCHEMA_VERSION_V4, SCHEMA_VERSION_V5,
+    SCHEMA_VERSION_V4, SCHEMA_VERSION_V5, SCHEMA_VERSION_V6,
 };
 pub use resolve::{
     combined_cache_files_hash, combined_inputs_hash, combined_outputs_hash,
@@ -24,6 +24,7 @@ pub use resolve::{
     resolve_inputs_with_semantics, resolve_inputs_with_semantics_and_options, resolve_outputs,
     resolve_outputs_with_options, ListingCache, PathRequestMatcher, ResolveOptions, ResolveRequest,
 };
+pub use serialization::EncodeError;
 pub use store::{
     resolve_cache_dir, task_cache_key, Cache, ReportInput, RunArtifacts, CACHE_DIR_ENV,
     CACHE_DIR_NAME, GITIGNORE_CONTENTS, GITIGNORE_FILE_NAME, LUCHTA_DIR_NAME,
@@ -34,7 +35,7 @@ pub enum CacheError {
     #[error("failed to access cache filesystem: {0}")]
     Io(#[from] std::io::Error),
     #[error("failed to serialize task run record: {0}")]
-    SerializeRecord(bincode::error::EncodeError),
+    SerializeRecord(#[source] EncodeError),
     #[error("invalid glob pattern: {0}")]
     InvalidGlob(globset::Error),
     #[error("failed to build glob matcher: {0}")]

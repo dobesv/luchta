@@ -29,11 +29,12 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use super::snapshot::{SnapshotUpload, SNAPSHOT_FILE_EXTENSION, SNAPSHOT_MERGED_EXTENSION};
+use super::entry_meta::entry_meta_filename;
+use super::snapshot::{SnapshotUpload, SNAPSHOT_FILE_EXTENSION};
 use super::stats::{directory_file_bytes, SharedCacheStats};
 use super::{
-    entry_meta_path, hex_hash, rclone, MergeEntryOutcome, RcloneRcd, SharedCachePaths,
-    SnapshotStore, BLOBS_DIR_NAME, ENTRIES_DIR_NAME, SNAPSHOTS_DIR_NAME,
+    entry_meta_path, rclone, MergeEntryOutcome, RcloneRcd, SharedCachePaths, SnapshotStore,
+    BLOBS_DIR_NAME, ENTRIES_DIR_NAME, SNAPSHOTS_DIR_NAME,
 };
 use limiter::RemoteOperationLimiter;
 
@@ -878,7 +879,7 @@ impl RemoteSync {
         if local_path.exists() {
             return Ok(());
         }
-        let file_name = format!("{}.bin", hex_hash(*input_key));
+        let file_name = entry_meta_filename(input_key);
         self.state
             .stats
             .fallback_meta_gets
@@ -962,7 +963,7 @@ impl RemoteSync {
     }
 
     /// Pushes the content-addressed blob (when `has_outputs`) and the fallback
-    /// `entries/<input_key>.bin` object (when metadata was too large to inline).
+    /// `entries/<input_key>.postcard` object (when metadata was too large to inline).
     ///
     /// Independent of [`push_index_merge`](Self::push_index_merge): both the
     /// blob and the entry meta are useful to a restore on another machine
@@ -1008,14 +1009,13 @@ impl RemoteSync {
             if self.is_disabled() {
                 break;
             }
-            self.delete_remote_snapshot_file(shard_key, shard_id, SNAPSHOT_FILE_EXTENSION);
-            self.delete_remote_snapshot_file(shard_key, shard_id, SNAPSHOT_MERGED_EXTENSION);
+            self.delete_remote_snapshot_file(shard_key, shard_id);
         }
     }
 
     fn push_entry_meta_if_missing(&self, paths: &SharedCachePaths, input_key: &[u8; 32]) {
         let remote_fs = self.entries_fs();
-        let file_name = format!("{}.bin", hex_hash(*input_key));
+        let file_name = entry_meta_filename(input_key);
         let Some((preflight, _)) =
             self.remote_operation(|timeout| self.rclone.stat(&remote_fs, &file_name, timeout))
         else {
@@ -1087,12 +1087,12 @@ impl RemoteSync {
         true
     }
 
-    fn delete_remote_snapshot_file(&self, commit_key: &str, shard_id: &str, extension: &str) {
+    fn delete_remote_snapshot_file(&self, commit_key: &str, shard_id: &str) {
         if self.is_disabled() {
             return;
         }
         let remote_fs = self.snapshots_fs(commit_key);
-        let remote_name = format!("{shard_id}.{extension}");
+        let remote_name = format!("{shard_id}.{SNAPSHOT_FILE_EXTENSION}");
         let Some((result, _)) = self
             .remote_operation(|timeout| self.rclone.deletefile(&remote_fs, &remote_name, timeout))
         else {
@@ -1170,7 +1170,8 @@ impl RemoteSync {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shared::snapshot::snapshot_bincode_config;
+    use crate::serialization::encode;
+    use crate::shared::hex_hash;
     use crate::shared::tests::{create_commit, sample_record, setup_git_repo};
     use crate::shared::{
         derive_input_key, input_key_hex, MergeResult, OpenExtras, SharedCache,
@@ -1381,16 +1382,16 @@ mod tests {
         assert!(remote_blob_path(remote_root, outputs_hash).exists());
     }
 
-    /// Asserts the bucket holds exactly `bincode_count` shard files and no
+    /// Asserts the bucket holds exactly `shard_count` shard files and no
     /// `.merged` sidecars. Nothing writes sidecars any more (#284), so a
     /// stray one means something reintroduced the write.
-    fn assert_snapshot_shard_count(files: &[String], bincode_count: usize) {
+    fn assert_snapshot_shard_count(files: &[String], shard_count: usize) {
         assert_eq!(
             files
                 .iter()
-                .filter(|name| name.ends_with(".bincode"))
+                .filter(|name| name.ends_with(".postcard"))
                 .count(),
-            bincode_count
+            shard_count
         );
         assert_eq!(
             files
@@ -1901,7 +1902,7 @@ mod tests {
         fs::create_dir_all(&remote_commit_dir).unwrap();
         fs::write(
             remote_commit_dir.join(format!("missing.{SNAPSHOT_FILE_EXTENSION}")),
-            bincode::serde::encode_to_vec(&snapshot, snapshot_bincode_config()).unwrap(),
+            zstd::encode_all(encode(&snapshot).unwrap().as_slice(), 3).unwrap(),
         )
         .unwrap();
 
@@ -2054,25 +2055,25 @@ mod tests {
             .path()
             .join("snapshots")
             .join(seed.shard_key());
-        let mut bincode_files = Vec::new();
+        let mut shard_files = Vec::new();
         let mut merged_files = Vec::new();
         for entry in fs::read_dir(&snapshot_dir).unwrap() {
             let entry = entry.unwrap();
             let file_name = entry.file_name().into_string().unwrap();
-            if file_name.ends_with(".bincode") {
-                bincode_files.push(file_name);
+            if file_name.ends_with(".postcard") {
+                shard_files.push(file_name);
             } else if file_name.ends_with(".merged") {
                 merged_files.push(file_name);
             }
         }
-        assert_eq!(bincode_files.len(), 1);
+        assert_eq!(shard_files.len(), 1);
         assert!(
             merged_files.is_empty(),
             "the unread .merged sidecar is no longer uploaded (#284)"
         );
 
         let local_snapshot_dir = seed.cache.paths().snapshots_dir.join(seed.shard_key());
-        let local_shard_name = bincode_files.pop().unwrap();
+        let local_shard_name = shard_files.pop().unwrap();
         assert_eq!(
             fs::read(snapshot_dir.join(&local_shard_name)).unwrap(),
             fs::read(local_snapshot_dir.join(&local_shard_name)).unwrap()
@@ -2263,7 +2264,7 @@ mod tests {
         );
         let shard_name = remote_snapshot_files(seed.harness.remote_root.path(), seed.shard_key())
             .into_iter()
-            .find(|name| name.ends_with(".bincode"))
+            .find(|name| name.ends_with(".postcard"))
             .expect("expected remote shard");
         fs::remove_file(
             seed.harness
@@ -2322,9 +2323,8 @@ mod tests {
 
         let upload_shard_id = "subsuming-shard-mid-push".to_string();
         let upload_shard_bytes = b"synthetic-shard".to_vec();
-        // A sidecar as an older luchta would have written it. Nothing
-        // writes these any more, but subsume still deletes them so existing
-        // remotes get cleaned up rather than accumulating orphans (#284).
+        // A sidecar as an older luchta would have written it. New clients
+        // leave these alone, even if a Postcard shard has the same stem.
         let upload_merged_bytes = b"synthetic-merged".to_vec();
         let merge3 = MergeEntryOutcome {
             result: MergeResult::Inserted,
@@ -2348,7 +2348,7 @@ mod tests {
         )
         .unwrap();
         fs::write(
-            remote_shard_dir.join(format!("{}.{}", upload_shard_id, SNAPSHOT_MERGED_EXTENSION)),
+            remote_shard_dir.join(format!("{upload_shard_id}.merged")),
             &upload_merged_bytes,
         )
         .unwrap();
@@ -2358,7 +2358,7 @@ mod tests {
             remote_shard_dir.join(format!("{disabling_shard_id}.{SNAPSHOT_FILE_EXTENSION}"));
         fs::create_dir_all(&poisoned_file).unwrap();
         fs::write(
-            remote_shard_dir.join(format!("{disabling_shard_id}.{SNAPSHOT_MERGED_EXTENSION}")),
+            remote_shard_dir.join(format!("{disabling_shard_id}.merged")),
             b"disabling-merged",
         )
         .unwrap();
@@ -2383,7 +2383,7 @@ mod tests {
         assert_eq!(snapshot_files.len(), 4);
         assert!(snapshot_files
             .iter()
-            .any(|name| name == &format!("{disabling_shard_id}.{SNAPSHOT_MERGED_EXTENSION}")));
+            .any(|name| name == &format!("{disabling_shard_id}.merged")));
         assert!(snapshot_files
             .iter()
             .any(|name| name == &format!("{surviving_shard_id}.{SNAPSHOT_FILE_EXTENSION}")));
@@ -2399,84 +2399,57 @@ mod tests {
             .any(|name| name == &format!("{}.{}", upload_shard_id, SNAPSHOT_FILE_EXTENSION)));
         assert!(snapshot_files
             .iter()
-            .any(|name| name == &format!("{}.{}", upload_shard_id, SNAPSHOT_MERGED_EXTENSION)));
+            .any(|name| name == &format!("{upload_shard_id}.merged")));
     }
 
     #[test]
-    fn remote_store_deletes_subsumed_remote_shards_when_rclone_enabled() {
+    fn remote_compaction_deletes_only_subsumed_postcard_shards_when_rclone_enabled() {
         if !should_run_rclone_test() {
-            eprintln!("skipping rclone-gated shared-cache shard delete test; rclone not on PATH or LUCHTA_TEST_RCLONE disabled");
+            eprintln!("skipping rclone-gated snapshot compaction test");
             return;
         }
 
         let harness = RemoteHarness::new("console.log('compact');\n");
-        // Build the cache first so the pre-seeded shards below land in the
-        // exact shard `cache.store()` will write (and compact) into: the
-        // cache picks its own write key at construction, so there is no
-        // predictable key to seed ahead of time otherwise.
         let cache = harness.cache();
-        let shard_key = cache.write_bucket_key().expect("write key").to_string();
-        let (seed_cache, merge1_id, merge2_id) = seed_remote_snapshot_entries(
+        let shard_key = cache.write_bucket_key().unwrap();
+        let (_seed_cache, _, old_id) = seed_remote_snapshot_entries(
             harness.temp_repo.path(),
-            &shard_key,
+            shard_key,
             harness.remote_root.path(),
         );
-        let seeded_files = remote_snapshot_files(harness.remote_root.path(), &shard_key);
-        // One object: the consolidated shard. The second used to be its
-        // `.merged` sidecar, no longer uploaded (#284).
-        assert_eq!(seeded_files.len(), 1);
-        assert!(harness
-            .remote_root
-            .path()
-            .join("snapshots")
-            .join(&shard_key)
-            .join(format!("{merge2_id}.bincode"))
-            .exists());
+        let remote_dir = harness.remote_root.path().join("snapshots").join(shard_key);
+        let old_postcard = remote_dir.join(format!("{old_id}.postcard"));
+        assert!(old_postcard.is_file());
+        let old_bincode = old_postcard.with_extension("bincode");
+        let sidecar = old_postcard.with_extension("merged");
+        let unreadable = remote_dir.join("unreadable.postcard");
+        let foreign_only = remote_dir.join("foreign-only.bincode");
+        let legacy = include_bytes!("../../tests/fixtures/legacy-bincode/shard.bincode");
+        fs::write(&old_bincode, legacy).unwrap();
+        fs::write(&foreign_only, legacy).unwrap();
+        fs::write(&sidecar, b"legacy sidecar").unwrap();
+        fs::write(&unreadable, b"not zstd").unwrap();
 
-        fs::remove_dir_all(harness.local_cache.path().join("snapshots")).ok();
-        let input_key = derive_input_key([1; 32], [2; 32], [3; 32], [4; 32], [5; 32]);
-        let outcome = cache
-            .store(
-                "pkg#build",
-                &input_key,
-                &[0x55; 32],
-                &harness.package_dir,
-                &[PathBuf::from("dist/main.js")],
-                &sample_record(true, 320),
-                b"stdout-compact",
-                b"stderr-compact",
-                &[],
-                harness.temp_repo.path(),
-            )
-            .unwrap();
-        // The index merge (and the compaction it drives) is deferred to the
-        // end-of-run flush.
-        cache.flush_pending_entries();
-        cache.flush_push_queue();
-        assert!(matches!(outcome, StoreOutcome::Stored));
-        drop(seed_cache);
+        harness
+            .remote
+            .pull_snapshot_commit(&cache.snapshot_store, shard_key);
+        let input_key = [7; 32];
+        let merge = cache
+            .snapshot_store
+            .merge_entry_with_outcome(shard_key, remote_snapshot_entry(7, input_key, [8; 32]));
+        assert_eq!(merge.subsumed_shard_ids, [old_id]);
+        harness.remote.push_index_merge(shard_key, &merge);
 
-        let snapshot_files = remote_snapshot_files(harness.remote_root.path(), &shard_key);
-        // Two fewer than before: neither the seeded shard nor the one this
-        // store writes uploads a `.merged` sidecar any more (#284).
-        assert_eq!(snapshot_files.len(), 2);
-        assert!(!snapshot_files
-            .iter()
-            .any(|name| name.starts_with(&merge1_id)));
-        // merge2's shard must survive the unrelated `cache.store()` above
-        // (its entries a+b are still valid, so it's not subsumed by
-        // anything) alongside the brand-new shard the store just created.
-        // Check set membership, not position: `remote_snapshot_files` sorts
-        // lexicographically by shard_id, an opaque hash, so which shard
-        // happens to sort first is not a meaningful thing to assert on.
-        assert!(
-            snapshot_files
-                .iter()
-                .filter_map(|name| name.strip_suffix(".bincode"))
-                .any(|id| id == merge2_id),
-            "merge2's shard must still be present, not subsumed: {snapshot_files:?}"
+        let upload = merge.new_snapshot_upload.unwrap();
+        assert_eq!(
+            fs::read(remote_dir.join(format!("{}.postcard", upload.shard_id))).unwrap(),
+            upload.shard_bytes
         );
-        assert_snapshot_shard_count(&snapshot_files, 2);
+        assert!(!old_postcard.exists());
+        assert_eq!(fs::read(old_bincode).unwrap(), legacy);
+        assert_eq!(fs::read(foreign_only).unwrap(), legacy);
+        assert_eq!(fs::read(sidecar).unwrap(), b"legacy sidecar");
+        assert_eq!(fs::read(unreadable).unwrap(), b"not zstd");
     }
 
     #[test]
@@ -2538,7 +2511,7 @@ mod tests {
     }
 
     #[test]
-    fn candidate_keys_include_remote_only_shards() {
+    fn remote_only_shard_restores_postcard_entry_alongside_same_key_legacy_entry() {
         if !should_run_rclone_test() {
             eprintln!("skipping rclone-gated remote-only shard discovery test; rclone not on PATH or LUCHTA_TEST_RCLONE disabled");
             return;
@@ -2570,12 +2543,13 @@ mod tests {
         // shares a cache dir with this one, only the remote.
         let seed_cache_dir = tempfile::tempdir().unwrap();
         let seed_paths = crate::shared::open_shared_paths(seed_cache_dir.path()).unwrap();
-        let input_key = derive_input_key([61; 32], [62; 32], [63; 32], [64; 32], [5; 32]);
-        let record_bytes = bincode::serde::encode_to_vec(
-            sample_record(true, 150),
-            crate::serialization::bincode_config(),
-        )
-        .unwrap();
+        let input_key = [3; 32];
+        let entries_dir = remote_root.path().join("entries");
+        fs::create_dir(&entries_dir).unwrap();
+        let legacy_path = entries_dir.join(format!("{}.bin", hex_hash(input_key)));
+        let legacy = include_bytes!("../../tests/fixtures/legacy-bincode/entry.bin");
+        fs::write(&legacy_path, legacy).unwrap();
+        let record_bytes = encode(&sample_record(true, 150)).unwrap();
         crate::shared::write_entry_meta(
             &seed_paths,
             &input_key,
@@ -2612,6 +2586,9 @@ mod tests {
             presence: ArtifactPresence::metadata_only(),
         });
         remote_seed.push_index_merge(&remote_only_key, &merge);
+        let postcard_path = entries_dir.join(format!("{}.postcard", hex_hash(input_key)));
+        let encoded_meta = fs::read(entry_meta_path(&seed_paths, &input_key)).unwrap();
+        assert_eq!(fs::read(postcard_path).unwrap(), encoded_meta);
 
         // Fresh local cache: it never wrote to `remote_only_key`, and that
         // key isn't its own write bucket either. The only way it can see
@@ -2619,6 +2596,10 @@ mod tests {
         // remote.
         let fresh_cache_dir = tempfile::tempdir().unwrap();
         let cache = open_cache_with_remote(repo.path(), fresh_cache_dir.path(), &remote_seed);
+        let downloaded_path = entry_meta_path(cache.paths(), &input_key);
+        assert!(!downloaded_path.exists());
+        let local_legacy_path = downloaded_path.with_extension("bin");
+        fs::write(&local_legacy_path, legacy).unwrap();
         let restore_dir = repo.path().join("restore-remote-only");
         fs::create_dir_all(&restore_dir).unwrap();
 
@@ -2627,6 +2608,9 @@ mod tests {
             .next()
             .expect("a shard that exists only on the remote must still be reachable");
         assert_eq!(candidate.stdout, b"remote-only-stdout");
+        assert_eq!(fs::read(downloaded_path).unwrap(), encoded_meta);
+        assert_eq!(fs::read(local_legacy_path).unwrap(), legacy);
+        assert_eq!(fs::read(legacy_path).unwrap(), legacy);
     }
 
     #[test]
@@ -2652,11 +2636,7 @@ mod tests {
         // `refresh_entry` is ever called -- `try_restore_candidates` requires
         // `read_entry_meta` to succeed to produce a candidate at all -- so
         // seed one here for `flush_pending_entries` to read `has_outputs` from.
-        let record_bytes = bincode::serde::encode_to_vec(
-            sample_record(true, 200),
-            crate::serialization::bincode_config(),
-        )
-        .unwrap();
+        let record_bytes = encode(&sample_record(true, 200)).unwrap();
         crate::shared::write_entry_meta(
             cache.paths(),
             &input_key,
@@ -2717,7 +2697,7 @@ mod tests {
                 .remote_root
                 .path()
                 .join("entries")
-                .join(format!("{}.bin", hex_hash(input_key)))
+                .join(entry_meta_filename(&input_key))
                 .exists(),
             "flush_pending_entries must push the entry meta object to the remote too"
         );
@@ -2760,11 +2740,7 @@ mod tests {
         ];
 
         for (input_key, outputs_hash, seed) in hits {
-            let record_bytes = bincode::serde::encode_to_vec(
-                sample_record(true, 200),
-                crate::serialization::bincode_config(),
-            )
-            .unwrap();
+            let record_bytes = encode(&sample_record(true, 200)).unwrap();
             crate::shared::write_entry_meta(
                 cache.paths(),
                 &input_key,
@@ -3017,7 +2993,7 @@ mod tests {
             .remote_root
             .path()
             .join("entries")
-            .join(format!("{}.bin", hex_hash(input_key)));
+            .join(entry_meta_filename(&input_key));
         assert!(
             remote_entry.exists(),
             "store() must push its own entry meta immediately, before any flush"

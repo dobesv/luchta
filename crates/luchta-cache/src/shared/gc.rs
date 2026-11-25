@@ -3,7 +3,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::shared::snapshot::{SNAPSHOT_FILE_EXTENSION, SNAPSHOT_MERGED_EXTENSION};
+use crate::shared::entry_meta::ENTRY_META_FILE_EXTENSION;
+use crate::shared::snapshot::SNAPSHOT_FILE_EXTENSION;
 use crate::shared::{atomic_write, SharedCachePaths};
 
 #[cfg(test)]
@@ -15,9 +16,7 @@ pub const DEFAULT_GC_RETENTION: Duration = Duration::from_secs(14 * 24 * 60 * 60
 pub const DEFAULT_GC_THROTTLE: Duration = Duration::from_secs(24 * 60 * 60);
 /// Marker file for the GC throttle.
 const GC_MARKER_NAME: &str = ".gc-marker";
-const SNAPSHOT_SUFFIX: &str = ".bincode";
 const BLOB_SUFFIX: &str = ".tar.zst";
-const ENTRY_META_SUFFIX: &str = ".bin";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct GcStats {
@@ -98,17 +97,7 @@ fn gc_snapshot_dir(
 
         if path.is_dir() {
             gc_snapshot_commit_dir(&path, retention, now, stats);
-            continue;
         }
-
-        if !has_file_name_suffix(&path, SNAPSHOT_SUFFIX) {
-            continue;
-        }
-        if !is_older_than(&path, retention, now) {
-            continue;
-        }
-
-        delete_snapshot_file(&path, stats);
     }
 }
 
@@ -135,21 +124,10 @@ fn gc_snapshot_commit_dir(path: &Path, retention: Duration, now: SystemTime, sta
             continue;
         }
 
-        delete_snapshot_shard(&shard_path, stats);
+        delete_snapshot_file(&shard_path, stats);
     }
 
     prune_empty_dir(path);
-}
-
-fn delete_snapshot_shard(path: &Path, stats: &mut GcStats) {
-    let snapshot_bytes = file_len(path);
-    if remove_file_if_exists(path) {
-        stats.snapshots_deleted += 1;
-        stats.bytes_freed = stats.bytes_freed.saturating_add(snapshot_bytes);
-    }
-
-    let sidecar_path = path.with_extension(SNAPSHOT_MERGED_EXTENSION);
-    let _ = remove_file_if_exists(&sidecar_path);
 }
 
 fn delete_snapshot_file(path: &Path, stats: &mut GcStats) {
@@ -208,7 +186,7 @@ fn gc_entries_dir(
     for entry in entries {
         let Ok(entry) = entry else { continue };
         let path = entry.path();
-        if !has_file_name_suffix(&path, ENTRY_META_SUFFIX) {
+        if path.extension().and_then(|ext| ext.to_str()) != Some(ENTRY_META_FILE_EXTENSION) {
             continue;
         }
         if !is_older_than(&path, retention, now) {
@@ -343,7 +321,9 @@ mod tests {
         let mut entries = fs::read_dir(&shard_dir)
             .unwrap()
             .map(|entry| entry.unwrap().path())
-            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("bincode"))
+            .filter(|path| {
+                path.extension().and_then(|ext| ext.to_str()) == Some(SNAPSHOT_FILE_EXTENSION)
+            })
             .collect::<Vec<_>>();
         entries.sort();
         entries.into_iter().next().unwrap()
@@ -374,17 +354,21 @@ mod tests {
     }
 
     #[test]
-    fn run_gc_deletes_old_shard_and_merged_sidecar() {
+    fn run_gc_deletes_only_old_postcard_shard_at_same_stem() {
         let temp_dir = tempdir().unwrap();
         let paths = open_shared_paths(temp_dir.path()).unwrap();
         let old_snapshot = write_snapshot(&paths, "old-commit", [9; 32]);
-        let merged_sidecar = old_snapshot.with_extension(SNAPSHOT_MERGED_EXTENSION);
+        let merged_sidecar = old_snapshot.with_extension("merged");
         fs::write(&merged_sidecar, b"older-shard\n").unwrap();
+        let old_bincode = old_snapshot.with_extension("bincode");
+        let legacy = include_bytes!("../../tests/fixtures/legacy-bincode/shard.bincode");
+        fs::write(&old_bincode, legacy).unwrap();
         let snapshot_bytes = file_len(&old_snapshot);
 
         let stale = SystemTime::now() - Duration::from_secs(3 * 24 * 60 * 60);
         set_mtime(&old_snapshot, stale);
         set_mtime(&merged_sidecar, stale);
+        set_mtime(&old_bincode, stale);
 
         let stats = run_gc(&paths, Duration::from_secs(24 * 60 * 60));
 
@@ -392,8 +376,8 @@ mod tests {
         assert_eq!(stats.blobs_deleted, 0);
         assert_eq!(stats.bytes_freed, snapshot_bytes);
         assert!(!old_snapshot.exists());
-        assert!(!merged_sidecar.exists());
-        assert!(!old_snapshot.parent().unwrap().exists());
+        assert_eq!(fs::read(merged_sidecar).unwrap(), b"older-shard\n");
+        assert_eq!(fs::read(old_bincode).unwrap(), legacy);
     }
 
     #[test]
@@ -412,21 +396,19 @@ mod tests {
     }
 
     #[test]
-    fn run_gc_deletes_old_legacy_snapshot_file() {
+    fn run_gc_preserves_old_flat_snapshot_file() {
         let temp_dir = tempdir().unwrap();
         let paths = open_shared_paths(temp_dir.path()).unwrap();
         let legacy_snapshot = paths.snapshots_dir.join("legacy-commit.bincode");
-        fs::write(&legacy_snapshot, b"legacy snapshot").unwrap();
-        let expected_bytes = file_len(&legacy_snapshot);
+        let legacy = include_bytes!("../../tests/fixtures/legacy-bincode/shard.bincode");
+        fs::write(&legacy_snapshot, legacy).unwrap();
         let stale = SystemTime::now() - Duration::from_secs(3 * 24 * 60 * 60);
         set_mtime(&legacy_snapshot, stale);
 
         let stats = run_gc(&paths, Duration::from_secs(24 * 60 * 60));
 
-        assert_eq!(stats.snapshots_deleted, 1);
-        assert_eq!(stats.blobs_deleted, 0);
-        assert_eq!(stats.bytes_freed, expected_bytes);
-        assert!(!legacy_snapshot.exists());
+        assert_eq!(stats, GcStats::default());
+        assert_eq!(fs::read(legacy_snapshot).unwrap(), legacy);
     }
 
     #[test]
@@ -441,8 +423,7 @@ mod tests {
         let old_cache_file_blob = paths.cache_files_dir.join("old.tar.zst");
         fs::write(&old_cache_file_blob, b"old cache-file blob").unwrap();
 
-        let recent_snapshot = paths.snapshots_dir.join("recent-commit.bincode");
-        fs::write(&recent_snapshot, b"recent").unwrap();
+        let recent_snapshot = write_snapshot(&paths, "recent-commit", [10; 32]);
         let recent_blob = paths.blobs_dir.join("recent.tar.zst");
         fs::write(&recent_blob, b"recent blob").unwrap();
         let recent_cache_file_blob = paths.cache_files_dir.join("recent.tar.zst");
@@ -554,10 +535,13 @@ mod tests {
     }
 
     #[test]
-    fn run_gc_deletes_old_entry_meta() {
+    fn run_gc_deletes_only_old_postcard_entry_at_same_key() {
         let temp = TempDir::new().unwrap();
         let paths = crate::shared::paths::open_shared_paths(temp.path()).unwrap();
-        let input_key = [12_u8; 32];
+        let input_key = [3; 32];
+        let legacy_path = crate::shared::entry_meta_path(&paths, &input_key).with_extension("bin");
+        let legacy = include_bytes!("../../tests/fixtures/legacy-bincode/entry.bin");
+        fs::write(&legacy_path, legacy).unwrap();
 
         let meta = crate::shared::EntryMeta {
             schema_version: crate::shared::ENTRY_META_SCHEMA_VERSION,
@@ -571,15 +555,15 @@ mod tests {
         crate::shared::write_entry_meta(&paths, &input_key, &meta).unwrap();
 
         let path = crate::shared::entry_meta_path(&paths, &input_key);
-        set_mtime(
-            &path,
-            SystemTime::now() - Duration::from_secs(60 * 60 * 24 * 30),
-        );
+        let stale = SystemTime::now() - Duration::from_secs(60 * 60 * 24 * 30);
+        set_mtime(&path, stale);
+        set_mtime(&legacy_path, stale);
 
         let stats = run_gc(&paths, Duration::from_secs(60 * 60 * 24 * 7));
 
         assert_eq!(stats.entries_deleted, 1);
         assert!(!path.exists());
+        assert_eq!(fs::read(legacy_path).unwrap(), legacy);
     }
 
     #[test]

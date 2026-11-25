@@ -1,6 +1,7 @@
 use std::fs;
 
 use assert_fs::prelude::*;
+use luchta_cache::{Cache, RunReason, SCHEMA_VERSION_V6};
 
 mod common;
 
@@ -30,6 +31,58 @@ fn task_cache_dir(workspace_root: &std::path::Path, task_id: &str) -> std::path:
         .join(blake3::hash(task_id.as_bytes()).to_hex().as_str())
 }
 
+/// Genuine pre-Postcard record bytes captured at 905b038 before the codec
+/// switch (see crates/luchta-cache/tests/fixtures/legacy-bincode/README.md).
+const LEGACY_META_RECORD: &[u8] =
+    include_bytes!("../../luchta-cache/tests/fixtures/legacy-bincode/meta.bincode");
+
+/// Test: a genuine legacy `meta.bincode` record at the exact path the build
+/// reads is a miss, not a crash and not a skip.
+///
+/// The task executes despite the legacy record, writes the new
+/// `meta.postcard` next to it, and the second run skips on the new record
+/// while the legacy file stays in place byte-identical.
+#[test]
+fn legacy_bincode_local_record_is_a_miss_not_a_skip() {
+    let temp = assert_fs::TempDir::new().unwrap();
+    CachePersistenceWorkspace {
+        task_json: r#""app#pkgbuild":{"cache":{},"worker":"shell","inputs":["src.txt"],"outputs":["counter.txt"],"command":"count=$(cat counter.txt 2>/dev/null || echo 0); count=$((count+1)); echo $count > counter.txt"}"#,
+        extra_files: &[("packages/app/src.txt", "one\n")],
+    }
+    .build(&temp);
+
+    let cache_dir = task_cache_dir(temp.path(), "app#pkgbuild");
+    fs::create_dir_all(&cache_dir).unwrap();
+    let legacy_record = cache_dir.join("meta.bincode");
+    fs::write(&legacy_record, LEGACY_META_RECORD).unwrap();
+
+    let first = common::run_luchta(&temp, "pkgbuild").success();
+    let first_stdout = String::from_utf8_lossy(&first.get_output().stdout).into_owned();
+    assert!(
+        first_stdout.contains("✔ 1") && !first_stdout.contains("⏩"),
+        "legacy record must produce a miss: task executes, stdout was:\n{first_stdout}"
+    );
+    temp.child("packages/app/counter.txt").assert("1\n");
+    assert!(
+        cache_dir.join("meta.postcard").is_file(),
+        "execution must write the new-format record next to the legacy one"
+    );
+
+    let second = common::run_luchta(&temp, "pkgbuild").success();
+    let second_stdout = String::from_utf8_lossy(&second.get_output().stdout).into_owned();
+    assert!(
+        second_stdout.contains("⏩ 1"),
+        "second run must skip on the new record, stdout was:\n{second_stdout}"
+    );
+    temp.child("packages/app/counter.txt").assert("1\n");
+
+    assert_eq!(
+        fs::read(&legacy_record).unwrap(),
+        LEGACY_META_RECORD,
+        "legacy record must stay in place byte-identical"
+    );
+}
+
 #[test]
 fn non_cacheable_task_persists_local_run_record_but_still_reruns() {
     let temp = assert_fs::TempDir::new().unwrap();
@@ -45,7 +98,14 @@ fn non_cacheable_task_persists_local_run_record_but_still_reruns() {
     temp.child("packages/app/stderr.txt").assert("err-1\n");
 
     let cache_dir = task_cache_dir(temp.path(), "app#pkgbuild");
-    assert!(cache_dir.join("meta.bincode").exists());
+    assert!(cache_dir.join("meta.postcard").is_file());
+    let cache = Cache::open(&temp.path().join(".luchta/cache")).unwrap();
+    let record = cache
+        .read("app#pkgbuild")
+        .expect("execution record should be readable");
+    assert_eq!(record.schema_version, SCHEMA_VERSION_V6);
+    assert_ne!(record.run_reason, Some(RunReason::SharedCacheHit));
+    assert!(record.succeeded);
     assert!(cache_dir.join("stdout.log").exists());
     assert!(cache_dir.join("stderr.log").exists());
     assert_eq!(

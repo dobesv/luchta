@@ -744,7 +744,7 @@ mod tests {
             ":local:{}",
             remote_dir.path().join("snapshots/commit").display()
         );
-        let file_name = "part-01.bincode";
+        let file_name = "part-01.postcard";
         let payload = b"snapshot-bytes\nwith-second-line";
 
         rclone
@@ -787,7 +787,7 @@ mod tests {
                 UploadFile {
                     fs: &remote_fs,
                     remote_dir: "snapshots/commit",
-                    file_name: "shard.bincode",
+                    file_name: "shard.postcard",
                     bytes: payload,
                 },
                 timeout,
@@ -797,7 +797,7 @@ mod tests {
         let written = remote_dir
             .path()
             .join("snapshots/commit")
-            .join("shard.bincode");
+            .join("shard.postcard");
         assert_eq!(fs::read(&written).unwrap(), payload);
     }
 }

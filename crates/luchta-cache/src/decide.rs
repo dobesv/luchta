@@ -376,7 +376,7 @@ mod tests {
 
     use crate::{
         combined_inputs_hash, CacheError, FileDelta, FileEntry, RunReason, TaskRunRecord,
-        SCHEMA_VERSION_V5,
+        SCHEMA_VERSION_V6,
     };
 
     use super::{
@@ -902,7 +902,7 @@ mod tests {
 
     fn sample_record() -> TaskRunRecord {
         TaskRunRecord {
-            schema_version: SCHEMA_VERSION_V5,
+            schema_version: SCHEMA_VERSION_V6,
             task_spec_hash: [1; 32],
             input_patterns: vec!["src/**/*.ts".to_owned()],
             inputs: vec![sample_present_file("src/main.ts", [3; 32])],

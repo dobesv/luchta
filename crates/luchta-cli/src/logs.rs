@@ -398,7 +398,7 @@ mod tests {
 
     fn dummy_record(reports: Vec<&str>) -> TaskRunRecord {
         TaskRunRecord {
-            schema_version: luchta_cache::SCHEMA_VERSION_V5,
+            schema_version: luchta_cache::SCHEMA_VERSION_V6,
             task_spec_hash: [0; 32],
             input_patterns: vec![],
             inputs: vec![],
