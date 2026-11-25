@@ -59,7 +59,7 @@ description = "Rust monorepo build orchestration tool"
 # Renovate's Cargo manager skips patches; the custom regex manager in
 # renovate.json tracks this entry as part of the OXC toolchain group.
 [patch.crates-io]
-oxc_allocator = { git = "https://github.com/oxc-project/oxc.git", rev = "fa492d66e0df5d88ef68cf4c20d40f676611e547", package = "oxc_allocator" }
+oxc_allocator = { git = "https://github.com/oxc-project/oxc.git", rev = "f10f033671ccf54ccd80eeb0eaaaa327841620b6", package = "oxc_allocator" }
 
 # tsrs_core pins unicode-id-start =1.1.2, but SWC requires ^1.2.0. This fork
 # relaxes that constraint; identifiers may include newer Unicode 16/17 characters.
@@ -119,19 +119,19 @@ mimalloc = "0.1.43"
 #
 # Keep every oxc git dependency, including `[patch.crates-io]`, at one rev.
 # `xtask::tests::oxc_git_dependencies_share_one_revision` guards this.
-oxc_allocator = { git = "https://github.com/oxc-project/oxc.git", rev = "fa492d66e0df5d88ef68cf4c20d40f676611e547" }
-oxc_parser = { git = "https://github.com/oxc-project/oxc.git", rev = "fa492d66e0df5d88ef68cf4c20d40f676611e547" }
-oxc_semantic = { git = "https://github.com/oxc-project/oxc.git", rev = "fa492d66e0df5d88ef68cf4c20d40f676611e547" }
-oxc_linter = { git = "https://github.com/oxc-project/oxc.git", rev = "fa492d66e0df5d88ef68cf4c20d40f676611e547" }
-oxc_span = { git = "https://github.com/oxc-project/oxc.git", rev = "fa492d66e0df5d88ef68cf4c20d40f676611e547" }
-oxc_syntax = { git = "https://github.com/oxc-project/oxc.git", rev = "fa492d66e0df5d88ef68cf4c20d40f676611e547" }
-oxc_diagnostics = { git = "https://github.com/oxc-project/oxc.git", rev = "fa492d66e0df5d88ef68cf4c20d40f676611e547" }
-oxc_transformer = { git = "https://github.com/oxc-project/oxc.git", rev = "fa492d66e0df5d88ef68cf4c20d40f676611e547" }
-oxc_codegen = { git = "https://github.com/oxc-project/oxc.git", rev = "fa492d66e0df5d88ef68cf4c20d40f676611e547" }
+oxc_allocator = { git = "https://github.com/oxc-project/oxc.git", rev = "f10f033671ccf54ccd80eeb0eaaaa327841620b6" }
+oxc_parser = { git = "https://github.com/oxc-project/oxc.git", rev = "f10f033671ccf54ccd80eeb0eaaaa327841620b6" }
+oxc_semantic = { git = "https://github.com/oxc-project/oxc.git", rev = "f10f033671ccf54ccd80eeb0eaaaa327841620b6" }
+oxc_linter = { git = "https://github.com/oxc-project/oxc.git", rev = "f10f033671ccf54ccd80eeb0eaaaa327841620b6" }
+oxc_span = { git = "https://github.com/oxc-project/oxc.git", rev = "f10f033671ccf54ccd80eeb0eaaaa327841620b6" }
+oxc_syntax = { git = "https://github.com/oxc-project/oxc.git", rev = "f10f033671ccf54ccd80eeb0eaaaa327841620b6" }
+oxc_diagnostics = { git = "https://github.com/oxc-project/oxc.git", rev = "f10f033671ccf54ccd80eeb0eaaaa327841620b6" }
+oxc_transformer = { git = "https://github.com/oxc-project/oxc.git", rev = "f10f033671ccf54ccd80eeb0eaaaa327841620b6" }
+oxc_codegen = { git = "https://github.com/oxc-project/oxc.git", rev = "f10f033671ccf54ccd80eeb0eaaaa327841620b6" }
 oxc_sourcemap = "10.0.0"
-oxc_formatter = { git = "https://github.com/oxc-project/oxc.git", rev = "fa492d66e0df5d88ef68cf4c20d40f676611e547" }
-oxc_formatter_core = { git = "https://github.com/oxc-project/oxc.git", rev = "fa492d66e0df5d88ef68cf4c20d40f676611e547" }
-oxc_formatter_css = { git = "https://github.com/oxc-project/oxc.git", rev = "fa492d66e0df5d88ef68cf4c20d40f676611e547", default-features = false }
+oxc_formatter = { git = "https://github.com/oxc-project/oxc.git", rev = "f10f033671ccf54ccd80eeb0eaaaa327841620b6" }
+oxc_formatter_core = { git = "https://github.com/oxc-project/oxc.git", rev = "f10f033671ccf54ccd80eeb0eaaaa327841620b6" }
+oxc_formatter_css = { git = "https://github.com/oxc-project/oxc.git", rev = "f10f033671ccf54ccd80eeb0eaaaa327841620b6", default-features = false }
 json-strip-comments = "3.1.1"
 serde-sarif = "0.8.0"
 url = "2.5.8"
