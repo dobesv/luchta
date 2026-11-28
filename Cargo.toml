@@ -39,7 +39,7 @@ members = [
 
 [workspace.package]
 edition = "2021"
-version = "0.3.9"
+version = "0.3.10"
 license = "MIT"
 authors = ["Luchta Contributors"]
 # Rust 1.99 required by tsrs at pinned rev cb2d7948f3686cba8448963a5147b0840bb53e5e,
